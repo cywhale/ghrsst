@@ -1,7 +1,7 @@
 # ghrsst_app.py
 import os, json, re, math
 from datetime import date, datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Set
 import numpy as np
 import xarray as xr
 from fastapi import FastAPI, HTTPException, Query
@@ -117,13 +117,36 @@ def _idx_from_coord(val: float, arr: np.ndarray) -> int:
     return j if abs(arr[j]-val) < abs(arr[j-1]-val) else j-1
 
 def _fields_from_append(append: Optional[str]) -> List[str]:
-    if not append: 
+    if not append:
         return ["sst"]  # default
     want = [t.strip() for t in append.split(",") if t.strip()]
     bad = [w for w in want if w not in cfg.ALLOWED_FIELDS]
     if bad:
         _err(f"Unsupported field(s): {','.join(bad)}. Allowed: {','.join(cfg.ALLOWED_FIELDS)}")
     return want
+
+ALLOWED_MODES = {"truncate"}
+
+def _parse_modes(mode: Optional[str]) -> Set[str]:
+    if not mode:
+        return set()
+    items = {m.strip().lower() for m in mode.split(",") if m.strip()}
+    bad = [m for m in items if m not in ALLOWED_MODES]
+    if bad:
+        _err(f"Unsupported mode(s): {','.join(bad)}. Allowed: {','.join(sorted(ALLOWED_MODES))}")
+    return items
+
+def _apply_modes(rows: List[dict], modes: Set[str], data_fields: List[str]) -> List[dict]:
+    if "truncate" in modes:
+        for row in rows:
+            if "lon" in row and row["lon"] is not None:
+                row["lon"] = round(float(row["lon"]), 5)
+            if "lat" in row and row["lat"] is not None:
+                row["lat"] = round(float(row["lat"]), 5)
+            for field in data_fields:
+                if field in row and row[field] is not None:
+                    row[field] = round(float(row[field]), 3)
+    return rows
 
 def _load_coords_from_any(days: List[str]):
     """Open the first existing day's group to fetch lon/lat & bounds."""
@@ -166,14 +189,13 @@ app = FastAPI(docs_url=None, lifespan=lifespan, default_response_class=ORJSONRes
 def generate_custom_openapi():
     if app.openapi_schema: return app.openapi_schema
     openapi_schema = get_openapi(
-        title="Open API of GHRSST (MUR v4.1, daily 1 km)",
-        version="1.2.0",
+        title="ODB Open API of GHRSST (MUR v4.1)",
+        version="1.0.0",
         description=(
-            "Daily 1-km GHRSST MUR v4.1 (SST, SST anomaly, sea ice).\n\n"
-            "• Point mode (lon0,lat0 only): single day (default latest) or ≤ 31-day range; "
-            "clamped to available [earliest, latest]; missing days are skipped.\n"
-            "• BBox mode (lon0,lat0,lon1,lat1): single day only; if a specific day is outside the available range, returns 400 with an error; "
-            f"limit: nx*ny ≤ {cfg.POINT_LIMIT}.\n"
+            "Open API to query daily 1-km GHRSST MUR v4.1 (SST, SST anomaly, sea ice) data.\n\n"
+            "* Data source: MUR-JPL-L4-GLOB-v4.1. JPL MUR MEaSUREs Project. 2015. GHRSST Level 4 MUR Global Foundation Sea Surface Temperature Analysis. Ver. 4.1. PO.DAAC, CA, USA. https://doi.org/10.5067/GHGMR-4FJ04\n"
+            "* Point mode (lon0,lat0 only): default latest day or requested range ≤31 days; clamped to available [earliest, latest] with missing days skipped.\n"
+            f"* BBox mode (lon0,lat0,lon1,lat1): single-day only (uses provided start/end to choose the day); requested day must exist; limit nx*ny ≤ {cfg.POINT_LIMIT}.\n"
         ),
         routes=app.routes,
     )
@@ -200,7 +222,7 @@ class GHRSSTRow(BaseModel):
 # Endpoint
 # =========================
 
-@app.get("/api/ghrsst", response_model=List[GHRSSTRow], tags=["GHRSST"], summary="Point (single or ≤1 month) or BBox (single day)")
+@app.get("/api/ghrsst", response_model=List[GHRSSTRow], tags=["GHRSST"], summary="Query GHRSST (MUR v4.1, daily 1-km) data")
 async def read_ghrsst(
     lon0: float = Query(..., description="Longitude (or min lon) [-180,180]"),
     lat0: float = Query(..., description="Latitude (or min lat) [-90,90]"),
@@ -208,10 +230,29 @@ async def read_ghrsst(
     lat1: Optional[float] = Query(None, description="Max latitude (BBox mode)"),
     start: Optional[str] = Query(None, description="Start date YYYY-MM-DD (inclusive)"),
     end: Optional[str] = Query(None, description="End date YYYY-MM-DD (inclusive)"),
-    append: Optional[str] = Query(None, description="Fields: sst,sst_anomaly,sea_ice (default: all)"),
+    append: Optional[str] = Query(None, description="Fields: sst,sst_anomaly,sea_ice (default: sst)"),
     sample: Optional[int] = Query(None, description="(BBox) optional stride ≥1 to reduce points"),
+    mode: Optional[str] = Query(
+        None,
+        description=(
+            "Allowed modes: truncate. Multiple modes can be comma-separated. "
+            "The mode 'truncate' rounds lon/lat to 5 decimals and data values to 3 decimals."
+        ),
+    ),
 ):
+    """
+    Query global marine SST (sst), SST anomalies (sst_anomaly) and sea ice fraction (sea_ice) from NASA MUR v4.1 by using spatial and temporal filters.
+
+    #### Usage
+    * Point query (lon0,lat0 only): single day (default latest) or ≤ 31-day range; clamped to available [earliest, latest]; missing days are skipped.
+    * /api/ghrsst?lon0=-60&lat0=10&append=sst,sst_anomaly (point query, default date).
+    * BBox query (lon0,lat0,lon1,lat1): single day only (uses `start` when both start/end provided, otherwise whichever is supplied, otherwise latest); requested day must exist in the dataset; per-day limit nx*ny ≤ 1,000,000.
+    * /api/ghrsst?lon0=125&lat0=15&lon1=126&lat1=16&start=2025-10-30 (bbox query, specific date).
+    * Use mode=truncate to round lon/lat (5 dp) and data fields (3 dp) for lighter payloads.
+    """
+
     fields = _fields_from_append(append)
+    modes = _parse_modes(mode)
 
     # Determine mode
     bbox_mode = (lon1 is not None) and (lat1 is not None) and not (lon1 == lon0 and lat1 == lat0)
@@ -270,12 +311,10 @@ async def read_ghrsst(
                         row[f] = None if (v is None or np.isnan(v)) else float(v)
                 rows.append(row)
 
+        rows = _apply_modes(rows, modes, fields)
         return ORJSONResponse(rows)
 
     # ----- BBOX MODE: single day only -----
-    # pick the date according to the rules
-    # both given -> use start; one given -> use that; none -> latest
-    chosen = None
     if start and end:
         chosen = _parse_date(start)
     elif start or end:
@@ -283,9 +322,11 @@ async def read_ghrsst(
     else:
         chosen = _latest_or_503()
 
-    # strict: if specified date outside available, error
     if chosen < rt.earliest or chosen > rt.latest or (not _group_exists(chosen)):
-        _err(f"Data not exist, available date is {rt.earliest}/{rt.latest}.", 400)
+        _err(
+            f"BBOX query only allows single-day data. Requested {chosen} is unavailable; available range is {rt.earliest}/{rt.latest}.",
+            400,
+        )
 
     # open coords from the chosen day
     lon, lat, lon_name, lat_name = _load_coords_from_any([chosen])
@@ -335,8 +376,8 @@ async def read_ghrsst(
                 row[f] = None if np.isnan(v) else float(v)
             rows.append(row)
 
+    rows = _apply_modes(rows, modes, fields)
     resp = ORJSONResponse(rows)
     resp.headers["X-Stride"] = str(stride)
     resp.headers["X-Served-Rows"] = str(len(rows))
     return resp
-
