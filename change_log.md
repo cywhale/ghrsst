@@ -1,5 +1,6 @@
 #### ver 0.1.1 (2025-11-05)
 - Enforced single-day bbox behaviour with explicit error messaging when the requested day is missing.
-- Added optional truncate mode and API tests for payload rounding and bbox date validation.
+- Added optional truncate mode, bbox `sample` stride (default 1), and API tests covering rounding and bbox validation.
+- GHRSST MCP tools now support `method=nearest` fallbacks (≤7-day tolerance) and HTTPS deployment via `/mcp/ghrsst`.
 
 #### ver 0.1.0 first-commit ghrsst_app.py  

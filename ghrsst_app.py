@@ -36,6 +36,7 @@ class RT:
     lat: Optional[np.ndarray] = None
     LonRange = (-180.0, 180.0)
     LatRange = (-90.0, 90.0)
+    index_mtime: Optional[float] = None
 
 rt = RT()
 
@@ -73,7 +74,12 @@ def _scan_bounds(zarr_root: str):
 def _load_bounds():
     # prefer minimal latest.json with {"earliest":"...", "latest":"..."}
     e = l = None
+    mtime = None
     if os.path.isfile(cfg.INDEX_JSON):
+        try:
+            mtime = os.path.getmtime(cfg.INDEX_JSON)
+        except OSError:
+            mtime = None
         try:
             j = json.load(open(cfg.INDEX_JSON, "r", encoding="utf-8"))
             e = j.get("earliest"); l = j.get("latest")
@@ -82,9 +88,30 @@ def _load_bounds():
     if not e or not l:
         e2, l2 = _scan_bounds(cfg.ZARR_PATH)
         e = e or e2; l = l or l2
+        if mtime is None:
+            try:
+                mtime = os.path.getmtime(cfg.ZARR_PATH)
+            except OSError:
+                mtime = None
     rt.earliest, rt.latest = e, l
+    rt.index_mtime = mtime
+
+
+def _refresh_bounds_if_index_changed():
+    if os.path.isfile(cfg.INDEX_JSON):
+        try:
+            mtime = os.path.getmtime(cfg.INDEX_JSON)
+        except OSError:
+            mtime = None
+        if (
+            mtime is not None
+            and (rt.index_mtime is None or mtime > rt.index_mtime + 1e-9)
+        ):
+            _load_bounds()
+
 
 def _latest_or_503():
+    _refresh_bounds_if_index_changed()
     if not rt.latest:
         _load_bounds()
     if not rt.latest:
@@ -231,7 +258,7 @@ async def read_ghrsst(
     start: Optional[str] = Query(None, description="Start date YYYY-MM-DD (inclusive)"),
     end: Optional[str] = Query(None, description="End date YYYY-MM-DD (inclusive)"),
     append: Optional[str] = Query(None, description="Fields: sst,sst_anomaly,sea_ice (default: sst)"),
-    sample: Optional[int] = Query(None, description="(BBox) optional stride ≥1 to reduce points"),
+    sample: int = Query(1, description="(BBox) re-sample every N points (default 1) to thin the grid"),
     mode: Optional[str] = Query(
         None,
         description=(
@@ -246,16 +273,21 @@ async def read_ghrsst(
     #### Usage
     * Point query (lon0,lat0 only): single day (default latest) or ≤ 31-day range; clamped to available [earliest, latest]; missing days are skipped.
     * /api/ghrsst?lon0=-60&lat0=10&append=sst,sst_anomaly (point query, default date).
-    * BBox query (lon0,lat0,lon1,lat1): single day only (uses `start` when both start/end provided, otherwise whichever is supplied, otherwise latest); requested day must exist in the dataset; per-day limit nx*ny ≤ 1,000,000.
+    * BBox query (lon0,lat0,lon1,lat1): single day only (uses `start` when both start/end provided, otherwise whichever is supplied, otherwise latest); requested day must exist in the dataset; per-day limit nx*ny ≤ 1,000,000 and supports `sample` stride to thin grids.
     * /api/ghrsst?lon0=125&lat0=15&lon1=126&lat1=16&start=2025-10-30 (bbox query, specific date).
     * Use mode=truncate to round lon/lat (5 dp) and data fields (3 dp) for lighter payloads.
     """
+
+    _refresh_bounds_if_index_changed()
 
     fields = _fields_from_append(append)
     modes = _parse_modes(mode)
 
     # Determine mode
     bbox_mode = (lon1 is not None) and (lat1 is not None) and not (lon1 == lon0 and lat1 == lat0)
+
+    if not bbox_mode and sample != 1:
+        _err("Parameter 'sample' is only supported in BBox mode.")
 
     # Load / refresh earliest/latest if missing
     if not (rt.earliest and rt.latest):
@@ -344,7 +376,9 @@ async def read_ghrsst(
     if j1 < j0: j0, j1 = j1, j0
     if i1 < i0: i0, i1 = i1, i0
 
-    stride = int(sample) if (sample is not None and sample >= 1) else 1
+    if sample < 1:
+        _err("Parameter 'sample' must be >= 1.")
+    stride = int(sample)
     nj = (j1 - j0) // stride + 1
     ni = (i1 - i0) // stride + 1
     total = nj * ni

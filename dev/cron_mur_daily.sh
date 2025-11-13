@@ -1,9 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SHELL=/bin/bash
+PATH=/home/odbadmin/.pyenv/shims:/home/odbadmin/.pyenv/bin:/usr/local/bin:/usr/bin:/bin
+HOME=/home/odbadmin
+
+# Initialize pyenv (needed for shims to work)
+export PYENV_ROOT="$HOME/.pyenv"
+export PATH="$PYENV_ROOT/bin:$PATH"
+if command -v pyenv >/dev/null 2>&1; then
+  eval "$(pyenv init --path)"
+  eval "$(pyenv init -)"
+fi
+
+# Ensure .netrc is readable
+if [[ -f "$HOME/.netrc" ]]; then
+  chmod 600 "$HOME/.netrc"
+fi
+
 # --------- EDIT THESE PATHS ONCE ----------
 PY_BIN="$HOME/.pyenv/versions/py314/bin/python"       # Python 3.14 venv (Zarr v3)
-PDS_BIN="$HOME/.pyenv/shims/podaac-data-downloader"   # podaac-data-downloader CLI
+PDS_BIN="$HOME/.pyenv/versions/py314/bin/podaac-data-downloader"   # podaac-data-downloader CLI
 WRITER="$HOME/python/ghrsst/dev/mur2zarr_v3.py"       # your writer (v3, no consolidation)
 TESTER="$HOME/python/ghrsst/tests/test_compare_mur_point.py"  # verifier
 

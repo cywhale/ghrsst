@@ -12,13 +12,14 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def bbox_client(tmp_path, monkeypatch):
     zarr_root = tmp_path / "mur.zarr"
-    lon = np.array([135.0], dtype=np.float32)
-    lat = np.array([15.0], dtype=np.float32)
+    lon = np.array([135.0, 136.0], dtype=np.float32)
+    lat = np.array([15.0, 16.0], dtype=np.float32)
 
     days = ["2025-10-30", "2025-11-03"]
     for idx, day in enumerate(days):
+        vals = np.array([[20.0 + idx, 21.0 + idx], [22.0 + idx, 23.0 + idx]], dtype=np.float32)
         ds = xr.Dataset(
-            data_vars={"sst": (("lat", "lon"), np.array([[20.0 + idx]], dtype=np.float32))},
+            data_vars={"sst": (("lat", "lon"), vals)},
             coords={"lon": lon, "lat": lat},
         )
         ds.to_zarr(
@@ -63,8 +64,32 @@ def test_bbox_single_day_selected_from_range(bbox_client):
     )
     assert resp.status_code == 200
     rows = resp.json()
+    assert len(rows) == 4
+    assert all(row["date"] == "2025-10-30" for row in rows)
+    coords = {(row["lon"], row["lat"]) for row in rows}
+    assert coords == {(135.0, 15.0), (136.0, 15.0), (135.0, 16.0), (136.0, 16.0)}
+
+
+def test_bbox_sample_stride(bbox_client):
+    resp = bbox_client.get(
+        "/api/ghrsst",
+        params={
+            "lon0": 135,
+            "lat0": 15,
+            "lon1": 136,
+            "lat1": 16,
+            "start": "2025-10-30",
+            "sample": 2,
+            "append": "sst",
+        },
+    )
+    assert resp.status_code == 200
+    rows = resp.json()
     assert len(rows) == 1
-    assert rows[0]["date"] == "2025-10-30"
+    row = rows[0]
+    assert row["lon"] == pytest.approx(135.0)
+    assert row["lat"] == pytest.approx(15.0)
+    assert row["date"] == "2025-10-30"
 
 
 def test_bbox_range_without_overlap_errors(bbox_client):

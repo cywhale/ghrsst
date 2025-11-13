@@ -6,3 +6,4 @@ numpy>=1.26
 xarray>=2024.1
 zarr>=2.16
 pydantic>=2.6
+httpx>=0.28

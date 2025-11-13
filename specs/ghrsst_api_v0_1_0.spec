@@ -65,6 +65,7 @@ Single endpoint serving both **point** and **bbox** queries.
 | `end`    | `YYYY-MM-DD` | no       | End date (inclusive). See mode rules below.                                         |
 | `append` | string       | no       | Comma list of fields. Allowed: `sst`, `sst_anomaly`, `sea_ice`. **Default:** `sst`. |
 | `sample` | int ≥ 1      | no       | **BBox only:** stride/decimation factor. Default `1`.                               |
+| `mode`   | string       | no       | Optional response modifier. `truncate` rounds lon/lat to 5 dp and data fields to 3 dp. |
 
 **Content type:** `application/json` (ORJSON).
 
@@ -92,7 +93,7 @@ Single endpoint serving both **point** and **bbox** queries.
   * If none → **use latest**.
 * If the **specified** date is outside `[earliest, latest]` **or** its subgroup folder is missing → **400** `"Data not exist, available date is EARLIEST/LATEST."`
 * **Size limit:** `nx * ny ≤ POINT_LIMIT` (see §7).
-  Optional `sample` (stride) can be used to reduce `nx`/`ny`.
+  Optional `sample` (stride, default `1`) can be used to reduce `nx`/`ny`.
 
 ---
 
@@ -131,6 +132,7 @@ Each item is a row (point/day). Schema:
   (Example: indices 10..13, stride=2 → picks 10,12 → 2 = `(13-10)//2 + 1`.)
 * **Serialization:** `ORJSONResponse` for performance.
 * **No pagination**; enforce result limits with `POINT_LIMIT`.
+* **`mode=truncate`:** rounds `lon/lat` to 5 decimal places and numeric fields (`sst`, `sst_anomaly`, `sea_ice`) to 3 decimal places to reduce payload size.
 
 ---
 
@@ -313,4 +315,3 @@ Data not exist, available date is 2025-11-01/2025-11-02.
   * BBox: single day only; removed soft target row limit; kept hard `POINT_LIMIT`.
   * Point: range allowed (≤31), clamp & skip missing.
   * Paths default to `data/mur.zarr`, `data/latest.json` (project-relative).
-
