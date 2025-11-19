@@ -4,14 +4,14 @@ module.exports = {
       name: "ghrsst_mcp",
       cwd: "/home/odbadmin/python/ghrsst",
       // Option A (recommended): let PM2 run the script with your Python
-      script: "mcp/ghrsst_mcp_server.py",
+      script: "mcp/metocean_mcp_server.py",
       interpreter: "/home/odbadmin/.pyenv/versions/py314/bin/python",
       // Option B (alternative): comment the 2 lines above and use the two below instead
       // script: "/home/odbadmin/.pyenv/versions/py314/bin/python",
       // args: "mcp/ghrsst_mcp_server.py",
 
       // MCP server args
-      args: "--transport http --host 0.0.0.0 --port 8765 --path /mcp/ghrsst",
+      args: "--transport http --host 0.0.0.0 --port 8765 --path /mcp/metocean",
 
       // Process behavior
       instances: 1,
@@ -22,8 +22,8 @@ module.exports = {
       kill_timeout: 5000,
 
       // Logs
-      error_file: "/home/odbadmin/tmp/ghrsst_mcp.err.log",
-      out_file: "/home/odbadmin/tmp/ghrsst_mcp.out.log",
+      error_file: "/home/odbadmin/tmp/metocean_mcp.err.log",
+      out_file: "/home/odbadmin/tmp/metocean_mcp.out.log",
       merge_logs: true,
       time: true,
 
