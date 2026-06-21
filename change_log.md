@@ -7,3 +7,7 @@
 
 #### ver 0.2.0
 - Renamed the MCP surface to `metocean-mcp`, kept GHRSST tools intact, and added the new `tide.forecast` tool for tide/sun/moon contexts at `/mcp/metocean`.
+
+#### ver 0.2.1
+- small fix for TLS only on NGINX, and Gunicorn use only HTTP upsream/A small test for API/WMS data consistency
+

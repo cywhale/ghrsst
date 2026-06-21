@@ -45,3 +45,4 @@ data
 **/src.egg-info
 **/*.mat
 **/.python-version
+**/tests/*.png
