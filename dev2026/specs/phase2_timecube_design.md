@@ -134,9 +134,11 @@ The VM24 No-go happened because the local P1 "365-day" run used a **warm, ~260-d
 store. Phase-2 forbids relying on synthetic/partial data for promotion. **Two fixtures**:
 
 - **Fixture A — synthetic/regional (pre-gate, CI, candidate comparison)**: a small lat/lon box ×
-  **≥365 (pref 730) contiguous days**, daily-group format, real days where available + **synthesized
-  realistic-compressibility fill** for the rest (`dev2026/ingest/build_fixture.py`). Use for fast
-  repeatable architecture-timing and apples-to-apples candidate comparison.
+  **≥365 (pref 730) contiguous days**, daily-group format (`dev2026/ingest/build_fixture.py`). Use
+  for fast repeatable architecture-timing and apples-to-apples candidate comparison.
+  > **S0 implementation note**: `build_fixture.py` is currently **synthetic-only** (smooth field +
+  > noise). Real+synth seeding (copy real days where available, synthesize the rest) is deferred —
+  > not needed yet because Fixture A is never promotion-eligible. **The real-data path is Fixture B.**
   **⚠ Synthetic data can hide real compression / chunk / decompression behavior** — so a pass on
   Fixture A **alone CANNOT authorize the VM24 binding gate** (it would repeat the P1 local→VM24
   optimism trap).

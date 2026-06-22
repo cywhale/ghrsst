@@ -11,6 +11,11 @@ compressibility). It CANNOT certify real compression/decompression behaviour —
 why Fixture B (real data) is the promotion gate. A `fixture_meta.json` records day
 count, contiguity, real-vs-synthetic composition, grid, and chunk shape.
 
+NOTE: this builder is currently **synthetic-only** (composition.real = 0). Real+synth
+seeding (copy real days from a source mur.zarr where available, synthesize the rest) is
+deferred until needed — Fixture A is never promotion-eligible, so the real-data path is
+Fixture B (`bench_timecube_microcost.py --fixture-b`), not this tool.
+
 Run:
   dev2026/.venv/bin/python dev2026/ingest/build_fixture.py \
     --out /tmp/fixtureA --days 365 --ny 256 --nx 256 --chunk 256 --start 2024-01-01
