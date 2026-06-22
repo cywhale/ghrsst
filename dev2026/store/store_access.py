@@ -249,7 +249,7 @@ class StoreAccess:
         return [r for r in rows if r is not None]
 
     # ---- bbox as batched row generator (HTTP layer streams it) -----------
-    def bbox_batches(
+    def bbox_arrays(
         self,
         day: str,
         lon0: float,
@@ -258,15 +258,14 @@ class StoreAccess:
         lat1: float,
         fields: Sequence[str],
         stride: int = 1,
-        batch_rows: int = 50_000,
-    ) -> Iterator[List[dict]]:
-        """Field-absence semantics: `null` (matches old bbox path).
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
+        """Read the bbox slice (the blocking I/O part; offload this). Returns
+        (lons, lats, cols) where cols[field] is a 2-D (nlat,nlon) float32 array.
 
-        NOTE (P1-S2/P1-S4 follow-up): this reads each field's FULL bbox slice into
-        `cols` before yielding — the working set is the whole bbox (not one batch).
-        That is far below the old row-dict explosion (doc 00 §4.8) and fine within
-        POINT_LIMIT, but P1-S4 scenario-BBOX worker RSS is the authoritative gate;
-        if it fails, switch to row-window/chunk-window streaming reads here."""
+        NOTE (P1-S2/P1-S4 follow-up): the working set is the WHOLE bbox slice (not
+        one batch). Far below the old row-dict explosion (doc 00 §4.8) and fine within
+        POINT_LIMIT, but P1-S4 scenario-BBOX worker RSS is the authoritative gate; if
+        it fails, switch to row/chunk-window streaming reads here."""
         fields = self._check_fields(fields)
         if not self.day_present(day):
             raise ValueError(f"day not available: {day}")
@@ -280,7 +279,6 @@ class StoreAccess:
         j0, j1 = sorted((_nearest_idx(lo0, lon_arr), _nearest_idx(lo1, lon_arr)))
         i0, i1 = sorted((_nearest_idx(la0, lat_arr), _nearest_idx(la1, lat_arr)))
 
-        # store-level point-limit guard (defense-in-depth; P1-S2 API also guards)
         nj = (j1 - j0) // stride + 1
         ni = (i1 - i0) // stride + 1
         if ni * nj > self.bbox_point_limit:
@@ -290,7 +288,6 @@ class StoreAccess:
             )
 
         g = self._open_day(day)
-        # read the bbox slice once (this is the working set); then yield rows in batches
         cols: Dict[str, np.ndarray] = {}
         for f in fields:
             if f in g:
@@ -303,20 +300,50 @@ class StoreAccess:
                 cols[f] = np.asarray(sub, dtype=np.float32)
         lats = lat_arr[i0 : i1 + 1 : stride].astype(float)
         lons = lon_arr[j0 : j1 + 1 : stride].astype(float)
+        return lons, lats, cols
 
-        batch: List[dict] = []
-        for ri, la in enumerate(lats):
-            for cj, lo in enumerate(lons):
-                row = {"lon": float(lo), "lat": float(la), "date": day}
-                for f in fields:
-                    if f in cols:
-                        v = cols[f][ri, cj]
-                        row[f] = None if np.isnan(v) else float(v)
-                    else:
-                        row[f] = None
-                batch.append(row)
-                if len(batch) >= batch_rows:
-                    yield batch
-                    batch = []
-        if batch:
-            yield batch
+    @staticmethod
+    def bbox_rows_window(
+        lons: np.ndarray,
+        lats: np.ndarray,
+        cols: Dict[str, np.ndarray],
+        fields: Sequence[str],
+        day: str,
+        k0: int,
+        k1: int,
+    ) -> List[dict]:
+        """Build row dicts for flat row indices [k0, k1) over the (nlat*nlon) grid.
+        Pure CPU; no I/O. Absent field -> null (matches old bbox path)."""
+        nlon = lons.size
+        rows: List[dict] = []
+        for k in range(k0, k1):
+            ri, cj = divmod(k, nlon)
+            row = {"lon": float(lons[cj]), "lat": float(lats[ri]), "date": day}
+            for f in fields:
+                if f in cols:
+                    v = cols[f][ri, cj]
+                    row[f] = None if np.isnan(v) else float(v)
+                else:
+                    row[f] = None
+            rows.append(row)
+        return rows
+
+    def bbox_batches(
+        self,
+        day: str,
+        lon0: float,
+        lat0: float,
+        lon1: float,
+        lat1: float,
+        fields: Sequence[str],
+        stride: int = 1,
+        batch_rows: int = 50_000,
+    ) -> Iterator[List[dict]]:
+        """Convenience generator (tests / non-streaming callers). The HTTP layer
+        uses bbox_arrays + bbox_rows_window directly so it can offload per batch."""
+        fields = self._check_fields(fields)
+        lons, lats, cols = self.bbox_arrays(day, lon0, lat0, lon1, lat1, fields, stride)
+        total = lons.size * lats.size
+        for k0 in range(0, total, batch_rows):
+            yield self.bbox_rows_window(lons, lats, cols, fields, day,
+                                        k0, min(k0 + batch_rows, total))

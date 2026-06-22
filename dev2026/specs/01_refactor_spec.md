@@ -94,6 +94,7 @@ dev2026/
   - 換言之:拒絕是「保護機制」,只在超出容量時啟動;容量內不得用拒絕來假裝達標。
 - **canonical 過載回應 = `HTTP 503` + `Retry-After`**(非 429)。理由:這是**全域容量**保護(伺服器暫時無法處理),非 per-client 配額;client 依 `Retry-After` 退避重試。`429` 保留給未來真正的 per-client rate-limit。門檻可設(`GHRSST_OVERLOAD_QUEUE_MAX` / `GHRSST_OVERLOAD_WAIT_MS`)。
 - **可觀測性**:輸出 executor 佇列深度與等待時間指標,供 G2′/G7 驗收(backlog 判定須含 executor 佇列,非只 HTTP in-flight)。
+- **串流請求(bbox)必須在「整個串流生命週期」持有一個 admission permit**(回應 PR review):不可只 gate 初始 slice 讀取就釋放 permit、再用 ungated 工作串流剩餘批次 —— 否則進行中的串流對 `queue_depth` 不可見、RSS/threadpool 不被容量計入,違反 G6/G7。permit 於串流完成或 client 斷線(generator `finally`/`aclose`)釋放;permit 持有期間的分批 encode 才可用 ungated 執行。P1-S2 已實作並以「成功/錯誤路徑皆不洩漏 permit」測試驗證。
 
 ## 5. 第一階段(純軟體,不動資料)— steps 與驗收
 
@@ -111,7 +112,7 @@ dev2026/
 - 端點:
   - `GET /api/ghrsst`(相容舊參數:point / bbox / range / append / mode / sample)。
   - `POST /api/ghrsst/points`(新)。
-  - point range 上限改為可設定(預設提高,如 365),由 `GHRSST_MAX_DAYS` 控制。
+  - point range 上限 `GHRSST_MAX_DAYS`(**預設 365**,定案)。**請求 span > 上限 → HTTP 413**,body 含 `max_days` / `requested_days` / 拆分建議;**不做 pagination**;上限對「**請求 span(clamp 前)**」計算。VM24 staging 實測後可調(如 730)。
 - 所有 zarr 工作經**有界 executor**(`GHRSST_ZARR_WORKERS`)+ 背壓 offload(**先快取後 offload**,順序見 §3.4;細節見 §4「有界 executor 與背壓」)。
 - **過載降級(G7)**:佇列深度/等待超門檻 → 快速 **`503` + `Retry-After`**(canonical,見 §4 容量模式),不無限排隊;容量內不得拒絕。
 - **Cache-Control 政策(與 P1-S6 cache 一致)**:
@@ -348,7 +349,7 @@ upstream ghrsst_mcp { server 127.0.0.1:8765; }   # 已定義但「未被任何 l
 
 ## 8. 給 reviewer 的開放問題(部分已於 v2 修補)
 
-1. point range 解除後的硬上限(365?730?無上限但分頁?)— 影響 `GHRSST_MAX_DAYS` 預設與是否需分頁。
+1. ~~point range 解除後的硬上限~~ **已定案(P1-S2):`GHRSST_MAX_DAYS=365`,超過回 413(含 max_days/requested_days/拆分建議),不做 pagination,可設定。**
 2. 第二階段是否預先排程,或嚴格以 P1 數字觸發?
 3. 新 app 與舊 app 的最終關係:cutover 後**長期取代**舊 `ghrsst_app.py`(deprecate),或**永遠並存**?影響 P1 是否要做到 100% 參數相容。
 4. cutover 的 canary 流量來源:用內部測試流量,或對 production 直接小比例導流?go/no-go 由誰簽核?
