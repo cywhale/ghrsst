@@ -361,8 +361,26 @@ async def read_points(request: Request, body: PointsRequest):
     return _json(rows, headers=_no_store())  # batch: never cache (URI-only key)
 
 
+def _rss_mb() -> Optional[float]:
+    """Current process RSS in MB (this worker). Portable; None if unavailable."""
+    try:
+        import psutil
+        return round(psutil.Process().memory_info().rss / 1e6, 1)
+    except Exception:
+        try:
+            with open("/proc/self/statm") as fh:           # Linux fallback
+                pages = int(fh.read().split()[1])
+            return round(pages * os.sysconf("SC_PAGE_SIZE") / 1e6, 1)
+        except Exception:
+            return None
+
+
 @app.get("/healthz", include_in_schema=False)
 async def healthz(request: Request):
     e, l = request.app.state.store.bounds()
+    bex = request.app.state.bex
     return {"status": "ok", "earliest": e, "latest": l,
-            "executor_queue_depth": request.app.state.bex.queue_depth()}
+            "executor_queue_depth": bex.queue_depth(),
+            "executor_limit": bex.limit,
+            "rss_mb": _rss_mb(),
+            "pid": os.getpid()}
