@@ -46,3 +46,5 @@ data
 **/*.mat
 **/.python-version
 **/tests/*.png
+**/.DS_Store
+**/.venv
