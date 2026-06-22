@@ -67,55 +67,106 @@ read chunks; large → opposite). Measured by an append micro-benchmark.
 **H3 — global file count**: small spatial chunks explode file count for a global daily store
 → **Zarr v3 sharding** packs many inner chunks per shard. Measure files/day and total.
 
-## 4. Candidate data structures — each with a decision gate
-Pick by benchmark, not intuition. Build a small **regional subset** (e.g. a few-degree box ×
-the available days) first so candidates iterate in seconds, then validate the winner at scale.
+**H4 — no-rewrite ceiling (E1/F)**: `chunk_count_per_query` is the discriminator. A time store
+(Tier 2) makes it **O(T/time_chunk)** (single-digit for T=365); E1/F leave it **O(T)** (≈365)
+and can only change *wall time* (parallelism) or *open overhead* (manifest). So the H1 table is
+run for E1/F too, but their gate is purely empirical — do they hit §5 *despite* O(T) reads? If
+not, the cache-independent `chunk_count`/`decompressed_bytes` evidence explains why and justifies
+the rewrite.
 
+## 4. Candidate data structures — risk-ordered, each with a decision gate
+**Best-solution principle (review-driven): try the lowest-operational-risk approach that can
+pass the §5 local gate before committing to a data rewrite.** A no-rewrite win avoids dual-write
+ingest, storage doubling, and conversion/backfill risk — so it is *preferred if it passes*, even
+if a time-cube is faster. Evaluate strictly in this order; stop at the first that passes the gate.
+
+Build the §5 contiguous fixture first so every candidate iterates against the SAME full-time data.
+
+### Tier 1 — NO data rewrite (lowest operational risk; evaluate first)
 | # | candidate | hypothesis | decide by |
 |---|---|---|---|
-| A | **time-cube** `(time,lat,lon)`, time-contiguous chunk + small spatial chunk + **v3 sharding** | best point-series locality | H1 metrics + append (H2) + files (H3) |
-| B | **rechunked time-major Zarr** (moderate `(time, lat, lon)` chunks, no sharding) | simpler; maybe enough | same; compare file count vs A |
-| C | **per-variable time-stack** (one array per var, time-major) | isolates sst vs anomaly vs ice | append/read per var |
-| D | **spatial-tile + time-chunk hybrid** (coarse spatial tiles, long time) | balance bbox-adjacent reuse | bbox impact + point-series |
-| E | **index sidecar / manifest** over existing daily groups (precomputed offsets; no re-store) | avoid data conversion entirely | does it actually cut O(T) open cost? likely NO (still per-day reads) — cheap to disprove first |
+| **E1** | **manifest / index sidecar** over daily groups (precomputed day→path/offset map; no re-store) | cuts per-day *open* overhead only | H1 metrics; **likely rejected** — P1 already opens directly, the cost is per-day *reads* not opens. Cheap to disprove. |
+| **F** | **existing daily store + smarter read engine** (no rewrite): xarray/dask **virtual concat** over daily groups; **bounded-concurrency parallel per-day reads**; zarr v3 async/concurrent reads where available; consolidated-metadata / metadata caching; optional **kerchunk/reference** virtual dataset | **parallelizes** O(days), does not *remove* it | full H1 metrics (§3) incl. **concurrency curve + RSS** |
 
-**Decision rules**:
-- Run **E first** (cheapest): if a manifest/offset index alone meets the gate, no re-store needed. VM24 evidence suggests it won't (the cost is per-day reads, not just opens), but disprove it cheaply.
-- Among A–D, pick the one that **passes §5 point-series gate with the lowest append cost + file count**, and **does not regress bbox** (if a candidate also serves bbox).
-- **bbox protection**: if the chosen time store hurts bbox vs the daily store, **keep bbox on the daily store** (hybrid §2). The spec must state the final routing per pattern with benchmark numbers.
+**F ceiling (state honestly, design the bench to catch it):** F's best case is `O(days)` reads done
+in parallel. Whether that meets the gate depends on **CPU-bound vs I/O-bound**:
+- If VM24's 14 s was dominated by **decompress (CPU)** → parallel reads across cores can cut C=1
+  wall time a lot (e.g. 14 s / 8 ≈ 1.75 s) and F may pass C=1.
+- But under **LR concurrency** the cores are already busy with other requests, so per-request
+  parallelism collapses → F likely **fails the LR multipliers** even if it passes C=1.
+- And parallel in-flight day-chunks **multiply RSS** (was not a P1 blocker because reads were
+  sequential) → F's RSS gate must be watched.
+- If I/O-bound (cold-disk seeks) → parallelism helps less; reference/kerchunk reduces open
+  overhead but not the O(days) byte reads.
+**F decision gate:** if F hits the §5 local gate (incl. LR + RSS + cache-independent metrics)
+**without a rewrite → adopt F, skip Tier 2.** If F only passes C=1 but fails LR/RSS, or cannot
+hit 365-day p95<4 s → **reject, proceed to Tier 2.**
+
+### Tier 2 — data rewrite (structural fix; only if Tier 1 fails the gate)
+| # | candidate | hypothesis | decide by |
+|---|---|---|---|
+| A | **time-cube** `(time,lat,lon)`, time-contiguous chunk + small spatial chunk + **v3 sharding** | removes O(days): point series → O(T/time_chunk) chunk reads | H1 + append (H2) + files (H3) |
+| B | **rechunked time-major Zarr** (moderate `(time,lat,lon)` chunks, no sharding) | simpler; maybe enough | same; file count vs A |
+| C | **per-variable time-stack** (one array per var, time-major) | isolates sst/anomaly/ice | append/read per var |
+| D | **spatial-tile + time-chunk hybrid** (coarse spatial tiles, long time) | balance bbox reuse | bbox impact + point series |
+
+**Tier-2 decision rules**:
+- Pick the candidate that **passes §5 with the lowest append cost (H2) + file count (H3)** and **does not regress bbox**.
+- **bbox protection / hybrid routing**: if the chosen time store hurts bbox vs the daily store, **keep bbox on the daily store** (§2). Final spec states routing per pattern with benchmark numbers.
+- Expectation (review + VM24 evidence): the structural fix is most likely **A** (time-cube), but this is decided by benchmark, not assumed.
 
 ## 5. LOCAL GATE (must pass BEFORE any VM24 work)
 > The VM24 No-go proved local functional/small benchmarks are insufficient. **Local gate is
 > not the production gate, but it must prove the architecture direction works** under
 > realistic critical-path load. If local fails, do NOT push to VM24.
 
-Thresholds (per the Phase-2 task requirement), measured via `bench/loadtest.py` (+ the
-micro-cost bench), machine-readable JSON:
-- **365-day point series, C=1**: **p95 < 4 s** (target p50 < 2.5 s).
-- **365-day LR C=4**: p95 < **2× baseline**; **C=8** < **3× baseline**; **C=16**: no timeout, no OOM, may 503-shed, served p95 < **4× baseline**.
-- **730-day point series**: report; should remain bounded (target similar multiples of its own C=1 baseline).
-- **RSS not monotonically growing**; within ceiling.
-- Workloads required: single-point 365-day & 730-day; LR C=1/4/8/16; SB-short; SB range-heavy; BBOX near limit; overload/backpressure.
-- Artifacts: same JSON schema as `loadtest.py` (windowed stability incl.), so local and VM24 runs diff directly.
+### 5.1 Required fixture (a local pass is INVALID without it)
+The VM24 No-go happened because the local P1 "365-day" run used a **warm, ~260-day partial**
+store. Phase-2 forbids that:
+- **Minimum: a 365-day CONTIGUOUS fixture** (no gaps) for the hard gate. **Preferred: 730-day**
+  fixture for the report target.
+- The local copied store has only ~260 contiguous days, so **build a regional-subset fixture**:
+  a small lat/lon box × **≥365 (pref 730) contiguous days** in daily-group format (`dev2026/
+  ingest/build_fixture.py`). Use real days where available; **synthesize realistic-compressibility
+  days** to fill the full time length (the fixture validates *time-axis architecture & timing*,
+  not data values — value parity uses real overlapping days separately).
+- For Tier-2 candidates, convert this same fixture to the time store, so daily-vs-time numbers
+  are apples-to-apples.
+- **A local pass is INVALID** if it used a shorter span than 365 contiguous, or a purely warm
+  partial store. The fixture's day count + contiguity must be recorded in the artifact `meta`.
 
-> Caveat baked in: the local store is **partial / warm**. To reduce the local↔VM24 gap, the
-> local gate run MUST (a) use the largest contiguous local span available, (b) **drop OS page
-> cache before the run where possible** (or report cache state), and (c) report `chunk_count_
-> per_query` + `decompressed_bytes` from the micro-bench — these are cache-independent and are
-> the real architectural signal. A pass on cache-independent metrics + warm latency is the
-> minimum bar to spend VM24 time.
+### 5.2 Thresholds
+Measured via `bench/loadtest.py` (+ micro-cost bench), machine-readable JSON; **365-day = HARD
+gate, 730-day = REPORT target** (per orchestrator decision):
+- **365-day point series, C=1 (HARD)**: **p95 < 4 s** (target p50 < 2.5 s).
+- **365-day LR C=4**: p95 < **2× baseline**; **C=8** < **3× baseline**; **C=16**: no timeout, no OOM, may 503-shed, served p95 < **4× baseline**.
+- **730-day point series (REPORT)**: report C=1 + LR; bounded vs its own C=1 baseline (not a hard fail).
+- **RSS not monotonically growing**; within ceiling (watch F especially — parallel reads inflate RSS).
+- Workloads required: single-point 365-day & 730-day; LR C=1/4/8/16; SB-short; SB range-heavy; BBOX near limit; overload/backpressure.
+- Artifacts: same JSON schema as `loadtest.py` (windowed stability incl.) + the micro-cost JSON; `meta` records fixture span/contiguity + cache state.
+
+### 5.3 Cache discipline
+- **Drop OS page cache before each gate run** where possible (`vmtouch -e` / `echo 3 >
+  /proc/sys/vm/drop_caches` on Linux; document if not possible on the dev Mac) **or report cache
+  state**; report both cold and warm where feasible.
+- Always report the **cache-independent** signals (`chunk_count_per_query`, `decompressed_bytes`)
+  from the micro-bench — these are the real architectural discriminator and don't depend on
+  cache warmth. A pass on cache-independent metrics + cold-ish latency is the minimum bar to
+  spend VM24 time.
 
 ## 6. Per-step plan — every step ships code + benchmark + gate
+Tier-1 (no rewrite) is evaluated FIRST; Tier-2 (time store) only starts if Tier-1 fails the gate.
 | step | deliverable | benchmark + gate (local) |
 |---|---|---|
-| **P2-S1** | candidate-E manifest/offset probe over daily store | micro-bench: does it cut O(T)? gate: meet §5 365-day or **reject E** |
-| **P2-S2** | `dev2026/ingest/` time-store converter (regional subset first), v3 sharding | conversion correctness (parity vs daily) + files/day (H3) |
-| **P2-S3** | `bench/bench_timecube_microcost.py` (chunk_count / decompressed_bytes / read_ampl / py_alloc / rss per query) | produce the H1 table for each chunking candidate; pick chunking by gate |
-| **P2-S4** | `store/time_store.py` access layer (point_series/range via time store) | **parity** vs P1 `point_series` (exact values) + thread-safety stress (reuse P1 patterns) |
-| **P2-S5** | hybrid router in `store`/`api` (route by pattern) | routing unit tests + **full parity across all routes** vs old/P1 |
-| **P2-S6** | daily-append into the time store wired into the ingest path | append micro-bench (H2): cost/day, no rewrite of existing, new-day visibility |
-| **P2-S7** | full local load gate (`loadtest.py` all scenarios incl 365/730-day) | **§5 LOCAL GATE — must pass to proceed** |
-| **P2-S8** | VM24 shadow + binding gate (Codex/ops) + cutover discussion | runbook (extend `p1s5_s6_runbook.md`); VM24 binding only after S7 |
+| **P2-S0** | `dev2026/ingest/build_fixture.py` — 365 (pref 730) day **contiguous regional fixture** (daily-group format; real + synthesized days) + `bench/bench_timecube_microcost.py` (chunk_count / decompressed_bytes / read_ampl / py_alloc / rss per query) | fixture has ≥365 contiguous days (recorded in meta); micro-bench runs on the daily store as the O(days) baseline |
+| **P2-S1 (Tier 1)** | **E1** manifest/offset sidecar over daily groups | micro-bench: does it cut O(T)? **gate: meet §5 365-day or reject E1** |
+| **P2-S2 (Tier 1)** | **F** smarter read engine (dask/xarray virtual concat, bounded-concurrency parallel per-day reads, zarr async, optional kerchunk) over the daily store | full §5 gate incl. **LR multipliers + RSS** + H1 metrics. **If F passes the §5 local gate → ADOPT F, skip S3–S6 (no rewrite).** If F fails → proceed to Tier 2. |
+| **P2-S3 (Tier 2)** | time-store converter (subset first), v3 sharding; produce H1 table per chunking candidate (A–D) | pick chunking by gate (read_ampl/latency/append/files) |
+| **P2-S4 (Tier 2)** | `store/time_store.py` access layer (point_series/range via time store) | **parity** vs P1 `point_series` (exact values) + thread-safety stress (reuse P1 patterns) |
+| **P2-S5 (Tier 2)** | hybrid router in `store`/`api` (route by pattern) | routing unit tests + **full parity across all routes** vs old/P1 |
+| **P2-S6 (Tier 2)** | daily-append (dual-write) into the time store in the ingest path | append micro-bench (H2): cost/day, no rewrite of existing, new-day visibility |
+| **P2-S7** | full local load gate (`loadtest.py` all scenarios incl 365/730-day) on the adopted approach (F or time store) | **§5 LOCAL GATE — must pass to proceed** |
+| **P2-S8** | VM24 shadow + binding gate (Codex/ops) + cutover discussion | extend `p1s5_s6_runbook.md`; VM24 binding only after S7 |
 
 ## 7. Promotion checklist (gate to advance; no skipping)
 1. code complete (the step's module)
@@ -127,8 +178,9 @@ micro-cost bench), machine-readable JSON:
 7. **only after VM24 binding pass** → NGINX cutover discussion
 
 ## 8. Hybrid routing — correctness & ingest contract
-- Router maps (has bbox? / #days / single-day?) → store; documented + unit-tested; default safe (unknown → daily store).
-- **Dual-write ingest**: the daily pipeline keeps writing daily groups AND appends to the time store; both must stay consistent (a parity check in CI/local). Storage roughly doubles for the time-served variables — accepted; quantify in S2.
+- Router maps (has bbox? / #days / single-day?) → store; documented + unit-tested; default safe (unknown → daily store). `POST /points` stays **single-day** on the daily store (no multi-day in Phase-2 scope).
+- **Dual-write ingest applies ONLY if Tier-2 (a time store) is adopted** — F (Tier-1) needs no second store, no dual-write, no extra storage (its main appeal).
+- If Tier-2: the daily pipeline keeps writing daily groups AND appends to the time store; both stay consistent (parity check in CI/local). **Keep all three time-series vars `sst`, `sst_anomaly`, `sea_ice`** in the time store (dropping vars would break append/parity); storage ~doubles for those vars — accepted initially, quantify in S3, phase by benchmark only if VM24 capacity is tight.
 - live-store tolerance + new-day visibility carried over from P1 (filesystem rescan / append visibility test).
 
 ## 9. Risks & mitigations
@@ -141,8 +193,12 @@ micro-cost bench), machine-readable JSON:
 | local↔VM24 gap recurs | §5 cache-independent metrics + drop-cache + largest-span discipline |
 | time store helps point but hurts bbox | hybrid routing keeps bbox on daily store (§2/§4) |
 
-## 10. Open questions for reviewer
-1. 730-day a hard target now, or just "bounded / report"? (sets `time_chunk` & gate.)
-2. Storage budget on VM24 for the duplicated time store (drives keep-all-vars vs sst-only).
-3. Is candidate-E (manifest-only, no re-store) worth a first attempt, or skip straight to a time-cube given the VM24 evidence?
-4. Does `POST /points` ever need multi-day batch? (would pull it toward the time store.)
+## 10. Open questions — RESOLVED (orchestrator, 2026-06)
+1. **730-day** → **report target, not a hard gate**; **365-day is the hard gate**. (§5.2)
+2. **Storage** → keep **`sst`, `sst_anomaly`, `sea_ice`** (3 vars) in the time store initially (dropping breaks append parity); if capacity tight, phase by benchmark. (§8)
+3. **Candidate E first?** → **Yes, but expanded to E1 (manifest) + F (dask/xarray/zarr smarter-read)** as the Tier-1 no-rewrite ladder, evaluated before any time-cube. (§4 Tier 1, §6 S1–S2)
+4. **`POST /points` multi-day?** → **No — out of Phase-2 scope; stays single-day** on the daily store. (§2, §8)
+
+Remaining for reviewer: confirm the Tier-1→Tier-2 ladder + F's gate (adopt-if-passes) is the
+right risk posture, and whether the synthesized-fill fixture (§5.1) is acceptable for the
+architecture-timing gate (value parity uses real days separately).
