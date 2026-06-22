@@ -6,14 +6,23 @@
 1. [`specs/00_diagnosis_and_evidence.md`](specs/00_diagnosis_and_evidence.md) — 專案現況、問題、**實測證據**、根因。
 2. [`specs/01_refactor_spec.md`](specs/01_refactor_spec.md) — 目標、非目標、分階段 steps、驗收標準、開放問題。
 
-## 重現 benchmark(請自跑驗證數字)
+## 環境與相依(P1-S1..S4)
 ```bash
 uv venv dev2026/.venv --python 3.13
-uv pip install --python dev2026/.venv/bin/python "zarr>=3" "xarray>=2025.1" numpy orjson
+# diagnostics/store + API(P1-S2)+ load harness(P1-S4):
+uv pip install --python dev2026/.venv/bin/python \
+  "zarr>=3" "xarray>=2025.1" numpy orjson \
+  fastapi "uvicorn[standard]" httpx psutil
 export GHRSST_ZARR_PATH=$(pwd)/bak/data/mur.zarr     # 或 production 路徑;切勿硬編碼
+```
+> `fastapi`/`uvicorn`/`httpx` 為 P1-S2 app 與 P1-S4 harness/parity 測試所需;`psutil` 供 `/healthz` worker RSS 取樣(缺時退回 `/proc`)。VM24 部署相依見 P1-S5。
+
+## 重現 benchmark / 測試
+```bash
 dev2026/.venv/bin/python dev2026/bench/bench_pointseries.py --days 150
 dev2026/.venv/bin/python dev2026/bench/bench_concurrency.py --n 16
 dev2026/.venv/bin/python dev2026/bench/bench_bbox.py
+dev2026/.venv/bin/python -m unittest dev2026.tests.test_store_access dev2026.tests.test_api dev2026.tests.test_parity
 ```
 
 ## 慣例

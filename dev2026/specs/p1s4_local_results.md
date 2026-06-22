@@ -10,8 +10,8 @@
 - configurable `--base` (or `GHRSST_LOADTEST_BASE`); default `http://127.0.0.1:8036` (local, non-prod). No hardcoded production host.
 - scenarios **SB / LR / BBOX / OL** (spec §P1-S4).
 - per (scenario, C): p50/p95/p99 latency, `ok` / `shed_503` / `errors` / `timeouts`, throughput, **executor queue depth** + **worker RSS** time series from `/healthz`, OL **recovery_ms**.
-- machine-readable **JSON** output (`--out`) with `meta.binding=false` so a local run and a VM24 run can be diffed.
-- `/healthz` now returns `executor_queue_depth`, `executor_limit`, `rss_mb` (psutil; `/proc` fallback), `pid`.
+- machine-readable **JSON** output (`--out`). **`--run-kind local|vm24`** sets `meta.binding` (local→false, vm24→true; `--binding` forces true) so the same tool produces both the local validation artifact and the VM24 authoritative gate artifact.
+- `/healthz` returns `executor_queue_depth`, `executor_limit`, `rss_mb` (psutil; `/proc` fallback), `pid`. The sampler **preserves `pid` + `executor_limit`** per sample and reports **`by_pid`** (per-worker `rss_mb_max` / `queue_depth_max`) — because under gunicorn `-w N` each `/healthz` is one worker's view. `rss_mb_max` is the max across sampled workers, **not a total**; total RSS must be collected externally (e.g. `ps` over SSH, sum by worker pid).
 
 ## Local environment (context only)
 - 28-core Mac, Python 3.13, uvicorn single worker. Store = `bak/data/mur.zarr` (partial, ~260 contiguous recent days + sparse older; still copying).

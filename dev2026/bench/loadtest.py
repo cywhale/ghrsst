@@ -134,6 +134,8 @@ async def _sampler(base, stop_t, series, interval=1.0):
             try:
                 h = (await sc.get("/healthz")).json()
                 series.append({"t": round(time.monotonic(), 2),
+                               "pid": h.get("pid"),                       # worker identity
+                               "executor_limit": h.get("executor_limit"),
                                "queue_depth": h.get("executor_queue_depth"),
                                "rss_mb": h.get("rss_mb")})
             except Exception:
@@ -185,11 +187,28 @@ async def run_scenario(base, name, concurrency, duration, bbox_deg, req_timeout,
                 recovery_ms = round((time.perf_counter() - t0) * 1000, 1)
     qd = [s["queue_depth"] for s in series if s.get("queue_depth") is not None]
     rss = [s["rss_mb"] for s in series if s.get("rss_mb") is not None]
+    # per-pid summary: /healthz is a SINGLE-worker view; on gunicorn -w N samples
+    # land on different workers. Group by pid so RSS/queue are interpreted per worker
+    # (NOT summed — total RSS must be collected externally over SSH, e.g. ps).
+    by_pid = {}
+    for s in series:
+        pid = s.get("pid")
+        if pid is None:
+            continue
+        d = by_pid.setdefault(str(pid), {"samples": 0, "rss_mb_max": None,
+                                         "queue_depth_max": None, "executor_limit": s.get("executor_limit")})
+        d["samples"] += 1
+        if s.get("rss_mb") is not None:
+            d["rss_mb_max"] = s["rss_mb"] if d["rss_mb_max"] is None else max(d["rss_mb_max"], s["rss_mb"])
+        if s.get("queue_depth") is not None:
+            d["queue_depth_max"] = s["queue_depth"] if d["queue_depth_max"] is None else max(d["queue_depth_max"], s["queue_depth"])
     res = {"scenario": name, "concurrency": concurrency, "duration_s": duration,
            **stats.summary(wall),
            "queue_depth_max": max(qd) if qd else None,
-           "rss_mb_max": max(rss) if rss else None,
+           "rss_mb_max": max(rss) if rss else None,     # max across sampled workers (NOT a total)
            "rss_mb_last": rss[-1] if rss else None,
+           "workers_sampled": len(by_pid),
+           "by_pid": by_pid,
            "recovery_ms": recovery_ms,
            "healthz_series": series}
     return res
@@ -223,13 +242,21 @@ def main():
     ap.add_argument("--req-timeout", type=float, default=60.0, dest="req_timeout")
     ap.add_argument("--dense-days", type=int, default=300, dest="dense_days",
                     help="sample days within the last N days (avoids 400s on a sparse local store)")
+    ap.add_argument("--run-kind", choices=["local", "vm24"], default="local", dest="run_kind",
+                    help="local = non-binding harness validation; vm24 = authoritative gate (binding=true)")
+    ap.add_argument("--binding", dest="binding", action="store_true", default=None,
+                    help="force meta.binding=true (overrides --run-kind)")
     ap.add_argument("--out", default=None, help="write machine-readable JSON here")
     args = ap.parse_args()
 
+    binding = args.binding if args.binding is not None else (args.run_kind == "vm24")
     print("=" * 78)
-    print(f"P1-S4 load harness -> {args.base}")
-    print(">>> NON-BINDING if run locally: harness validation + relative/mechanics only.")
-    print(">>> AUTHORITATIVE G1'/G6/G7 gate = this tool on VM24 + full store + spec params.")
+    print(f"P1-S4 load harness -> {args.base}  [run-kind={args.run_kind} binding={binding}]")
+    if binding:
+        print(">>> BINDING run: this output is treated as an authoritative G1'/G6/G7 gate.")
+    else:
+        print(">>> NON-BINDING: harness validation + relative/mechanics only.")
+        print(">>> AUTHORITATIVE gate = this tool with --run-kind vm24 on VM24 + full store.")
     print("=" * 78)
 
     results = asyncio.run(main_async(args))
@@ -247,8 +274,9 @@ def main():
     out = {"meta": {"base": args.base, "ts": time.time(),
                     "iso": datetime.now(timezone.utc).isoformat(),
                     "duration_s": args.duration, "bbox_deg": args.bbox_deg,
-                    "binding": False,
-                    "note": "LOCAL run is non-binding; VM24 full-store run is the release gate."},
+                    "run_kind": args.run_kind, "binding": binding,
+                    "note": ("BINDING VM24 gate run." if binding else
+                             "LOCAL run is non-binding; rerun with --run-kind vm24 on VM24 as the gate.")},
            "results": results}
     if args.out:
         with open(args.out, "w") as fh:
