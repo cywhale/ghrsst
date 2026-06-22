@@ -73,6 +73,8 @@ dev2026/
 - 取值 API:
   - `point_series(lon, lat, days, fields)` → 用快取座標解 index,**逐日 chunk 取值後即釋放**(不得一次把整段序列的 chunk 全載入記憶體再組裝;peak 記憶體 = 單一 chunk×fields)。
   - `points_batch(pairs, day, fields)` → 座標解一次,**依 1024×1024 chunk 分組,逐 chunk 讀→取點→釋放**(peak = 單一 chunk×fields,而非同時持有所有 fan-out chunk);受 `GHRSST_POINTS_BATCH_MAX` 與「單一 batch 可觸及之不同 chunk 數上限 `GHRSST_BATCH_CHUNK_FANOUT_MAX`」雙重限制。
+  - **欄位缺失語意(P1-S1 定案,回應 Codex review #1;與舊 API 對齊)**:被請求但「該日 group 不含」的 allowed 欄位 —— **`point_series` 省略該 key**(與舊 GET point path 一致:`if f in ds` 才寫);**`bbox` 回 `null`**(與舊 bbox path 一致:缺欄填 NaN→null);**`points_batch`(新端點)明確定為 `null`**(與 bbox 對齊,給 client 穩定欄位)。三者皆有 deterministic 測試(`sst_anomaly` 缺日)。陸地/NaN 一律 `null`。
+  - **bbox 點數上限**:store 層 `bbox_point_limit`(預設 1,000,000,defense-in-depth)+ P1-S2 API 層同樣 guard(回應 Codex review #3)。
   - `bbox(day, bbox, fields, stride)` → **分批 streaming 回應,但維持既有 wire format**(回應 Codex review [High] #1):**預設仍輸出單一 JSON array of row objects** —— 實作為 `StreamingResponse`,先送 `[`,再分批 encode「以逗號相接的 row 物件」,最後送 `]`(每批 encode 後釋放)。**對 client 而言 schema / media-type / JSON-array 相容**(回應 Codex review:**非位元組級相同** —— 空白、chunk 邊界、flush 時機可能與舊 `ORJSONResponse` 不同,但解析出的 JSON 陣列與欄位一致),REST/MCP 既有 client 不需改。
     - **不得**把 `/api/ghrsst` 預設回應改成 NDJSON(那是 wire-format 破壞性變更)。
     - 如需 NDJSON,只能走**opt-in**(例如 `?format=ndjson` 或 `Accept: application/x-ndjson`),預設不啟用。
@@ -184,6 +186,7 @@ response(HTTP 200):
 
 **scenario-BBOX:max bbox 記憶體(G6)**:
 - 連續打接近 `POINT_LIMIT`(1M 點)的單日 bbox(含多 fields),**以 HTTP-level RSS 取樣**量測 worker RSS 峰值(非僅 tracemalloc;見下「RSS 為權威 gate」);要求 ≤ `GHRSST_RSS_CEILING_MB`。這是 streaming 序列化是否生效的證據(逐列 dict / columnar 會在此爆掉,doc 00 §4.8)。
+- **已知限制(回應 Codex review #2)**:P1-S1 `bbox_batches` 雖 streaming **row dicts**,但目前一次讀入整個 bbox 的 data slice 作為 working set(遠小於舊的 row-list 爆量,且在 POINT_LIMIT 內可接受)。**若此情境 RSS 破表**,需把 `bbox_batches` 改為 row-window / chunk-window 逐窗讀取(而非整片 slice);RSS gate 是此決策的觸發點。
 
 **scenario-OL:overload 降級(G7)**:
 - 故意以遠超 `GHRSST_ZARR_WORKERS` 的並發灌入。**pass**:回**快速 `503` + `Retry-After`**(canonical;非逾時/卡死);RSS 不失控;**負載移除後秒級恢復**正常延遲。

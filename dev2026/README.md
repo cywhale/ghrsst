@@ -22,5 +22,7 @@ dev2026/.venv/bin/python dev2026/bench/bench_bbox.py
 
 ## 現況
 - [x] 診斷 + benchmark harness(`bench/`、`store/zarr_paths.py`)
-- [x] spec(`specs/00`、`specs/01`)— **待獨立 reviewer 審查**
-- [ ] P1 實作(審查通過後)
+- [x] spec(`specs/00`、`specs/01`)— **reviewer accepted (v9)**
+- [x] **P1-S1** `store/store_access.py`(座標快取 + thread-safe LRU + 逐 chunk 釋放;`tests/test_store_access.py` 13 tests pass:real-store parity / thread-safety stress / new-day visibility / memory-bound;point_series 12.4×、points_batch 818×)
+- [ ] P1-S2 新 FastAPI(GET 相容 + `POST /points` + streaming bbox + 503 背壓)
+- [ ] P1-S3 parity test / P1-S4 load+RSS scenarios / P1-S5 部署 / P1-S6 cutover
