@@ -101,27 +101,31 @@ def _rand_pt():
     return (round(random.uniform(-179, 179), 4), round(random.uniform(-80, 80), 4))
 
 
-# ---- request generators (return (method, path, params, json_body)) -------
-def gen_sb(b: Bounds, bbox_deg):
+# ---- request generators: (b, opts) -> (method, path, params, json_body) ---
+# opts has .bbox_deg and .sb_range_max (max day-span for SB point requests; set 1
+# for short single-day SB to measure the G2 latency SLO; >1 for range-heavy SB
+# whose gate is G2' STABILITY, not an absolute p99).
+def gen_sb(b: Bounds, opts):
     if random.random() < 0.8:
         lon, lat = _rand_pt()
-        s, e = b.random_range(60)
+        s, e = b.random_range(opts.sb_range_max)
         return ("GET", "/api/ghrsst", {"lon0": lon, "lat0": lat, "start": s, "end": e, "append": "sst"}, None)
     pts = [list(_rand_pt()) for _ in range(16)]
     return ("POST", "/api/ghrsst/points", None, {"date": b.random_day(), "points": pts, "append": "sst"})
 
 
-def gen_lr(b: Bounds, bbox_deg):
+def gen_lr(b: Bounds, opts):
     lon, lat = _rand_pt()
     s, e = b.last_n(365)
     return ("GET", "/api/ghrsst", {"lon0": lon, "lat0": lat, "start": s, "end": e, "append": "sst,sea_ice"}, None)
 
 
-def gen_bbox(b: Bounds, bbox_deg):
-    lon0 = round(random.uniform(-170, 170 - bbox_deg), 3)
-    lat0 = round(random.uniform(-70, 70 - bbox_deg), 3)
-    return ("GET", "/api/ghrsst", {"lon0": lon0, "lat0": lat0, "lon1": lon0 + bbox_deg,
-            "lat1": lat0 + bbox_deg, "start": b.latest, "append": "sst"}, None)
+def gen_bbox(b: Bounds, opts):
+    d = opts.bbox_deg
+    lon0 = round(random.uniform(-170, 170 - d), 3)
+    lat0 = round(random.uniform(-70, 70 - d), 3)
+    return ("GET", "/api/ghrsst", {"lon0": lon0, "lat0": lat0, "lon1": lon0 + d,
+            "lat1": lat0 + d, "start": b.latest, "append": "sst"}, None)
 
 
 GENERATORS = {"SB": gen_sb, "LR": gen_lr, "BBOX": gen_bbox, "OL": gen_lr}
@@ -143,9 +147,9 @@ async def _sampler(base, stop_t, series, interval=1.0):
             await asyncio.sleep(interval)
 
 
-async def _worker(client, stop_t, gen, b, bbox_deg, stats, req_timeout):
+async def _worker(client, stop_t, gen, b, opts, stats, req_timeout):
     while time.monotonic() < stop_t:
-        method, path, params, body = gen(b, bbox_deg)
+        method, path, params, body = gen(b, opts)
         t0 = time.perf_counter()
         try:
             if method == "GET":
@@ -160,8 +164,10 @@ async def _worker(client, stop_t, gen, b, bbox_deg, stats, req_timeout):
             stats.errors += 1
 
 
-async def run_scenario(base, name, concurrency, duration, bbox_deg, req_timeout, dense_days):
+async def run_scenario(base, name, concurrency, duration, bbox_deg, req_timeout, dense_days, sb_range_max):
+    from types import SimpleNamespace
     gen = GENERATORS[name]
+    opts = SimpleNamespace(bbox_deg=bbox_deg, sb_range_max=sb_range_max)
     stats = Stats()
     series = []
     limits = httpx.Limits(max_connections=concurrency + 8, max_keepalive_connections=concurrency + 8)
@@ -170,7 +176,7 @@ async def run_scenario(base, name, concurrency, duration, bbox_deg, req_timeout,
         b = Bounds(b0["earliest"], b0["latest"], dense_days)
         stop_t = time.monotonic() + duration
         wall0 = time.monotonic()
-        tasks = [asyncio.create_task(_worker(client, stop_t, gen, b, bbox_deg, stats, req_timeout))
+        tasks = [asyncio.create_task(_worker(client, stop_t, gen, b, opts, stats, req_timeout))
                  for _ in range(concurrency)]
         sampler = asyncio.create_task(_sampler(base, stop_t, series))
         await asyncio.gather(*tasks)
@@ -226,7 +232,8 @@ async def main_async(args):
         for c in concs:
             print(f"  running {name} @ C={c} for {args.duration}s ...", flush=True)
             results.append(await run_scenario(args.base, name, c, args.duration,
-                                              args.bbox_deg, args.req_timeout, args.dense_days))
+                                              args.bbox_deg, args.req_timeout, args.dense_days,
+                                              args.sb_range_max))
     return results
 
 
@@ -239,6 +246,9 @@ def main():
     ap.add_argument("--concurrency", type=int, default=None, help="override scenario default C")
     ap.add_argument("--bbox-deg", type=float, default=5.0, dest="bbox_deg",
                     help="bbox edge in degrees for BBOX/OL (crank toward POINT_LIMIT on VM24)")
+    ap.add_argument("--sb-range-max", type=int, default=60, dest="sb_range_max",
+                    help="SB point-request max day span. Use 1 for short single-day SB (G2 "
+                         "latency SLO); >1 for range-heavy SB (gate = G2' stability, not p99).")
     ap.add_argument("--req-timeout", type=float, default=60.0, dest="req_timeout")
     ap.add_argument("--dense-days", type=int, default=300, dest="dense_days",
                     help="sample days within the last N days (avoids 400s on a sparse local store)")

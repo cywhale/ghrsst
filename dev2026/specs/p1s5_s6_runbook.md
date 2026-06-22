@@ -39,7 +39,7 @@ Example `-w 2`, `GHRSST_ZARR_WORKERS=8` → 16 threads, ~192 MB concurrent-decom
 ```bash
 cd dev2026
 GHRSST_ZARR_PATH=$GHRSST_ZARR_PATH GHRSST_RSS_CEILING_MB=<X> GHRSST_ZARR_WORKERS=<W_THREADS> \
-PYTHONPATH=. ../dev2026/.venv/bin/gunicorn api.app:app \
+PYTHONPATH=. .venv/bin/gunicorn api.app:app \
   -w <GUNICORN_WORKERS> -k uvicorn.workers.UvicornWorker -b 127.0.0.1:<NEW_PORT> --timeout 180
 curl -s http://127.0.0.1:<NEW_PORT>/healthz   # {latest, executor_limit, rss_mb, pid}
 ```
@@ -48,22 +48,35 @@ curl -s http://127.0.0.1:<NEW_PORT>/healthz   # {latest, executor_limit, rss_mb,
 ```bash
 cd dev2026
 B=http://127.0.0.1:<NEW_PORT>
-P=../dev2026/.venv/bin/python
-$P bench/loadtest.py --base $B --run-kind vm24 --scenario SB   --concurrency 32 --duration 120 --out vm24_sb.json
-$P bench/loadtest.py --base $B --run-kind vm24 --scenario LR   --duration 120 --out vm24_lr.json   # C=4,8,16
-$P bench/loadtest.py --base $B --run-kind vm24 --scenario BBOX --bbox-deg 10 --duration 120 --out vm24_bbox.json  # ~1M pts
-$P bench/loadtest.py --base $B --run-kind vm24 --scenario OL   --concurrency <4×limit> --duration 120 --out vm24_ol.json
+P=.venv/bin/python
+
+# (a) BASELINE: single 365-day series, C=1 -> defines G1 baseline `B` (p50/p95)
+$P bench/loadtest.py --base $B --run-kind vm24 --scenario LR --concurrency 1 --duration 120 --out vm24_g1_baseline.json
+
+# (b) LR concurrency: C=4,8,16 -> G1'
+$P bench/loadtest.py --base $B --run-kind vm24 --scenario LR --duration 120 --out vm24_lr.json
+
+# (c) SB SHORT (single-day point + batch) -> G2 latency SLO
+$P bench/loadtest.py --base $B --run-kind vm24 --scenario SB --sb-range-max 1 --concurrency 32 --duration 120 --out vm24_sb_short.json
+
+# (d) SB RANGE-HEAVY (1-60 day mix) -> G2' stability (NOT an absolute p99)
+$P bench/loadtest.py --base $B --run-kind vm24 --scenario SB --sb-range-max 60 --concurrency 32 --duration 120 --out vm24_sb_range.json
+
+# (e) BBOX ~1M pts (G6) and (f) OL overload (G7)
+$P bench/loadtest.py --base $B --run-kind vm24 --scenario BBOX --bbox-deg 10 --duration 120 --out vm24_bbox.json
+$P bench/loadtest.py --base $B --run-kind vm24 --scenario OL --concurrency <4×limit> --duration 120 --out vm24_ol.json
 ```
 - `--run-kind vm24` stamps `meta.binding=true`.
 - **Total RSS** (harness gives per-worker max, not a sum): collect externally during the run, e.g.
   `ssh vm24 'ps -o rss= -p $(pgrep -f "gunicorn api.app")' | awk '{s+=$1} END{print s/1024" MB total"}'`.
 
 ### 5. Binding pass/fail (from spec; record in the JSON + a short note)
-- **G1** single 365-day p50<2.5 s, p95<4 s (= baseline `B`).
-- **G1′** LR: C=4 served p95 < 2·B; C=8 < 3·B (zero reject/timeout); C=16 may 503-shed but served p95 < 4·B, **zero timeout/OOM**, log shed %.
-- **G2′** SB: p99<150 ms, last-window p95 ≤ 1.2× first, no executor-queue/backlog growth, **zero 5xx**.
-- **G6** every worker RSS ≤ `GHRSST_RSS_CEILING_MB`, no monotonic growth (check `by_pid` + external `ps`).
-- **G7** OL: fast `503`+`Retry-After`, RSS bounded, `recovery_ms` small.
+- **`B` = baseline run (a)**: its p50/p95. **G1**: `B` p50<2.5 s, p95<4 s.
+- **G1′** LR (b): C=4 served p95 < 2·B; C=8 < 3·B (zero reject/timeout); C=16 may 503-shed but served p95 < 4·B, **zero timeout/OOM**, log shed %.
+- **G2** SB-short (c): single-day point + batch → **p50<50 ms, p99<150 ms**. (This absolute SLO applies ONLY to short requests.)
+- **G2′** SB range-heavy (d): the gate is **STABILITY, not an absolute p99** — last-window p95 ≤ 1.2× first window, executor-queue/backlog not growing, throughput ±10%, **zero 5xx**. A 1–60-day range legitimately takes longer than 150 ms, so do NOT apply the G2 latency bound here.
+- **G6** BBOX (e) + all runs: every worker RSS ≤ `GHRSST_RSS_CEILING_MB`, no monotonic growth (`by_pid` + external `ps` sum).
+- **G7** OL (f): fast `503`+`Retry-After`, RSS bounded, `recovery_ms` small.
 - **If G1′/G6 fail → trigger Phase-2 time-cube** (spec §6); do NOT loosen gates to pass.
 
 ---
@@ -103,9 +116,9 @@ GET beyond confirming with the probe (Step 4).
 ```bash
 cd dev2026
 # GET behavior (current prod / canary):
-../dev2026/.venv/bin/python bench/probe_nginx_cache.py --base https://eco.odb.ntu.edu.tw/api/ghrsst
+.venv/bin/python bench/probe_nginx_cache.py --base https://eco.odb.ntu.edu.tw/api/ghrsst
 # STRICT gate once /points is live on the canary/new app (fails CI on collision/absence):
-../dev2026/.venv/bin/python bench/probe_nginx_cache.py \
+.venv/bin/python bench/probe_nginx_cache.py \
   --base https://eco.odb.ntu.edu.tw/api/ghrsst --strict
 ```
 Pass = date-less GET no longer cached-stale (MISS/BYPASS or no-store), and **POST-3 shows no
