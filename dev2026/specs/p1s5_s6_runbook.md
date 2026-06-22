@@ -13,7 +13,7 @@
 ### 1. Environment
 ```bash
 # on VM24, in a checkout of the branch (dev2026-refactor-baseline)
-uv venv dev2026/.venv --python 3.13        # py314 also acceptable; match prod stack
+uv venv dev2026/.venv --python 3.13        # 3.13 = the tested dev2026 stack; use it
 uv pip install --python dev2026/.venv/bin/python \
   "zarr>=3" "xarray>=2025.1" numpy orjson fastapi "uvicorn[standard]" gunicorn httpx psutil
 export GHRSST_ZARR_PATH=<ABS PATH to the FULL mur.zarr on VM24>   # NOT under bak/
@@ -71,10 +71,10 @@ $P bench/loadtest.py --base $B --run-kind vm24 --scenario OL --concurrency <4×l
   `ssh vm24 'ps -o rss= -p $(pgrep -f "gunicorn api.app")' | awk '{s+=$1} END{print s/1024" MB total"}'`.
 
 ### 5. Binding pass/fail (from spec; record in the JSON + a short note)
-- **`B` = baseline run (a)**: its p50/p95. **G1**: `B` p50<2.5 s, p95<4 s.
-- **G1′** LR (b): C=4 served p95 < 2·B; C=8 < 3·B (zero reject/timeout); C=16 may 503-shed but served p95 < 4·B, **zero timeout/OOM**, log shed %.
-- **G2** SB-short (c): single-day point + batch → **p50<50 ms, p99<150 ms**. (This absolute SLO applies ONLY to short requests.)
-- **G2′** SB range-heavy (d): the gate is **STABILITY, not an absolute p99** — last-window p95 ≤ 1.2× first window, executor-queue/backlog not growing, throughput ±10%, **zero 5xx**. A 1–60-day range legitimately takes longer than 150 ms, so do NOT apply the G2 latency bound here.
+- **Baseline run (a)**: read `vm24_g1_baseline.json` → `results[0].latency_ms`. **G1**: baseline p50<2.5 s AND p95<4 s. **`B` (for the G1′ multipliers below) := baseline `p95`** (the single 365-day, C=1 p95).
+- **G1′** LR (b), using `B = baseline p95`: C=4 served p95 < **2·B**; C=8 < **3·B** (zero reject/timeout); C=16 may 503-shed but served p95 < **4·B**, **zero timeout/OOM**, log shed %.
+- **G2** SB-short (c): single-day point + batch → **p50<50 ms, p99<150 ms** (`latency_ms`). This absolute SLO applies ONLY to short requests.
+- **G2′** SB range-heavy (d): the gate is **STABILITY, not an absolute p99** — computed from `windowed.stability`: **`tail_drift_ok==true`** (last full-window p95 ≤ 1.2× first), **`rps_within_10pct==true`**, and **zero 5xx** across `windowed.windows` (sum `shed_503`/`errors` per window; also check executor `queue_depth` not climbing in `healthz_series`). A 1–60-day range legitimately exceeds 150 ms, so do NOT apply the G2 latency bound here.
 - **G6** BBOX (e) + all runs: every worker RSS ≤ `GHRSST_RSS_CEILING_MB`, no monotonic growth (`by_pid` + external `ps` sum).
 - **G7** OL (f): fast `503`+`Retry-After`, RSS bounded, `recovery_ms` small.
 - **If G1′/G6 fail → trigger Phase-2 time-cube** (spec §6); do NOT loosen gates to pass.

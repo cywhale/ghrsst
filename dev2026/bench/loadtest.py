@@ -46,28 +46,74 @@ def _pcts(xs):
 
 
 class Stats:
+    """Event-based so we can compute time-windowed metrics (G2' stability gate)."""
     def __init__(self):
-        self.lat = []          # successful latencies (s)
-        self.ok = 0
-        self.shed = 0          # 503
-        self.errors = 0        # other non-2xx
-        self.timeouts = 0
+        self.events = []       # (t_rel_s, dt_s_or_None, kind) kind in ok|shed|err|timeout
 
-    def record(self, dt, status):
+    def record(self, t_rel, dt, status):
         if status == 503:
-            self.shed += 1
+            self.events.append((t_rel, None, "shed"))
         elif 200 <= status < 300:
-            self.ok += 1
-            self.lat.append(dt)
+            self.events.append((t_rel, dt, "ok"))
         else:
-            self.errors += 1
+            self.events.append((t_rel, None, "err"))
+
+    def timeout(self, t_rel):
+        self.events.append((t_rel, None, "timeout"))
+
+    @staticmethod
+    def _bucket_metrics(evs, window_s):
+        lat = [dt for _, dt, k in evs if k == "ok" and dt is not None]
+        n = len(evs)
+        return {"n": n,
+                "ok": sum(k == "ok" for *_, k in evs),
+                "shed_503": sum(k == "shed" for *_, k in evs),
+                "errors": sum(k == "err" for *_, k in evs),
+                "timeouts": sum(k == "timeout" for *_, k in evs),
+                "rps": round(n / window_s, 1),
+                "latency_ms": _pcts(lat)}
 
     def summary(self, wall):
-        total = self.ok + self.shed + self.errors + self.timeouts
-        return {"requests": total, "ok": self.ok, "shed_503": self.shed,
-                "errors": self.errors, "timeouts": self.timeouts,
+        ok = sum(k == "ok" for *_, k in self.events)
+        shed = sum(k == "shed" for *_, k in self.events)
+        err = sum(k == "err" for *_, k in self.events)
+        to = sum(k == "timeout" for *_, k in self.events)
+        lat = [dt for _, dt, k in self.events if k == "ok" and dt is not None]
+        total = len(self.events)
+        return {"requests": total, "ok": ok, "shed_503": shed, "errors": err, "timeouts": to,
                 "throughput_rps": round(total / wall, 1) if wall else None,
-                "latency_ms": _pcts(self.lat)}
+                "latency_ms": _pcts(lat)}
+
+    def windowed(self, window_s, warmup_s):
+        """10s (default) rolling buckets + first-vs-last stability summary for G2'."""
+        buckets = {}
+        max_t = 0.0
+        for t_rel, dt, kind in self.events:
+            buckets.setdefault(int(t_rel // window_s), []).append((t_rel, dt, kind))
+            max_t = max(max_t, t_rel)
+        wins = []
+        for b in sorted(buckets):
+            m = self._bucket_metrics(buckets[b], window_s)
+            m["bucket"] = b
+            m["t0_s"] = b * window_s
+            # a trailing bucket the run ended inside is "partial": its rps is not
+            # comparable (covers < window_s), so exclude it from the stability gate.
+            m["partial"] = (b * window_s + window_s) > (max_t + 1e-3)
+            wins.append(m)
+        # stability: first vs last FULL bucket after warmup that has ok samples
+        post = [w for w in wins if w["t0_s"] >= warmup_s and w["ok"] > 0
+                and not w["partial"] and w["latency_ms"]["p95"] is not None]
+        stab = None
+        if len(post) >= 2:
+            f, l = post[0], post[-1]
+            fp, lp = f["latency_ms"]["p95"], l["latency_ms"]["p95"]
+            stab = {"first_bucket_t0_s": f["t0_s"], "last_bucket_t0_s": l["t0_s"],
+                    "first_p95_ms": fp, "last_p95_ms": lp,
+                    "p95_ratio": round(lp / fp, 2) if fp else None,
+                    "tail_drift_ok": (lp <= 1.2 * fp) if (fp and lp) else None,
+                    "first_rps": f["rps"], "last_rps": l["rps"],
+                    "rps_within_10pct": (abs(l["rps"] - f["rps"]) <= 0.1 * f["rps"]) if f["rps"] else None}
+        return {"window_s": window_s, "warmup_s": warmup_s, "windows": wins, "stability": stab}
 
 
 class Bounds:
@@ -147,7 +193,7 @@ async def _sampler(base, stop_t, series, interval=1.0):
             await asyncio.sleep(interval)
 
 
-async def _worker(client, stop_t, gen, b, opts, stats, req_timeout):
+async def _worker(client, stop_t, start_perf, gen, b, opts, stats, req_timeout):
     while time.monotonic() < stop_t:
         method, path, params, body = gen(b, opts)
         t0 = time.perf_counter()
@@ -157,14 +203,16 @@ async def _worker(client, stop_t, gen, b, opts, stats, req_timeout):
             else:
                 r = await client.post(path, json=body, timeout=req_timeout)
             _ = r.content  # ensure full body read (captures streaming completion)
-            stats.record(time.perf_counter() - t0, r.status_code)
+            now = time.perf_counter()
+            stats.record(now - start_perf, now - t0, r.status_code)  # (t_rel, latency, status)
         except httpx.TimeoutException:
-            stats.timeouts += 1
+            stats.timeout(time.perf_counter() - start_perf)
         except Exception:
-            stats.errors += 1
+            stats.events.append((time.perf_counter() - start_perf, None, "err"))
 
 
-async def run_scenario(base, name, concurrency, duration, bbox_deg, req_timeout, dense_days, sb_range_max):
+async def run_scenario(base, name, concurrency, duration, bbox_deg, req_timeout, dense_days,
+                       sb_range_max, window_s, warmup_s):
     from types import SimpleNamespace
     gen = GENERATORS[name]
     opts = SimpleNamespace(bbox_deg=bbox_deg, sb_range_max=sb_range_max)
@@ -176,7 +224,8 @@ async def run_scenario(base, name, concurrency, duration, bbox_deg, req_timeout,
         b = Bounds(b0["earliest"], b0["latest"], dense_days)
         stop_t = time.monotonic() + duration
         wall0 = time.monotonic()
-        tasks = [asyncio.create_task(_worker(client, stop_t, gen, b, opts, stats, req_timeout))
+        start_perf = time.perf_counter()
+        tasks = [asyncio.create_task(_worker(client, stop_t, start_perf, gen, b, opts, stats, req_timeout))
                  for _ in range(concurrency)]
         sampler = asyncio.create_task(_sampler(base, stop_t, series))
         await asyncio.gather(*tasks)
@@ -210,6 +259,7 @@ async def run_scenario(base, name, concurrency, duration, bbox_deg, req_timeout,
             d["queue_depth_max"] = s["queue_depth"] if d["queue_depth_max"] is None else max(d["queue_depth_max"], s["queue_depth"])
     res = {"scenario": name, "concurrency": concurrency, "duration_s": duration,
            **stats.summary(wall),
+           "windowed": stats.windowed(window_s, warmup_s),   # G2' stability source
            "queue_depth_max": max(qd) if qd else None,
            "rss_mb_max": max(rss) if rss else None,     # max across sampled workers (NOT a total)
            "rss_mb_last": rss[-1] if rss else None,
@@ -233,7 +283,7 @@ async def main_async(args):
             print(f"  running {name} @ C={c} for {args.duration}s ...", flush=True)
             results.append(await run_scenario(args.base, name, c, args.duration,
                                               args.bbox_deg, args.req_timeout, args.dense_days,
-                                              args.sb_range_max))
+                                              args.sb_range_max, args.window_s, args.warmup_s))
     return results
 
 
@@ -250,6 +300,9 @@ def main():
                     help="SB point-request max day span. Use 1 for short single-day SB (G2 "
                          "latency SLO); >1 for range-heavy SB (gate = G2' stability, not p99).")
     ap.add_argument("--req-timeout", type=float, default=60.0, dest="req_timeout")
+    ap.add_argument("--window-s", type=int, default=10, dest="window_s", help="metrics bucket size (s)")
+    ap.add_argument("--warmup-s", type=int, default=10, dest="warmup_s",
+                    help="exclude buckets before this from the first-vs-last stability summary")
     ap.add_argument("--dense-days", type=int, default=300, dest="dense_days",
                     help="sample days within the last N days (avoids 400s on a sparse local store)")
     ap.add_argument("--run-kind", choices=["local", "vm24"], default="local", dest="run_kind",

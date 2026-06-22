@@ -9,7 +9,9 @@
 ## Harness: `dev2026/bench/loadtest.py`
 - configurable `--base` (or `GHRSST_LOADTEST_BASE`); default `http://127.0.0.1:8036` (local, non-prod). No hardcoded production host.
 - scenarios **SB / LR / BBOX / OL** (spec §P1-S4).
-- per (scenario, C): p50/p95/p99 latency, `ok` / `shed_503` / `errors` / `timeouts`, throughput, **executor queue depth** + **worker RSS** time series from `/healthz`, OL **recovery_ms**.
+- per (scenario, C): aggregate p50/p95/p99 latency, `ok` / `shed_503` / `errors` / `timeouts`, throughput, **executor queue depth** + **worker RSS** time series from `/healthz`, OL **recovery_ms**.
+- **windowed metrics** (`--window-s`, default 10 s; `--warmup-s`, default 10 s): per-bucket p50/p95/p99 + counts + rps in `windowed.windows`, plus a `windowed.stability` summary (first-vs-last **full** bucket: `tail_drift_ok` = last p95 ≤ 1.2× first, `rps_within_10pct`) — this is the **computable source for the G2′ stability gate** (partial trailing buckets are flagged and excluded).
+- **`--sb-range-max`**: SB point-request day span — `1` = short single-day (G2 latency SLO), `>1` = range-heavy (G2′ stability).
 - machine-readable **JSON** output (`--out`). **`--run-kind local|vm24`** sets `meta.binding` (local→false, vm24→true; `--binding` forces true) so the same tool produces both the local validation artifact and the VM24 authoritative gate artifact.
 - `/healthz` returns `executor_queue_depth`, `executor_limit`, `rss_mb` (psutil; `/proc` fallback), `pid`. The sampler **preserves `pid` + `executor_limit`** per sample and reports **`by_pid`** (per-worker `rss_mb_max` / `queue_depth_max`) — because under gunicorn `-w N` each `/healthz` is one worker's view. `rss_mb_max` is the max across sampled workers, **not a total**; total RSS must be collected externally (e.g. `ps` over SSH, sum by worker pid).
 
