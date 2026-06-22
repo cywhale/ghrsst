@@ -98,12 +98,23 @@ def main():
                     help="use the largest CONTIGUOUS REAL span in the store (promotion-gate input)")
     ap.add_argument("--cache-state", default="unknown", choices=["cold", "warm", "unknown"])
     ap.add_argument("--repeats", type=int, default=5)
+    ap.add_argument("--engine", default="baseline", choices=["baseline", "e1"],
+                    help="read engine to TIME: baseline=P1 StoreAccess, e1=manifest sidecar "
+                         "(cache-independent metrics are identical — geometry-based)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     store = args.store or resolve_zarr_path()
     fields = [f.strip() for f in args.fields.split(",") if f.strip()]
     sa = StoreAccess(store)
+    # the engine whose latency we measure (cache-independent metrics use sa/geometry either way)
+    if args.engine == "e1":
+        from store.e1_manifest import E1ManifestStore
+        engine = E1ManifestStore(store)
+        engine.build_manifest()
+        read_series = engine.point_series
+    else:
+        read_series = sa.point_series
     all_days = sa.existing_days()
     if not all_days:
         raise SystemExit(f"no day groups under {store}")
@@ -139,7 +150,7 @@ def main():
     tracemalloc.start()
     for _ in range(args.repeats):
         t0 = time.perf_counter()
-        rows = sa.point_series(args.lon, args.lat, existing, fields_present)
+        rows = read_series(args.lon, args.lat, existing, fields_present)
         lats.append(time.perf_counter() - t0)
     py_peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
@@ -158,7 +169,7 @@ def main():
 
     out = {
         "meta": {
-            "store": store, "ts": time.time(),
+            "store": store, "ts": time.time(), "engine": args.engine,
             "point": {"lon": args.lon, "lat": args.lat, "ii": ii, "jj": jj,
                       "grid_lon": glon, "grid_lat": glat},
             "span_requested_days": len(span_days), "span_existing_days": n,
