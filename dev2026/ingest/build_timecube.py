@@ -129,6 +129,10 @@ def append_day(cube_path: str, day_iso: str, data: dict) -> None:
     slab lands in the current time-chunk -> only that chunk's spatial chunks are (re)written)."""
     g = zarr.open_group(cube_path, mode="a")
     days = list(g.attrs["days"])
+    if day_iso in days:                       # idempotency: never duplicate a day
+        raise ValueError(
+            f"day {day_iso} already in cube (would duplicate). For re-sync use "
+            f"dual_write.upsert_day(); for recovery use dual_write.sync_missing().")
     t = len(days)
     var_valid = {k: list(v) for k, v in dict(g.attrs.get("var_valid", {})).items()}
     for v in g.attrs.get("vars", VARS):

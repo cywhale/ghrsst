@@ -53,6 +53,18 @@ class TimeCubeStore:
         self._lock = threading.Lock()
         self._arr = {}   # var -> zarr.Array (handles are read-only/concurrent-safe)
 
+    @property
+    def latest(self) -> Optional[str]:
+        return self.days[-1] if self.days else None
+
+    @property
+    def day_count(self) -> int:
+        return len(self.days)
+
+    def covers_days(self, days: Sequence[str]) -> bool:
+        """True iff every given day is present in the cube (dual-write coverage check)."""
+        return all(d in self._day_index for d in days)
+
     def _array(self, var: str):
         with self._lock:
             a = self._arr.get(var)
