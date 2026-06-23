@@ -22,16 +22,18 @@ class HybridRouter:
     def __init__(self, daily: StoreAccess, cube: Optional[TimeCubeStore] = None):
         self.daily = daily
         self.cube = cube
+        self.route_counts = {"cube": 0, "daily": 0}   # observability (healthz)
 
     # ---- routing decision (exposed for tests / observability) ------------
     def route_point(self, days: Sequence[str]) -> str:
         """'cube' for a multi-day series fully covered by the cube; else 'daily'."""
-        if self.cube is None:
-            return "daily"
-        existing = [d for d in days if self.daily.day_present(d)]
-        if len(existing) > 1 and all(d in self.cube._day_index for d in existing):
-            return "cube"
-        return "daily"
+        route = "daily"
+        if self.cube is not None:
+            existing = [d for d in days if self.daily.day_present(d)]
+            if len(existing) > 1 and self.cube.covers_days(existing):
+                route = "cube"
+        self.route_counts[route] += 1
+        return route
 
     # ---- point/range time-series (routed) --------------------------------
     def point_series(self, lon: float, lat: float, days: Sequence[str],

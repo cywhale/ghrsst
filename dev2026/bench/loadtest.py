@@ -49,6 +49,7 @@ class Stats:
     """Event-based so we can compute time-windowed metrics (G2' stability gate)."""
     def __init__(self):
         self.events = []       # (t_rel_s, dt_s_or_None, kind) kind in ok|shed|err|timeout
+        self.route_counts = {}  # X-Store-Route tally (confirms multi-day -> cube under load)
 
     def record(self, t_rel, dt, status):
         if status == 503:
@@ -82,7 +83,7 @@ class Stats:
         total = len(self.events)
         return {"requests": total, "ok": ok, "shed_503": shed, "errors": err, "timeouts": to,
                 "throughput_rps": round(total / wall, 1) if wall else None,
-                "latency_ms": _pcts(lat)}
+                "latency_ms": _pcts(lat), "route_counts": dict(self.route_counts)}
 
     def windowed(self, window_s, warmup_s):
         """10s (default) rolling buckets + first-vs-last stability summary for G2'."""
@@ -205,6 +206,9 @@ async def _worker(client, stop_t, start_perf, gen, b, opts, stats, req_timeout):
             _ = r.content  # ensure full body read (captures streaming completion)
             now = time.perf_counter()
             stats.record(now - start_perf, now - t0, r.status_code)  # (t_rel, latency, status)
+            route = r.headers.get("x-store-route")
+            if route:
+                stats.route_counts[route] = stats.route_counts.get(route, 0) + 1
         except httpx.TimeoutException:
             stats.timeout(time.perf_counter() - start_perf)
         except Exception:

@@ -395,8 +395,16 @@ def _rss_mb() -> Optional[float]:
 async def healthz(request: Request):
     e, l = request.app.state.store.bounds()
     bex = request.app.state.bex
+    router = request.app.state.router
+    cube = router.cube
     return {"status": "ok", "earliest": e, "latest": l,
             "executor_queue_depth": bex.queue_depth(),
             "executor_limit": bex.limit,
             "rss_mb": _rss_mb(),
-            "pid": os.getpid()}
+            "pid": os.getpid(),
+            # P2-S6 cube observability
+            "cube_loaded": cube is not None,
+            "cube_latest": (cube.latest if cube else None),
+            "cube_day_count": (cube.day_count if cube else 0),
+            "cube_latest_in_sync": (cube.latest == l if cube else None),
+            "route_counts": dict(router.route_counts)}
