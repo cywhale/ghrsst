@@ -43,7 +43,31 @@
   daily's ~1 M×), or use **regional/tiled cubes** (bounded append, hybrid router already falls back to
   daily for uncovered areas).
 
+## Shard-size sweep (review item 2 — shard is NOT a free lever)
+File count is controlled by **shard** size, not inner chunk — but a larger shard packs more inner
+chunks per shard FILE, so a daily append's read-modify-write rewrites a bigger shard, and shard size
+can affect read/metadata/cache behaviour. So it must be **measured**, not assumed. `bench/
+bench_shard_sweep.py` sweeps shard ∈ {64,128,256} with `spatial=8, time_chunk=90` fixed (365-day
+fixture, 256², warm):
+| shard | files regional | files global est | read p95 C1 | C8 | p99 C8 | RSS | append p50 | append global est |
+|---|---|---|---|---|---|---|---|---|
+| 64 | 248 | ~2.45 M | 4.6 ms | 38.9 | 41.3 | 166 MB | 420 ms | ~69 min |
+| **128** | 68 | **~672 K** | 4.7 ms | 37.5 | 39.7 | 180 MB | 450 ms | ~74 min |
+| 256 | 23 | ~227 K | 4.8 ms | 38.2 | 40.2 | 299 MB | 547 ms | ~90 min |
+
+**Shard IS a real tradeoff (measured, not free):** read p95/p99 ~unchanged (read_amp is set by inner
+chunk=8, not shard) → read-neutral; larger shard → far fewer files (2.45 M→227 K) BUT more expensive
+append (69→90 min, bigger read-modify-write) AND higher RSS (166→299 MB). **`shard=128` is the
+operational balance** (10× fewer files than 64 ≈ 672 K, append ~74 min within a 3 h window, RSS 180 MB).
+
+**Updated chunking recommendation: `spatial=8 / time_chunk=90 / shard=128`.** Final shard confirmed on
+VM24 vs the real ingest window + file-count tolerance (shard=256 if files dominate and ~90 min append
+fits; shard=64 if append/RSS must be minimal and ~2.4 M files acceptable).
+
 ## Caveats / binding gate
+- **RSS from `bench_chunking_select.py` / `bench_shard_sweep.py` is ILLUSTRATIVE only** (store-level
+  threads, warm, synthetic). The **binding RSS comes from the P2-S7 HTTP gate** (`/healthz` sampling
+  under load) and ultimately VM24.
 - Warm + synthetic + extrapolated. The append extrapolation assumes ~linear scaling with area and
   doesn't fully model shard read-modify-write at global scale. **VM24 is binding**: real ≥365
   contiguous + cold-cache read p95/p99 + LR concurrency + RSS, AND a real full-grid (or per-tile)

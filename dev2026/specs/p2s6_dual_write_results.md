@@ -1,5 +1,13 @@
 # P2-S6 — dual-write ingest + append-at-scale — result (with a design-relevant finding)
 
+> **⚠ SUPERSEDED IN PART BY [P2-S7](p2s7_chunking_selection_results.md):** this doc's conclusion
+> that `s8` is "append-infeasible / retired" was **corrected**. Per review, **append is an
+> operational CONSTRAINT, not the optimization target** — selection is **read-first**. P2-S7 shows
+> `s8`'s global append (~67 min est) fits a typical multi-hour ingest window, so **`s8` is NOT
+> retired**; it is the read-first candidate. The dual-write / recovery / coverage / observability
+> work below stands; only the append-driven chunking *conclusion* is superseded. Read §"Revised
+> chunking guidance" here as historical; the live guidance is in P2-S7.
+
 > Daily store = source of truth; the time-cube is a derived append-only mirror kept in lock-step.
 > Tools: `ingest/dual_write.py`, `bench/bench_append_scale.py`, `tests/test_phase2_s6.py` (8/8),
 > `/healthz` cube fields, `loadtest.py` route tally. NON-BINDING (synthetic/regional).
