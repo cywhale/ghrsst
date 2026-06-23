@@ -49,40 +49,48 @@ echo "estimated cube <= ${EST_GB} GB ; free ${FREE_GB} GB"
 test "$FREE_GB" -ge $(( EST_GB * 12 / 10 )) || { echo "INSUFFICIENT DISK — abort"; exit 1; }
 ```
 
-## 2. Build the cube — to a STAGING path, then rename (path safety)
-**Never build `--out` directly onto an existing/production path.** `build_timecube` now **refuses to
-delete an existing `--out`** (raises `FileExistsError`) unless `--overwrite` is passed. Build to a
-fresh staging path, verify coverage (§3), then atomically rename.
+## 2. Build the cube — to a STAGING path (HOLDOUT), promoted only at the end of §6
+**Never build `--out` directly onto an existing/production path.** `build_timecube` **refuses to
+delete an existing `--out`** (`FileExistsError`) unless `--overwrite`. Build to a fresh staging path
+on the **same filesystem** as the final `<CUBE>` (so the §6 rename is atomic), **holding out the
+latest day** (`--exclude-latest`) for the §6 true-append test.
 ```bash
 cd dev2026; P=.venv/bin/python
-STAGE=<CUBE>.building.$(date +%s)         # fresh staging path; never a production path
-# --- full global cube (if disk/append/files all within gates) ---
+STAGE=<CUBE>.building.$(date +%s)         # fresh staging path; SAME filesystem as <CUBE>; never production
+# --- full global cube (holdout) — if disk/append/files all within gates ---
 $P ingest/build_timecube.py --src "$SRC" --out "$STAGE" \
-   --spatial-chunk 8 --time-chunk 90 --shard-spatial 128
-# --- OR tiled (bounds append + disk per tile; build the regions that get point queries) ---
+   --spatial-chunk 8 --time-chunk 90 --shard-spatial 128 --exclude-latest
+# --- OR tiled (holdout) — bounds append/disk per tile; build the regions that get point queries ---
 $P ingest/build_timecube.py --src "$SRC" --out "$STAGE" \
-   --spatial-chunk 8 --time-chunk 90 --shard-spatial 128 --region i0,i1,j0,j1
+   --spatial-chunk 8 --time-chunk 90 --shard-spatial 128 --exclude-latest --region i0,i1,j0,j1
 find "$STAGE" -type f | wc -l ; du -sh "$STAGE"          # record file count + disk
-# ... run §3 coverage on $STAGE; ONLY after ok==true:
-test ! -e <CUBE> && mv "$STAGE" <CUBE>                   # atomic promote; refuse if final exists
+HOLD=<the latest real day held out>                      # appended in §6 for a TRUE append measure
+# IMPORTANT: $STAGE and the final <CUBE> MUST be on the SAME filesystem — mv/rename is atomic only
+# within one filesystem. Do NOT rename here. Promotion happens in §6, AFTER the holdout day is
+# appended and POST-append coverage passes. The whole gate (§3→§6) runs on $STAGE.
 ```
 > NOTE: the current `TimeCubeStore`/`HybridRouter` load ONE cube. **Tiled (multi-cube) routing is a
 > P2-S5 follow-up** (route a point to the tile covering it; daily fallback for uncovered). If tiling is
 > chosen here, that router extension must land **before any cutover** (see §7).
 
-## 3. Coverage / structural check (after build, and after each append)
+## 3. PRE-append coverage (holdout cube is intentionally 1 day behind)
 ```bash
 $P - <<PY
 from ingest.dual_write import check_coverage
-import json; print(json.dumps(check_coverage("$SRC", "<CUBE>"), indent=2, default=str))
+import json; cov = check_coverage("$SRC", "$STAGE"); print(json.dumps(cov, indent=2, default=str))
+# PRE-append REQUIRE (do NOT require cov['ok']==True yet — the holdout day isn't appended):
+#   missing_after_cube_latest == [HOLD]   (exactly the held-out day, nothing more)
+#   missing_within_cube_span  == []       (no in-span gaps)
+#   extra_cube_days           == []       (no orphan cube days)
+#   days_sorted and days_unique           (well-formed time axis)
 PY
-# REQUIRE: ok == true (latest_in_sync, no missing_within_cube_span, no extra_cube_days,
-#          days_sorted, days_unique)
 ```
 
 ## 4. Serve the cube-backed API (shadow; separate port; production untouched)
+> Serve the **`$STAGE`** holdout cube — the whole gate (read + append) runs on it; promote to `<CUBE>`
+> only at the end of §6.
 ```bash
-GHRSST_ZARR_PATH="$SRC" GHRSST_TIMECUBE_PATH=<CUBE> GHRSST_RSS_CEILING_MB=<X> \
+GHRSST_ZARR_PATH="$SRC" GHRSST_TIMECUBE_PATH="$STAGE" GHRSST_RSS_CEILING_MB=<X> \
 GHRSST_ZARR_WORKERS=<W> PYTHONPATH=. .venv/bin/gunicorn api.app:app \
   -w <GUNICORN_WORKERS> -k uvicorn.workers.UvicornWorker -b 127.0.0.1:<NEW_PORT> --timeout 180
 curl -s http://127.0.0.1:<NEW_PORT>/healthz   # cube_loaded, cube_latest, cube_latest_in_sync, route_counts
@@ -93,8 +101,8 @@ curl -s http://127.0.0.1:<NEW_PORT>/healthz   # cube_loaded, cube_latest, cube_l
 > other service on VM24. Use **targeted eviction of the cube files only**:
 ```bash
 B=http://127.0.0.1:<NEW_PORT>
-# COLD-ish: evict ONLY the cube's files (preferred). Requires vmtouch.
-vmtouch -e <CUBE>                         # targeted; safe for other projects
+# COLD-ish: evict ONLY the staged cube's files (preferred). Requires vmtouch.
+vmtouch -e "$STAGE"                       # targeted; safe for other projects
 #   - if vmtouch is unavailable: mark the run as cache-state=best_effort (NOT strict cold), or
 #     schedule strict-cold testing in a maintenance window (a global drop_caches is allowed ONLY
 #     in an approved maintenance window, never during normal operation).
@@ -112,37 +120,51 @@ $P bench/loadtest.py --base $B --run-kind vm24 --scenario LR --duration 120 --de
 - **Pass**: 365-day p95 < 4 s **cold**; LR C=4/8/16 bounded, zero timeout/OOM, RSS ≤
   `GHRSST_RSS_CEILING_MB`; SB stable (G2′-style).
 
-## 6. Append/upsert measurement — TRUE append via HOLDOUT (binding: fits the ingest window?)
-**A `sync_day` for a day already in the cube is an OVERWRITE, which UNDER-estimates append cost.**
-Measure a true append by **holding out a day** at build time, then appending it:
+## 6. TRUE append (holdout) → POST-append coverage → atomic promote
+The cube was built in §2 holding out `HOLD`; §3 (pre-append) and §5 (read gate) ran on `$STAGE`.
+Now append `HOLD` into `$STAGE` (a `sync_day` for an in-cube day would be an OVERWRITE that
+under-estimates cost — the holdout guarantees a TRUE append), require **post-append** coverage
+`ok==true`, THEN promote `$STAGE` → `<CUBE>`.
 ```bash
-# Option A (preferred): build the gate cube WITHOUT the latest real day, then append it.
-#   At §2, build with --exclude-latest (or --end-day <D-1>):
-$P ingest/build_timecube.py --src "$SRC" --out "$STAGE" --spatial-chunk 8 --time-chunk 90 \
-   --shard-spatial 128 --exclude-latest        # holds out the latest real day D
-#   (run §3 coverage + §5 read gate on this holdout cube; dense-days = its day count)
-HOLD=<the latest real day D held out>
+# stop the §4 shadow app first if it locks the cube, then:
 $P - <<PY
-import time; from ingest.dual_write import sync_day, sync_missing, check_coverage
+import time, json
+from ingest.dual_write import sync_day, sync_missing, check_coverage
 from store.time_cube import TimeCubeStore
-b = TimeCubeStore("<CUBE>").day_count
-t = time.perf_counter(); res = sync_day("$SRC", "<CUBE>", "$HOLD"); dt = time.perf_counter() - t
-a = TimeCubeStore("<CUBE>").day_count
-print("sync_day:", res, "append_s", round(dt, 1), "day_count", b, "->", a)   # res MUST be 'append'
-assert res == "append" and a == b + 1, "not a true append (was it already present?)"
-# idempotency: re-run SAME day -> 'overwrite', count unchanged
-print("idempotent:", sync_day("$SRC", "<CUBE>", "$HOLD"), "count", TimeCubeStore("<CUBE>").day_count)
-# coverage after
-import json; print(json.dumps(check_coverage("$SRC", "<CUBE>"), default=str))
+b = TimeCubeStore("$STAGE").day_count
+t = time.perf_counter(); res = sync_day("$SRC", "$STAGE", "$HOLD"); dt = time.perf_counter() - t
+a = TimeCubeStore("$STAGE").day_count
+print("sync_day:", res, "append_s", round(dt, 1), "day_count", b, "->", a)
+assert res == "append" and a == b + 1, "NOT a true append — was HOLD already present? (rebuild holdout)"
+# REQUIRE append_s (+ margin) <= INGEST_WINDOW
+# idempotency: re-running the SAME day must be 'overwrite' with unchanged count
+print("idempotent:", sync_day("$SRC", "$STAGE", "$HOLD"), "count", TimeCubeStore("$STAGE").day_count)
+# POST-append coverage MUST now be fully ok
+cov = check_coverage("$SRC", "$STAGE"); print(json.dumps(cov, default=str))
+assert cov["ok"] is True, "post-append coverage not ok"
 PY
-# Option B: don't hold out — just wait for the NEXT cron day (a day not yet in the cube) and time
-#   sync_day for it. Either way: REQUIRE res=='append', append_s (+ margin) <= INGEST_WINDOW,
-#   coverage ok==true. Recovery: simulate a missed day -> sync_missing appends it (re-runnable).
+# recovery drill (optional, re-runnable): if a day was missed, sync_missing appends it.
+# Promote ONLY after the asserts pass (same filesystem -> atomic; refuse if final exists):
+test ! -e <CUBE> && mv "$STAGE" <CUBE> && echo "promoted -> <CUBE>"
 ```
+> **Alternative to the holdout**: instead of `--exclude-latest`, build the full cube and wait for the
+> NEXT cron day (a day not yet in the cube), then time `sync_day` for it — also a true append. Either
+> way the binding requirements are the same: `res=='append'`, `append_s` (+ margin) ≤ `INGEST_WINDOW`,
+> POST-append `check_coverage.ok == true`. Recovery: a missed day is re-appended by `sync_missing`
+> (re-runnable).
+
+## Ordered gate sequence (summary)
+1. §2 build holdout cube to `$STAGE` (`--exclude-latest`, same fs as `<CUBE>`).
+2. §3 **pre-append** coverage: `missing_after_cube_latest==[HOLD]`, no in-span gaps, no extra, sorted/unique (cov.ok will be False — expected).
+3. §5 read gate on `$STAGE` (cold via `vmtouch -e`, then warm).
+4. §6 `sync_day(HOLD)` → assert `append` + count+1 + `append_s ≤ INGEST_WINDOW`.
+5. §6 **post-append** coverage: now require `cov.ok == true`.
+6. §6 promote `$STAGE` → `<CUBE>` (atomic, same fs).
 
 ## 7. Go / No-Go
 **GO (proceed to cutover discussion)** iff ALL:
-- disk precheck passed; cube built **to staging then renamed**; `check_coverage.ok == true`.
+- disk precheck passed; built to `$STAGE` (holdout); **pre-append** coverage = only `[HOLD]` missing,
+  no in-span/extra/order problems; **POST-append** `check_coverage.ok == true`; promoted `$STAGE`→`<CUBE>` (atomic, same fs).
 - cold 365-day p95 < 4 s; LR C=4/8/16 bounded, zero timeout/OOM; RSS ≤ ceiling.
 - **append measured as a TRUE append (holdout; `sync_day` returned `append`)** ≤ `INGEST_WINDOW`
   (with margin); file count ≤ `FILE_MAX`.
