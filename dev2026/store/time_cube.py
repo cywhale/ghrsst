@@ -46,6 +46,10 @@ class TimeCubeStore:
         self._day_index = {d: i for i, d in enumerate(days)}
         self.days = days
         self.vars = list(self._g.attrs.get("vars", ALLOWED_FIELDS))
+        # per-(day,var) validity: distinguishes ABSENT (omit, P1 parity) from
+        # present-but-NaN land (null). Missing mask -> treat all present (back-compat).
+        self.var_valid = {v: list(flags) for v, flags in
+                          dict(self._g.attrs.get("var_valid", {})).items()}
         self._lock = threading.Lock()
         self._arr = {}   # var -> zarr.Array (handles are read-only/concurrent-safe)
 
@@ -99,8 +103,12 @@ class TimeCubeStore:
             row = {"lon": glon, "lat": glat, "date": day}
             pos = (t - t0) if contiguous else k
             for f in fields:
-                if f in colvals:
-                    v = float(colvals[f][pos])
-                    row[f] = None if np.isnan(v) else v
+                if f not in colvals:
+                    continue                       # field never in cube -> omit
+                valid = self.var_valid.get(f)
+                if valid is not None and not valid[t]:
+                    continue                       # var ABSENT on this day -> omit (P1 parity)
+                v = float(colvals[f][pos])
+                row[f] = None if np.isnan(v) else v   # present-but-NaN land -> null
             rows.append(row)
         return rows

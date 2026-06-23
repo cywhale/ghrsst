@@ -36,21 +36,42 @@ def _count_files(path: str) -> int:
 
 def build_timecube(src: str, out: str, spatial_chunk: int = 8,
                    time_chunk: Optional[int] = None, shard_spatial: Optional[int] = None,
+                   region: Optional[tuple] = None, days: Optional[list] = None,
                    compressor: str = "zstd") -> dict:
     """Build a time-cube from daily-group store `src` into `out`. Returns meta dict.
-    time_chunk=None -> all days in one time chunk. shard_spatial=None -> no sharding."""
-    days = list_existing_days(src)
+    time_chunk=None -> all days in one time chunk. shard_spatial=None -> no sharding.
+    region=(i0,i1,j0,j1) -> spatial subset (lat slice i0:i1, lon slice j0:j1); None = whole
+    grid. Subsetting is required to build a REGIONAL cube from the global production store
+    (reading whole global fields is infeasible); global/tiled conversion is P2-S6 ingest work.
+    days -> explicit ordered day list (subset); None = all existing days under src."""
+    days = list(days) if days is not None else list_existing_days(src)
     if not days:
         raise SystemExit(f"no days under {src}")
     g0 = zarr.open_group(group_path(src, days[0]), mode="r")
-    lon = np.asarray(g0["lon"][:])
-    lat = np.asarray(g0["lat"][:])
+    lon_full = np.asarray(g0["lon"][:])
+    lat_full = np.asarray(g0["lat"][:])
+    if region:
+        i0, i1, j0, j1 = region
+    else:
+        i0, i1, j0, j1 = 0, lat_full.size, 0, lon_full.size
+    lon = lon_full[j0:j1]
+    lat = lat_full[i0:i1]
     ny, nx = lat.size, lon.size
     T = len(days)
     tc = T if time_chunk is None else min(time_chunk, T)
     cy = min(spatial_chunk, ny)
     cx = min(spatial_chunk, nx)
-    present_vars = [v for v in VARS if v in g0]
+
+    # UNION of vars across ALL days (not just day 0) + per-(day,var) validity mask.
+    # Presence is a cheap filesystem check (var dir under the day group). A var absent on
+    # a day -> NaN in the cube AND valid=False, so the access layer can OMIT it for that day
+    # (P1 parity), distinct from a present-but-NaN land cell (valid=True -> null).
+    valid: Dict[str, list] = {}
+    for v in VARS:
+        flags = [os.path.isdir(os.path.join(group_path(src, day), v)) for day in days]
+        if any(flags):
+            valid[v] = flags
+    union_vars = list(valid.keys())
 
     if os.path.exists(out):
         import shutil
@@ -65,32 +86,35 @@ def build_timecube(src: str, out: str, spatial_chunk: int = 8,
     if shard_spatial:
         sy = min(max(shard_spatial, cy), ny)
         sx = min(max(shard_spatial, cx), nx)
-        # shard dims must be multiples of chunk dims; clamp to grid
         sy = (sy // cy) * cy or cy
         sx = (sx // cx) * cx or cx
         shards = (tc, sy, sx)
 
     arrs = {}
-    for v in present_vars:
-        kw = dict(shape=(T, ny, nx), dtype="float32", chunks=(tc, cy, cx))
+    for v in union_vars:
+        kw = dict(shape=(T, ny, nx), dtype="float32", chunks=(tc, cy, cx),
+                  fill_value=float("nan"))      # absent days stay NaN
         if shards:
             kw["shards"] = shards
         arrs[v] = g.create_array(v, **kw)
 
-    # fill time-major: read each day's spatial field, place at time index i
+    # fill time-major; skip (leave NaN fill for) days where the var is absent
     for i, day in enumerate(days):
         gd = zarr.open_group(group_path(src, day), mode="r")
-        for v in present_vars:
-            arrs[v][i, :, :] = np.asarray(gd[v][0, :, :])
+        for v in union_vars:
+            if valid[v][i]:
+                arrs[v][i, :, :] = np.asarray(gd[v][0, i0:i1, j0:j1])
 
     g.attrs["days"] = days
-    g.attrs["vars"] = present_vars
+    g.attrs["vars"] = union_vars
+    g.attrs["var_valid"] = {v: [bool(x) for x in flags] for v, flags in valid.items()}
     g.attrs["layout"] = "time_lat_lon"
+    g.attrs["region"] = [int(i0), int(i1), int(j0), int(j1)]
 
     nfiles = _count_files(out)
     meta = {"out": out, "src": src, "days": T, "grid": [ny, nx],
             "chunk": [tc, cy, cx], "shards": list(shards) if shards else None,
-            "vars": present_vars, "file_count": nfiles,
+            "vars": union_vars, "file_count": nfiles,
             "bytes_on_disk": sum(os.path.getsize(os.path.join(r, f))
                                  for r, _, fs in os.walk(out) for f in fs)}
     with open(os.path.join(out, "timecube_meta.json"), "w") as fh:
@@ -99,19 +123,24 @@ def build_timecube(src: str, out: str, spatial_chunk: int = 8,
 
 
 def append_day(cube_path: str, day_iso: str, data: dict) -> None:
-    """Append ONE day to an existing cube: resize each var's time dim +1 and write the
-    new (ny,nx) slab; update attrs['days']. Cost depends on time_chunk (the slab lands in
-    the current time-chunk -> only that chunk's spatial chunks are (re)written)."""
+    """Append ONE day to an existing cube: resize EACH cube var's time dim +1; write the
+    slab where the var is present (else leave NaN fill) and update the validity mask, so a
+    day missing a var is omitted by the reader (P1 parity). Cost depends on time_chunk (the
+    slab lands in the current time-chunk -> only that chunk's spatial chunks are (re)written)."""
     g = zarr.open_group(cube_path, mode="a")
     days = list(g.attrs["days"])
     t = len(days)
+    var_valid = {k: list(v) for k, v in dict(g.attrs.get("var_valid", {})).items()}
     for v in g.attrs.get("vars", VARS):
-        if v not in data:
-            continue
         arr = g[v]
         arr.resize((t + 1, arr.shape[1], arr.shape[2]))
-        arr[t, :, :] = np.asarray(data[v], dtype=np.float32)
+        present = v in data and data[v] is not None
+        if present:
+            arr[t, :, :] = np.asarray(data[v], dtype=np.float32)
+        # else: resized region stays NaN fill
+        var_valid.setdefault(v, [True] * t).append(bool(present))
     g.attrs["days"] = days + [day_iso]
+    g.attrs["var_valid"] = var_valid
 
 
 def main():
