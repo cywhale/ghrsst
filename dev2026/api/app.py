@@ -32,6 +32,8 @@ from pydantic import BaseModel
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from store.store_access import ALLOWED_FIELDS, StoreAccess  # noqa: E402
+from store.hybrid_router import HybridRouter  # noqa: E402
+from store.time_cube import TimeCubeStore  # noqa: E402
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -117,6 +119,16 @@ async def lifespan(app: FastAPI):
         points_batch_max=cfg.POINTS_BATCH_MAX,
         bbox_point_limit=cfg.BBOX_POINT_LIMIT,
     )
+    # optional time-cube for multi-day point/range routing (P2-S5 hybrid routing).
+    # Unset / missing -> router uses the daily store for everything (== P1 behaviour).
+    cube = None
+    tc_path = os.environ.get("GHRSST_TIMECUBE_PATH")
+    if tc_path and os.path.isdir(tc_path):
+        try:
+            cube = TimeCubeStore(tc_path)
+        except Exception as e:  # noqa: BLE001
+            print(f"[GHRSST] time-cube load skipped: {e}")
+    app.state.router = HybridRouter(app.state.store, cube)
     app.state.bex = BoundedExecutor(cfg.ZARR_WORKERS, cfg.OVERLOAD_QUEUE_MAX, cfg.OVERLOAD_WAIT_MS)
     yield
     app.state.bex.shutdown()
@@ -258,9 +270,13 @@ async def read_ghrsst(
         if not existing:
             raise HTTPException(400, f"Data not exist for requested period; "
                                      f"available range is {earliest}/{latest}.")
-        rows = await bex.run(store.point_series, lon0, lat0, existing, fields)
+        router = request.app.state.router
+        route = router.route_point(existing)             # 'cube' (multi-day) or 'daily'
+        rows = await bex.run(router.point_series, lon0, lat0, existing, fields)
         rows = _apply_modes(rows, modes, fields)
-        return _json(rows, headers=_fixed_cache() if cacheable else _no_store())
+        headers = _fixed_cache() if cacheable else _no_store()
+        headers["X-Store-Route"] = route                 # observability (canary/tests)
+        return _json(rows, headers=headers)
 
     # ---------------- BBOX MODE (single day, streaming JSON array) ----------------
     if sample < 1:
