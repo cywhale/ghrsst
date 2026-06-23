@@ -8,6 +8,16 @@
 
 ---
 
+## 0a. VM24 isolation rules (MUST hold for the whole gate)
+- Work in a **separate checkout / git worktree**, e.g. `~/python/ghrsst-dev2026-phase2`. **Do NOT
+  modify the production tree** (`~/python/ghrsst`) or its data.
+- **Shadow port only.** Do NOT modify NGINX, system services, cron, or any unrelated process. Do NOT
+  `kill` anything you did not start. Start the shadow app, run the gate, then stop only that shadow
+  process.
+- Build the cube to a path on a filesystem with spare capacity (see §1) — **never** under the daily
+  store / production data dirs.
+- Production daily store, MCP (8765), and the live API (8035) stay running and untouched throughout.
+
 ## 0. Operational gates (fill in the accepted values BEFORE running)
 | gate | symbol | accepted value (ops sets) | default to assume |
 |---|---|---|---|
@@ -39,21 +49,26 @@ echo "estimated cube <= ${EST_GB} GB ; free ${FREE_GB} GB"
 test "$FREE_GB" -ge $(( EST_GB * 12 / 10 )) || { echo "INSUFFICIENT DISK — abort"; exit 1; }
 ```
 
-## 2. Build the cube (full OR tiled)
+## 2. Build the cube — to a STAGING path, then rename (path safety)
+**Never build `--out` directly onto an existing/production path.** `build_timecube` now **refuses to
+delete an existing `--out`** (raises `FileExistsError`) unless `--overwrite` is passed. Build to a
+fresh staging path, verify coverage (§3), then atomically rename.
 ```bash
 cd dev2026; P=.venv/bin/python
+STAGE=<CUBE>.building.$(date +%s)         # fresh staging path; never a production path
 # --- full global cube (if disk/append/files all within gates) ---
-$P ingest/build_timecube.py --src "$SRC" --out <CUBE> \
+$P ingest/build_timecube.py --src "$SRC" --out "$STAGE" \
    --spatial-chunk 8 --time-chunk 90 --shard-spatial 128
 # --- OR tiled (bounds append + disk per tile; build the regions that get point queries) ---
-$P ingest/build_timecube.py --src "$SRC" --out <CUBE_TILE_k> \
+$P ingest/build_timecube.py --src "$SRC" --out "$STAGE" \
    --spatial-chunk 8 --time-chunk 90 --shard-spatial 128 --region i0,i1,j0,j1
-# record file count + disk:
-find <CUBE> -type f | wc -l ; du -sh <CUBE>
+find "$STAGE" -type f | wc -l ; du -sh "$STAGE"          # record file count + disk
+# ... run §3 coverage on $STAGE; ONLY after ok==true:
+test ! -e <CUBE> && mv "$STAGE" <CUBE>                   # atomic promote; refuse if final exists
 ```
 > NOTE: the current `TimeCubeStore`/`HybridRouter` load ONE cube. **Tiled (multi-cube) routing is a
 > P2-S5 follow-up** (route a point to the tile covering it; daily fallback for uncovered). If tiling is
-> chosen here, that router extension must land before cutover.
+> chosen here, that router extension must land **before any cutover** (see §7).
 
 ## 3. Coverage / structural check (after build, and after each append)
 ```bash
@@ -74,10 +89,15 @@ curl -s http://127.0.0.1:<NEW_PORT>/healthz   # cube_loaded, cube_latest, cube_l
 ```
 
 ## 5. Binding read gate — cold AND warm (loadtest)
+> **Do NOT run a global `drop_caches`** — it evicts the whole machine's page cache and harms every
+> other service on VM24. Use **targeted eviction of the cube files only**:
 ```bash
 B=http://127.0.0.1:<NEW_PORT>
-# COLD: drop OS page cache first (Linux), then run immediately
-sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null   # or vmtouch -e <CUBE>
+# COLD-ish: evict ONLY the cube's files (preferred). Requires vmtouch.
+vmtouch -e <CUBE>                         # targeted; safe for other projects
+#   - if vmtouch is unavailable: mark the run as cache-state=best_effort (NOT strict cold), or
+#     schedule strict-cold testing in a maintenance window (a global drop_caches is allowed ONLY
+#     in an approved maintenance window, never during normal operation).
 $P bench/loadtest.py --base $B --run-kind vm24 --scenario LR --duration 120 --dense-days 365 \
    --cache-state cold --out vm24_cube_lr_cold.json
 $P bench/loadtest.py --base $B --run-kind vm24 --scenario SB --sb-range-max 60 --concurrency 32 \
@@ -92,26 +112,43 @@ $P bench/loadtest.py --base $B --run-kind vm24 --scenario LR --duration 120 --de
 - **Pass**: 365-day p95 < 4 s **cold**; LR C=4/8/16 bounded, zero timeout/OOM, RSS ≤
   `GHRSST_RSS_CEILING_MB`; SB stable (G2′-style).
 
-## 6. Append/upsert measurement (binding — fits the ingest window?)
+## 6. Append/upsert measurement — TRUE append via HOLDOUT (binding: fits the ingest window?)
+**A `sync_day` for a day already in the cube is an OVERWRITE, which UNDER-estimates append cost.**
+Measure a true append by **holding out a day** at build time, then appending it:
 ```bash
-# measure a REAL daily append from the daily store into the cube (read-from-daily + upsert)
+# Option A (preferred): build the gate cube WITHOUT the latest real day, then append it.
+#   At §2, build with --exclude-latest (or --end-day <D-1>):
+$P ingest/build_timecube.py --src "$SRC" --out "$STAGE" --spatial-chunk 8 --time-chunk 90 \
+   --shard-spatial 128 --exclude-latest        # holds out the latest real day D
+#   (run §3 coverage + §5 read gate on this holdout cube; dense-days = its day count)
+HOLD=<the latest real day D held out>
 $P - <<PY
-import time; from ingest.dual_write import sync_day, check_coverage
-t=time.perf_counter(); sync_day("$SRC", "<CUBE>", "<NEW_DAY_ISO>")
-print("append_s", round(time.perf_counter()-t,1))
-import json; print(json.dumps(check_coverage("$SRC","<CUBE>"), default=str))
+import time; from ingest.dual_write import sync_day, sync_missing, check_coverage
+from store.time_cube import TimeCubeStore
+b = TimeCubeStore("<CUBE>").day_count
+t = time.perf_counter(); res = sync_day("$SRC", "<CUBE>", "$HOLD"); dt = time.perf_counter() - t
+a = TimeCubeStore("<CUBE>").day_count
+print("sync_day:", res, "append_s", round(dt, 1), "day_count", b, "->", a)   # res MUST be 'append'
+assert res == "append" and a == b + 1, "not a true append (was it already present?)"
+# idempotency: re-run SAME day -> 'overwrite', count unchanged
+print("idempotent:", sync_day("$SRC", "<CUBE>", "$HOLD"), "count", TimeCubeStore("<CUBE>").day_count)
+# coverage after
+import json; print(json.dumps(check_coverage("$SRC", "<CUBE>"), default=str))
 PY
-# REQUIRE: append_s (+ margin) <= INGEST_WINDOW ; coverage ok == true
-# idempotency check: re-run sync_day for the SAME day -> 'overwrite', day_count unchanged
-# recovery check: simulate a missed day, then ingest.dual_write.sync_missing -> appends it
+# Option B: don't hold out — just wait for the NEXT cron day (a day not yet in the cube) and time
+#   sync_day for it. Either way: REQUIRE res=='append', append_s (+ margin) <= INGEST_WINDOW,
+#   coverage ok==true. Recovery: simulate a missed day -> sync_missing appends it (re-runnable).
 ```
 
 ## 7. Go / No-Go
 **GO (proceed to cutover discussion)** iff ALL:
-- disk precheck passed; cube built; `check_coverage.ok == true`.
+- disk precheck passed; cube built **to staging then renamed**; `check_coverage.ok == true`.
 - cold 365-day p95 < 4 s; LR C=4/8/16 bounded, zero timeout/OOM; RSS ≤ ceiling.
-- append/day ≤ `INGEST_WINDOW` (with margin); file count ≤ `FILE_MAX`.
+- **append measured as a TRUE append (holdout; `sync_day` returned `append`)** ≤ `INGEST_WINDOW`
+  (with margin); file count ≤ `FILE_MAX`.
 - routing confirmed (`route_counts` cube; `X-Store-Route: cube`).
+- **If a TILED (multi-cube) cube was chosen: NOT cutover-eligible yet** — the multi-cube routing
+  (P2-S5 follow-up) must be implemented and re-gated first. A single global cube can proceed.
 
 **NO-GO / do not cut over (and the fix)**:
 - read p95 fails cold → larger time/spatial issue; re-tune (should not happen given P2-S7, but verify).

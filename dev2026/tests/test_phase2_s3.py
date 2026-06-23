@@ -92,6 +92,19 @@ class TimeCubeTests(unittest.TestCase):
         self.assertIn("sst", rows[0])
         self.assertNotIn("sst_anomaly", rows[0])
 
+    def test_overwrite_guard(self):
+        out = os.path.join(self.tmp, "cube_guard")
+        build_timecube(self.daily, out, spatial_chunk=8)              # first build ok
+        with self.assertRaises(FileExistsError):
+            build_timecube(self.daily, out, spatial_chunk=8)          # exists -> refuse (path safety)
+        build_timecube(self.daily, out, spatial_chunk=8, overwrite=True)   # explicit overwrite ok
+
+    def test_holdout_days_subset(self):
+        out = os.path.join(self.tmp, "cube_holdout")
+        build_timecube(self.daily, out, spatial_chunk=8, days=self.days[:-1])  # exclude latest
+        self.assertEqual(TimeCubeStore(out).day_count, len(self.days) - 1)
+        self.assertNotIn(self.days[-1], TimeCubeStore(out).days)
+
     def test_append_day_visible(self):
         ny, nx = self.meta["grid"]
         append_day(self.cube, "2024-07-15", {v: np.ones((ny, nx), np.float32)
