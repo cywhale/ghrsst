@@ -104,6 +104,29 @@ class DualWriteTests(unittest.TestCase):
         self.assertIn(self.days[3], cov["missing_within_cube_span"])
         self.assertFalse(cov["ok"])
 
+    def test_coverage_extra_cube_day(self):
+        # a cube day not in the daily store -> orphan, needs rebuild
+        sync_missing(self.daily, self.cube)                      # cube now == daily
+        slab = {v: np.zeros((NY, NX), np.float32) for v in ("sst", "sst_anomaly", "sea_ice")}
+        append_day(self.cube, "2099-01-01", slab)               # day daily doesn't have
+        cov = check_coverage(self.daily, self.cube)
+        self.assertEqual(cov["extra_cube_days"], ["2099-01-01"])
+        self.assertFalse(cov["structural_ok"])
+        self.assertFalse(cov["ok"])
+
+    def test_coverage_flags_unsorted_and_dup(self):
+        sync_missing(self.daily, self.cube)
+        g = zarr.open_group(self.cube, mode="a")
+        good = list(g.attrs["days"])
+        g.attrs["days"] = [good[1], good[0]] + good[2:]         # unsorted
+        cov = check_coverage(self.daily, self.cube)
+        self.assertFalse(cov["days_sorted"])
+        self.assertFalse(cov["structural_ok"])
+        g.attrs["days"] = good + [good[-1]]                     # duplicate
+        cov = check_coverage(self.daily, self.cube)
+        self.assertFalse(cov["days_unique"])
+        self.assertFalse(cov["structural_ok"])
+
 
 # ---- API healthz / route observability ----
 _TMP = tempfile.mkdtemp(prefix="p2s6api_")
@@ -141,11 +164,12 @@ class HealthzObservabilityTests(unittest.TestCase):
         self.assertEqual(h["cube_day_count"], len(_DAYS))
         self.assertTrue(h["cube_latest_in_sync"])
 
-    def test_route_counts_increment(self):
+    def test_route_counts_no_double(self):
+        before = self.client.get("/healthz").json()["route_counts"].get("cube", 0)
         self.client.get("/api/ghrsst", params={
-            "lon0": 115.0, "lat0": 12.0, "start": "2025-03-02", "end": "2025-03-06"})  # multi-day
-        h = self.client.get("/healthz").json()
-        self.assertGreaterEqual(h["route_counts"].get("cube", 0), 1)
+            "lon0": 115.0, "lat0": 12.0, "start": "2025-03-02", "end": "2025-03-06"})  # 1 multi-day req
+        after = self.client.get("/healthz").json()["route_counts"].get("cube", 0)
+        self.assertEqual(after - before, 1)              # exactly once (no double-count)
 
 
 if __name__ == "__main__":

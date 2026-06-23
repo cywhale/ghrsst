@@ -109,6 +109,13 @@ def check_coverage(daily_path: str, cube_path: str) -> dict:
                        if cube_earliest and cube_latest and cube_earliest <= d <= cube_latest
                        and d not in cube_set]
     after_latest = [d for d in daily if cube_latest and d > cube_latest]
+    # cube days that are NOT in the daily store (daily is source of truth -> these are
+    # orphans needing a rebuild); and structural problems in the cube's time axis.
+    daily_set = set(daily)
+    extra_cube_days = [d for d in cube_days if d not in daily_set]
+    days_sorted = all(cube_days[i] < cube_days[i + 1] for i in range(len(cube_days) - 1))
+    days_unique = len(cube_days) == len(cube_set)
+    structural_ok = days_sorted and days_unique and not extra_cube_days
     return {
         "cube_loaded": True,
         "daily_latest": daily_latest, "cube_latest": cube_latest,
@@ -116,5 +123,9 @@ def check_coverage(daily_path: str, cube_path: str) -> dict:
         "latest_in_sync": (daily_latest == cube_latest),
         "missing_after_cube_latest": after_latest,         # fix via sync_missing (append)
         "missing_within_cube_span": in_span_missing,       # needs REBUILD (out-of-order)
-        "ok": (daily_latest == cube_latest) and not in_span_missing,
+        "extra_cube_days": extra_cube_days,                # cube has days daily lacks -> REBUILD
+        "days_sorted": days_sorted,                        # time axis strictly ascending?
+        "days_unique": days_unique,                        # no duplicate days?
+        "structural_ok": structural_ok,                    # cube time-axis is well-formed
+        "ok": (daily_latest == cube_latest) and not in_span_missing and structural_ok,
     }

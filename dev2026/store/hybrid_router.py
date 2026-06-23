@@ -12,6 +12,7 @@ If no cube is configured, everything uses the daily store (graceful: behaves exa
 """
 from __future__ import annotations
 
+import threading
 from typing import Iterator, List, Optional, Sequence
 
 from .store_access import StoreAccess
@@ -23,22 +24,25 @@ class HybridRouter:
         self.daily = daily
         self.cube = cube
         self.route_counts = {"cube": 0, "daily": 0}   # observability (healthz)
+        self._rc_lock = threading.Lock()
 
-    # ---- routing decision (exposed for tests / observability) ------------
+    # ---- routing decision: PURE (no side effects; safe to call for the
+    #      X-Store-Route header AND inside point_series without double-counting) ----
     def route_point(self, days: Sequence[str]) -> str:
         """'cube' for a multi-day series fully covered by the cube; else 'daily'."""
-        route = "daily"
         if self.cube is not None:
             existing = [d for d in days if self.daily.day_present(d)]
             if len(existing) > 1 and self.cube.covers_days(existing):
-                route = "cube"
-        self.route_counts[route] += 1
-        return route
+                return "cube"
+        return "daily"
 
-    # ---- point/range time-series (routed) --------------------------------
+    # ---- point/range time-series (routed; counts ONCE per actual query) --
     def point_series(self, lon: float, lat: float, days: Sequence[str],
                      fields: Sequence[str]) -> List[dict]:
-        if self.route_point(days) == "cube":
+        route = self.route_point(days)
+        with self._rc_lock:
+            self.route_counts[route] += 1
+        if route == "cube":
             return self.cube.point_series(lon, lat, days, fields)
         return self.daily.point_series(lon, lat, days, fields)
 
