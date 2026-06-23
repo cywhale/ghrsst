@@ -154,8 +154,11 @@ def main():
     ap.add_argument("--spatial-chunk", type=int, default=8, dest="spatial_chunk")
     ap.add_argument("--time-chunk", type=int, default=None, dest="time_chunk")
     ap.add_argument("--shard-spatial", type=int, default=None, dest="shard_spatial")
+    ap.add_argument("--region", default=None, help="i0,i1,j0,j1 lat/lon index slice (tiled build)")
     args = ap.parse_args()
-    meta = build_timecube(args.src, args.out, args.spatial_chunk, args.time_chunk, args.shard_spatial)
+    region = tuple(int(x) for x in args.region.split(",")) if args.region else None
+    meta = build_timecube(args.src, args.out, args.spatial_chunk, args.time_chunk,
+                          args.shard_spatial, region=region)
     print(f"time-cube -> {args.out}")
     print(f"  days={meta['days']} chunk={meta['chunk']} shards={meta['shards']} "
           f"files={meta['file_count']} disk={meta['bytes_on_disk']/1e6:.1f}MB")

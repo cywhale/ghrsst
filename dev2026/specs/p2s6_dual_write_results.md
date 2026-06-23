@@ -42,21 +42,23 @@
    for the new time-slice): ~4× per 2× edge (128→256→512 ≈ 290→960→3680 ms unsharded).
 2. **Sharding ~halves append** (119 vs 290, 405 vs 960, 1638 vs 3680) AND cuts file count 40–60×
    (12296 → 200). Keep sharding ON — it helps both files and append.
-3. **⚠ DESIGN-RELEVANT: the read-optimal `s8` chunking is append-infeasible GLOBALLY.** Global MUR
-   (17999×36000 ≈ 648M cells) is ~2470× the 512² area; extrapolating 1638 ms × 2470 ⇒ **~hours per
-   daily append** at spatial=8, plus ~10M tiny chunks/time-slice. **The sweep's read-optimal `s8` is
-   NOT a viable global production chunking.** The production config is a **balance** of read (P2-S3
-   sweep) and append (this bench).
+3. **Append scales with grid area** (this bench): a global daily append at `spatial=8` is in the tens
+   of minutes range (extrapolated). At the time this was first written it was read as "s8 infeasible";
+   **that conclusion was WRONG and is SUPERSEDED by P2-S7** (see below).
 
-## Revised chunking guidance (supersedes the P2-S3 `s8` starting point)
-- **`spatial=8` is read-optimal but append-infeasible for a GLOBAL cube.** Options to balance:
-  - **(a) larger spatial chunk** (e.g. 32–64): far fewer chunks/time-slice ⇒ cheaper append, while
-    still a large point-read win vs daily's 1024² (read_amp ~256–1024× vs daily ~1M×). Quantify on VM24.
-  - **(b) regional cubes** — build cubes only for regions where point queries occur (hybrid router
-    already falls back to daily for uncovered areas). Bounds append cost to the region.
-  - **(c)** revisit `time_chunk` (more frequent fresh chunks reduce read-modify-write shards).
-- **Final production chunking is NOT decided here** — it needs the VM24 full-grid (or careful
-  per-tile) append + read numbers. `s8` is explicitly retired as the global recommendation.
+## ~~Revised chunking guidance~~ — HISTORICAL, SUPERSEDED BY [P2-S7](p2s7_chunking_selection_results.md)
+> **This section's original conclusion ("`s8` is append-infeasible / retired as the global
+> recommendation") was CORRECTED in P2-S7 and must not be used.** It over-weighted append. The
+> correct framing (review): **append is an operational CONSTRAINT, not the optimization target; select
+> read-first.** P2-S7 measured global append at ~67 min (s8) — within a typical multi-hour ingest
+> window — so **`s8` is NOT retired**; it is the read-first candidate (`spatial=8 / time_chunk=90 /
+> shard=128`, shard tuned for file count). The original options below are kept only as historical
+> notes; the live guidance is P2-S7.
+>
+> _Historical (do not act on):_ append-driven preference for larger spatial chunk (32–64), regional
+> cubes, or `time_chunk` tuning. P2-S7 supersedes this: larger spatial chunk / regional cubes are now
+> a **fallback** (only if the real VM24 ingest window is tight or file count is unacceptable), not the
+> primary recommendation.
 
 ## Status / next
 - Dual-write, recovery, coverage, observability: done + tested. Append-at-scale: measured + the
