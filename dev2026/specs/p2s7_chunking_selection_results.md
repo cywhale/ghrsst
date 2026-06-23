@@ -75,6 +75,25 @@ fits; shard=64 if append/RSS must be minimal and ~2.4 M files acceptable).
 - No promotion claim. The final production chunking is decided on VM24, with s8 as the read-first
   starting candidate (shard size tuned for files), s16/s32 or regional as the append/ops fallback.
 
+## P2-S7 full HTTP gate — `s8/t90/shard=128` cube-backed API (365-day fixture, warm)
+Cube-backed app (`GHRSST_TIMECUBE_PATH`), `loadtest.py` over real HTTP. `/healthz`: `cube_loaded`,
+365 days, `cube_latest_in_sync`. **Authoritative RSS from `/healthz`** (review item 3).
+| scenario | p50 | p95 | p99 | RSS (/healthz) | shed/timeout |
+|---|---|---|---|---|---|
+| LR 365-day C=4 | 26 ms | **50 ms** | 51 ms | 74 MB | 0 / 0 |
+| LR 365-day C=8 | 61 ms | 116 ms | 118 ms | 76 MB | 0 / 0 |
+| LR 365-day C=16 | 131 ms | 205 ms | 209 ms | 78 MB | 0 / 0 |
+| SB range-heavy C=32 | 57 ms | 252 ms | 377 ms | 84 MB | 0 / 0 |
+
+- **365-day point series p95 50–205 ms across C=4/8/16 — far under the 4 s gate** and ~70–280× better
+  than the daily store's VM24 14 s. **Zero timeouts/503**; RSS bounded ~74–85 MB.
+- **Routing confirmed under load**: `route_counts {cube: 6438, daily: 57}` — multi-day → cube, the 57
+  daily are single-day requests. `X-Store-Route: cube` works end-to-end.
+- The end-to-end HTTP gate confirms the time-cube turns the VM24 daily-store failure into a fast,
+  bounded, correctly-routed read path.
+
 ## Next
-P2-S7 full local gate on the chosen chunking via the HTTP `loadtest.py` scenarios (cube-backed API,
-confirming `X-Store-Route: cube` + read p95/p99 + RSS + backpressure) → then P2-S8 VM24 binding.
+NON-BINDING still (synthetic, warm, 256² regional, not cold). **P2-S8 VM24 binding**: real ≥365
+contiguous + cold-cache LR/SB p95/p99 + RSS + a real full-grid (or per-tile) append measurement
+against the actual daily ingest window + file-count tolerance, to confirm `s8/t90/shard=128` (or the
+ops-tuned shard / regional fallback) as the production config.
