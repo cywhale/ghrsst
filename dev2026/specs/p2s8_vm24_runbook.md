@@ -50,19 +50,29 @@ test "$FREE_GB" -ge $(( EST_GB * 12 / 10 )) || { echo "INSUFFICIENT DISK — abo
 ```
 
 ## 2. Build the cube — to a STAGING path (HOLDOUT), promoted only at the end of §6
-**Never build `--out` directly onto an existing/production path.** `build_timecube` **refuses to
-delete an existing `--out`** (`FileExistsError`) unless `--overwrite`. Build to a fresh staging path
-on the **same filesystem** as the final `<CUBE>` (so the §6 rename is atomic), **holding out the
-latest day** (`--exclude-latest`) for the §6 true-append test.
+**Use the BULK builder `build_timecube_bulk` — NOT the per-day `build_timecube`.** The per-day writer
+writes one day at a time, which read-modify-writes the whole `time_chunk`-spanning shard every day
+(~90× write amplification → multi-day global builds). The bulk builder writes one shard-block
+(`time_chunk × shard × shard`) at a time = each shard written once (measured ~**78× faster** at 256²;
+larger at global scale). It is **resumable** (checkpoint per var/time-block/tile) and bounded-parallel.
+
+**Never build `--out` onto an existing/production path** — `build_timecube_bulk` refuses (`FileExistsError`)
+unless `--overwrite`, or resumes an existing partial build (its `_build_checkpoint.json`). Build to a
+fresh staging path on the **same filesystem** as the final `<CUBE>` (so the §6 rename is atomic),
+**holding out the latest day** (`--exclude-latest`) for the §6 true-append test.
 ```bash
 cd dev2026; P=.venv/bin/python
 STAGE=<CUBE>.building.$(date +%s)         # fresh staging path; SAME filesystem as <CUBE>; never production
-# --- full global cube (holdout) — if disk/append/files all within gates ---
-$P ingest/build_timecube.py --src "$SRC" --out "$STAGE" \
-   --spatial-chunk 8 --time-chunk 90 --shard-spatial 128 --exclude-latest
-# --- OR tiled (holdout) — bounds append/disk per tile; build the regions that get point queries ---
-$P ingest/build_timecube.py --src "$SRC" --out "$STAGE" \
-   --spatial-chunk 8 --time-chunk 90 --shard-spatial 128 --exclude-latest --region i0,i1,j0,j1
+# --- full global cube (holdout), bounded parallel + resumable ---
+$P ingest/build_timecube_bulk.py --src "$SRC" --out "$STAGE" \
+   --spatial-chunk 8 --time-chunk 90 --shard-spatial 128 --workers 4 --exclude-latest
+#   incremental availability: add --latest-days 90 to build the most recent 90 days FIRST
+#   (the hybrid router falls back to daily for older ranges), then rerun with a larger N to extend.
+#   resume after an interruption: rerun the SAME command — completed (var,time-block,tile) units skip.
+#   memory ≈ workers × time_chunk × read_block² × 4 bytes (per var); lower --read-block/--workers if RAM-bound.
+# --- OR tiled (holdout): build the regions that get point queries ---
+$P ingest/build_timecube_bulk.py --src "$SRC" --out "$STAGE" \
+   --spatial-chunk 8 --time-chunk 90 --shard-spatial 128 --workers 4 --exclude-latest --region i0,i1,j0,j1
 find "$STAGE" -type f | wc -l ; du -sh "$STAGE"          # record file count + disk
 HOLD=<the latest real day held out>                      # appended in §6 for a TRUE append measure
 # IMPORTANT: $STAGE and the final <CUBE> MUST be on the SAME filesystem — mv/rename is atomic only
