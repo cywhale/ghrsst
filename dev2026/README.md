@@ -74,6 +74,17 @@ curl -sS -D - -o /tmp/ghrsst_365.json \
   "http://127.0.0.1:8035/api/ghrsst?lon0=121&lat0=24&start=2025-06-24&end=2026-06-23&append=sst,sst_anomaly,sea_ice"
 ```
 Expected for multi-day point/range queries: `X-Store-Route: cube`.
+Swagger/OpenAPI:
+```text
+https://eco.odb.ntu.edu.tw/api/swagger/ghrsst
+https://eco.odb.ntu.edu.tw/api/swagger/ghrsst/openapi.json
+```
+
+`zarr.json` metadata is maintained by the cube builders/append tools. Do not edit
+it manually. Base cube days are stored in the base root attrs; recent and
+backfilled gap days are stored in the delta root attrs. VM24 production currently
+keeps `2025-06-22`, `2026-06-22`, and `2026-06-23` in delta so ranges crossing
+the base start still route to the cube.
 
 Daily delta append cron:
 ```cron

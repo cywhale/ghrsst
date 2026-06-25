@@ -19,3 +19,5 @@
 - Reduced default production bbox guard to 300,000 points to avoid browser/front-end freezes from very large row-oriented JSON payloads.
 - Fixed bbox date semantics in the refactor API: bbox is single-day only; `start` and `end` must match when both are supplied.
 - Set the production range cap to 366 days so one-calendar-year queries work across leap years.
+- Restored Swagger/OpenAPI under `/api/swagger/ghrsst` and `/api/swagger/ghrsst/openapi.json`.
+- Added the daily-only gap day `2025-06-22` to the delta cube so ranges crossing that day still route to the cube.

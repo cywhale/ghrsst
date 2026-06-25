@@ -140,7 +140,11 @@ async def lifespan(app: FastAPI):
     app.state.bex.shutdown()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan,
+    docs_url="/api/swagger/ghrsst",
+    openapi_url="/api/swagger/ghrsst/openapi.json",
+)
 
 
 def _json(obj, status_code: int = 200, headers: Optional[dict] = None) -> Response:
