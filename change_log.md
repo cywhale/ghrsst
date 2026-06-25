@@ -18,3 +18,4 @@
 - Added daily delta append cron wrappers after the existing MUR daily ingest retries.
 - Reduced default production bbox guard to 300,000 points to avoid browser/front-end freezes from very large row-oriented JSON payloads.
 - Fixed bbox date semantics in the refactor API: bbox is single-day only; `start` and `end` must match when both are supplied.
+- Set the production range cap to 366 days so one-calendar-year queries work across leap years.

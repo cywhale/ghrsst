@@ -47,7 +47,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 class Cfg:
-    MAX_DAYS = _env_int("GHRSST_MAX_DAYS", 365)
+    # Allow "one year" queries across leap years without forcing clients to split.
+    MAX_DAYS = _env_int("GHRSST_MAX_DAYS", 366)
     POINTS_BATCH_MAX = _env_int("GHRSST_POINTS_BATCH_MAX", 1000)
     BATCH_CHUNK_FANOUT_MAX = _env_int("GHRSST_BATCH_CHUNK_FANOUT_MAX", 64)
     LRU_MAX = _env_int("GHRSST_LRU_MAX", 64)

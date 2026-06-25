@@ -107,8 +107,8 @@ class ApiTests(unittest.TestCase):
             "lon0": 110.0, "lat0": 12.0, "start": "2024-01-01", "end": "2025-06-01"})
         self.assertEqual(r.status_code, 413)
         detail = r.json()["detail"]
-        self.assertEqual(detail["max_days"], 365)
-        self.assertGreater(detail["requested_days"], 365)
+        self.assertEqual(detail["max_days"], 366)
+        self.assertGreater(detail["requested_days"], 366)
 
     def test_point_omits_absent_field(self):
         r = self.client.get("/api/ghrsst", params={
