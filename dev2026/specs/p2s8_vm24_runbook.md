@@ -141,17 +141,20 @@ $P bench/loadtest.py --base $B --run-kind vm24 --scenario LR --duration 120 --de
 The §2 base (`--exclude-latest`) is the COMPLETE base for older days, so promote it directly; the
 held-out latest day(s) live in the DELTA. The tier (base+delta) covers everything.
 ```bash
-DELTA=<CUBE>.delta            # time_chunk=1 delta cube
+DELTA=<CUBE>.delta            # time_chunk=1 delta cube, APPEND-optimized layout (s256/shard256)
 # promote the base (atomic; same fs; refuse if final exists):
 test ! -e <CUBE> && mv "$STAGE" <CUBE> && echo "promoted base -> <CUBE>"
 # DAILY APPEND = the production cron CLI (TILED/streaming; never materializes a full global array).
-# This is the EXACT path cron runs — do NOT hand-build the delta. Run once per held-out day:
+# Delta chunking is DECOUPLED from the base read-cube (base=s8 for reads; delta=s256 for cheap append
+# -- s8 delta = ~10M tiny chunks/var = the >2h/day; s256 was 215x faster, no read penalty). This is
+# the EXACT path cron runs -- do NOT hand-build the delta. Run once per held-out day:
 for HOLD in <D D+1 ...>; do
   PYTHONPATH=. $P ingest/append_delta_day.py --daily "$SRC" --delta "$DELTA" --day "$HOLD" \
-    --spatial-chunk 8 --shard-spatial 128 --workers 4   # prints {op,append_s,tile_count,max_block_cells,grid_cells,rss_mb}
+    --delta-spatial-chunk 256 --delta-shard-spatial 256 --workers 4   # defaults already s256/s256
 done
-# REQUIRE: append_s (+ margin) <= INGEST_WINDOW (BINDING gate); AND peak RSS bounded —
-#   max_block_cells << grid_cells and RSS must NOT scale with the grid (the >7.8 GB pattern is gone).
+# prints {op,append_s,tile_count,max_block_cells,grid_cells,rss_mb}
+# REQUIRE: append_s (+ margin) <= INGEST_WINDOW (BINDING gate, now MINUTES not hours); AND peak RSS
+#   bounded -- max_block_cells << grid_cells, RSS must NOT scale with the grid (>7.8 GB pattern gone).
 $P - <<PY
 from store.time_cube import TimeCubeStore
 from store.tiered_cube import TieredCube

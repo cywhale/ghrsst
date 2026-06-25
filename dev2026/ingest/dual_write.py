@@ -110,34 +110,43 @@ def sync_missing(daily_path: str, cube_path: str) -> List[str]:
 # ---------------------------------------------------------------------------
 # Base + delta + compaction (production cheap-append design; store/tiered_cube.py)
 # ---------------------------------------------------------------------------
-def append_to_delta(daily_path: str, delta_path: str, day: str, *, spatial_chunk: int = 8,
-                    shard_spatial: int = 128, region: Optional[tuple] = None,
+# Delta chunking is DECOUPLED from the base read-cube (base=s8/shard128 for long point reads). The
+# delta is APPEND-optimized: large spatial_chunk == shard_spatial -> one chunk per shard, ~1000× fewer
+# chunk writes per daily global append than s8 (the VM24 >2h/day was chunk-count bound, not memory).
+DELTA_SPATIAL_CHUNK = 256
+DELTA_SHARD_SPATIAL = 256
+
+
+def append_to_delta(daily_path: str, delta_path: str, day: str, *,
+                    spatial_chunk: int = DELTA_SPATIAL_CHUNK,
+                    shard_spatial: int = DELTA_SHARD_SPATIAL, region: Optional[tuple] = None,
                     workers: int = 4, read_block: Optional[int] = None) -> dict:
     """TILED/STREAMING append of one day into the DELTA cube (time_chunk=1 -> fresh shard, no RMW).
 
     Production daily-ingest path (used by VM24 + cron). Reads/writes ONE spatial tile at a time so it
-    NEVER materializes a full global array (peak block = read_block² per worker, not ny×nx). Creates
-    the delta if missing (time_chunk=1, spatial_chunk=8, shard_spatial=128, same region/coords/vars/
-    var_valid semantics). Bounded workers; checkpoint/resume per (day,var,tile) in
-    `<delta>/_delta_append_<day>.json` (safe to rerun after interruption). Preserves P1 semantics:
-    absent var -> valid False (omit); present NaN -> null; values match the daily store.
+    NEVER materializes a full global array (peak block = read_block² per worker, not ny×nx).
 
-    Returns {op: create|append|overwrite, append_s, tile_count, max_block_cells, rss_mb}.
+    Delta chunking is DECOUPLED from the base read-cube: the base needs spatial_chunk=8 for long
+    point-series reads, but s8 makes daily global append write ~10M tiny 8×8 chunks/var (the VM24
+    >2h/day bottleneck — chunk count, not memory). The delta defaults to an APPEND-optimized layout
+    (large spatial_chunk == shard_spatial, so one chunk per shard, ~1000× fewer chunk writes). On
+    append the layout is read FROM THE EXISTING delta (params only matter at create). Bounded workers;
+    checkpoint/resume per (day,var,tile) in `<delta>/_delta_append_<day>.json`. P1 semantics: absent
+    var -> valid False (omit); present NaN -> null; values match the daily store.
+
+    Returns {op: create|append|overwrite, append_s, tile_count, max_block_cells, grid_cells, rss_mb}.
     """
     gd = zarr.open_group(group_path(daily_path, day), mode="r")
     lon_full = np.asarray(gd["lon"][:]); lat_full = np.asarray(gd["lat"][:])
     i0, i1, j0, j1 = region if region else (0, lat_full.size, 0, lon_full.size)
     ny, nx = i1 - i0, j1 - j0
-    cy, cx = min(spatial_chunk, ny), min(spatial_chunk, nx)
-    sh_y = min((shard_spatial // cy) * cy or cy, ny)
-    sh_x = min((shard_spatial // cx) * cx or cx, nx)
-    daily_cy = int(gd["sst"].chunks[-2]) if "sst" in gd else sh_y
-    rb = read_block or daily_cy
-    rb_y = min(max(sh_y, (rb // sh_y) * sh_y or sh_y), ((ny + sh_y - 1) // sh_y) * sh_y)
-    rb_x = min(max(sh_x, (rb // sh_x) * sh_x or sh_x), ((nx + sh_x - 1) // sh_x) * sh_x)
+    daily_cy = int(gd["sst"].chunks[-2]) if "sst" in gd else 1024
     day_vars = [v for v in VARS if v in gd]
 
-    if not os.path.isdir(delta_path):           # CREATE (empty, time_chunk=1), then unified append
+    if not os.path.isdir(delta_path):           # CREATE (empty, time_chunk=1) w/ append-opt layout
+        cy, cx = min(spatial_chunk, ny), min(spatial_chunk, nx)
+        sh_y = min((shard_spatial // cy) * cy or cy, ny)
+        sh_x = min((shard_spatial // cx) * cx or cx, nx)
         g = zarr.open_group(delta_path, mode="w", zarr_format=3)
         g.create_array("lon", shape=(nx,), dtype="float32", chunks=(nx,)); g["lon"][:] = lon_full[j0:j1].astype(np.float32)
         g.create_array("lat", shape=(ny,), dtype="float32", chunks=(ny,)); g["lat"][:] = lat_full[i0:i1].astype(np.float32)
@@ -147,9 +156,17 @@ def append_to_delta(daily_path: str, delta_path: str, day: str, *, spatial_chunk
         g.attrs["days"] = []; g.attrs["vars"] = list(day_vars)
         g.attrs["var_valid"] = {v: [] for v in day_vars}
         g.attrs["region"] = [int(i0), int(i1), int(j0), int(j1)]; g.attrs["layout"] = "time_lat_lon"
+        g.attrs["delta_spatial_chunk"] = int(cy); g.attrs["delta_shard_spatial"] = int(sh_y)
         created = True
-    else:
+    else:                                       # APPEND: derive layout from the EXISTING delta
         g = zarr.open_group(delta_path, mode="a"); created = False
+        a0 = g[list(g.attrs["vars"])[0]]
+        cy, cx = int(a0.chunks[-2]), int(a0.chunks[-1])
+        sh_y, sh_x = int(a0.shards[-2]), int(a0.shards[-1])
+
+    rb = read_block or max(daily_cy, sh_y, sh_x)
+    rb_y = min(max(sh_y, (rb // sh_y) * sh_y or sh_y), ((ny + sh_y - 1) // sh_y) * sh_y)
+    rb_x = min(max(sh_x, (rb // sh_x) * sh_x or sh_x), ((nx + sh_x - 1) // sh_x) * sh_x)
 
     days = list(g.attrs["days"]); Tcur = len(days)
     delta_vars = list(g.attrs.get("vars", day_vars))
@@ -228,11 +245,14 @@ def append_to_delta(daily_path: str, delta_path: str, day: str, *, spatial_chunk
 
 def compact(daily_path: str, base_path: str, delta_path: str, end_day: str, *,
             spatial_chunk: int = 8, time_chunk: int = 90, shard_spatial: int = 128,
+            delta_spatial_chunk: int = DELTA_SPATIAL_CHUNK,
+            delta_shard_spatial: int = DELTA_SHARD_SPATIAL,
             region: Optional[tuple] = None, workers: int = 4) -> dict:
-    """Fold the delta into the base: bulk-REBUILD the base through `end_day` (fast bulk builder),
-    and rebuild the delta with only days AFTER `end_day`. Returns staging paths; the caller swaps
-    base<-new_base and delta<-new_delta atomically (same filesystem). The daily store is the source
-    of truth, so this is a clean re-derive — no in-place base mutation while serving."""
+    """Fold the delta into the base: bulk-REBUILD the base through `end_day` (BASE read-chunking
+    s8/shard128/t90), and rebuild the delta with only days AFTER `end_day` (APPEND-optimized delta
+    chunking, decoupled from base). Returns staging paths; the caller swaps base<-new_base and
+    delta<-new_delta atomically (same filesystem). The daily store is the source of truth, so this is
+    a clean re-derive — no in-place base mutation while serving."""
     from ingest.build_timecube_bulk import build_timecube_bulk
     new_base = f"{base_path}.compact"
     build_timecube_bulk(daily_path, new_base, spatial_chunk=spatial_chunk, time_chunk=time_chunk,
@@ -244,9 +264,9 @@ def compact(daily_path: str, base_path: str, delta_path: str, end_day: str, *,
         new_delta = f"{delta_path}.compact"
         if os.path.exists(new_delta):
             import shutil; shutil.rmtree(new_delta)
-        for d in later:                          # tiled append (no full-global array)
-            append_to_delta(daily_path, new_delta, d, spatial_chunk=spatial_chunk,
-                            shard_spatial=shard_spatial, region=region, workers=workers)
+        for d in later:                          # tiled append, append-optimized delta layout
+            append_to_delta(daily_path, new_delta, d, spatial_chunk=delta_spatial_chunk,
+                            shard_spatial=delta_shard_spatial, region=region, workers=workers)
     return {"new_base": new_base, "new_delta": new_delta, "compacted_through": end_day,
             "delta_days_after": later}
 

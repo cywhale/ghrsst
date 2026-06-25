@@ -4,12 +4,19 @@
 > build — appending one day into a `time_chunk=90` shard read-modify-writes the whole 90-step shard,
 > and it loads a full global day into memory. Read chunking (`s8/t90/shard=128`) is unchanged.
 > Tools: `store/tiered_cube.py`, `ingest/dual_write.py` (`append_to_delta` TILED/streaming + `compact`),
-> `ingest/append_delta_day.py` (cron CLI), `ingest/build_timecube_bulk.bulk_append_day`;
-> tests `tests/test_phase2_append.py` (10/10). Full 114/114.
+> `ingest/append_delta_day.py` (cron CLI), `ingest/build_timecube_bulk.bulk_append_day`,
+> `bench/bench_delta_layout.py`; tests `tests/test_phase2_append.py` (11/11). Full 115/115.
 
 > **PR #12 follow-up (Codex):** the first `append_to_delta` still called `read_daily_day` →
 > materialized full global arrays (~7.8 GB RSS observed). The production daily-append path is now
 > **tiled/streaming** (below) and is the EXACT path the VM24 gate + cron run — no hand-built delta.
+
+> **PR #13 VM24 follow-up (Codex):** memory was fixed (RSS ~245 MB on VM24) but append was still
+> >2 h/day — the real critical path was **delta chunking**, not materialization. The delta had
+> inherited the base read layout (`spatial_chunk=8`), so a global daily append wrote ~10 M tiny 8×8
+> chunks/var. **Fix: decouple base and delta chunking** — base keeps `s8/shard128/t90` for long point
+> reads; the delta defaults to an **append-optimized `s256/shard256`** (one chunk per shard). See
+> "Delta chunking decoupled from base" below.
 
 ## Why the old append is slow (at scale)
 The base inner chunk is `(time_chunk=90, 8, 8)`. Appending one day at time index `t` writes into the
@@ -33,6 +40,26 @@ tiled too; a var that appears later gets a NaN-filled array with **validity Fals
 Latency is the same (same data volume written); the win is **memory**: peak RSS is bounded by
 `read_block²`, not the grid. At **global** scale `read_block=1024` ⇒ peak block ≈ **1/618 of grid**,
 so the old ~7.8 GB RSS becomes a bounded few-×-tens of MB. Binding number on VM24.
+
+## Delta chunking decoupled from base (the VM24 >2h/day critical path)
+The base needs `spatial_chunk=8` for long point-series reads, but s8 makes a global daily append
+write ~10 M tiny 8×8 chunks/var — **chunk count, not memory, was the VM24 >2h/day**. The delta does
+NOT need s8 (it holds only a few recent days). So base and delta chunking are now **decoupled**: the
+delta defaults to an **append-optimized `s256/shard256`** (one chunk per shard), set only at delta
+CREATE; on append the existing delta's layout is read back (params ignored). `compact()` takes
+separate `delta_spatial_chunk`/`delta_shard_spatial`; CLI exposes `--delta-spatial-chunk` /
+`--delta-shard-spatial`.
+
+`bench/bench_delta_layout.py` (2048², 3 days, daily chunk 1024):
+| delta layout | chunks/var | **append_s/day** | peak RSS | files | point-read |
+|---|---|---|---|---|---|
+| s8/shard128 (= base, WRONG) | 65,536 | **17.22 s** | 48 MB | 2,312 | 3.8 ms |
+| s128/shard128 | 256 | 0.27 s | 16 MB | 2,312 | 3.4 ms |
+| **s256/shard256 (default)** | 64 | **0.08 s** | 8 MB | 584 | 3.4 ms |
+s256 is **215× faster append** than s8 with the **fewest files** and **no read penalty** (point-read
+~3.4 ms across all layouts — the delta's few recent days make its read-amp negligible; the 365-day
+read is mostly base). At global scale this is the difference between Codex's >2 h/day and minutes.
+Binding number on VM24.
 
 ## Production design: base + delta + compaction (preferred)
 - **BASE** cube: `time_chunk=90` (fast reads; built by the bulk builder).
@@ -65,9 +92,11 @@ and **checkpoint/resume** per `(var,tile)`. It still RMWs the time-spanning shar
 time_chunk>1 cube) — it only removes the memory blow-up and parallelizes/resumes it. Use only until
 base+delta lands.
 
-## Correctness (10/10) — all preserve exact P1 semantics
+## Correctness (11/11) — all preserve exact P1 semantics
 - `bulk_append_day` parity vs P1 + append/upsert + resumable (checkpoint cleared on completion).
 - **tiled** `append_to_delta` create-then-append (parity vs P1); delta layout `time_chunk==1`.
+- **delta chunking decoupled from base**: base s8 vs append-optimized delta chunk differ, yet
+  TieredCube reads both parity-exact vs P1.
 - **no full-global materialization**: `max_block_cells ≤ read_block²` and `< grid_cells` (tiled).
 - **missing-var validity**: a day lacking a var → that var omitted for that day (P1); late-appearing
   var → NaN-filled + validity False for prior days.

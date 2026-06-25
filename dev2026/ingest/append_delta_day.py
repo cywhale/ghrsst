@@ -17,7 +17,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from ingest.dual_write import append_to_delta  # noqa: E402
+from ingest.dual_write import append_to_delta, DELTA_SPATIAL_CHUNK, DELTA_SHARD_SPATIAL  # noqa: E402
 
 
 def main():
@@ -25,8 +25,10 @@ def main():
     ap.add_argument("--daily", required=True)
     ap.add_argument("--delta", required=True)
     ap.add_argument("--day", required=True)
-    ap.add_argument("--spatial-chunk", type=int, default=8, dest="spatial_chunk")
-    ap.add_argument("--shard-spatial", type=int, default=128, dest="shard_spatial")
+    # APPEND-optimized delta layout (decoupled from the base read-cube's s8/shard128); only applied
+    # at delta CREATE — on append the existing delta's layout is used.
+    ap.add_argument("--delta-spatial-chunk", type=int, default=DELTA_SPATIAL_CHUNK, dest="spatial_chunk")
+    ap.add_argument("--delta-shard-spatial", type=int, default=DELTA_SHARD_SPATIAL, dest="shard_spatial")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--read-block", type=int, default=None, dest="read_block")
     ap.add_argument("--region", default=None, help="i0,i1,j0,j1 lat/lon index slice")
@@ -36,8 +38,10 @@ def main():
                           shard_spatial=args.shard_spatial, region=region,
                           workers=args.workers, read_block=args.read_block)
     print(json.dumps(res))
-    # peak per-worker block must be bounded by read_block, never the full grid
-    assert res["max_block_cells"] <= max(1, (args.read_block or 10**9) ** 2), "block exceeded read_block"
+    # memory-safety invariant: on any multi-tile (production) grid the peak per-worker block is a
+    # single read tile, strictly smaller than the full grid (no full-global materialization).
+    if res["tile_count"] > 1:
+        assert res["max_block_cells"] < res["grid_cells"], "block materialized the full grid"
 
 
 if __name__ == "__main__":

@@ -115,6 +115,25 @@ class TieredTests(Base, unittest.TestCase):
         self.assertEqual(d.point_series(115.0, 12.0, [self.days[8], self.days[9]], ["sst", "sst_anomaly"]),
                          self.sa.point_series(115.0, 12.0, [self.days[8], self.days[9]], ["sst", "sst_anomaly"]))
 
+    def test_delta_layout_decoupled_from_base(self):
+        # base uses s8 (long-read layout); delta uses the APPEND-optimized default (large spatial
+        # chunk). Chunkings differ, but TieredCube reads both parity-exact vs P1.
+        base = os.path.join(self.tmp, "base_dec")
+        build_timecube_bulk(self.daily, base, spatial_chunk=8, time_chunk=4, shard_spatial=16,
+                            read_block=16, workers=2, end_day=self.days[6])
+        delta = os.path.join(self.tmp, "delta_dec")
+        for d in self.days[7:]:
+            append_to_delta(self.daily, delta, d)              # DEFAULT append-optimized layout
+        bchunk = int(zarr.open_group(base, mode="r")["sst"].chunks[-1])
+        dchunk = int(zarr.open_group(delta, mode="r")["sst"].chunks[-1])
+        self.assertNotEqual(bchunk, dchunk)                    # decoupled (base s8 vs large delta chunk)
+        self.assertGreater(dchunk, bchunk)
+        self.assertEqual(int(zarr.open_group(delta, mode="r")["sst"].chunks[0]), 1)  # delta time_chunk=1
+        tc = TieredCube(TimeCubeStore(base), TimeCubeStore(delta))
+        for lon, lat in [(119.3, 22.3), (104.0, 7.0)]:
+            self.assertEqual(tc.point_series(lon, lat, self.days, ["sst", "sst_anomaly"]),
+                             self.sa.point_series(lon, lat, self.days, ["sst", "sst_anomaly"]))
+
     def test_no_full_global_materialization(self):
         # tiled: the largest block processed must be <= read_block^2, NOT the full grid
         delta = os.path.join(self.tmp, "delta_tiled")
