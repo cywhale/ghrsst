@@ -86,6 +86,29 @@ backfilled gap days are stored in the delta root attrs. VM24 production currentl
 keeps `2025-06-22`, `2026-06-22`, and `2026-06-23` in delta so ranges crossing
 the base start still route to the cube.
 
+### Base vs delta operational rule
+
+The daily store remains the only source of truth. The time-cube is a derived
+serving index split into:
+
+- **base cube** (`time_chunk=90`, `spatial_chunk=8`): read-optimized for long
+  point/range time series; expensive to update one day at a time.
+- **delta cube** (`time_chunk=1`, `spatial_chunk=256`): append-optimized for
+  daily ingest and small gap fixes; cheap to append a few days.
+
+Use delta append for:
+- normal daily ingest, e.g. today's new MUR day;
+- small coverage repairs, e.g. one or a few missing days such as `2025-06-22`.
+
+Do **not** use delta as the long-term home for large historical backfills (months
+or years). For a large backfill, rebuild/compact the base cube from the daily
+store with the bulk builder, then reset delta to only days after the chosen base
+cutoff. This keeps routing, metadata, and read performance easy to reason about.
+
+`mur_timecube_s8_t90_sh128.zarr/zarr.json` describes only the base cube. Complete
+production coverage is base plus delta; check `/healthz` (`cube_kind=tiered`,
+`cube_day_count`, `delta_day_count`, `cube_latest_in_sync`) for the served view.
+
 Daily delta append cron:
 ```cron
 # Runs after the existing MUR daily retries. Idempotent.
