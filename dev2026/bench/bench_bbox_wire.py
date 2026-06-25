@@ -38,6 +38,7 @@ HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, ".."))
 from store.zarr_paths import group_path  # noqa: E402
 from store.store_access import StoreAccess  # noqa: E402
+from store.bbox_encode import encode_columnar as _enc_col_canon, encode_grid as _enc_grid_canon  # noqa: E402
 
 VARS = ("sst", "sst_anomaly", "sea_ice")
 SIZES = [("250k", 500, 500), ("750k", 1000, 750), ("1M", 1000, 1000)]
@@ -67,29 +68,14 @@ def _enc_row(lons, lats, cols, day):
     return rows
 
 
+# Delegate to the CANONICAL encoders (store/bbox_encode.py) so the bench measures the exact bytes the
+# API ships — no prototype drift. Thin wrappers keep the (lons,lats,cols,day) call sites + the S0 test.
 def _enc_columnar(lons, lats, cols, day):
-    nlon, nlat = lons.size, lats.size
-    obj = {"date": day, "format": "columnar",
-           "lon": np.tile(lons.astype(np.float32), nlat),
-           "lat": np.repeat(lats.astype(np.float32), nlon),
-           "fields": {}, "field_status": {}}
-    for f in VARS:
-        if f in cols:
-            obj["fields"][f] = cols[f].ravel(); obj["field_status"][f] = "present"
-        else:
-            obj["fields"][f] = None; obj["field_status"][f] = "absent"
-    return orjson.dumps(obj, option=_NPOPT)
+    return _enc_col_canon(lons, lats, cols, VARS, day)
 
 
 def _enc_grid(lons, lats, cols, day):
-    obj = {"date": day, "format": "grid", "lon": lons.astype(np.float32), "lat": lats.astype(np.float32),
-           "shape": [int(lats.size), int(lons.size)], "fields": {}, "field_status": {}}
-    for f in VARS:
-        if f in cols:
-            obj["fields"][f] = cols[f]; obj["field_status"][f] = "present"   # 2-D numpy, NaN->null
-        else:
-            obj["fields"][f] = None; obj["field_status"][f] = "absent"
-    return orjson.dumps(obj, option=_NPOPT)
+    return _enc_grid_canon(lons, lats, cols, VARS, day)
 
 
 def main():

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -35,6 +36,7 @@ from store.store_access import ALLOWED_FIELDS, StoreAccess  # noqa: E402
 from store.hybrid_router import HybridRouter  # noqa: E402
 from store.time_cube import TimeCubeStore  # noqa: E402
 from store.tiered_cube import TieredCube  # noqa: E402
+from store.bbox_encode import ALL_FORMATS, COMPACT_FORMATS, ENCODERS  # noqa: E402
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -239,11 +241,15 @@ async def read_ghrsst(
     append: Optional[str] = Query(None),
     sample: int = Query(1),
     mode: Optional[str] = Query(None),
+    format: str = Query("json"),
 ):
     store: StoreAccess = request.app.state.store
     bex: BoundedExecutor = request.app.state.bex
     fields = _fields(append)
     modes = _parse_modes(mode)
+    fmt = (format or "json").strip().lower()
+    if fmt not in ALL_FORMATS:
+        raise HTTPException(400, f"Unsupported format '{fmt}'. Allowed: {', '.join(sorted(ALL_FORMATS))}")
     earliest, latest = store.bounds()
     if not latest:
         raise HTTPException(503, "No available dates.")
@@ -251,6 +257,8 @@ async def read_ghrsst(
     bbox_mode = (lon1 is not None) and (lat1 is not None) and not (lon1 == lon0 and lat1 == lat0)
     if not bbox_mode and sample != 1:
         raise HTTPException(400, "Parameter 'sample' is only supported in BBox mode.")
+    if not bbox_mode and fmt != "json":
+        raise HTTPException(400, "Parameter 'format' is only supported in BBox mode.")
 
     # ---------------- POINT MODE ----------------
     if not bbox_mode:
@@ -329,8 +337,10 @@ async def read_ghrsst(
     # (G6/G7). Released in the generator's finally on completion OR client disconnect.
     await bex.acquire()                       # Overloaded -> 503 (before any bytes)
     try:
+        _t0 = time.perf_counter()
         lons, lats, cols = await bex.run_ungated(
             store.bbox_arrays, chosen, lon0, lat0, lon1, lat1, fields, int(sample))
+        read_ms = round((time.perf_counter() - _t0) * 1000, 1)
     except ValueError as ve:
         bex.release()
         raise HTTPException(400, str(ve))
@@ -339,6 +349,25 @@ async def read_ghrsst(
         raise
     total = int(lons.size) * int(lats.size)
 
+    # ---- compact opt-in formats (grid / columnar): buffered single Response ----
+    if fmt in COMPACT_FORMATS:
+        try:
+            def _encode_compact() -> bytes:
+                return ENCODERS[fmt](lons, lats, cols, fields, chosen, truncate=("truncate" in modes))
+            _t1 = time.perf_counter()
+            payload = await bex.run_ungated(_encode_compact)   # under held permit
+            encode_ms = round((time.perf_counter() - _t1) * 1000, 1)
+        finally:
+            bex.release()
+        headers = _fixed_cache() if cacheable else _no_store()
+        headers["X-Served-Rows"] = str(total)
+        headers["X-Stride"] = str(int(sample))
+        headers["X-Bbox-Format"] = fmt
+        headers["X-Read-Ms"] = str(read_ms)
+        headers["X-Encode-Ms"] = str(encode_ms)
+        return Response(payload, media_type="application/json", headers=headers)
+
+    # ---- default json: row-array streaming (UNCHANGED) ----
     def _encode_window(k0: int, k1: int) -> bytes:
         rows = StoreAccess.bbox_rows_window(lons, lats, cols, fields, chosen, k0, k1)
         if "truncate" in modes:
@@ -363,6 +392,8 @@ async def read_ghrsst(
     headers = _fixed_cache() if cacheable else _no_store()
     headers["X-Served-Rows"] = str(total)
     headers["X-Stride"] = str(int(sample))
+    headers["X-Bbox-Format"] = "json"
+    headers["X-Read-Ms"] = str(read_ms)
     return StreamingResponse(gen(), media_type="application/json", headers=headers)
 
 
