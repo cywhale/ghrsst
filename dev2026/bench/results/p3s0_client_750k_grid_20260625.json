@@ -1,0 +1,15 @@
+{
+  "source": "results/payloads/bbox_750k_grid.json",
+  "format": "grid",
+  "bytes": 14537226,
+  "content_encoding": null,
+  "points": 750000,
+  "valid": 712548,
+  "runs": 3,
+  "heap_mb": 11.8,
+  "t_fetch_ms": null,
+  "t_text_ms": 1.5,
+  "t_parse_ms": 53.2,
+  "t_transform_ms": 2.8,
+  "t_client_total_ms": 57.5
+}

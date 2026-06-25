@@ -74,6 +74,43 @@ curl -sS -D - -o /tmp/ghrsst_365.json \
   "http://127.0.0.1:8035/api/ghrsst?lon0=121&lat0=24&start=2025-06-24&end=2026-06-23&append=sst,sst_anomaly,sea_ice"
 ```
 Expected for multi-day point/range queries: `X-Store-Route: cube`.
+Swagger/OpenAPI:
+```text
+https://eco.odb.ntu.edu.tw/api/swagger/ghrsst
+https://eco.odb.ntu.edu.tw/api/swagger/ghrsst/openapi.json
+```
+
+`zarr.json` metadata is maintained by the cube builders/append tools. Do not edit
+it manually. Base cube days are stored in the base root attrs; recent and
+backfilled gap days are stored in the delta root attrs. VM24 production currently
+keeps `2025-06-22`, `2026-06-22`, and `2026-06-23` in delta so ranges crossing
+the base start still route to the cube.
+
+### Base vs delta operational rule
+
+The daily store remains the only source of truth. The time-cube is a derived
+serving index split into:
+
+- **base cube** (`time_chunk=90`, `spatial_chunk=8`): read-optimized for long
+  point/range time series; expensive to update one day at a time.
+- **delta cube** (`time_chunk=1`, `spatial_chunk=256`): append-optimized for
+  daily ingest and small gap fixes; cheap to append a few days.
+
+Use delta append for:
+- normal daily ingest, e.g. today's new MUR day;
+- small coverage repairs, e.g. one or a few missing days such as `2025-06-22`.
+
+Do **not** use delta as the long-term home for large historical backfills (months
+or years). For a large backfill, rebuild/compact the base cube from the daily
+store with the bulk builder, then reset delta to only days after the chosen base
+cutoff. This keeps routing, metadata, and read performance easy to reason about.
+
+`mur_timecube_s8_t90_sh128.zarr/zarr.json` describes only the base cube. Complete
+production coverage is base plus delta; check `/healthz` (`cube_kind=tiered`,
+`cube_day_count`, `delta_day_count`, `cube_latest_in_sync`) for the served view.
+`/healthz` also exposes raw `earliest/latest` and user-facing
+`primary_earliest/primary_latest`; the latter ignores isolated test days such as
+`2023-03-06` and is used in unavailable-date error messages.
 
 Daily delta append cron:
 ```cron

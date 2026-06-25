@@ -1,8 +1,10 @@
 # P3 design — single-day bbox payload / wire-format performance (dev2026)
 
-Status: **DRAFT — revised per Codex review round 1** (Claude authored; Codex reviewed; Claude folded
-the 7 review points below and will implement starting P3-S0). Builds on
-[`bbox_performance_notes.md`](bbox_performance_notes.md) and the v0.3.0 VM24 deployment.
+Status: **APPROVED for P3-S0 (Codex round 2)** — Claude authored; Codex reviewed twice; all points
+folded. Round 2 added: front-end is **out of scope** (server-side only; the API may serve multiple
+front-ends), and S0 must ship a **reusable browser/client benchmark harness** + **machine-readable
+JSON artifacts**. Builds on [`bbox_performance_notes.md`](bbox_performance_notes.md) and the v0.3.0
+VM24 deployment.
 
 > Codex round-1 verdict: direction correct, proceed to S0 after spec hygiene fixes. Folded:
 > (1) compression = **verify existing NGINX brotli/gzip**, not add; (2) default JSON = **semantic**
@@ -43,8 +45,14 @@ browser parse/render — via **opt-in** compact response formats and a front-end
 - Not multi-day bbox (single-day semantics fixed in v0.3.0 stay).
 - **No new bbox-optimized STORE** unless S0/S1 prove server read is dominant AFTER the format fix
   (deferred Tier; current evidence says read is not dominant).
-- Not a forced device/browser matrix; one representative headless measure + a documented manual Chrome
-  measure on the public URL is the gate (can be tightened by Codex).
+- Not a forced device/browser matrix; a reusable headless harness (Codex round-2 #1) + a documented
+  manual Chrome measure is the gate (can be tightened by Codex).
+- **The front-end is OUT OF SCOPE for this repo (Codex round-2 + orchestrator).** This API may be
+  consumed by **multiple/independent front-ends**, so P3 is **purely server-side**: implement the
+  response formats + a **minimal reproducible browser/client benchmark harness** (proves the format
+  helps without the eco.odb app) + a **written front-end contract** (how a client should pick
+  `format`/`sample`/tiling for large bbox). **Do NOT change the `eco.odb` front-end.** After S0/S1
+  numbers prove the chosen format, whether/how any front-end adopts it is a separate decision.
 
 ## 2. Critical path as TESTABLE hypotheses (estimate AND measure) — **P3-S0 is the gate**
 Split end-to-end into measured segments for the SAME bbox, at **250k / 750k / 1M points × 3 vars**.
@@ -147,13 +155,13 @@ client), **Parquet**, or raw little-endian typed-array blob + tiny JSON header. 
 JSON, measured bytes + browser decode time + client-integration cost; pick exactly one. Binary is a
 larger client contract change, so it ships behind `format=` and only if S1 is insufficient.
 
-### Tier 3 — front-end large-bbox contract (object-graph cap; defense regardless of format)
-The API already has `sample`(stride). Spec the front-end rule: when estimated points
-(`(nlon*nlat)` after stride) exceed a threshold, **auto-increase stride** or **tile** the bbox into
-sub-requests, OR request a compact `format`. Server keeps `GHRSST_BBOX_POINT_LIMIT` as defense and
-returns a **clear 400 with a suggested stride/format** (today's message already hints stride).
-> The public front-end lives on `eco.odb.ntu.edu.tw` (NOT in this repo). **Open question:** is the
-> front-end in-scope for Claude, or is this spec-only (recommended contract for the front-end owner)?
+### Tier 3 — large-bbox contract = WRITTEN server-side contract (no front-end change)
+The API already has `sample`(stride). P3 delivers a **documented contract** any client can follow
+(the API may serve several independent front-ends): when estimated points (`nlon*nlat` after stride)
+exceed a threshold, the client should **request a compact `format`**, **raise `sample`**, or **tile**
+the bbox into sub-requests. Server enforcement stays server-side: keep `GHRSST_BBOX_POINT_LIMIT` as
+defense and return a **clear 400 with a suggested stride/format** (today's message already hints
+stride). The reusable client harness (S0) is the reference consumer. **No `eco.odb` change in P3.**
 
 ### Deferred Tier — bbox-optimized store
 Only if S0 (and re-measure after S1) shows `T_read` dominant. Current evidence says no. Documented to
@@ -174,18 +182,28 @@ avoid premature spatial-store work.
   `format=json` path unchanged and **semantically** parity-exact (not byte-for-byte).
 
 ## 5. Per-step plan — every step ships code + benchmark + gate
-- **P3-S0** — instrumentation + critical-path benchmark (`bench/bench_bbox_wire.py`): the
-  server+browser segment breakdown (incl. compressed bytes / `Content-Encoding`) at 250k/750k/1M;
-  confirm/refute H1–H5; **no format change yet**; cap bypassed per §4. Output
-  `specs/p3s0_bbox_breakdown.md`. **This step decides S1/S2 scope.** (Disproof gate, like P2-S1/S2.)
+- **P3-S0** — instrumentation + critical-path benchmark; **no format change yet**; cap bypassed per §4.
+  Deliverables (Codex round-2):
+  - **server** `bench/bench_bbox_wire.py`: `T_read`/`T_rows`/`T_encode`/`bytes`(+gzip estimate) at
+    250k/750k/1M; writes the row-JSON payload files the client harness consumes.
+  - **reusable browser/client harness** (#1) so "Chrome freeze" is **regression-able, not manual**:
+    `bench/client/bbox_client_bench.mjs` (Node: fetch / `response.text()`|`arrayBuffer` / `JSON.parse` /
+    a minimal transform≈map-layer-build loop; file-mode for CI + URL-mode for shadow) **and**
+    `bench/client/bbox_bench.html` (minimal page for the documented manual Chrome devtools run).
+    Format-agnostic so S1/S2 reuse it for grid/binary.
+  - **machine-readable artifact** (#2): `bench/results/p3s0_bbox_breakdown_YYYYMMDD.json` (raw numbers)
+    **plus** `specs/p3s0_bbox_breakdown.md` (summary). S1/S2 append comparable rows so row-JSON vs
+    grid-aware vs binary compare directly.
+  - confirm/refute H1–H5. **This step decides S1/S2 scope.** (Disproof gate, like P2-S1/S2.)
 - **P3-S1** — opt-in compact columnar, **grid-aware (`format=grid`) primary** + flat (`format=columnar`)
   comparison: encode directly from `cols` (bypass per-row dicts), with the absent/NaN `field_status`
   semantics (§3 Tier 1); `format=json` default untouched; parity tests (compact↔row identical data +
   absent/NaN semantics + cache headers + `sample`); bytes/parse/render benchmark + gate.
 - **P3-S2** — *(conditional on S0/S1)* binary format eval + one opt-in `format=arrow|netcdf|...`;
   benchmark vs grid-aware; client-decode note.
-- **P3-S3** — front-end large-bbox contract: auto-sample/tile rule + server hint on cap; (front-end
-  change vs spec-only per open question §7.1).
+- **P3-S3** — **written front-end contract only** (no eco.odb change): document in spec/README how any
+  client picks `format`/`sample`/tiling for large bbox, the server cap + 400-hint behavior, and the
+  reusable client harness as the reference consumer. (Front-end adoption is a separate, later decision.)
 - **P3-S4** — *(conditional)* bbox-store only if read proves dominant after S1.
 - **P3-S5** — VM24 binding + rollout: re-measure on VM24 (verify brotli applied); set the large-bbox
   **cache policy** (§8); raise/relax `GHRSST_BBOX_POINT_LIMIT` only once a compact format makes large
@@ -222,12 +240,14 @@ cacheability. Default (small bbox) caching is unchanged.
 - *Browser measure* → split fetch/text/parse/render (§2, §4).
 - *Cache* → large-bbox cache policy gate (§7).
 
+**Resolved by round 2:**
+- *Front-end scope* → **server-side only**; P3 ships formats + a **minimal reproducible client harness**
+  + a **written front-end contract**; **no eco.odb change** (the API may serve multiple front-ends).
+- *S0 must produce a reusable browser/client benchmark harness* (#1) and *machine-readable JSON
+  artifacts* (#2) — folded into §5 P3-S0.
+
 **Still open:**
-1. **Front-end scope:** does Claude implement the `eco.odb` front-end auto-sample/tile (S3), or is P3
-   server-side + a written front-end contract only? (No front-end in this repo.)
-2. **Binary format choice** if S2 triggers: Arrow IPC vs NetCDF vs typed-array blob — which does the
+1. **Binary format choice** if S2 triggers: Arrow IPC vs NetCDF vs typed-array blob — which does a
    science client prefer / already consume elsewhere?
-3. **Manual-Chrome fidelity:** is one documented Chrome devtools run (page+flow recorded) enough, or is
-   a device/browser matrix required?
-4. **Target max bbox:** what point count should the lifted `GHRSST_BBOX_POINT_LIMIT` allow once a
+2. **Target max bbox:** what point count should the lifted `GHRSST_BBOX_POINT_LIMIT` allow once a
    compact format ships (e.g. 1M? unbounded only with a mandatory compact `format`)?

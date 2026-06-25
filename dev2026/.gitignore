@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# P3-S0 large regeneratable bbox payloads (keep result JSONs, drop payloads)
+bench/results/payloads/

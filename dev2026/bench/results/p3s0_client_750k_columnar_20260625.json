@@ -1,0 +1,15 @@
+{
+  "source": "results/payloads/bbox_750k_columnar.json",
+  "format": "columnar",
+  "bytes": 29686766,
+  "content_encoding": null,
+  "points": 750000,
+  "valid": 712548,
+  "runs": 3,
+  "heap_mb": 64.2,
+  "t_fetch_ms": null,
+  "t_text_ms": 3.1,
+  "t_parse_ms": 94.2,
+  "t_transform_ms": 3.5,
+  "t_client_total_ms": 100.8
+}
