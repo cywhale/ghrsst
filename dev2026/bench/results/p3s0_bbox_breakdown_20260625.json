@@ -1,0 +1,87 @@
+{
+  "date_tag": "20260625",
+  "grid": 2048,
+  "vars": [
+    "sst",
+    "sst_anomaly",
+    "sea_ice"
+  ],
+  "gzip_note": "gzip=zlib L6 LOCAL ESTIMATE; brotli/Content-Encoding verified on VM24 (curl --compressed)",
+  "sizes": [
+    {
+      "label": "250k",
+      "ni": 500,
+      "nj": 500,
+      "points": 250000,
+      "T_read_ms": 7.0,
+      "T_rows_ms": 366.4,
+      "formats": {
+        "row": {
+          "bytes": 38532005,
+          "gzip_bytes": 5250183,
+          "T_encode_ms": 28.7
+        },
+        "columnar": {
+          "bytes": 9728414,
+          "gzip_bytes": 274278,
+          "T_encode_ms": 14.5
+        },
+        "grid": {
+          "bytes": 4575261,
+          "gzip_bytes": 253943,
+          "T_encode_ms": 7.4
+        }
+      }
+    },
+    {
+      "label": "750k",
+      "ni": 1000,
+      "nj": 750,
+      "points": 750000,
+      "T_read_ms": 8.1,
+      "T_rows_ms": 1071.8,
+      "formats": {
+        "row": {
+          "bytes": 115979437,
+          "gzip_bytes": 15755701,
+          "T_encode_ms": 83.3
+        },
+        "columnar": {
+          "bytes": 29686766,
+          "gzip_bytes": 861849,
+          "T_encode_ms": 36.5
+        },
+        "grid": {
+          "bytes": 14537226,
+          "gzip_bytes": 801743,
+          "T_encode_ms": 22.2
+        }
+      }
+    },
+    {
+      "label": "1M",
+      "ni": 1000,
+      "nj": 1000,
+      "points": 1000000,
+      "T_read_ms": 8.5,
+      "T_rows_ms": 1465.8,
+      "formats": {
+        "row": {
+          "bytes": 154605904,
+          "gzip_bytes": 20863054,
+          "T_encode_ms": 117.1
+        },
+        "columnar": {
+          "bytes": 39540123,
+          "gzip_bytes": 1143793,
+          "T_encode_ms": 52.7
+        },
+        "grid": {
+          "bytes": 19413292,
+          "gzip_bytes": 1055117,
+          "T_encode_ms": 30.2
+        }
+      }
+    }
+  ]
+}

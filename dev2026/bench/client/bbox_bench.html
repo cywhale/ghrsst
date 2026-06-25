@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<!-- dev2026 — P3-S0 manual Chrome bbox harness (Codex round-2 #1: documented manual run).
+     Open in Chrome, start a DevTools > Performance recording, enter a bbox API URL (use a shadow app
+     with a raised GHRSST_BBOX_POINT_LIMIT for 750k/1M; production cap is 300k), Run, then stop the
+     recording. It runs the SAME segments as bbox_client_bench.mjs: fetch / text / JSON.parse /
+     transform (map-layer input build) and a light canvas scatter as a render proxy. Format-agnostic
+     (row / columnar / grid auto-detected), so reuse for S1/S2 by changing &format=. NOT shipped to
+     any front-end; a benchmarking page only. -->
+<head><meta charset="utf-8"><title>P3-S0 bbox client bench</title>
+<style>body{font:14px system-ui;margin:16px;max-width:820px}input{width:100%}
+pre{background:#f4f4f4;padding:8px;overflow:auto}canvas{border:1px solid #ccc;margin-top:8px}</style></head>
+<body>
+<h3>P3-S0 bbox client benchmark</h3>
+<p>Record a DevTools &gt; Performance trace while you click Run. Segments are logged below.</p>
+<input id="url" placeholder="http://host/api/ghrsst?lon0=..&lat0=..&lon1=..&lat1=..&append=sst,sst_anomaly,sea_ice&format=grid">
+<p><button id="run">Run</button> <label><input type="checkbox" id="draw" checked> draw scatter (render proxy)</label></p>
+<pre id="out">(idle)</pre>
+<canvas id="cv" width="640" height="240"></canvas>
+<script>
+function detect(p){ if(Array.isArray(p)) return 'row'; if(p&&p.shape) return 'grid'; return 'columnar'; }
+function transform(p,fmt){
+  if(fmt==='row'){const n=p.length,lon=new Float32Array(n),lat=new Float32Array(n),val=new Float32Array(n);let v=0;
+    for(let i=0;i<n;i++){const r=p[i];lon[i]=r.lon;lat[i]=r.lat;const s=r.sst;if(s!=null){val[i]=s;v++}else val[i]=NaN;}return{n,valid:v,lon,lat,val};}
+  if(fmt==='columnar'){const lonA=p.lon,latA=p.lat,sstA=(p.fields&&p.fields.sst)||[];const n=lonA.length,lon=new Float32Array(n),lat=new Float32Array(n),val=new Float32Array(n);let v=0;
+    for(let i=0;i<n;i++){lon[i]=lonA[i];lat[i]=latA[i];const s=sstA[i];if(s!=null){val[i]=s;v++}else val[i]=NaN;}return{n,valid:v,lon,lat,val};}
+  const lonAx=p.lon,latAx=p.lat,[nlat,nlon]=p.shape,n=nlat*nlon,lon=new Float32Array(n),lat=new Float32Array(n),val=new Float32Array(n),sst=p.fields&&p.fields.sst;let k=0,v=0;
+  for(let i=0;i<nlat;i++){const row=sst?sst[i]:null;for(let j=0;j<nlon;j++){lon[k]=lonAx[j];lat[k]=latAx[i];const s=row?row[j]:null;if(s!=null){val[k]=s;v++}else val[k]=NaN;k++;}}return{n,valid:v,lon,lat,val};
+}
+function draw(t){const cv=document.getElementById('cv'),ctx=cv.getContext('2d');ctx.clearRect(0,0,cv.width,cv.height);
+  let mnx=Infinity,mxx=-Infinity,mny=Infinity,mxy=-Infinity;const step=Math.max(1,Math.floor(t.n/200000));
+  for(let i=0;i<t.n;i+=step){mnx=Math.min(mnx,t.lon[i]);mxx=Math.max(mxx,t.lon[i]);mny=Math.min(mny,t.lat[i]);mxy=Math.max(mxy,t.lat[i]);}
+  for(let i=0;i<t.n;i+=step){const x=(t.lon[i]-mnx)/(mxx-mnx)*cv.width,y=cv.height-(t.lat[i]-mny)/(mxy-mny)*cv.height;ctx.fillStyle=isNaN(t.val[i])?'#ddd':'#06c';ctx.fillRect(x,y,1,1);}}
+document.getElementById('run').onclick=async()=>{
+  const url=document.getElementById('url').value.trim(); const out=document.getElementById('out'); if(!url){out.textContent='enter a URL';return;}
+  out.textContent='running...';
+  const t0=performance.now(); const res=await fetch(url,{headers:{'Accept-Encoding':'br,gzip'}}); const ab=await res.arrayBuffer(); const t_fetch=performance.now()-t0;
+  const buf=new Uint8Array(ab); let t=performance.now(); const text=new TextDecoder().decode(buf); const t_text=performance.now()-t;
+  t=performance.now(); const parsed=JSON.parse(text); const t_parse=performance.now()-t; const fmt=detect(parsed);
+  t=performance.now(); const tr=transform(parsed,fmt); const t_transform=performance.now()-t;
+  let t_render=0; if(document.getElementById('draw').checked){t=performance.now();draw(tr);t_render=performance.now()-t;}
+  out.textContent=JSON.stringify({format:fmt,bytes:buf.length,content_encoding:res.headers.get('content-encoding'),points:tr.n,valid:tr.valid,
+    t_fetch_ms:+t_fetch.toFixed(1),t_text_ms:+t_text.toFixed(1),t_parse_ms:+t_parse.toFixed(1),t_transform_ms:+t_transform.toFixed(1),t_render_ms:+t_render.toFixed(1)},null,2);
+};
+</script>
+</body></html>

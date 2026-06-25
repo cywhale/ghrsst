@@ -1,0 +1,15 @@
+{
+  "source": "results/payloads/bbox_750k_row.json",
+  "format": "row",
+  "bytes": 115979437,
+  "content_encoding": null,
+  "points": 750000,
+  "valid": 712548,
+  "runs": 3,
+  "heap_mb": 141.7,
+  "t_fetch_ms": null,
+  "t_text_ms": 11.6,
+  "t_parse_ms": 224.6,
+  "t_transform_ms": 5.2,
+  "t_client_total_ms": 241.4
+}
