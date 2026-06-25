@@ -29,6 +29,69 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_store_access dev2026.tes
 - `uv` 管理 Python(3.13)與 venv。
 - store 路徑一律 `GHRSST_ZARR_PATH`,程式不硬編碼;`bak/` 僅本機部分複本,**仍在持續拷貝/每日增長**,工具須容忍缺日。
 
+## VM24 production deployment (v0.3.0, 2026-06-25)
+
+Production on VM24 now runs the dev2026 API through the existing PM2 app `ghrsst`
+and the existing NGINX upstream `127.0.0.1:8035`. NGINX was not changed.
+
+Paths:
+- Production daily source of truth: `/home/odbadmin/Data/ghrsst/mur.zarr`
+- Base time-cube: `/home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.zarr`
+- Delta cube: `/home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.delta.zarr`
+- Runtime worktree: `/home/odbadmin/python/ghrsst-dev2026-phase2`
+- Production launcher: `/home/odbadmin/python/ghrsst/conf/start_app.sh`
+- Rollback launcher backup: `/home/odbadmin/python/ghrsst/conf/start_app.sh.pre-dev2026`
+
+Production launcher environment:
+```bash
+GHRSST_ZARR_PATH=/home/odbadmin/Data/ghrsst/mur.zarr
+GHRSST_TIMECUBE_PATH=/home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.zarr
+GHRSST_DELTACUBE_PATH=/home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.delta.zarr
+GHRSST_ZARR_WORKERS=4
+GHRSST_RSS_CEILING_MB=4096
+GHRSST_BBOX_POINT_LIMIT=300000
+```
+
+Restart current production app:
+```bash
+pm2 restart ghrsst --update-env
+curl -fsS http://127.0.0.1:8035/healthz
+```
+
+Rollback to the pre-dev2026 app:
+```bash
+cp /home/odbadmin/python/ghrsst/conf/start_app.sh.pre-dev2026 \
+   /home/odbadmin/python/ghrsst/conf/start_app.sh
+chmod +x /home/odbadmin/python/ghrsst/conf/start_app.sh
+pm2 restart ghrsst --update-env
+```
+
+Operational checks:
+```bash
+curl -sS http://127.0.0.1:8035/healthz
+curl -sS -D - -o /tmp/ghrsst_365.json \
+  "http://127.0.0.1:8035/api/ghrsst?lon0=121&lat0=24&start=2025-06-24&end=2026-06-23&append=sst,sst_anomaly,sea_ice"
+```
+Expected for multi-day point/range queries: `X-Store-Route: cube`.
+
+Daily delta append cron:
+```cron
+# Runs after the existing MUR daily retries. Idempotent.
+30 20 * * * /home/odbadmin/python/ghrsst-dev2026-phase2/ops/cron_mur_delta_append.sh $(date -u -d "yesterday" +\%Y-\%m-\%d)
+30 07 * * * /home/odbadmin/python/ghrsst-dev2026-phase2/ops/cron_mur_delta_append.sh $(date -u -d "yesterday" +\%Y-\%m-\%d)
+```
+Logs: `/home/odbadmin/Data/ghrsst/logs/delta_append/append_YYYY-MM-DD.log`.
+
+### Known bbox limitation
+
+The v0.3.0 performance work primarily fixes multi-day point/range queries. Bbox
+requests still use the daily store and the existing JSON-array wire format. A
+752,001-point bbox currently produces about 108 MB of row-oriented JSON; VM24 can
+stream it in roughly 4 seconds, but browsers/front-ends may spend much longer
+parsing, formatting, and rendering the payload. Production therefore sets
+`GHRSST_BBOX_POINT_LIMIT=300000` as a safety guard. A deeper bbox redesign should
+be handled as a separate phase; see [`specs/bbox_performance_notes.md`](specs/bbox_performance_notes.md).
+
 ## 現況
 - [x] 診斷 + benchmark harness(`bench/`、`store/zarr_paths.py`)
 - [x] spec(`specs/00`、`specs/01`)— **reviewer accepted (v9)**

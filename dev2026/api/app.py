@@ -287,7 +287,15 @@ async def read_ghrsst(
     if sample < 1:
         raise HTTPException(400, "Parameter 'sample' must be >= 1.")
     if start and end:
-        chosen = _parse_date(start)
+        s = _parse_date(start)
+        e = _parse_date(end)
+        if s != e:
+            raise HTTPException(
+                400,
+                "BBOX query only allows single-day data; use start=end (or a single start/end) "
+                "and increase sample or shrink bbox for large areas.",
+            )
+        chosen = s
     elif start or end:
         chosen = _parse_date(start or end)
     else:
