@@ -37,7 +37,7 @@ def _count_files(path: str) -> int:
 def build_timecube(src: str, out: str, spatial_chunk: int = 8,
                    time_chunk: Optional[int] = None, shard_spatial: Optional[int] = None,
                    region: Optional[tuple] = None, days: Optional[list] = None,
-                   compressor: str = "zstd") -> dict:
+                   overwrite: bool = False, compressor: str = "zstd") -> dict:
     """Build a time-cube from daily-group store `src` into `out`. Returns meta dict.
     time_chunk=None -> all days in one time chunk. shard_spatial=None -> no sharding.
     region=(i0,i1,j0,j1) -> spatial subset (lat slice i0:i1, lon slice j0:j1); None = whole
@@ -74,6 +74,10 @@ def build_timecube(src: str, out: str, spatial_chunk: int = 8,
     union_vars = list(valid.keys())
 
     if os.path.exists(out):
+        if not overwrite:
+            raise FileExistsError(
+                f"--out already exists: {out}. Refusing to delete (path-safety). Build to a fresh "
+                f"staging path and rename, or pass overwrite=True / --overwrite if you are certain.")
         import shutil
         shutil.rmtree(out)
     g = zarr.open_group(out, mode="w", zarr_format=3)
@@ -154,8 +158,23 @@ def main():
     ap.add_argument("--spatial-chunk", type=int, default=8, dest="spatial_chunk")
     ap.add_argument("--time-chunk", type=int, default=None, dest="time_chunk")
     ap.add_argument("--shard-spatial", type=int, default=None, dest="shard_spatial")
+    ap.add_argument("--region", default=None, help="i0,i1,j0,j1 lat/lon index slice (tiled build)")
+    ap.add_argument("--end-day", default=None, dest="end_day",
+                    help="build through this day inclusive (holdout: leaves later days for a TRUE append test)")
+    ap.add_argument("--exclude-latest", action="store_true", dest="exclude_latest",
+                    help="drop the latest existing day (holdout for a true append measurement)")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="allow deleting an existing --out (default: refuse, path-safety)")
     args = ap.parse_args()
-    meta = build_timecube(args.src, args.out, args.spatial_chunk, args.time_chunk, args.shard_spatial)
+    region = tuple(int(x) for x in args.region.split(",")) if args.region else None
+    days = list_existing_days(args.src)
+    if args.end_day:
+        days = [d for d in days if d <= args.end_day]
+    if args.exclude_latest and days:
+        days = days[:-1]
+    meta = build_timecube(args.src, args.out, args.spatial_chunk, args.time_chunk,
+                          args.shard_spatial, region=region, days=days, overwrite=args.overwrite)
+    print(f"  built {len(days)} days (holdout: end_day={args.end_day} exclude_latest={args.exclude_latest})")
     print(f"time-cube -> {args.out}")
     print(f"  days={meta['days']} chunk={meta['chunk']} shards={meta['shards']} "
           f"files={meta['file_count']} disk={meta['bytes_on_disk']/1e6:.1f}MB")
