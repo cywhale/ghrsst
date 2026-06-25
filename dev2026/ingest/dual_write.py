@@ -24,7 +24,7 @@ import numpy as np
 import zarr
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from ingest.build_timecube import VARS, append_day  # noqa: E402
+from ingest.build_timecube import VARS, append_day, build_timecube  # noqa: E402
 from store.zarr_paths import group_path, list_existing_days  # noqa: E402
 
 
@@ -91,6 +91,47 @@ def sync_missing(daily_path: str, cube_path: str) -> List[str]:
     for d in todo:
         sync_day(daily_path, cube_path, d)
     return todo
+
+
+# ---------------------------------------------------------------------------
+# Base + delta + compaction (production cheap-append design; store/tiered_cube.py)
+# ---------------------------------------------------------------------------
+def append_to_delta(daily_path: str, delta_path: str, day: str, *, spatial_chunk: int = 8,
+                    shard_spatial: int = 128, region: Optional[tuple] = None) -> str:
+    """Append one day into the DELTA cube (time_chunk=1 -> the new day is its own fresh shard, so
+    this is a CHEAP append with NO read-modify-write of a 90-day shard). Creates the delta if
+    missing. Returns 'create' or 'append'."""
+    if not os.path.isdir(delta_path):
+        build_timecube(daily_path, delta_path, spatial_chunk=spatial_chunk, time_chunk=1,
+                       shard_spatial=shard_spatial, region=region, days=[day])
+        return "create"
+    data = read_daily_day(daily_path, day, _cube_region(delta_path))
+    append_day(delta_path, day, data)            # time_chunk=1 -> fresh shard, no RMW
+    return "append"
+
+
+def compact(daily_path: str, base_path: str, delta_path: str, end_day: str, *,
+            spatial_chunk: int = 8, time_chunk: int = 90, shard_spatial: int = 128,
+            region: Optional[tuple] = None, workers: int = 4) -> dict:
+    """Fold the delta into the base: bulk-REBUILD the base through `end_day` (fast bulk builder),
+    and rebuild the delta with only days AFTER `end_day`. Returns staging paths; the caller swaps
+    base<-new_base and delta<-new_delta atomically (same filesystem). The daily store is the source
+    of truth, so this is a clean re-derive — no in-place base mutation while serving."""
+    from ingest.build_timecube_bulk import build_timecube_bulk
+    new_base = f"{base_path}.compact"
+    build_timecube_bulk(daily_path, new_base, spatial_chunk=spatial_chunk, time_chunk=time_chunk,
+                        shard_spatial=shard_spatial, region=region, workers=workers,
+                        end_day=end_day, overwrite=True)
+    later = [d for d in list_existing_days(daily_path) if d > end_day]
+    new_delta = None
+    if later:
+        new_delta = f"{delta_path}.compact"
+        if os.path.exists(new_delta):
+            import shutil; shutil.rmtree(new_delta)
+        build_timecube(daily_path, new_delta, spatial_chunk=spatial_chunk, time_chunk=1,
+                       shard_spatial=shard_spatial, region=region, days=later)
+    return {"new_base": new_base, "new_delta": new_delta, "compacted_through": end_day,
+            "delta_days_after": later}
 
 
 def check_coverage(daily_path: str, cube_path: str) -> dict:

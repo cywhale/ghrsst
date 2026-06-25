@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from store.store_access import ALLOWED_FIELDS, StoreAccess  # noqa: E402
 from store.hybrid_router import HybridRouter  # noqa: E402
 from store.time_cube import TimeCubeStore  # noqa: E402
+from store.tiered_cube import TieredCube  # noqa: E402
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -126,6 +127,10 @@ async def lifespan(app: FastAPI):
     if tc_path and os.path.isdir(tc_path):
         try:
             cube = TimeCubeStore(tc_path)
+            # optional delta cube (time_chunk=1, cheap appends) -> tier base+delta
+            dc_path = os.environ.get("GHRSST_DELTACUBE_PATH")
+            if dc_path and os.path.isdir(dc_path):
+                cube = TieredCube(cube, TimeCubeStore(dc_path))
         except Exception as e:  # noqa: BLE001
             print(f"[GHRSST] time-cube load skipped: {e}")
     app.state.router = HybridRouter(app.state.store, cube)
@@ -404,7 +409,11 @@ async def healthz(request: Request):
             "pid": os.getpid(),
             # P2-S6 cube observability
             "cube_loaded": cube is not None,
+            "cube_kind": (None if cube is None else
+                          ("tiered" if isinstance(cube, TieredCube) else "timecube")),
             "cube_latest": (cube.latest if cube else None),
             "cube_day_count": (cube.day_count if cube else 0),
             "cube_latest_in_sync": (cube.latest == l if cube else None),
+            "delta_latest": (cube.delta.latest if isinstance(cube, TieredCube) and cube.delta else None),
+            "delta_day_count": (cube.delta.day_count if isinstance(cube, TieredCube) and cube.delta else 0),
             "route_counts": dict(router.route_counts)}

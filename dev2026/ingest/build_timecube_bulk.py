@@ -158,6 +158,91 @@ def build_timecube_bulk(src: str, out: str, spatial_chunk: int = 8, time_chunk: 
                                  for r, _, fs in os.walk(out) for f in fs)}
 
 
+def bulk_append_day(src: str, cube: str, day: str, workers: int = 4,
+                    read_block: Optional[int] = None) -> dict:
+    """Short-term append fix: write a day into the cube TILE-by-TILE with bounded workers and NO
+    full-global array in memory (one tile per worker). Resumable per (var,tile) via a per-day
+    checkpoint. Append (new day, resize +1) or upsert (existing day, write in place).
+
+    NOTE: with a time_chunk>1 base cube this STILL read-modify-writes the time-spanning shard (that
+    is inherent to writing one day into a 90-day shard) — it only removes the memory blow-up and
+    parallelizes/resumes it. The production-cheap append is the base+delta+compaction design
+    (store/tiered_cube.py); use this only as an interim until that lands."""
+    g = zarr.open_group(cube, mode="a")
+    days = list(g.attrs["days"])
+    region = g.attrs.get("region")
+    i0, j0 = (region[0], region[2]) if region else (0, 0)
+    union_vars = list(g.attrs.get("vars", VARS))
+    var_valid = {k: list(v) for k, v in dict(g.attrs.get("var_valid", {})).items()}
+    ny, nx = g["sst"].shape[-2], g["sst"].shape[-1] if "sst" in g else g[union_vars[0]].shape[-2:]
+    a0 = g[union_vars[0]]
+    sh_y, sh_x = a0.shards[-2], a0.shards[-1]
+    rb = read_block or max(sh_y, sh_x)
+    rb_y = max(sh_y, (rb // sh_y) * sh_y or sh_y); rb_x = max(sh_x, (rb // sh_x) * sh_x or sh_x)
+
+    appended = day not in days
+    if appended:
+        t = len(days)
+        for v in union_vars:
+            arr = g[v]; arr.resize((t + 1, arr.shape[1], arr.shape[2]))
+    else:
+        t = days.index(day)
+
+    gd = zarr.open_group(group_path(src, day), mode="r")
+    present = {v: (v in gd) for v in union_vars}
+    ck = os.path.join(cube, f"_append_{day}.json")
+    if os.path.isfile(ck):
+        with open(ck) as fh:
+            done = set(json.load(fh)["done"])
+    else:
+        done = set()
+    ck_lock = threading.Lock()
+
+    units = [(v, ti, tj) for v in union_vars
+             for ti in range(0, ny, rb_y) for tj in range(0, nx, rb_x)
+             if f"{v}|{ti}|{tj}" not in done]
+
+    def process(u):
+        v, ti, tj = u
+        bi1 = min(ti + rb_y, ny); bj1 = min(tj + rb_x, nx)
+        if present[v]:
+            block = np.asarray(gd[v][0, i0 + ti:i0 + bi1, j0 + tj:j0 + bj1])
+        else:
+            block = np.full((bi1 - ti, bj1 - tj), np.nan, np.float32)
+        g[v][t, ti:bi1, tj:bj1] = block          # tiled write (RMW of that shard only)
+        with ck_lock:
+            if os.path.isfile(ck):
+                with open(ck) as fh:
+                    d = json.load(fh)["done"]
+            else:
+                d = []
+            d.append(f"{v}|{ti}|{tj}")
+            with open(ck, "w") as fh:
+                json.dump({"done": d}, fh)
+
+    t0 = time.perf_counter()
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(process, units))
+    else:
+        for u in units:
+            process(u)
+    # finalize attrs (days + validity) and clear the per-day checkpoint
+    if appended:
+        g.attrs["days"] = days + [day]
+        for v in union_vars:
+            var_valid.setdefault(v, [True] * len(days)).append(bool(present[v]))
+    else:
+        for v in union_vars:
+            if v in var_valid:
+                var_valid[v][t] = bool(present[v])
+    g.attrs["var_valid"] = var_valid
+    if os.path.isfile(ck):
+        os.remove(ck)
+    return {"day": day, "op": "append" if appended else "upsert",
+            "tiles": len(units), "append_s": round(time.perf_counter() - t0, 2)}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)

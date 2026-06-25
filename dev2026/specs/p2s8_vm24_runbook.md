@@ -100,10 +100,12 @@ PY
 > Serve the **`$STAGE`** holdout cube — the whole gate (read + append) runs on it; promote to `<CUBE>`
 > only at the end of §6.
 ```bash
-GHRSST_ZARR_PATH="$SRC" GHRSST_TIMECUBE_PATH="$STAGE" GHRSST_RSS_CEILING_MB=<X> \
-GHRSST_ZARR_WORKERS=<W> PYTHONPATH=. .venv/bin/gunicorn api.app:app \
+GHRSST_ZARR_PATH="$SRC" GHRSST_TIMECUBE_PATH="$STAGE" GHRSST_DELTACUBE_PATH=<DELTA or unset> \
+GHRSST_RSS_CEILING_MB=<X> GHRSST_ZARR_WORKERS=<W> PYTHONPATH=. .venv/bin/gunicorn api.app:app \
   -w <GUNICORN_WORKERS> -k uvicorn.workers.UvicornWorker -b 127.0.0.1:<NEW_PORT> --timeout 180
-curl -s http://127.0.0.1:<NEW_PORT>/healthz   # cube_loaded, cube_latest, cube_latest_in_sync, route_counts
+curl -s http://127.0.0.1:<NEW_PORT>/healthz   # cube_kind (timecube|tiered), cube_latest, delta_*, route_counts
+# Production append uses a base+delta tier: set GHRSST_DELTACUBE_PATH to a time_chunk=1 delta cube
+# (cheap daily appends; see §6). For the read gate alone, the base (STAGE) cube is enough.
 ```
 
 ## 5. Binding read gate — cold AND warm (loadtest)
@@ -130,11 +132,45 @@ $P bench/loadtest.py --base $B --run-kind vm24 --scenario LR --duration 120 --de
 - **Pass**: 365-day p95 < 4 s **cold**; LR C=4/8/16 bounded, zero timeout/OOM, RSS ≤
   `GHRSST_RSS_CEILING_MB`; SB stable (G2′-style).
 
-## 6. TRUE append (holdout) → POST-append coverage → atomic promote
-The cube was built in §2 holding out `HOLD`; §3 (pre-append) and §5 (read gate) ran on `$STAGE`.
-Now append `HOLD` into `$STAGE` (a `sync_day` for an in-cube day would be an OVERWRITE that
-under-estimates cost — the holdout guarantees a TRUE append), require **post-append** coverage
-`ok==true`, THEN promote `$STAGE` → `<CUBE>`.
+## 6. Append + promote — Path A (PRODUCTION base+delta) or Path B (interim single-tier)
+> **Production daily append is the DELTA cube (`time_chunk=1`), NOT `sync_day` into the base.**
+> Appending into the `time_chunk=90` base read-modify-writes the whole 90-step shard (>80 min global,
+> the deploy problem). The delta append writes one fresh shard = cheap (`append_strategy_results.md`).
+
+### Path A — base + delta (RECOMMENDED; cheap daily append)
+The §2 base (`--exclude-latest`) is the COMPLETE base for older days, so promote it directly; the
+held-out latest day(s) live in the DELTA. The tier (base+delta) covers everything.
+```bash
+DELTA=<CUBE>.delta            # time_chunk=1 delta cube
+# promote the base (atomic; same fs; refuse if final exists):
+test ! -e <CUBE> && mv "$STAGE" <CUBE> && echo "promoted base -> <CUBE>"
+$P - <<PY
+import time
+from ingest.dual_write import append_to_delta
+from store.time_cube import TimeCubeStore
+from store.tiered_cube import TieredCube
+for HOLD in [<held-out day(s): D, D+1, ...>]:                 # the real daily ingest op
+    t = time.perf_counter()
+    print(append_to_delta("$SRC", "$DELTA", HOLD, spatial_chunk=8, shard_spatial=128),
+          "delta_append_s", round(time.perf_counter() - t, 1))
+    # REQUIRE delta_append_s (+ margin) <= INGEST_WINDOW   (BINDING append gate)
+tc = TieredCube(TimeCubeStore("<CUBE>"), TimeCubeStore("$DELTA"))
+assert tc.latest == "<daily latest>", "tier latest mismatch"
+print("tier latest:", tc.latest, "days:", tc.day_count)      # tier must cover all daily days
+PY
+# serve base+delta: GHRSST_TIMECUBE_PATH=<CUBE> GHRSST_DELTACUBE_PATH=$DELTA (§4) -> /healthz cube_kind==tiered
+# PERIODIC COMPACTION (cron; e.g. weekly or when the delta fills a 90-day block): fold delta -> base
+$P - <<PY
+from ingest.dual_write import compact
+out = compact("$SRC", "<CUBE>", "$DELTA", end_day="<90-day-block-boundary day>",
+              spatial_chunk=8, time_chunk=90, shard_spatial=128, workers=4)
+print("compact ->", out)     # new_base / new_delta staging paths; swap both atomically, keep daily as truth
+PY
+```
+
+### Path B — single-tier (INTERIM only; slow RMW daily append — migrate to Path A)
+True-append into the base via the holdout; daily append here is the slow RMW path (`bulk_append_day`
+at best). Use only until base+delta is rolled out.
 ```bash
 # stop the §4 shadow app first if it locks the cube, then:
 $P - <<PY
@@ -164,20 +200,20 @@ test ! -e <CUBE> && mv "$STAGE" <CUBE> && echo "promoted -> <CUBE>"
 > (re-runnable).
 
 ## Ordered gate sequence (summary)
-1. §2 build holdout cube to `$STAGE` (`--exclude-latest`, same fs as `<CUBE>`).
-2. §3 **pre-append** coverage: `missing_after_cube_latest==[HOLD]`, no in-span gaps, no extra, sorted/unique (cov.ok will be False — expected).
-3. §5 read gate on `$STAGE` (cold via `vmtouch -e`, then warm).
-4. §6 `sync_day(HOLD)` → assert `append` + count+1 + `append_s ≤ INGEST_WINDOW`.
-5. §6 **post-append** coverage: now require `cov.ok == true`.
-6. §6 promote `$STAGE` → `<CUBE>` (atomic, same fs).
+1. §2 build holdout base to `$STAGE` with the **bulk builder** (`--exclude-latest`, same fs as `<CUBE>`).
+2. §3 **pre-append** coverage on `$STAGE`: `missing_after_cube_latest==[HOLD]`, no in-span gaps, no extra, sorted/unique (cov.ok False — expected; the holdout day(s) live in the delta).
+3. §5 read gate on `$STAGE` (cold via `vmtouch -e $STAGE`, then warm).
+4. §6 **Path A (recommended)**: promote `$STAGE`→`<CUBE>`; `append_to_delta(HOLD)` → **binding append gate** `delta_append_s ≤ INGEST_WINDOW`; `TieredCube(base,delta)` covers all daily days; serve base+delta; periodic `compact`. **Path B (interim)**: `sync_day(HOLD)` into base + post-append coverage + promote (slow RMW append — migrate to A).
+5. §7 go/no-go; §8 cutover (config-only rollback: unset cube/delta env).
 
 ## 7. Go / No-Go
 **GO (proceed to cutover discussion)** iff ALL:
 - disk precheck passed; built to `$STAGE` (holdout); **pre-append** coverage = only `[HOLD]` missing,
   no in-span/extra/order problems; **POST-append** `check_coverage.ok == true`; promoted `$STAGE`→`<CUBE>` (atomic, same fs).
 - cold 365-day p95 < 4 s; LR C=4/8/16 bounded, zero timeout/OOM; RSS ≤ ceiling.
-- **append measured as a TRUE append (holdout; `sync_day` returned `append`)** ≤ `INGEST_WINDOW`
-  (with margin); file count ≤ `FILE_MAX`.
+- **append gate**: Path A **`delta_append_s` ≤ `INGEST_WINDOW`** (with margin) and the `TieredCube`
+  covers all daily days; compaction completes within budget. (Path B interim: `sync_day` returned
+  `append` ≤ window.) file count ≤ `FILE_MAX` (base; delta is small).
 - routing confirmed (`route_counts` cube; `X-Store-Route: cube`).
 - **If a TILED (multi-cube) cube was chosen: NOT cutover-eligible yet** — the multi-cube routing
   (P2-S5 follow-up) must be implemented and re-gated first. A single global cube can proceed.
@@ -194,10 +230,10 @@ test ! -e <CUBE> && mv "$STAGE" <CUBE> && echo "promoted -> <CUBE>"
 - The cube is **additive**: enabling it is just setting `GHRSST_TIMECUBE_PATH` on the new app; the
   hybrid router sends only multi-day point/range to the cube, everything else to the daily store. No
   NGINX/data change beyond the P1 cutover path (`p1s5_s6_runbook.md`) if the new app isn't already live.
-- **Rollback**: unset `GHRSST_TIMECUBE_PATH` (router → daily for everything = P1 behaviour) and
-  restart; or NGINX upstream rollback per the P1 runbook. The daily store is untouched throughout, so
-  rollback is config-only and instant.
-- Keep the dual-write cron (daily `sync_day` + a `sync_missing` safety pass + `check_coverage` alert)
+- **Rollback**: unset `GHRSST_TIMECUBE_PATH` (and `GHRSST_DELTACUBE_PATH`) → router falls back to the
+  daily store for everything (= P1 behaviour); restart; or NGINX upstream rollback per the P1 runbook.
+  The daily store is untouched throughout, so rollback is config-only and instant.
+- Keep the ingest cron (daily **`append_to_delta`** + periodic **`compact`** + `check_coverage` alert)
   running and monitored before and after cutover.
 
 ## 9. Decision to record
