@@ -2,6 +2,7 @@
 
 ## Project Structure & Module Organization
 - `ghrsst_app.py` hosts the FastAPI entry point, combining routing, Zarr access, and validation helpers.
+- `dev2026/` contains the 2026 refactor API, store layer, time-cube tooling, and deployment runbooks. As of v0.3.0, VM24 production runs the dev2026 API through the existing `ghrsst` PM2 app.
 - `data/` stores the production Zarr tree (`mur.zarr`) plus optional `latest.json`; load MUR v4.1 slices here before serving traffic.
 - `conf/` contains deployment scripts (`start_app.sh`, `simu.sh`), PM2 config, and TLS assets; treat certificates as secrets.
 - `dev/` provides ingestion and sync utilities (cron, NetCDF→Zarr) that keep the store up to date.
@@ -34,3 +35,6 @@
 ## Configuration Notes
 - Set `GHRSST_ZARR_PATH` and `GHRSST_INDEX_JSON` to point at alternate stores during local runs; avoid committing absolute paths.
 - Keep TLS secrets (`conf/fullchain.pem`, `conf/privkey.pem`) out of forks; replace them with environment mounts or placeholders when sharing.
+- VM24 production data lives under `/home/odbadmin/Data/ghrsst/`. The daily store remains the source of truth; the deployed time-cube paths are `mur_timecube_s8_t90_sh128.zarr` plus `mur_timecube_s8_t90_sh128.delta.zarr`.
+- Do not modify NGINX or unrelated PM2/system processes when working on GHRSST. The deployed API is switched through `/home/odbadmin/python/ghrsst/conf/start_app.sh`; rollback uses `start_app.sh.pre-dev2026`.
+- Multi-day point/range queries should route to the cube (`X-Store-Route: cube`). Bbox queries are still daily-store, single-day JSON-array responses and have a production point guard; see `dev2026/specs/bbox_performance_notes.md` before changing bbox behavior.

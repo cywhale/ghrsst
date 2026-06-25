@@ -141,19 +141,23 @@ $P bench/loadtest.py --base $B --run-kind vm24 --scenario LR --duration 120 --de
 The §2 base (`--exclude-latest`) is the COMPLETE base for older days, so promote it directly; the
 held-out latest day(s) live in the DELTA. The tier (base+delta) covers everything.
 ```bash
-DELTA=<CUBE>.delta            # time_chunk=1 delta cube
+DELTA=<CUBE>.delta            # time_chunk=1 delta cube, APPEND-optimized layout (s256/shard256)
 # promote the base (atomic; same fs; refuse if final exists):
 test ! -e <CUBE> && mv "$STAGE" <CUBE> && echo "promoted base -> <CUBE>"
+# DAILY APPEND = the production cron CLI (TILED/streaming; never materializes a full global array).
+# Delta chunking is DECOUPLED from the base read-cube (base=s8 for reads; delta=s256 for cheap append
+# -- s8 delta = ~10M tiny chunks/var = the >2h/day; s256 was 215x faster, no read penalty). This is
+# the EXACT path cron runs -- do NOT hand-build the delta. Run once per held-out day:
+for HOLD in <D D+1 ...>; do
+  PYTHONPATH=. $P ingest/append_delta_day.py --daily "$SRC" --delta "$DELTA" --day "$HOLD" \
+    --delta-spatial-chunk 256 --delta-shard-spatial 256 --workers 4   # defaults already s256/s256
+done
+# prints {op,append_s,tile_count,max_block_cells,grid_cells,rss_mb}
+# REQUIRE: append_s (+ margin) <= INGEST_WINDOW (BINDING gate, now MINUTES not hours); AND peak RSS
+#   bounded -- max_block_cells << grid_cells, RSS must NOT scale with the grid (>7.8 GB pattern gone).
 $P - <<PY
-import time
-from ingest.dual_write import append_to_delta
 from store.time_cube import TimeCubeStore
 from store.tiered_cube import TieredCube
-for HOLD in [<held-out day(s): D, D+1, ...>]:                 # the real daily ingest op
-    t = time.perf_counter()
-    print(append_to_delta("$SRC", "$DELTA", HOLD, spatial_chunk=8, shard_spatial=128),
-          "delta_append_s", round(time.perf_counter() - t, 1))
-    # REQUIRE delta_append_s (+ margin) <= INGEST_WINDOW   (BINDING append gate)
 tc = TieredCube(TimeCubeStore("<CUBE>"), TimeCubeStore("$DELTA"))
 assert tc.latest == "<daily latest>", "tier latest mismatch"
 print("tier latest:", tc.latest, "days:", tc.day_count)      # tier must cover all daily days
@@ -233,8 +237,8 @@ test ! -e <CUBE> && mv "$STAGE" <CUBE> && echo "promoted -> <CUBE>"
 - **Rollback**: unset `GHRSST_TIMECUBE_PATH` (and `GHRSST_DELTACUBE_PATH`) → router falls back to the
   daily store for everything (= P1 behaviour); restart; or NGINX upstream rollback per the P1 runbook.
   The daily store is untouched throughout, so rollback is config-only and instant.
-- Keep the ingest cron (daily **`append_to_delta`** + periodic **`compact`** + `check_coverage` alert)
-  running and monitored before and after cutover.
+- Keep the ingest cron (daily **`ingest/append_delta_day.py`** = tiled `append_to_delta`, memory-bounded
+  + periodic **`compact`** + `check_coverage` alert) running and monitored before and after cutover.
 
 ## 9. Decision to record
 Confirm the production chunking: **`s8/t90/shard=128`** if all gates pass, else the tuned variant

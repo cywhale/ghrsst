@@ -29,11 +29,75 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_store_access dev2026.tes
 - `uv` 管理 Python(3.13)與 venv。
 - store 路徑一律 `GHRSST_ZARR_PATH`,程式不硬編碼;`bak/` 僅本機部分複本,**仍在持續拷貝/每日增長**,工具須容忍缺日。
 
+## VM24 production deployment (v0.3.0, 2026-06-25)
+
+Production on VM24 now runs the dev2026 API through the existing PM2 app `ghrsst`
+and the existing NGINX upstream `127.0.0.1:8035`. NGINX was not changed.
+
+Paths:
+- Production daily source of truth: `/home/odbadmin/Data/ghrsst/mur.zarr`
+- Base time-cube: `/home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.zarr`
+- Delta cube: `/home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.delta.zarr`
+- Runtime worktree: `/home/odbadmin/python/ghrsst-dev2026-phase2`
+- Production launcher: `/home/odbadmin/python/ghrsst/conf/start_app.sh`
+- Rollback launcher backup: `/home/odbadmin/python/ghrsst/conf/start_app.sh.pre-dev2026`
+
+Production launcher environment:
+```bash
+GHRSST_ZARR_PATH=/home/odbadmin/Data/ghrsst/mur.zarr
+GHRSST_TIMECUBE_PATH=/home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.zarr
+GHRSST_DELTACUBE_PATH=/home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.delta.zarr
+GHRSST_ZARR_WORKERS=4
+GHRSST_RSS_CEILING_MB=4096
+GHRSST_BBOX_POINT_LIMIT=300000
+GHRSST_MAX_DAYS=366
+```
+
+Restart current production app:
+```bash
+pm2 restart ghrsst --update-env
+curl -fsS http://127.0.0.1:8035/healthz
+```
+
+Rollback to the pre-dev2026 app:
+```bash
+cp /home/odbadmin/python/ghrsst/conf/start_app.sh.pre-dev2026 \
+   /home/odbadmin/python/ghrsst/conf/start_app.sh
+chmod +x /home/odbadmin/python/ghrsst/conf/start_app.sh
+pm2 restart ghrsst --update-env
+```
+
+Operational checks:
+```bash
+curl -sS http://127.0.0.1:8035/healthz
+curl -sS -D - -o /tmp/ghrsst_365.json \
+  "http://127.0.0.1:8035/api/ghrsst?lon0=121&lat0=24&start=2025-06-24&end=2026-06-23&append=sst,sst_anomaly,sea_ice"
+```
+Expected for multi-day point/range queries: `X-Store-Route: cube`.
+
+Daily delta append cron:
+```cron
+# Runs after the existing MUR daily retries. Idempotent.
+30 20 * * * /home/odbadmin/python/ghrsst-dev2026-phase2/ops/cron_mur_delta_append.sh $(date -u -d "yesterday" +\%Y-\%m-\%d)
+30 07 * * * /home/odbadmin/python/ghrsst-dev2026-phase2/ops/cron_mur_delta_append.sh $(date -u -d "yesterday" +\%Y-\%m-\%d)
+```
+Logs: `/home/odbadmin/Data/ghrsst/logs/delta_append/append_YYYY-MM-DD.log`.
+
+### Known bbox limitation
+
+The v0.3.0 performance work primarily fixes multi-day point/range queries. Bbox
+requests still use the daily store and the existing JSON-array wire format. A
+752,001-point bbox currently produces about 108 MB of row-oriented JSON; VM24 can
+stream it in roughly 4 seconds, but browsers/front-ends may spend much longer
+parsing, formatting, and rendering the payload. Production therefore sets
+`GHRSST_BBOX_POINT_LIMIT=300000` as a safety guard. A deeper bbox redesign should
+be handled as a separate phase; see [`specs/bbox_performance_notes.md`](specs/bbox_performance_notes.md).
+
 ## 現況
 - [x] 診斷 + benchmark harness(`bench/`、`store/zarr_paths.py`)
 - [x] spec(`specs/00`、`specs/01`)— **reviewer accepted (v9)**
 - [x] **P1-S1** `store/store_access.py`(座標快取 + thread-safe LRU + 逐 chunk 釋放;`tests/test_store_access.py` 13 tests pass:real-store parity / thread-safety stress / new-day visibility / memory-bound;point_series 12.4×、points_batch 818×)
-- [x] **P1-S2** `api/app.py`(full GET 相容 + `POST /points` + streaming bbox(JSON-array)+ 有界 executor/503 背壓 + Cache-Control + MAX_DAYS=365/413);`tests/test_api.py` 15 tests pass + live uvicorn smoke(real store:point/range/bbox-40k-stream/points)
+- [x] **P1-S2** `api/app.py`(full GET 相容 + `POST /points` + streaming bbox(JSON-array)+ 有界 executor/503 背壓 + Cache-Control + MAX_DAYS=366/413);`tests/test_api.py` 15 tests pass + live uvicorn smoke(real store:point/range/bbox-40k-stream/points)
 - [x] **P1-S3** `tests/test_parity.py`(新 API vs **真實舊 `ghrsst_app.py`** 並排比對:point/range/bbox/append/mode/sample 的 **parsed JSON / data-shape 相同**(比較 parsed JSON equality,**非位元組級** —— 新 bbox 走 streaming,空白/分塊本就不同)+ 錯誤語意相同;刻意 divergence: cache header、31→365/413 已 assert)。11 tests pass;三模組合併 46/46 兩序皆綠
 - [~] **P1-S4** `bench/loadtest.py`(HTTP load harness:SB/LR/BBOX/OL,p50/p95/p99 + shed/timeout/err + `/healthz` queue+RSS 取樣 + JSON 輸出)。**本機已驗證 harness 與 G1′/G6/G7 機制**(LR 隨並發退化、503 shed+16.9ms 恢復、RSS 取樣);結果 **non-binding**,見 [`specs/p1s4_local_results.md`](specs/p1s4_local_results.md)。**待 VM24 全資料跑同工具作為正式 gate**
 - [x] **P1-S5/S6 runbook** → [`specs/p1s5_s6_runbook.md`](specs/p1s5_s6_runbook.md)。VM24 binding gate 由 Codex/ops 執行。
@@ -50,5 +114,5 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_store_access dev2026.tes
   - [x] **P2-S7 full HTTP gate** done(`s8/t90/shard=128` cube-backed API,loadtest 365-day LR):**p95 50/116/205ms @ C=4/8/16(« 4s,比 daily VM24 14s 快 ~70–280×)**,RSS 74–85MB(/healthz),0 timeout/503,**route_counts {cube:6438, daily:57} 確認多日→cube**。
 - [~] **P2-S8 VM24 runbook authored** → [`specs/p2s8_vm24_runbook.md`](specs/p2s8_vm24_runbook.md)(operational gates:ingest window/file-count tolerance/disk precheck;full 或 tiled cube build(`build_timecube --region`);cold+warm LR/SB loadtest;append/upsert 量測;coverage/healthz;go/no-go + rollback)。**VM24 執行(binding gate + cutover)由 Codex/ops**,Claude 不執行。
 - [x] **Bulk build fix**(`ingest/build_timecube_bulk.py`,`tests/test_phase2_bulk.py` 6/6)。修正部署時 build 過慢(per-day 寫法每天 RMW 整個 90-step shard,~90× 寫放大 → 20+ 天)。改為 **shard-block 批次寫**(time_block × spatial super-tile,每 shard 寫一次)+ bounded workers + checkpoint/resume + `--latest-days`/`--exclude-latest`。**實測 256² 90 天:41.8s→0.5s(77.7×)**;輸出與 per-day 完全相同(parity 通過)。read chunking(s8/t90/shard128)不變。runbook §2 已改用 bulk。結果 [`specs/bulk_build_results.md`](specs/bulk_build_results.md)。
-- [x] **Append fix(base+delta 生產設計 + bulk_append_day 過渡)**(`store/tiered_cube.py`,`ingest/dual_write.py` append_to_delta/compact,`ingest/build_timecube_bulk.bulk_append_day`,`tests/test_phase2_append.py` 7/7)。部署發現 append >80min(同 RMW 問題:寫一天 RMW 整個 90-step shard)。**生產解:DELTA cube(time_chunk=1,每日 append 寫一個新 shard,無 RMW)+ TieredCube(base+delta 讀)+ 週期 compaction(bulk 重建 base + reset delta)**;app 接 `GHRSST_DELTACUBE_PATH`,`/healthz` cube_kind=tiered。RMW 成本在「讀取量」,global 才顯著(小 grid 1.2×,global ~80min→分鐘級,binding 在 VM24)。bulk_append_day 為過渡(tiled/bounded/streaming/resume,仍 RMW)。結果 [`specs/append_strategy_results.md`](specs/append_strategy_results.md)。Full suite 111/111。
+- [x] **Append fix(base+delta 生產設計 + bulk_append_day 過渡)**(`store/tiered_cube.py`,`ingest/dual_write.py` append_to_delta/compact,`ingest/build_timecube_bulk.bulk_append_day`,`tests/test_phase2_append.py` 7/7)。部署發現 append >80min(同 RMW 問題:寫一天 RMW 整個 90-step shard)。**生產解:DELTA cube(time_chunk=1,每日 append 寫一個新 shard,無 RMW)+ TieredCube(base+delta 讀)+ 週期 compaction(bulk 重建 base + reset delta)**;app 接 `GHRSST_DELTACUBE_PATH`,`/healthz` cube_kind=tiered。RMW 成本在「讀取量」,global 才顯著(小 grid 1.2×,global ~80min→分鐘級,binding 在 VM24)。bulk_append_day 為過渡(tiled/bounded/streaming/resume,仍 RMW)。**`append_to_delta` 已改為 tiled/streaming**(逐 tile 讀寫,不再 materialize 全域陣列;bounded workers + per-(day,var,tile) checkpoint/resume;cron CLI `ingest/append_delta_day.py`)——2048² benchmark 峰值 RSS +58.9MB→+2.5MB,峰值 block 受 `read_block²` 限制(global ≈ grid 的 1/618),消除觀測到的 ~7.8GB RSS。**delta chunking 與 base 解耦**(PR #13 VM24 follow-up:VM24 記憶體已修好但 append 仍 >2h/day,真正瓶頸是 delta 沿用 base s8 → 每日 global append 寫 ~10M 個 8×8 tiny chunks/var)——base 維持 `s8/shard128/t90`(讀取),delta 改用 append-optimized `s256/shard256`(預設;create 時套用,append 時沿用既有 layout);`bench/bench_delta_layout.py` 顯示 s256 比 s8 **append 快 215×**、檔案最少、point-read 延遲不變(~3.4ms)。結果 [`specs/append_strategy_results.md`](specs/append_strategy_results.md)。Full suite 115/115。
 - [ ] P2-S8 VM24 binding 執行(Codex/ops:bulk build base + delta append + compaction)→ 確認 chunking → cutover

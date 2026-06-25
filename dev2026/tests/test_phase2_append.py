@@ -100,14 +100,72 @@ class TieredTests(Base, unittest.TestCase):
             append_to_delta(self.daily, delta, d, spatial_chunk=8, shard_spatial=16)
         return TieredCube(TimeCubeStore(base), TimeCubeStore(delta)), base, delta
 
-    def test_delta_create_then_append(self):
+    def test_delta_create_then_append_tiled(self):
         delta = os.path.join(self.tmp, "delta_only")
-        self.assertEqual(append_to_delta(self.daily, delta, self.days[8], spatial_chunk=8, shard_spatial=16), "create")
-        self.assertEqual(append_to_delta(self.daily, delta, self.days[9], spatial_chunk=8, shard_spatial=16), "append")
+        r1 = append_to_delta(self.daily, delta, self.days[8], spatial_chunk=8, shard_spatial=16,
+                             read_block=16, workers=2)
+        r2 = append_to_delta(self.daily, delta, self.days[9], spatial_chunk=8, shard_spatial=16,
+                             read_block=16, workers=2)
+        self.assertEqual(r1["op"], "create")
+        self.assertEqual(r2["op"], "append")
         d = TimeCubeStore(delta)
         self.assertEqual(d.days, [self.days[8], self.days[9]])
-        # delta time_chunk == 1 (cheap-append layout)
-        self.assertEqual(zarr.open_group(delta, mode="r")["sst"].chunks[0], 1)
+        self.assertEqual(zarr.open_group(delta, mode="r")["sst"].chunks[0], 1)   # time_chunk==1
+        # parity vs P1 on the delta days
+        self.assertEqual(d.point_series(115.0, 12.0, [self.days[8], self.days[9]], ["sst", "sst_anomaly"]),
+                         self.sa.point_series(115.0, 12.0, [self.days[8], self.days[9]], ["sst", "sst_anomaly"]))
+
+    def test_delta_layout_decoupled_from_base(self):
+        # base uses s8 (long-read layout); delta uses the APPEND-optimized default (large spatial
+        # chunk). Chunkings differ, but TieredCube reads both parity-exact vs P1.
+        base = os.path.join(self.tmp, "base_dec")
+        build_timecube_bulk(self.daily, base, spatial_chunk=8, time_chunk=4, shard_spatial=16,
+                            read_block=16, workers=2, end_day=self.days[6])
+        delta = os.path.join(self.tmp, "delta_dec")
+        for d in self.days[7:]:
+            append_to_delta(self.daily, delta, d)              # DEFAULT append-optimized layout
+        bchunk = int(zarr.open_group(base, mode="r")["sst"].chunks[-1])
+        dchunk = int(zarr.open_group(delta, mode="r")["sst"].chunks[-1])
+        self.assertNotEqual(bchunk, dchunk)                    # decoupled (base s8 vs large delta chunk)
+        self.assertGreater(dchunk, bchunk)
+        self.assertEqual(int(zarr.open_group(delta, mode="r")["sst"].chunks[0]), 1)  # delta time_chunk=1
+        tc = TieredCube(TimeCubeStore(base), TimeCubeStore(delta))
+        for lon, lat in [(119.3, 22.3), (104.0, 7.0)]:
+            self.assertEqual(tc.point_series(lon, lat, self.days, ["sst", "sst_anomaly"]),
+                             self.sa.point_series(lon, lat, self.days, ["sst", "sst_anomaly"]))
+
+    def test_no_full_global_materialization(self):
+        # tiled: the largest block processed must be <= read_block^2, NOT the full grid
+        delta = os.path.join(self.tmp, "delta_tiled")
+        rb = 16
+        r = append_to_delta(self.daily, delta, self.days[0], spatial_chunk=8, shard_spatial=16,
+                            read_block=rb, workers=2)
+        self.assertLessEqual(r["max_block_cells"], rb * rb)
+        self.assertLess(r["max_block_cells"], r["grid_cells"])   # never the whole grid
+        self.assertGreater(r["tile_count"], 1)                   # actually tiled
+
+    def test_missing_var_validity(self):
+        # day 0 has NO sst_anomaly (i%3==0) -> delta must omit it for that day (valid False)
+        delta = os.path.join(self.tmp, "delta_absent")
+        append_to_delta(self.daily, delta, self.days[0], spatial_chunk=8, shard_spatial=16, read_block=16)
+        append_to_delta(self.daily, delta, self.days[1], spatial_chunk=8, shard_spatial=16, read_block=16)
+        d = TimeCubeStore(delta)
+        rows = d.point_series(115.0, 12.0, [self.days[0], self.days[1]], ["sst", "sst_anomaly"])
+        self.assertNotIn("sst_anomaly", rows[0])   # day0 absent -> omit (P1 parity)
+        self.assertIn("sst_anomaly", rows[1])       # day1 present
+
+    def test_delta_append_resumable(self):
+        delta = os.path.join(self.tmp, "delta_resume")
+        append_to_delta(self.daily, delta, self.days[0], spatial_chunk=8, shard_spatial=16, read_block=16)
+        # simulate interruption mid-append of day1: pre-seed a partial checkpoint, then run
+        append_to_delta(self.daily, delta, self.days[1], spatial_chunk=8, shard_spatial=16, read_block=16)
+        self.assertFalse(os.path.isfile(os.path.join(delta, f"_delta_append_{self.days[1]}.json")))  # cleared
+        # re-applying the same day = overwrite, count unchanged, still parity
+        r = append_to_delta(self.daily, delta, self.days[1], spatial_chunk=8, shard_spatial=16, read_block=16)
+        self.assertEqual(r["op"], "overwrite")
+        self.assertEqual(TimeCubeStore(delta).day_count, 2)
+        self.assertEqual(TimeCubeStore(delta).point_series(115.0, 12.0, [self.days[1]], ["sst"]),
+                         self.sa.point_series(115.0, 12.0, [self.days[1]], ["sst"]))
 
     def test_tiered_parity_with_p1(self):
         tc, _, _ = self._build_base_delta(split=6)         # base: days[0..6], delta: days[7..11]

@@ -107,8 +107,8 @@ class ApiTests(unittest.TestCase):
             "lon0": 110.0, "lat0": 12.0, "start": "2024-01-01", "end": "2025-06-01"})
         self.assertEqual(r.status_code, 413)
         detail = r.json()["detail"]
-        self.assertEqual(detail["max_days"], 365)
-        self.assertGreater(detail["requested_days"], 365)
+        self.assertEqual(detail["max_days"], 366)
+        self.assertGreater(detail["requested_days"], 366)
 
     def test_point_omits_absent_field(self):
         r = self.client.get("/api/ghrsst", params={
@@ -145,6 +145,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.headers["x-stride"], "2")
         self.assertEqual(len(json.loads(r.content)), ((NY - 1)//2 + 1) * ((NX - 1)//2 + 1))
+
+    def test_bbox_rejects_date_range(self):
+        r = self.client.get("/api/ghrsst", params={
+            "lon0": 100.0, "lat0": 0.0, "lon1": 130.0, "lat1": 30.0,
+            "start": "2025-01-01", "end": "2025-01-03"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("BBOX query only allows single-day data", r.json()["detail"])
 
     def test_sample_rejected_in_point_mode(self):
         r = self.client.get("/api/ghrsst", params={"lon0": 110.0, "lat0": 12.0, "sample": 2})
