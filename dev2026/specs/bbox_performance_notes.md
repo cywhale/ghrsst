@@ -2,6 +2,11 @@
 
 Status: preliminary assessment after the v0.3.0 VM24 deployment.
 
+> **The P3 design spec is now authored** → [`p3_bbox_performance_design.md`](p3_bbox_performance_design.md)
+> (measurement-first: P3-S0 benchmarks the read/row/encode/transfer/parse breakdown before any
+> format change; opt-in `format=columnar`/binary; front-end large-bbox contract; default JSON
+> array unchanged). This notes file is the evidence input; the spec is the plan under Codex review.
+
 ## Current behavior
 
 Bbox queries remain single-day queries served from the daily store. They do not
