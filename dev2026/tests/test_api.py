@@ -63,6 +63,7 @@ class ApiTests(unittest.TestCase):
     def setUpClass(cls):
         cls._prev_env = os.environ.get("GHRSST_ZARR_PATH")   # save to restore later
         cls._tmp = tempfile.mkdtemp(prefix="ghrsst_api_")
+        build_day(cls._tmp, "2023-03-06", with_anomaly=False)  # isolated test day
         for d in DAYS:
             build_day(cls._tmp, d, with_anomaly=False)        # synthetic days: NO sst_anomaly
         os.environ["GHRSST_ZARR_PATH"] = cls._tmp
@@ -109,6 +110,13 @@ class ApiTests(unittest.TestCase):
         detail = r.json()["detail"]
         self.assertEqual(detail["max_days"], 366)
         self.assertGreater(detail["requested_days"], 366)
+
+    def test_no_data_error_reports_primary_contiguous_range(self):
+        r = self.client.get("/api/ghrsst", params={
+            "lon0": 110.0, "lat0": 12.0, "start": "2024-01-01", "end": "2024-01-02"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("available contiguous range is 2025-01-01/2025-01-03", r.json()["detail"])
+        self.assertNotIn("2023-03-06/2025-01-03", r.json()["detail"])
 
     def test_point_omits_absent_field(self):
         r = self.client.get("/api/ghrsst", params={
@@ -188,6 +196,8 @@ class ApiTests(unittest.TestCase):
         r = self.client.get("/healthz")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["latest"], "2025-01-03")
+        self.assertEqual(r.json()["primary_earliest"], "2025-01-01")
+        self.assertEqual(r.json()["primary_latest"], "2025-01-03")
 
     def test_bbox_releases_permit_on_success(self):
         # [High] fix: the bbox stream holds ONE admission permit for its whole

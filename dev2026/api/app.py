@@ -216,6 +216,16 @@ def _fixed_cache():
     return {"Cache-Control": f"public, max-age={cfg.LONG_CACHE_SECONDS}"}
 
 
+def _available_range_text(store: StoreAccess) -> str:
+    p0, p1 = store.primary_bounds()
+    e0, e1 = store.bounds()
+    if p0 and p1:
+        if (p0, p1) != (e0, e1):
+            return f"available contiguous range is {p0}/{p1}"
+        return f"available range is {p0}/{p1}"
+    return f"available range is {e0}/{e1}"
+
+
 # ---- GET /api/ghrsst (full parity) ---------------------------------------
 @app.get("/api/ghrsst")
 async def read_ghrsst(
@@ -279,7 +289,7 @@ async def read_ghrsst(
         existing = [d for d in wanted if store.day_present(d)]
         if not existing:
             raise HTTPException(400, f"Data not exist for requested period; "
-                                     f"available range is {earliest}/{latest}.")
+                                     f"{_available_range_text(store)}.")
         router = request.app.state.router
         route = router.route_point(existing)             # 'cube' (multi-day) or 'daily'
         rows = await bex.run(router.point_series, lon0, lat0, existing, fields)
@@ -310,7 +320,7 @@ async def read_ghrsst(
         chosen = latest
     if chosen < earliest or chosen > latest or not store.day_present(chosen):
         raise HTTPException(400, f"BBOX query only allows single-day data. Requested "
-                                 f"{chosen} is unavailable; available range is {earliest}/{latest}.")
+                                 f"{chosen} is unavailable; {_available_range_text(store)}.")
     cacheable = (not date_less) and (chosen < latest)
 
     # Hold ONE admission permit for the WHOLE bbox stream lifecycle (read + every
@@ -384,7 +394,7 @@ async def read_points(request: Request, body: PointsRequest):
             raise HTTPException(400, "each point must be [lon, lat].")
     earliest, latest = store.bounds()
     if not latest or not store.day_present(day):
-        raise HTTPException(400, f"day {day} not available; range {earliest}/{latest}.")
+        raise HTTPException(400, f"day {day} not available; {_available_range_text(store)}.")
     try:
         rows = await bex.run(store.points_batch, body.points, day, fields)
     except ValueError as ve:
@@ -412,10 +422,12 @@ def _rss_mb() -> Optional[float]:
 @app.get("/healthz", include_in_schema=False)
 async def healthz(request: Request):
     e, l = request.app.state.store.bounds()
+    pe, pl = request.app.state.store.primary_bounds()
     bex = request.app.state.bex
     router = request.app.state.router
     cube = router.cube
     return {"status": "ok", "earliest": e, "latest": l,
+            "primary_earliest": pe, "primary_latest": pl,
             "executor_queue_depth": bex.queue_depth(),
             "executor_limit": bex.limit,
             "rss_mb": _rss_mb(),

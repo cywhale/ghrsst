@@ -108,6 +108,9 @@ cutoff. This keeps routing, metadata, and read performance easy to reason about.
 `mur_timecube_s8_t90_sh128.zarr/zarr.json` describes only the base cube. Complete
 production coverage is base plus delta; check `/healthz` (`cube_kind=tiered`,
 `cube_day_count`, `delta_day_count`, `cube_latest_in_sync`) for the served view.
+`/healthz` also exposes raw `earliest/latest` and user-facing
+`primary_earliest/primary_latest`; the latter ignores isolated test days such as
+`2023-03-06` and is used in unavailable-date error messages.
 
 Daily delta append cron:
 ```cron

@@ -20,6 +20,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict
+from datetime import date, timedelta
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -92,6 +93,33 @@ class StoreAccess:
     def bounds(self) -> Tuple[Optional[str], Optional[str]]:
         days = self.existing_days()
         return (days[0], days[-1]) if days else (None, None)
+
+    def primary_bounds(self) -> Tuple[Optional[str], Optional[str]]:
+        """Return the main contiguous production range.
+
+        Some stores contain isolated test days before the real production run
+        (for example VM24 has a single 2023-03-06 day). User-facing "available
+        range" messages should not advertise such isolated days as the start of
+        the usable range. Pick the longest contiguous run; if tied, pick latest.
+        """
+        days = self.existing_days()
+        if not days:
+            return (None, None)
+        best_start = best_end = cur_start = cur_end = date.fromisoformat(days[0])
+        best_len = 1
+        for s in days[1:]:
+            d = date.fromisoformat(s)
+            if d == cur_end + timedelta(days=1):
+                cur_end = d
+            else:
+                cur_len = (cur_end - cur_start).days + 1
+                if cur_len > best_len or (cur_len == best_len and cur_end > best_end):
+                    best_start, best_end, best_len = cur_start, cur_end, cur_len
+                cur_start = cur_end = d
+        cur_len = (cur_end - cur_start).days + 1
+        if cur_len > best_len or (cur_len == best_len and cur_end > best_end):
+            best_start, best_end = cur_start, cur_end
+        return (best_start.isoformat(), best_end.isoformat())
 
     def day_present(self, day: str) -> bool:
         # authoritative filesystem check (don't trust a stale day-list for a miss)

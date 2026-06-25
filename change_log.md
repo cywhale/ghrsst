@@ -21,3 +21,4 @@
 - Set the production range cap to 366 days so one-calendar-year queries work across leap years.
 - Restored Swagger/OpenAPI under `/api/swagger/ghrsst` and `/api/swagger/ghrsst/openapi.json`.
 - Added the daily-only gap day `2025-06-22` to the delta cube so ranges crossing that day still route to the cube.
+- User-facing unavailable-date errors now report the main contiguous production range, excluding isolated test days such as `2023-03-06`.
