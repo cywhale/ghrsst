@@ -167,8 +167,8 @@ def main():
     print("## bbox  | source | size | parity | read_amp | chunk_count | warm p95 ms | C8 p95/RSS | json MB | grid MB")
     for label, ni, nj in SIZES:
         lo0, la0, lo1, la1 = win(ni, nj)
-        d_lons, d_lats, d_cols = sa.bbox_arrays(d_hist, lo0, la0, lo1, la1, fields)
         for src, tc, day in (("daily", None, d_hist), ("base", base, d_hist), ("delta", delta, d_recent)):
+            _, _, ref_cols = sa.bbox_arrays(day, lo0, la0, lo1, la1, fields)   # daily ref for THIS day
             if src == "daily":
                 run = lambda: sa.bbox_arrays(day, lo0, la0, lo1, la1, fields)
                 lons, lats, cols = sa.bbox_arrays(day, lo0, la0, lo1, la1, fields)
@@ -177,7 +177,7 @@ def main():
                 run = lambda tc=tc, day=day: cube_bbox_arrays(tc, day, lo0, la0, lo1, la1, fields)
                 lons, lats, cols = cube_bbox_arrays(tc, day, lo0, la0, lo1, la1, fields)
                 ch = chunk_cost(tc._array("sst").chunks, ni, nj, len(cols))
-            par = _parity_bbox(d_cols, cols) if src in ("daily", "base") else None  # delta=recent day, no daily-hist ref
+            par = _parity_bbox(ref_cols, cols)                                # every source vs its daily day
             n = 3 if (src == "base" and ni >= 800) else 5
             wp95, _ = _p95(run, n)
             c8 = _conc(run, 8, waves=1)
@@ -195,16 +195,15 @@ def main():
     # ---------- POINT (single day) ----------
     print("\n## point (single day) | source | parity | read_amp | warm p95 ms | C8 p95/RSS")
     plon, plat = float(lon[lon.size // 2]), float(lat[lat.size // 2])
-    d_pt = sa.point_series(plon, plat, [d_hist], fields)
-    for src, tc, day, ref in (("daily", None, d_hist, d_pt), ("base", base, d_hist, d_pt),
-                              ("delta", delta, d_recent, None)):
+    for src, tc, day in (("daily", None, d_hist), ("base", base, d_hist), ("delta", delta, d_recent)):
+        ref = sa.point_series(plon, plat, [day], fields)                  # daily ref for THIS day
         if src == "daily":
             run = lambda: sa.point_series(plon, plat, [day], fields); got = sa.point_series(plon, plat, [day], fields)
             ch = chunk_cost((1, 1024, 1024), 1, 1, len(fields))
         else:
             run = lambda tc=tc, day=day: cube_point(tc, day, plon, plat, fields); got = cube_point(tc, day, plon, plat, fields)
             ch = chunk_cost(tc._array("sst").chunks, 1, 1, len(fields))
-        par = _parity_rows(ref, got) if ref is not None else None
+        par = _parity_rows(ref, got)
         wp95, _ = _p95(run, 9); c8 = _conc(run, 8, waves=3)
         rep["point"][src] = {"parity": par, **ch, "warm_p95_ms": wp95, "c8_p95_ms": c8["p95_ms"], "c8_rss_mb": c8["rss_mb"]}
         print(f"   | {src:5} | {str(par):5} | {ch['read_amp']:>8} | {wp95:>8} | {c8['p95_ms']}/{c8['rss_mb']}")
@@ -212,16 +211,15 @@ def main():
     # ---------- POST points (batch, single day) ----------
     print("\n## POST points (1000, single day) | source | parity | chunk_count | warm p95 ms | C8 p95/RSS")
     ijs = [( _idx(plat_v, lat), _idx(plon_v, lon)) for plon_v, plat_v in batch_pts]
-    d_b = sa.points_batch(batch_pts, d_hist, fields)
-    for src, tc, day, ref in (("daily", None, d_hist, d_b), ("base", base, d_hist, d_b),
-                              ("delta", delta, d_recent, None)):
+    for src, tc, day in (("daily", None, d_hist), ("base", base, d_hist), ("delta", delta, d_recent)):
+        ref = sa.points_batch(batch_pts, day, fields)                    # daily ref for THIS day
         if src == "daily":
             run = lambda: sa.points_batch(batch_pts, day, fields); got = sa.points_batch(batch_pts, day, fields)
             ch = chunk_cost((1, 1024, 1024), 1, 1, len(fields), access="batch", ij_list=ijs)
         else:
             run = lambda tc=tc, day=day: cube_points_batch(tc, day, batch_pts, fields); got = cube_points_batch(tc, day, batch_pts, fields)
             ch = chunk_cost(tc._array("sst").chunks, 1, 1, len(fields), access="batch", ij_list=ijs)
-        par = _parity_rows(ref, got) if ref is not None else None
+        par = _parity_rows(ref, got)
         wp95, _ = _p95(run, 5); c8 = _conc(run, 8, waves=1)
         rep["batch"][src] = {"parity": par, **ch, "warm_p95_ms": wp95, "c8_p95_ms": c8["p95_ms"], "c8_rss_mb": c8["rss_mb"]}
         print(f"   | {src:5} | {str(par):5} | {ch['chunk_count']:>7} | {wp95:>8} | {c8['p95_ms']}/{c8['rss_mb']}")

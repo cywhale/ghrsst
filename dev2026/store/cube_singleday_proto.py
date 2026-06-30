@@ -18,6 +18,7 @@ read_amp) the P2 work established — computed analytically from the array chunk
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from typing import Dict, List, Sequence
 
 import numpy as np
@@ -69,6 +70,9 @@ def cube_point(tc, day, lon, lat, fields) -> List[dict]:
 
 
 def cube_points_batch(tc, day, points: Sequence[Sequence[float]], fields) -> List[dict]:
+    """Chunk-GROUPED batch read mirroring StoreAccess.points_batch: group points by the cube's spatial
+    chunk, read each distinct chunk's minimal bounding block ONCE per field, extract from memory. (The
+    per-point version overstated cube latency, esp. for delta — Codex P4-S0 #High.)"""
     t = _day_t(tc, day)
     lon, lat = tc._lon, tc._lat
     idx = []
@@ -76,17 +80,31 @@ def cube_points_batch(tc, day, points: Sequence[Sequence[float]], fields) -> Lis
         jj = _nearest_idx(_clamp(float(lo), float(lon.min()), float(lon.max())), lon)
         ii = _nearest_idx(_clamp(float(la), float(lat.min()), float(lat.max())), lat)
         idx.append((ii, jj, float(lon[jj]), float(lat[ii])))
-    rows = []
-    for k, (ii, jj, glon, glat) in enumerate(idx):
-        row = {"index": k, "lon": glon, "lat": glat, "date": day}   # "index" matches points_batch
-        for f in fields:                                # absent -> null key present (points_batch parity)
+    a0 = tc._array(tc.vars[0])
+    cy, cx = int(a0.chunks[-2]), int(a0.chunks[-1])
+    groups: "OrderedDict[tuple, List[int]]" = OrderedDict()
+    for k, (ii, jj, _, _) in enumerate(idx):
+        groups.setdefault((ii // cy, jj // cx), []).append(k)
+    rows: List[dict] = [None] * len(points)
+    for _key, members in groups.items():
+        iis = [idx[k][0] for k in members]; jjs = [idx[k][1] for k in members]
+        i0, i1 = min(iis), max(iis); j0, j1 = min(jjs), max(jjs)
+        blocks: Dict[str, np.ndarray] = {}
+        for f in fields:
             if _present(tc, f, t):
-                v = float(np.asarray(tc._array(f)[t, ii, jj]))
-                row[f] = None if np.isnan(v) else v
-            else:
-                row[f] = None
-        rows.append(row)
-    return rows
+                blocks[f] = np.asarray(tc._array(f)[t, i0:i1 + 1, j0:j1 + 1])
+        for k in members:
+            ii, jj, glon, glat = idx[k]
+            row = {"index": k, "lon": glon, "lat": glat, "date": day}   # "index" matches points_batch
+            for f in fields:                            # absent -> null key present (points_batch parity)
+                if f in blocks:
+                    v = float(blocks[f][ii - i0, jj - j0])
+                    row[f] = None if np.isnan(v) else v
+                else:
+                    row[f] = None
+            rows[k] = row
+        del blocks
+    return [r for r in rows if r is not None]
 
 
 def chunk_cost(chunks, ni: int, nj: int, n_present: int, access="bbox", ij_list=None) -> dict:
