@@ -1,7 +1,14 @@
 """dev2026 — P3-S1 compact bbox response encoders (opt-in `format=grid` / `format=columnar`).
 
+EXPERIMENTAL / PROTOTYPE (Codex review of PR #16): these compact wire shapes are MEASUREMENT
+prototypes, NOT a finalized contract. After the VM24 time-cube rebuild + storage review, P4
+(`specs/p4_storage_policy_and_bbox_strategy.md`) will likely REDEFINE the compact format as
+raster-style (explicit bbox_actual/nx/ny/x0/y0/dx/dy/crs/scan/index_formula, flat row-major arrays of
+length nx*ny). Only `format=json` is a stable contract; do not build a frontend contract on `grid`
+yet.
+
 ONE canonical implementation shared by the API (`api/app.py`), the benches (`bench/bench_bbox_wire.py`,
-`bench/bench_bbox_http.py`), and the parity tests — so the wire format never drifts. Default
+`bench/bench_bbox_http.py`), and the parity tests — so the prototype never drifts. Default
 `format=json` (the row-array streaming path) is untouched and lives in app.py.
 
 Both compact formats encode straight from the 2-D `cols` arrays (no per-point dicts), so they skip the

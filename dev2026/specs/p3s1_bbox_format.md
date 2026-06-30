@@ -1,8 +1,21 @@
-# P3-S1 — opt-in compact bbox formats (`format=grid` / `format=columnar`)
+# P3-S1 — compact bbox PROTOTYPE + benchmark evidence (NOT a final contract)
 
-Ships the S0 decision: **grid-aware `format=grid`** as the primary opt-in bbox format (flat `columnar`
-as comparison), default **`format=json` unchanged**. No binary (S0: not justified). Server-only +
-shadow validation; **VM24 backfill is running → no production/store touch** (Codex S1 #5).
+> **STATUS (Codex review of PR #16): PROTOTYPE / measurement branch — NOT the final wire contract.**
+> Project direction changed after the VM24 full time-cube rebuild + storage review: the decision is now
+> whether the system can become **time-cube authoritative** with daily Zarr kept only as short-term
+> staging, and **bbox is a storage-architecture decision point** (blocker vs non-blocker), not just a
+> perf problem. So:
+> - **`format=json` default stays unchanged and stable.**
+> - `format=grid`/`columnar` here are **EXPERIMENTAL** measurement prototypes — do **not** document or
+>   ship as the final frontend contract. P4 will likely **redefine the compact format as raster-style**
+>   (`bbox_actual`/`nx`/`ny`/`x0`/`y0`/`dx`/`dy`/`crs`/`scan`/`index_formula`, flat row-major arrays).
+> - The frontend contract (P3-S3) **waits** for the storage decision in
+>   [`p4_storage_policy_and_bbox_strategy.md`](p4_storage_policy_and_bbox_strategy.md).
+> The evidence below stays valid: row JSON is expensive; compact formats cut server CPU, transfer, and
+> client heap — useful input to P4, where the bbox-from-cube-vs-daily benchmark decides the architecture.
+
+Server-side prototype of the S0 direction (grid-aware compact, flat columnar comparison), default
+`format=json` unchanged; shadow validation only; **VM24 production/store untouched.**
 
 ## What changed (server only)
 - `store/bbox_encode.py` — ONE canonical encoder (`encode_grid` / `encode_columnar`) shared by the
