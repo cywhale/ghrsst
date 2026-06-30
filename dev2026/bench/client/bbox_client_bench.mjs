@@ -6,10 +6,15 @@
 // Segments (spec §2 browser split): T_fetch (url mode) / T_text (decode body) / T_parse (JSON.parse)
 // / T_transform (minimal map-layer-input build: flat Float32Arrays of lon/lat/value over all points).
 //
+// Heap (Codex S1 #2): run with `node --expose-gc` to get a clean per-run heap delta (explicit gc()
+// before h0 and before h1). Without it, `gc_used:false` and the heap number is noisier (label only).
+// Bytes (Codex S1 #3): in URL mode `fetch().arrayBuffer()` is ALREADY DECOMPRESSED, so it is reported
+// as `decoded_bytes`, NOT transfer bytes. Compression is owned by NGINX (brotli/gzip); measure
+// COMPRESSED transfer + Content-Encoding separately with curl (see bench_bbox_http.py).
+//
 // Run:
-//   node dev2026/bench/client/bbox_client_bench.mjs --file dev2026/bench/results/payloads/bbox_750k_grid.json
-//   node dev2026/bench/client/bbox_client_bench.mjs --url 'http://127.0.0.1:8014/api/ghrsst?...&format=grid'
-//   (add --runs 3 to average; prints one JSON object)
+//   node --expose-gc dev2026/bench/client/bbox_client_bench.mjs --file .../bbox_750k_grid.json --runs 3
+//   node --expose-gc dev2026/bench/client/bbox_client_bench.mjs --url 'http://127.0.0.1:8099/api/ghrsst?...&format=grid'
 import { performance } from 'node:perf_hooks';
 import { readFile } from 'node:fs/promises';
 
@@ -56,29 +61,33 @@ function transform(p, fmt) {
   return { n, valid };
 }
 
+function gc_if() { if (global.gc) { global.gc(); return true; } return false; }
+
 async function once(o) {
-  let buf, t_fetch = null;
+  let buf, t_fetch = null, content_encoding = null, is_url = !!o.url;
   if (o.url) {
     const t0 = performance.now();
     const res = await fetch(o.url, { headers: { 'Accept-Encoding': 'br,gzip' } });
-    const ab = await res.arrayBuffer();
+    const ab = await res.arrayBuffer();        // NOTE: already decompressed -> decoded_bytes, not transfer
     t_fetch = performance.now() - t0;
     buf = Buffer.from(ab);
-    var content_encoding = res.headers.get('content-encoding');
+    content_encoding = res.headers.get('content-encoding');
   } else {
     buf = await readFile(o.file);
   }
-  const bytes = buf.length;
   let t = performance.now(); const text = buf.toString('utf8'); const t_text = performance.now() - t;
-  const h0 = process.memoryUsage().heapUsed;
+  const gc_used = gc_if(); const h0 = process.memoryUsage().heapUsed;
   t = performance.now(); const parsed = JSON.parse(text); const t_parse = performance.now() - t;
   const fmt = detect(parsed);
   t = performance.now(); const r = transform(parsed, fmt); const t_transform = performance.now() - t;
-  const heap_mb = Math.round((process.memoryUsage().heapUsed - h0) / 1e5) / 10;
-  return { fmt, bytes, content_encoding: o.url ? content_encoding : null,
-           t_fetch_ms: t_fetch == null ? null : +t_fetch.toFixed(1),
-           t_text_ms: +t_text.toFixed(1), t_parse_ms: +t_parse.toFixed(1),
-           t_transform_ms: +t_transform.toFixed(1), points: r.n, valid: r.valid, heap_mb };
+  gc_if(); const heap_mb = Math.round((process.memoryUsage().heapUsed - h0) / 1e5) / 10;
+  const out = { fmt, content_encoding, gc_used,
+                t_fetch_ms: t_fetch == null ? null : +t_fetch.toFixed(1),
+                t_text_ms: +t_text.toFixed(1), t_parse_ms: +t_parse.toFixed(1),
+                t_transform_ms: +t_transform.toFixed(1), points: r.n, valid: r.valid, heap_mb };
+  // bytes labelling (Codex S1 #3): URL = decoded (decompressed); FILE = on-disk size.
+  if (is_url) out.decoded_bytes = buf.length; else out.bytes = buf.length;
+  return out;
 }
 
 const o = args();
@@ -88,12 +97,15 @@ for (let i = 0; i < o.runs; i++) runs.push(await once(o));
 const last = runs[runs.length - 1];
 const avg = (k) => runs.every(r => r[k] == null) ? null
   : +(runs.reduce((s, r) => s + (r[k] || 0), 0) / runs.length).toFixed(1);
+const heaps = runs.map(r => r.heap_mb);
 console.log(JSON.stringify({
-  source: o.file || o.url, format: last.fmt, bytes: last.bytes,
+  source: o.file || o.url, mode: o.url ? 'url' : 'file', format: last.fmt,
+  bytes: last.bytes ?? null, decoded_bytes: last.decoded_bytes ?? null,
   content_encoding: last.content_encoding, points: last.points, valid: last.valid,
-  runs: o.runs, heap_mb: last.heap_mb,
+  runs: o.runs, gc_used: last.gc_used, heap_mb: last.heap_mb, heap_mb_runs: heaps,
   t_fetch_ms: avg('t_fetch_ms'), t_text_ms: avg('t_text_ms'),
   t_parse_ms: avg('t_parse_ms'), t_transform_ms: avg('t_transform_ms'),
   t_client_total_ms: +(['t_text_ms', 't_parse_ms', 't_transform_ms']
-    .reduce((s, k) => s + (avg(k) || 0), 0)).toFixed(1)
+    .reduce((s, k) => s + (avg(k) || 0), 0)).toFixed(1),
+  note: o.url ? 'decoded_bytes = decompressed body, NOT transfer; measure compressed transfer + Content-Encoding via curl' : undefined
 }, null, 2));

@@ -1,0 +1,115 @@
+{
+  "date_tag": "20260625",
+  "store": "synthetic(2048\u00b2,~5%NaN,no sst_anomaly)",
+  "day": "2026-01-01",
+  "points": 749956,
+  "shadow_port": 53444,
+  "results": {
+    "json": {
+      "curl": {
+        "transfer_bytes": 106371198,
+        "time_total_s": 0.949342,
+        "content_encoding": "(none)",
+        "x_read_ms": "12.5",
+        "x_encode_ms": null,
+        "x_served_rows": "749956",
+        "x_bbox_format": "json"
+      },
+      "client": {
+        "source": "http://127.0.0.1:53444/api/ghrsst?lon0=123.09721374511719&lat0=1.5486077070236206&lon1=156.9027862548828&lat1=18.451393127441406&start=2026-01-01&end=2026-01-01&append=sst,sst_anomaly,sea_ice&format=json",
+        "mode": "url",
+        "format": "row",
+        "bytes": null,
+        "decoded_bytes": 106371198,
+        "content_encoding": null,
+        "points": 749956,
+        "valid": 712549,
+        "runs": 3,
+        "gc_used": true,
+        "heap_mb": 130.8,
+        "heap_mb_runs": [
+          130.8,
+          130.8,
+          130.8
+        ],
+        "t_fetch_ms": 944.5,
+        "t_text_ms": 10.7,
+        "t_parse_ms": 189.2,
+        "t_transform_ms": 4.4,
+        "t_client_total_ms": 204.3,
+        "note": "decoded_bytes = decompressed body, NOT transfer; measure compressed transfer + Content-Encoding via curl"
+      }
+    },
+    "grid": {
+      "curl": {
+        "transfer_bytes": 10214281,
+        "time_total_s": 0.026557,
+        "content_encoding": "(none)",
+        "x_read_ms": "7.6",
+        "x_encode_ms": "14.1",
+        "x_served_rows": "749956",
+        "x_bbox_format": "grid"
+      },
+      "client": {
+        "source": "http://127.0.0.1:53444/api/ghrsst?lon0=123.09721374511719&lat0=1.5486077070236206&lon1=156.9027862548828&lat1=18.451393127441406&start=2026-01-01&end=2026-01-01&append=sst,sst_anomaly,sea_ice&format=grid",
+        "mode": "url",
+        "format": "grid",
+        "bytes": null,
+        "decoded_bytes": 10214281,
+        "content_encoding": null,
+        "points": 749956,
+        "valid": 712549,
+        "runs": 3,
+        "gc_used": true,
+        "heap_mb": 34.9,
+        "heap_mb_runs": [
+          34.9,
+          34.9,
+          34.9
+        ],
+        "t_fetch_ms": 39,
+        "t_text_ms": 1.1,
+        "t_parse_ms": 41.4,
+        "t_transform_ms": 4.3,
+        "t_client_total_ms": 46.8,
+        "note": "decoded_bytes = decompressed body, NOT transfer; measure compressed transfer + Content-Encoding via curl"
+      }
+    },
+    "columnar": {
+      "curl": {
+        "transfer_bytes": 24848333,
+        "time_total_s": 0.046284,
+        "content_encoding": "(none)",
+        "x_read_ms": "7.6",
+        "x_encode_ms": "29.6",
+        "x_served_rows": "749956",
+        "x_bbox_format": "columnar"
+      },
+      "client": {
+        "source": "http://127.0.0.1:53444/api/ghrsst?lon0=123.09721374511719&lat0=1.5486077070236206&lon1=156.9027862548828&lat1=18.451393127441406&start=2026-01-01&end=2026-01-01&append=sst,sst_anomaly,sea_ice&format=columnar",
+        "mode": "url",
+        "format": "columnar",
+        "bytes": null,
+        "decoded_bytes": 24848333,
+        "content_encoding": null,
+        "points": 749956,
+        "valid": 712549,
+        "runs": 3,
+        "gc_used": true,
+        "heap_mb": 46.8,
+        "heap_mb_runs": [
+          46.8,
+          46.8,
+          46.8
+        ],
+        "t_fetch_ms": 60.3,
+        "t_text_ms": 3.9,
+        "t_parse_ms": 67.6,
+        "t_transform_ms": 3.3,
+        "t_client_total_ms": 74.8,
+        "note": "decoded_bytes = decompressed body, NOT transfer; measure compressed transfer + Content-Encoding via curl"
+      }
+    }
+  },
+  "ops_note": "shadow uvicorn (no NGINX) -> Content-Encoding normally empty; real brotli/CE is a VM24 check, DEFERRED while backfill runs. Store never written."
+}
