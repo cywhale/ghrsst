@@ -88,21 +88,29 @@ Evidence supports one simple rule (evidence only — **NOT authorization to prun
 - **Time-cube authoritative**; daily Zarr = short-term staging only.
 - **Full history** for **point time-series / range** and **single-day point GET** (cheap from the cube
   at any age: ~2–3 ms).
-- **Spatial queries (bbox + POST /points) served only for the latest `SPATIAL_WINDOW_DAYS = 31` days**
-  (recent = bbox-friendly delta + newest base blocks). **Older spatial → clear 4xx** naming the
-  available window. **One date cutoff, no small/large split.**
+- **Spatial queries (bbox + POST /points) served only from days in the bbox-friendly recent tier — the
+  delta cube `t1/s256`** (currently `SPATIAL_WINDOW_DAYS = 31` days). **NOT from base blocks:** even the
+  *newest* base block is `t90/s8` and carries the same ~90× read amp (the numbers above), so it is
+  bbox-hostile just like old blocks. **Older spatial → clear 4xx** naming the available window.
+  **One date cutoff, no small/large split.**
+- **Delta retention invariant:** delta keeps ≥ 31 days; **compaction folds only days older than the
+  window into base** (never the latest 31, unless an equivalent bbox-friendly tier replaces them) — so
+  bbox/POST availability == delta membership.
 - The **historical/base bbox+POST results above are the RATIONALE for the 31-day cutoff** (base `s8/t90`
   ~90× read amp), **not** a path to optimize (base is read-optimal for the primary point-series).
 - **Option C** (separate single-day raster store) held in reserve only if full-history spatial later
   becomes a hard external requirement.
-One growing store (vs two ~2 TB+); every high-volume path stays fast. (Design: P4 spec §4.1.)
+One growing store (vs two ~2 TB+); every high-volume path stays fast. (Design: P4 spec §4.1 / §6.)
 
 ## Gate status — what this memo does NOT do
 - It does **not** authorize deleting or pruning the daily store.
 - Numbers are **synthetic + warm + local**; the **P4-S0b VM24 read-only binding gate** must validate the
   §4.1 policy on the real production base+delta (read-only): full-history point/range + single-day point,
-  recent-31-day bbox + POST within budget, and that older spatial would be rejected — before any
-  storage-policy commit.
+  bbox + POST on the **existing delta days** within budget, and that non-delta days would be rejected —
+  before any storage-policy commit. **Caveat:** prod delta currently holds only ~2 days, so P4-S0b can
+  validate per-day delta perf but **NOT** the full 31-day retention; testing 31 days needs a
+  **staging/shadow delta or an explicitly-approved backfill** — never mutate prod delta under the
+  read-only gate.
 - P3-S1 `format=grid`/`columnar` stay **experimental**; the frontend contract (P3-S3) stays paused
   until the policy sign-off (P4-S1).
 
