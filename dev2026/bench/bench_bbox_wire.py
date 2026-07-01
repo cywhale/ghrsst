@@ -38,7 +38,8 @@ HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, ".."))
 from store.zarr_paths import group_path  # noqa: E402
 from store.store_access import StoreAccess  # noqa: E402
-from store.bbox_encode import encode_columnar as _enc_col_canon, encode_grid as _enc_grid_canon  # noqa: E402
+from store.bbox_encode import (encode_columnar as _enc_col_canon, encode_grid as _enc_grid_canon,  # noqa: E402
+                               encode_coveragejson as _enc_cov)
 
 VARS = ("sst", "sst_anomaly", "sea_ice")
 SIZES = [("250k", 500, 500), ("750k", 1000, 750), ("1M", 1000, 1000)]
@@ -112,15 +113,18 @@ def main():
         t = time.perf_counter(); row_bytes = orjson.dumps(rows); t_enc_row = (time.perf_counter() - t) * 1000
         # COLUMNAR (flat, comparison)
         t = time.perf_counter(); col_bytes = _enc_columnar(lons, lats, cols, day); t_enc_col = (time.perf_counter() - t) * 1000
-        # GRID (primary candidate)
+        # GRID (comparison)
         t = time.perf_counter(); grid_bytes = _enc_grid(lons, lats, cols, day); t_enc_grid = (time.perf_counter() - t) * 1000
+        # COVERAGEJSON-lite (P4-S2 finalized format)
+        t = time.perf_counter(); cov_bytes = _enc_cov(lons, lats, cols, VARS, day); t_enc_cov = (time.perf_counter() - t) * 1000
 
         entry = {"label": label, "ni": ni, "nj": nj, "points": npoints,
                  "T_read_ms": round(t_read, 1), "T_rows_ms": round(t_rows, 1),
                  "formats": {}}
         for fmt, payload, t_enc in (("row", row_bytes, t_enc_row),
                                     ("columnar", col_bytes, t_enc_col),
-                                    ("grid", grid_bytes, t_enc_grid)):
+                                    ("grid", grid_bytes, t_enc_grid),
+                                    ("coveragejson", cov_bytes, t_enc_cov)):
             gz = _gzip(payload)
             entry["formats"][fmt] = {"bytes": len(payload), "gzip_bytes": gz,
                                      "T_encode_ms": round(t_enc, 1)}

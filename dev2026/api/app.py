@@ -374,7 +374,8 @@ async def read_ghrsst(
     if fmt in COMPACT_FORMATS:
         try:
             def _encode_compact() -> bytes:
-                return ENCODERS[fmt](lons, lats, cols, fields, chosen, truncate=("truncate" in modes))
+                return ENCODERS[fmt](lons, lats, cols, fields, chosen, truncate=("truncate" in modes),
+                                     bbox_requested=(lon0, lat0, lon1, lat1))
             _t1 = time.perf_counter()
             payload = await bex.run_ungated(_encode_compact)   # under held permit
             encode_ms = round((time.perf_counter() - _t1) * 1000, 1)
