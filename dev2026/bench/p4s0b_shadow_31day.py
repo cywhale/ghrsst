@@ -26,6 +26,7 @@ import os
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import zarr
@@ -42,7 +43,9 @@ from ingest.dual_write import append_to_delta  # noqa: E402  (writes SHADOW delt
 
 VARS = ("sst", "sst_anomaly", "sea_ice")
 BUDGET = {"bbox_warm_p95_ms": 200.0, "post_warm_p95_ms": 100.0, "post_c8_p95_ms": 1000.0}
-_PROD_HINTS = ("/Data/ghrsst/", "mur_timecube", ".delta.zarr")
+# Refuse the EXACT known production store basenames only (Codex #2). Staging under /Data/ghrsst (the 5 TB
+# disk) is ALLOWED, e.g. /home/odbadmin/Data/ghrsst/staging/p4s0b_shadow_31day.zarr — just not the prod stores.
+_PROD_BASENAMES = {"mur.zarr", "mur_timecube_s8_t90_sh128.zarr", "mur_timecube_s8_t90_sh128.delta.zarr"}
 
 
 def _p95(fn, n):
@@ -50,9 +53,19 @@ def _p95(fn, n):
     return round(ts[int(math.ceil(0.95 * len(ts)) - 1)], 1)
 
 
+def _c8(fn, C=8):
+    """Real concurrent p95 over C threads (Codex #1 — not sequential repeats)."""
+    with ThreadPoolExecutor(max_workers=C) as ex:
+        lat = list(ex.map(lambda _i: (lambda t0=time.perf_counter(): (fn(), (time.perf_counter() - t0) * 1000)[1])(), range(C)))
+    lat.sort()
+    return round(lat[int(math.ceil(0.95 * len(lat)) - 1)], 1)
+
+
 def _guard_not_production(path):
-    if any(h in path for h in _PROD_HINTS):
-        raise SystemExit(f"REFUSING: --delta-out '{path}' looks like production. Use a staging path.")
+    base = os.path.basename(os.path.normpath(path))
+    if base in _PROD_BASENAMES:
+        raise SystemExit(f"REFUSING: --delta-out basename '{base}' is a known PRODUCTION store. Use a "
+                         f"staging path, e.g. /home/odbadmin/Data/ghrsst/staging/p4s0b_shadow_31day.zarr")
 
 
 def _build_synth_daily(daily, G, days):
@@ -118,9 +131,9 @@ def main():
         run_bb = lambda d=d: cube_bbox_arrays(delta, d, *b, VARS)
         lons, lats, cols = run_bb()
         ch = chunk_cost(delta._array("sst").chunks, lats.size, lons.size, len(cols))
-        bw = _p95(run_bb, 4); bc = _p95(lambda d=d: run_bb(), 8)
+        bw = _p95(run_bb, 4); bc = _c8(run_bb)
         run_po = lambda d=d: cube_points_batch(delta, d, pts, VARS)
-        pw = _p95(run_po, 4); pc = _p95(lambda d=d: run_po(), 8)
+        pw = _p95(run_po, 4); pc = _c8(run_po)
         rep["per_day"].append({"day": d, "bbox_warm_p95_ms": bw, "bbox_c8_p95_ms": bc,
                                "read_amp": ch["read_amp"], "post_warm_p95_ms": pw, "post_c8_p95_ms": pc})
         print(f"{d:12} | {bw}/{bc} | {ch['read_amp']} | {pw}/{pc}")

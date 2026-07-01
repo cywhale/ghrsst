@@ -11,7 +11,8 @@ Validates:
   C. bbox + POST /points on EXISTING delta days (cube prototype reads, read-only) — latency / read_amp /
      RSS / parity vs the daily store for the same day
   D. policy dry-run: delta days are SERVED, a non-delta (older/base) day would be REJECTED (spatial_policy)
-  E. /healthz + RSS evidence (if --api-url)
+  E. /healthz + RSS + current API POST /points read-only smoke (DAILY-served today; the cube POST is
+     validated at store-prototype level in C, and policy enforcement is P4-S3)
 against the §3.2 ABSOLUTE budgets (bbox warm p95 < 200 ms; POST warm p95 < 100 ms & C8 < ~1 s; point
 ≤ daily+25% or < 50 ms).
 
@@ -77,6 +78,13 @@ def _http_get(url, timeout=30):
         return r.status, dict(r.headers), r.read()
 
 
+def _http_post(url, obj, timeout=30):
+    body = json.dumps(obj).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, dict(r.headers), r.read()
+
+
 def _bbox_vals(cols):
     return {f: np.nan_to_num(np.asarray(cols[f], np.float32), nan=-9e9) for f in cols}
 
@@ -121,8 +129,13 @@ def main():
     rng_days = days_all[-args.range_days:] if len(days_all) > args.range_days else days_all
     run_pr = lambda: tier.point_series(plon, plat, rng_days, VARS)
     rows = run_pr()
+    # sampled parity (Codex #5): compare cube vs daily point values on a few days across the range
+    sample_days = rng_days[::max(1, len(rng_days) // 5)][:5]
+    a_par = _rows_eq(sa.point_series(plon, plat, sample_days, VARS),
+                     tier.point_series(plon, plat, sample_days, VARS))
     rep["A_point_range"] = {"span": [rng_days[0], rng_days[-1]], "n_days": len(rows),
-                            "warm_p95_ms": _p95(run_pr, 5)}
+                            "warm_p95_ms": _p95(run_pr, 5),
+                            "sampled_days": sample_days, "sampled_parity": a_par}
     if args.api_url:
         try:
             st, hdr, _ = _http_get(f"{args.api_url}/api/ghrsst?lon0={plon}&lat0={plat}"
@@ -168,7 +181,7 @@ def main():
                               "reject_example": (spatial_policy.rejection_payload(older, delta_days) if older else None),
                               "note": "enforcement not yet implemented; validates the DECISION logic (delta membership)"}
 
-    # ---- E. healthz / RSS ----
+    # ---- E. healthz / RSS + current API POST /points read-only smoke ----
     if args.api_url:
         try:
             st, _, body = _http_get(f"{args.api_url}/healthz", timeout=20)
@@ -176,6 +189,14 @@ def main():
                                 ("cube_kind", "cube_latest", "cube_day_count", "delta_latest", "delta_day_count", "rss_mb")}}
         except Exception as e:  # noqa: BLE001
             rep["E_healthz"] = {"error": str(e)[:200]}
+        try:  # current API POST /points is DAILY-served today (policy wiring is P4-S3) — read-only smoke
+            st, _, resp = _http_post(f"{args.api_url}/api/ghrsst/points",
+                                     {"date": d0, "points": pts[:20], "append": "sst,sst_anomaly,sea_ice"})
+            rep["E_api_post_points"] = {"status": st, "n_rows": (len(json.loads(resp)) if st == 200 else None),
+                                        "note": "current API POST /points is daily-served today (cube POST validated at "
+                                                "store-prototype level in C); policy enforcement is P4-S3"}
+        except Exception as e:  # noqa: BLE001
+            rep["E_api_post_points"] = {"error": str(e)[:200]}
     rep["E_healthz"]["harness_process_rss_mb"] = round(_PROC.memory_info().rss / 1e6, 1)
 
     # ---- pass/fail vs absolute budgets ----
@@ -183,13 +204,17 @@ def main():
     post_ok = all(x["warm_p95_ms"] < BUDGET["post_warm_p95_ms"] and x["c8_p95_ms"] < BUDGET["post_c8_p95_ms"]
                   for x in rep["C_post"]) if rep["C_post"] else None
     point_ok = rep["B_single_point"]["cube_warm_p95_ms"] < BUDGET["point_abs_ms"]
-    parity_ok = (rep["B_single_point"]["parity"] and
-                 all(x["parity"] in (True, None) for x in rep["C_bbox"]) and
-                 all(x["parity"] in (True, None) for x in rep["C_post"]))
+    parity_ok = bool(rep["A_point_range"].get("sampled_parity") and
+                     rep["B_single_point"]["parity"] and
+                     all(x["parity"] in (True, None) for x in rep["C_bbox"]) and
+                     all(x["parity"] in (True, None) for x in rep["C_post"]))
+    policy_ok = bool(rep["D_policy_dryrun"]["older_day_rejected"])
+    perf_ok = bool(bbox_ok and post_ok and point_ok and parity_ok)     # budgets + parity
     rep["pass_fail"] = {"bbox_delta_within_budget": bbox_ok, "post_delta_within_budget": post_ok,
                         "single_point_within_budget": point_ok, "parity_ok": parity_ok,
-                        "policy_rejects_older": rep["D_policy_dryrun"]["older_day_rejected"],
-                        "OVERALL_per_day_delta": bool(bbox_ok and post_ok and point_ok and parity_ok),
+                        "PERF_overall_per_day_delta": perf_ok,
+                        "POLICY_rejects_older": policy_ok,                # spatial-policy decision logic
+                        "OVERALL_per_day_delta": bool(perf_ok and policy_ok),  # perf AND policy
                         "NOTE": "per-day delta only; full 31-day retention NOT validated here"}
     print(json.dumps({k: rep[k] for k in ("delta_days", "spatial_window", "A_point_range",
                                           "B_single_point", "pass_fail")}, indent=2, default=str))

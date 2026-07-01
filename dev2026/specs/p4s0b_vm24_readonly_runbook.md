@@ -36,24 +36,29 @@ dev2026/.venv/bin/python dev2026/bench/p4s0b_readonly_gate.py \
 ```
 
 ## What it validates (→ artifact JSON)
-- **A. full-history point/range** from base+delta (cube) + latency; optional API `X-Store-Route: cube`.
+- **A. full-history point/range** from base+delta (cube) + latency + **sampled parity vs daily** (a few
+  days across the range); optional API `X-Store-Route: cube`.
 - **B. single-day point GET** — cube vs daily **parity** + latency (cube ≈ or faster than daily).
 - **C. bbox + POST /points on EXISTING delta days** — per delta day: latency (warm p95 + `C8`),
   `read_amp`/`chunk_count`, and **parity** vs the daily store for that day.
 - **D. policy dry-run** — delta days are **served**; a historical/base day is **rejected** by the
   spatial policy (`store/spatial_policy.py`, delta-membership). Enforcement is not yet wired into the
   API (P4-S3) — this validates the decision logic.
-- **E. `/healthz` + RSS** — `cube_kind`/`cube_latest`/`delta_day_count`/`rss_mb` + harness process RSS.
+- **E. `/healthz` + RSS + API POST smoke** — `cube_kind`/`cube_latest`/`delta_day_count`/`rss_mb` +
+  harness process RSS, and a read-only **POST `/api/ghrsst/points`** smoke. Note: the API POST is
+  **daily-served today** (policy wiring is P4-S3); the cube POST feasibility is in **C** (prototype).
 
 ## Pass / fail (§3.2 absolute budgets)
 - bbox (recent/delta) **warm p95 < 200 ms**;
 - POST /points (recent/delta) **warm p95 < 100 ms** and **`C8` p95 < ~1 s**;
 - single-day point **< ~50 ms** (or ≤ daily p95 + 25 %);
-- **parity_ok** for point/bbox/POST vs daily; **policy rejects the older day**;
+- **parity_ok** for A(sampled)/B/C vs daily; **policy rejects the older day**;
 - RSS bounded (no OOM), route header `cube` for point/range.
-`pass_fail.OVERALL_per_day_delta == true` means the per-day delta gate passed — **not** that daily can be
-pruned. Demoting daily still requires (a) the full 31-day retention validated (shadow/staging), and (b)
-explicit approval + the P4-S1 sign-off.
+`pass_fail` splits **`PERF_overall_per_day_delta`** (budgets + parity), **`POLICY_rejects_older`**
+(spatial-policy decision logic), and **`OVERALL_per_day_delta`** (perf **and** policy).
+`OVERALL_per_day_delta == true` means the per-day delta gate passed — **not** that daily can be pruned.
+Demoting daily still requires (a) the full 31-day retention validated (shadow/staging), and (b) explicit
+approval + the P4-S1 sign-off.
 
 ## Hand-back
 Return the artifact JSON (+ console summary). Claude/orchestrator fold it into the P4-S1 decision. If any
