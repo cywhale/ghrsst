@@ -230,10 +230,11 @@ Before pruning ANY daily day (only after the §3.3 VM24 binding gate authorizes 
 - **corruption recovery plan:** if the cube is later found corrupt for a pruned span → re-derive from
   re-downloaded NetCDF (primary) or trash/hold (secondary, within the window); the prune manifest
   identifies exactly which spans need re-derivation.
-- **daily staging retention window:** initially **align to `SPATIAL_WINDOW_DAYS` = 31 days** (Codex
-  round-4) for operational simplicity — keep daily Zarr for the latest 31 days for re-derivation/
-  spot-checks, prune older; a later recovery-policy decision may lengthen it. (Must be ≥ the delta
-  window so any spatially-served day is also re-derivable from staging.)
+- **daily staging retention window:** initial retention is **31 days, aligned with
+  `SPATIAL_WINDOW_DAYS`** (keep daily Zarr for the latest 31 days for re-derivation/spot-checks, prune
+  older). It **may be extended** later, but **must not be shorter than `SPATIAL_WINDOW_DAYS` unless
+  NetCDF redownload is explicitly accepted as the recovery path** — so any spatially-served (delta) day
+  is also re-derivable from staging (or from redownload if the window is deliberately shortened).
 
 ## 7. Ops boundary (hard)
 **Do NOT touch VM24 production, cron, the daily store, base cube, delta cube, deployment scripts, or
@@ -265,19 +266,18 @@ restated because P4 reasons about production data that must stay untouched.)
 - **then** P3-S3 frontend contract resumes (recent-31-day spatial + the 4xx window contract).
 
 ## 9. Open questions (for orchestrator / Codex)
-**Decided (this patch):** policy = Option A + D with `SPATIAL_WINDOW_DAYS = 31` (spatial = bbox + POST,
-recent-31-day only, older → 4xx; full history for point/range + single-day point); POST bar is an
-absolute recent-window budget, not daily+25%; the single 31-day cutoff has no small/large split; WMS is
-not an API-facing substitute. (Old Q "is bbox a hard requirement / thresholds" resolved.)
+**Decided:** policy = Option A + D with **`SPATIAL_WINDOW_DAYS = 31`** (spatial = bbox + POST, served
+from the delta tier / recent-31-day only, older → 4xx; full history for point/range + single-day point);
+POST bar is an absolute recent-window budget, not daily+25%; single 31-day cutoff, no small/large split;
+WMS is not an API-facing substitute. **`SPATIAL_WINDOW_DAYS = 31` is the adopted default** (not an open
+14/30 choice) unless product later reopens it. **Daily staging retention = 31 days, aligned with
+`SPATIAL_WINDOW_DAYS`** (§6.2): may be **extended** later, but **must not be shorter unless NetCDF
+redownload is explicitly accepted as the recovery path**.
 
 **Still open:**
-1. **`SPATIAL_WINDOW_DAYS` value** — confirm **31** (vs 14 / 30) and align with the staging retention
-   window (Q2). Should the two be the same number?
-2. **Daily staging retention window:** 7 / 14 / 30 days (≥ `SPATIAL_WINDOW_DAYS`, since recent spatial
-   is served from the cube's recent tier regardless)?
-3. **CRS / cell_ref** for raster — EPSG:4326, `axis_order=lon,lat`, `cell_ref=center` confirmed?
-4. Confirm **re-chunking the base cube is off the table** (would hurt the primary point-series).
-5. If Option A: is **removing daily entirely** acceptable eventually, or always keep a rolling staging
-   window?
-6. **Compaction feasibility (§6.1):** is a second ~2 TB volume provisionable for staged rebuilds, or do
+1. **CRS / cell_ref** for raster — EPSG:4326, `axis_order=lon,lat`, `cell_ref=center` confirmed?
+2. Confirm **re-chunking the base cube is off the table** (would hurt the primary point-series).
+3. If Option A: is **removing daily staging entirely** eventually acceptable (relying on NetCDF
+   redownload for recovery), or always keep the rolling 31-day staging window?
+4. **Compaction feasibility (§6.1):** is a second ~2 TB volume provisionable for staged rebuilds, or do
    we commit to block-level/rolling compaction (or "defer compaction" with a delta-growth alarm)?
