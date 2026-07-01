@@ -14,6 +14,7 @@ synthetic fixtures have all vars on all days. Value parity vs the daily store is
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence
 
@@ -39,7 +40,14 @@ def _clamp(v, lo, hi):
 class TimeCubeStore:
     def __init__(self, cube_path: str):
         self.path = cube_path
-        self._g = zarr.open_group(cube_path, mode="r")
+        self._lock = threading.Lock()
+        self._load_meta()
+
+    def _load_meta(self):
+        """(Re)open the group so `group.attrs` reflect the CURRENT on-disk state. `append_to_delta`
+        finalizes `attrs['days']` LAST, so this only ever exposes fully-appended, VALIDATED days —
+        never a partially-written one."""
+        self._g = zarr.open_group(self.path, mode="r")
         self._lon = np.asarray(self._g["lon"][:])
         self._lat = np.asarray(self._g["lat"][:])
         days = list(self._g.attrs["days"])
@@ -50,8 +58,23 @@ class TimeCubeStore:
         # present-but-NaN land (null). Missing mask -> treat all present (back-compat).
         self.var_valid = {v: list(flags) for v, flags in
                           dict(self._g.attrs.get("var_valid", {})).items()}
-        self._lock = threading.Lock()
-        self._arr = {}   # var -> zarr.Array (handles are read-only/concurrent-safe)
+        self._arr = {}   # var -> zarr.Array; dropped on refresh (arrays may have been resized)
+        self._last_refresh = time.monotonic()
+
+    def refresh(self):
+        """P4-S3: re-read cube metadata from disk so new delta days become visible WITHOUT a process
+        restart. Concurrency-safe (under the store lock) and read-only. Call after a successful
+        append+validate, or on a TTL via `maybe_refresh`. In-flight reads keep their captured array
+        handles (old but valid); subsequent reads see the new days (eventual consistency)."""
+        with self._lock:
+            self._load_meta()
+
+    def maybe_refresh(self, ttl_seconds: float) -> bool:
+        """Refresh at most once per `ttl_seconds` (cheap monotonic guard). Returns True if it refreshed."""
+        if ttl_seconds and (time.monotonic() - self._last_refresh) >= ttl_seconds:
+            self.refresh()
+            return True
+        return False
 
     @property
     def latest(self) -> Optional[str]:

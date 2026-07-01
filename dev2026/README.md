@@ -51,6 +51,10 @@ GHRSST_ZARR_WORKERS=4
 GHRSST_RSS_CEILING_MB=4096
 GHRSST_BBOX_POINT_LIMIT=300000
 GHRSST_MAX_DAYS=366
+# P4-S3: background cube-metadata refresh interval (s) so a cron-appended delta day becomes visible
+# WITHOUT a PM2 restart. 0 = disabled. Set ~ the daily-append cadence, e.g. 300 (5 min). Refresh only
+# surfaces validated days (append_to_delta finalizes attrs['days'] last); /healthz shows cube_refresh_ttl_s.
+GHRSST_CUBE_REFRESH_TTL_SECONDS=0
 ```
 
 Restart current production app:
