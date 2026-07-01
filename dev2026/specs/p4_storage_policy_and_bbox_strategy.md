@@ -151,7 +151,14 @@ spatial is a structural blocker, so:
 
 This is the smallest sustainable footprint (one growing store) while every high-volume path stays fast.
 
-## 5. Compact bbox wire format → RASTER-style (redefine; supersedes the prototype `grid`) — **P4-S2**
+## 5. Compact bbox wire format → **SUPERSEDED by `specs/p4s2_raster_format_design.md`** — **P4-S2 (done)**
+> **This section is a historical early draft.** The compact bbox format was finalized as the
+> **CoverageJSON-lite `ghrsst-raster-json-1`** profile in
+> [`p4s2_raster_format_design.md`](p4s2_raster_format_design.md) and implemented (PR #22). The
+> ad-hoc RasterJSON sketch below (e.g. `fields[var]=null` for absent) is **NOT the shipped contract** —
+> in CoverageJSON-lite a whole-field-absent var OMITS `ranges.<var>` (never `null`). Kept only for the
+> §4.1 mapping reference; read the P4-S2 spec for the authoritative format.
+
 Only finalized once the serving store is chosen (§4). The xarray-like `lon[]`/`lat[]`+2-D `grid` is not
 intuitive for the frontend/API contract; use a **raster** contract:
 ```json

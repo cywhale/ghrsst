@@ -380,7 +380,7 @@ async def read_ghrsst(
         raise
     total = int(lons.size) * int(lats.size)
 
-    # ---- compact opt-in formats (grid / columnar): buffered single Response ----
+    # ---- compact opt-in formats (coveragejson / raster): buffered single Response ----
     if fmt in COMPACT_FORMATS:
         try:
             def _encode_compact() -> bytes:
