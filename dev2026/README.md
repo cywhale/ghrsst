@@ -55,6 +55,13 @@ GHRSST_MAX_DAYS=366
 # WITHOUT a PM2 restart. 0 = disabled. Set ~ the daily-append cadence, e.g. 300 (5 min). Refresh only
 # surfaces validated days (append_to_delta finalizes attrs['days'] last); /healthz shows cube_refresh_ttl_s.
 GHRSST_CUBE_REFRESH_TTL_SECONDS=0
+# P4-S3: enforce the spatial-window policy — bbox + POST /points served ONLY for days in the delta
+# window; older -> 4xx. DEFAULT 0 = OFF (daily serves any day). Turn ON only in time-cube-authoritative
+# mode once the delta retains SPATIAL_WINDOW_DAYS. point/range + single-day point GET stay full-history.
+GHRSST_SPATIAL_WINDOW_ENFORCE=0
+# P4-S2: enable opt-in coveragejson/raster bbox format. DEFAULT 0 = OFF. Enable only AFTER
+# GHRSST_SPATIAL_WINDOW_ENFORCE is on (so the compact format cannot bypass the window rule).
+GHRSST_ENABLE_COVERAGEJSON=0
 ```
 
 Restart current production app:

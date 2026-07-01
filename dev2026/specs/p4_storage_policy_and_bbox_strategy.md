@@ -135,7 +135,10 @@ spatial is a structural blocker, so:
   base block is `t90/s8` and carries the same ~90× read amplification (§2), so "recent base blocks" are
   bbox-hostile just like historical ones. **Older spatial queries return a clear 4xx** naming the
   available spatial window (e.g. "spatial queries limited to the latest 31 days; available window
-  <start>..<end>").
+  <start>..<end>"). **ENFORCEMENT WIRED (P4-S3):** bbox + POST /points gate on delta membership
+  (`store/spatial_policy.py`), behind `GHRSST_SPATIAL_WINDOW_ENFORCE` (default OFF = current
+  daily-serves-any-day). Turn ON in authoritative mode once the delta retains the window; point/range +
+  single-day point GET are NOT gated. `/healthz` exposes `spatial_window_enforce` + `spatial_window`.
 - **Delta retention invariant (spatial-serving guarantee):**
   - the delta must **retain at least `SPATIAL_WINDOW_DAYS` (31) days** of the bbox-friendly recent tier;
   - **compaction may fold ONLY days older than the spatial window into base**; it must **not** remove the
