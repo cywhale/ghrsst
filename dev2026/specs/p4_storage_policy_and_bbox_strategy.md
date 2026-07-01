@@ -95,9 +95,9 @@ Spatial reads (bbox + POST /points) are served ONLY from the recent window (§4.
 **absolute recent-window budgets**, not relative-to-daily:
 | metric | bar |
 |---|---|
-| **recent** single-day **bbox** warm p95 (≤ medium) | **< ~200 ms**; C8 bounded |
-| **recent** **POST /points** warm p95 | **< 100 ms**; **C8 p95 < ~1 s** |
-| full-history single-day **point** GET | **≤ daily-path p95 + 25 %** (or absolute < ~50 ms) |
+| **recent** single-day **bbox** warm p95 (≤ medium) | **< ~200 ms**; C8 bounded  · VM24: 24 ms / 178 ms C8 ✅ |
+| **recent** **POST /points** warm p95 | **< 100 ms** ✅ VM24 ~88 ms; **C8 p95 < ~1 s** ⚠ VM24 ~1.2–1.3 s (see below) |
+| full-history single-day **point** GET | **≤ daily-path p95 + 25 %** (or absolute < ~50 ms) · VM24: 4.5 ms ✅ |
 | **RSS** under C=8 | **≤ `GHRSST_RSS_CEILING_MB`** (prod 4096), no OOM, no unbounded growth |
 | **concurrency** C=4 / C=8 | bounded degradation, zero 5xx/OOM |
 POST is an absolute budget (not daily+25%) because it is served from the delta/recent tier only; daily's
@@ -105,6 +105,12 @@ POST is an absolute budget (not daily+25%) because it is served from the delta/r
 (base) bbox / scattered POST are NOT a threshold to pass** — their ~90× read amp is precisely the
 **rationale for the 31-day spatial cutoff (§4.1)**; the base layout is read-optimal for the primary
 point-series and is **not** a path we intend to optimize.
+
+> **POST C8 budget — DECISION PENDING (P4-S0b VM24, `p4s0b_vm24_results.md`).** Delta POST warm p95 is
+> ~88 ms (well inside 100 ms) but **C8 p95 ~1.2–1.3 s exceeds the ~1 s bar** → `OVERALL_per_day_delta`
+> failed on that alone. P4-S1 must **either optimize delta POST at C=8, or relax the POST C8 budget to
+> ~1.5 s** (recommended — POST /points at 8-way concurrency is a heavier, less-common call; 1.3 s is
+> operationally reasonable and warm p95 is fine). bbox / point / range all passed on real prod data.
 
 ### 3.3 Binding gate (Codex #1) — local/shadow is feasibility ONLY
 **Local/shadow P4-S0 proves feasibility; it CANNOT authorize deleting or pruning the daily store.**
@@ -194,7 +200,8 @@ daily is transient.
 - **validation:** coverage check + per-day/var presence + sanity (range/NaN-fraction) before commit.
 - **retry / resume:** checkpointed (existing per-(day,var,tile) checkpoint); idempotent re-run.
 - **duplicate / overwrite policy:** idempotent upsert (re-append same day = overwrite, count stable).
-- **latest metadata:** delta `days`/`latest` advance atomically; `/healthz` reflects tier latest.
+- **latest metadata:** delta `days`/`latest` advance atomically; `/healthz` reflects tier latest —
+  **but the SERVING process must reload to see it (§6.3).**
 - **rollback:** keep the prior delta (and a base snapshot pointer) until the new day validates; revert
   by pointer swap.
 ### 6.1 Compaction under the CURRENT disk reality (Codex #3) + spatial-window constraint
@@ -236,6 +243,27 @@ Before pruning ANY daily day (only after the §3.3 VM24 binding gate authorizes 
   NetCDF redownload is explicitly accepted as the recovery path** — so any spatially-served (delta) day
   is also re-derivable from staging (or from redownload if the window is deliberately shortened).
 
+### 6.3 Serving-side metadata reload after delta append (P4-S0b finding — REQUIRED for authoritative mode)
+P4-S0b found the running API's cube metadata is **stale after a delta append**: the API opens
+`TieredCube`/`TimeCubeStore` ONCE at lifespan and caches `delta.days`/`latest`, so a newly-appended delta
+day is **invisible until the process reloads** (VM24: disk delta had `2026-06-29` while `/healthz`
+`delta_latest = 2026-06-28`; a range ending `06-29` fell back to **daily**). Harmless today (daily is
+still authoritative), but a **blocker for time-cube-authoritative mode** — with daily demoted, an
+un-reloaded API would mis-serve / 4xx the newest day. **P4-S3 must include a reload strategy:**
+- **short-term (ops):** after a successful delta append, **restart the `ghrsst` PM2 process**
+  (`pm2 restart ghrsst`); simplest, already in the deploy runbook.
+- **better (code) — IMPLEMENTED (P4-S3, this PR):** `TimeCubeStore.refresh()` / `TieredCube.refresh()`
+  re-open the group and re-read `attrs['days']`/`latest`/`var_valid` (read-only, under the store lock;
+  drops cached array handles). `maybe_refresh(ttl)` is a cheap monotonic guard. The app runs a **TTL
+  background loop** (`GHRSST_CUBE_REFRESH_TTL_SECONDS`, 0 = disabled) that calls `cube.refresh()` off the
+  request path in an executor, so new delta days appear **without a restart**. Refresh only ever surfaces
+  **validated** days because `append_to_delta` finalizes `attrs['days']` LAST. `/healthz` exposes
+  `cube_refresh_ttl_s`. Tests: `tests/test_phase2_p4s3.py` (visible-after-refresh, TTL guard,
+  validated-only, app background loop).
+Either way the daily-append cron and the reload are ordered: **append → validate → reload** — the TTL
+loop reads only fully-appended days; set the TTL ≲ the daily-append cadence (the PM2 restart-after-append
+short-term fix stays as a belt-and-braces fallback).
+
 ## 7. Ops boundary (hard)
 **Do NOT touch VM24 production, cron, the daily store, base cube, delta cube, deployment scripts, or
 NGINX in this P4 work.** The production cube is working and must not be disturbed. This phase is
@@ -246,13 +274,13 @@ restated because P4 reasons about production data that must stay untouched.)
 - **P4-S0 (local/shadow — allowed now): FEASIBILITY only.** All-daily-routed-query benchmark
   (bbox + single-day point + POST points) daily vs base-cube vs delta-cube, with parity + the §3.2
   thresholds; cube prototype read paths. Output evidence. **Cannot authorize any pruning.**
-- **P4-S0b (VM24 READ-ONLY binding gate — needs explicit approval):** validate the §4.1 policy against
-  **real production base+delta** (read-only; no writes/pruning/cron/deploy). Confirm on prod:
-  **full-history point/range** ✓, **full-history single-day point GET** ✓, **bbox + POST /points on the
-  EXISTING delta days** within the absolute budget (§3.2), and that **days NOT in the delta would be
-  rejected** by the policy once implemented.
-  - **Caveat (Codex round-4):** production delta currently holds only **~2 days** (2026-06-27..28), so
-    P4-S0b can validate **per-day delta performance** but **NOT the full 31-day retention policy** —
+- **P4-S0b (VM24 READ-ONLY binding gate) — RAN 2026-07-01 (Codex/ops), PARTIAL PASS.** Results:
+  `p4s0b_vm24_results.md`. Full-history point/range ✓ (26 ms), single-day point ✓ (4.5 ms), delta bbox ✓
+  (24 ms / 178 ms C8), delta POST warm ✓ (~88 ms) + parity ✓ + policy-reject ✓, but **delta POST C8
+  ~1.2–1.3 s > ~1 s → `OVERALL_per_day_delta = false`** (POST C8 only). Surfaced two findings: harness
+  fan-out bug (fixed) and **stale delta metadata after append** (§6.3).
+  - **Caveat (Codex round-4):** production delta held only **~3 days** (2026-06-27..29) at run time, so
+    P4-S0b validated **per-day delta performance** but **NOT the full 31-day retention policy** —
     there aren't 31 delta days to serve yet.
   - **To test the full 31-day window** without mutating production: use a **staging/shadow delta** (build
     31 recent days into a shadow delta and benchmark it) OR an **explicitly-approved prep step** that
@@ -275,9 +303,13 @@ WMS is not an API-facing substitute. **`SPATIAL_WINDOW_DAYS = 31` is the adopted
 redownload is explicitly accepted as the recovery path**.
 
 **Still open:**
-1. **CRS / cell_ref** for raster — EPSG:4326, `axis_order=lon,lat`, `cell_ref=center` confirmed?
-2. Confirm **re-chunking the base cube is off the table** (would hurt the primary point-series).
-3. If Option A: is **removing daily staging entirely** eventually acceptable (relying on NetCDF
+1. **Delta POST C8 budget (P4-S0b, §3.2):** VM24 delta POST C8 ~1.2–1.3 s > ~1 s. **Relax C8 budget to
+   ~1.5 s** (recommended) **or optimize** delta POST at C=8? — P4-S1 decides. (warm p95 ~88 ms is fine.)
+2. **CRS / cell_ref** for raster — EPSG:4326, `axis_order=lon,lat`, `cell_ref=center` confirmed?
+3. Confirm **re-chunking the base cube is off the table** (would hurt the primary point-series).
+4. If Option A: is **removing daily staging entirely** eventually acceptable (relying on NetCDF
    redownload for recovery), or always keep the rolling 31-day staging window?
-4. **Compaction feasibility (§6.1):** is a second ~2 TB volume provisionable for staged rebuilds, or do
+5. **Compaction feasibility (§6.1):** is a second ~2 TB volume provisionable for staged rebuilds, or do
    we commit to block-level/rolling compaction (or "defer compaction" with a delta-growth alarm)?
+6. **Reload strategy (§6.3):** short-term PM2 restart-after-append, or ship the TTL/refresh code path in
+   P4-S3? (Required before authoritative mode — a stale API mis-serves the newest delta day.)

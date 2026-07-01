@@ -23,6 +23,18 @@ class TieredCube:
         self.base = base
         self.delta = delta
 
+    def refresh(self):
+        """P4-S3: refresh base + delta metadata (new delta days visible without a restart)."""
+        self.base.refresh()
+        if self.delta is not None:
+            self.delta.refresh()
+
+    def maybe_refresh(self, ttl_seconds: float) -> bool:
+        refreshed = self.base.maybe_refresh(ttl_seconds)
+        if self.delta is not None:
+            refreshed = self.delta.maybe_refresh(ttl_seconds) or refreshed
+        return refreshed
+
     @property
     def latest(self) -> Optional[str]:
         cands = [c.latest for c in (self.base, self.delta) if c is not None and c.latest]

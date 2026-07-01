@@ -60,6 +60,9 @@ class Cfg:
     OVERLOAD_QUEUE_MAX = _env_int("GHRSST_OVERLOAD_QUEUE_MAX", 4 * ZARR_WORKERS)
     LONG_CACHE_SECONDS = _env_int("GHRSST_FIXED_CACHE_SECONDS", 864000)  # 10d (immutable)
     BBOX_STREAM_BATCH = _env_int("GHRSST_BBOX_STREAM_BATCH", 50_000)
+    # P4-S3: background cube-metadata refresh interval (s) so new delta days appear without a restart.
+    # 0 = disabled (rely on restart-after-append). Recommended on VM24 ~ the daily-append cadence.
+    CUBE_REFRESH_TTL_SECONDS = _env_int("GHRSST_CUBE_REFRESH_TTL_SECONDS", 0)
 
 
 cfg = Cfg()
@@ -138,7 +141,25 @@ async def lifespan(app: FastAPI):
             print(f"[GHRSST] time-cube load skipped: {e}")
     app.state.router = HybridRouter(app.state.store, cube)
     app.state.bex = BoundedExecutor(cfg.ZARR_WORKERS, cfg.OVERLOAD_QUEUE_MAX, cfg.OVERLOAD_WAIT_MS)
+
+    # P4-S3: TTL background metadata refresh so a newly-appended delta day becomes visible WITHOUT a
+    # process restart (the daily-append cron writes attrs['days'] last, so refresh only surfaces
+    # validated days). Off the request path; runs cube.refresh() in an executor. 0 disables (manual/
+    # restart only). Ordering held by ingest: append -> validate -> (within TTL) this refresh.
+    app.state.cube_refresh_ttl = cfg.CUBE_REFRESH_TTL_SECONDS
+    refresh_task = None
+    if cube is not None and cfg.CUBE_REFRESH_TTL_SECONDS > 0:
+        async def _refresh_loop():
+            while True:
+                await asyncio.sleep(cfg.CUBE_REFRESH_TTL_SECONDS)
+                try:
+                    await asyncio.get_event_loop().run_in_executor(None, cube.refresh)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[GHRSST] cube refresh skipped: {e}")
+        refresh_task = asyncio.create_task(_refresh_loop())
     yield
+    if refresh_task is not None:
+        refresh_task.cancel()
     app.state.bex.shutdown()
 
 
@@ -472,4 +493,5 @@ async def healthz(request: Request):
             "cube_latest_in_sync": (cube.latest == l if cube else None),
             "delta_latest": (cube.delta.latest if isinstance(cube, TieredCube) and cube.delta else None),
             "delta_day_count": (cube.delta.day_count if isinstance(cube, TieredCube) and cube.delta else 0),
+            "cube_refresh_ttl_s": getattr(request.app.state, "cube_refresh_ttl", 0),
             "route_counts": dict(router.route_counts)}
