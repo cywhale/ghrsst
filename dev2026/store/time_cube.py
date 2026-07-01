@@ -44,11 +44,12 @@ class _Meta(NamedTuple):
     g: object
     lon: np.ndarray
     lat: np.ndarray
-    days: List[str]
+    days: List[str]               # PHYSICAL/append order (day_index maps to the stored time index)
     day_index: Dict[str, int]
     vars: List[str]
     var_valid: Dict[str, list]
     arr: Dict[str, object]        # var -> zarr.Array handle (precomputed; immutable)
+    latest_day: Optional[str]     # CHRONOLOGICAL max(days) — days may be append-order after backfills
 
 
 class TimeCubeStore:
@@ -68,7 +69,12 @@ class TimeCubeStore:
         # per-(day,var) validity: ABSENT (omit, P1 parity) vs present-but-NaN land (null).
         var_valid = {v: list(flags) for v, flags in dict(g.attrs.get("var_valid", {})).items()}
         arr = {v: g[v] for v in vars_ if v in g}
-        return _Meta(g, lon, lat, days, {d: i for i, d in enumerate(days)}, vars_, var_valid, arr)
+        # `latest` must be CHRONOLOGICAL, not days[-1]: an out-of-order backfill (e.g. append recent
+        # days then backfill older ones) leaves attrs['days'] in APPEND order. ISO date strings sort
+        # chronologically, so max(days) is the true latest. day_index keeps the PHYSICAL mapping — the
+        # stored arrays are NOT reordered.
+        latest_day = max(days) if days else None
+        return _Meta(g, lon, lat, days, {d: i for i, d in enumerate(days)}, vars_, var_valid, arr, latest_day)
 
     def refresh(self):
         """P4-S3: re-read cube metadata so new delta days become visible WITHOUT a process restart. The
@@ -114,8 +120,7 @@ class TimeCubeStore:
 
     @property
     def latest(self) -> Optional[str]:
-        days = self._meta.days
-        return days[-1] if days else None
+        return self._meta.latest_day        # chronological max(days), not days[-1] (see _build_meta)
 
     @property
     def day_count(self) -> int:

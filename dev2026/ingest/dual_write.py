@@ -99,8 +99,9 @@ def sync_missing(daily_path: str, cube_path: str) -> List[str]:
     Re-runnable. Returns the days synced. (Gaps BEFORE cube latest need a rebuild — see
     check_coverage.)"""
     g = zarr.open_group(cube_path, mode="r")
-    cube_days = set(g.attrs["days"])
-    cube_latest = g.attrs["days"][-1] if g.attrs["days"] else ""
+    _days = list(g.attrs["days"])
+    cube_days = set(_days)
+    cube_latest = max(_days) if _days else ""       # chronological (days may be append-order)
     todo = [d for d in list_existing_days(daily_path) if d > cube_latest and d not in cube_days]
     for d in todo:
         sync_day(daily_path, cube_path, d)
@@ -279,8 +280,8 @@ def check_coverage(daily_path: str, cube_path: str) -> dict:
     cube_set = set(cube_days)
     daily = list_existing_days(daily_path)
     daily_latest = daily[-1] if daily else None
-    cube_latest = cube_days[-1] if cube_days else None
-    cube_earliest = cube_days[0] if cube_days else None
+    cube_latest = max(cube_days) if cube_days else None      # chronological (days may be append-order)
+    cube_earliest = min(cube_days) if cube_days else None
     # daily days strictly WITHIN the cube's existing span [earliest, latest] that are missing
     # (these need a REBUILD); days AFTER cube_latest are just not-yet-appended (sync_missing).
     in_span_missing = [d for d in daily
