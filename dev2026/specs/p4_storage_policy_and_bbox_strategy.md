@@ -252,11 +252,17 @@ still authoritative), but a **blocker for time-cube-authoritative mode** — wit
 un-reloaded API would mis-serve / 4xx the newest day. **P4-S3 must include a reload strategy:**
 - **short-term (ops):** after a successful delta append, **restart the `ghrsst` PM2 process**
   (`pm2 restart ghrsst`); simplest, already in the deploy runbook.
-- **better (code):** a **metadata refresh / TTL-based reopen** of `TieredCube`/`TimeCubeStore` (re-read
-  `delta.attrs['days']`/`latest` on a short TTL or on an explicit refresh signal) so new delta days
-  become visible **without a restart**. Must stay read-only + concurrency-safe (the stores hold a lock).
-Either way the daily-append cron and the reload must be ordered: **append → validate → reload** before
-the new day is advertised as cube-served.
+- **better (code) — IMPLEMENTED (P4-S3, this PR):** `TimeCubeStore.refresh()` / `TieredCube.refresh()`
+  re-open the group and re-read `attrs['days']`/`latest`/`var_valid` (read-only, under the store lock;
+  drops cached array handles). `maybe_refresh(ttl)` is a cheap monotonic guard. The app runs a **TTL
+  background loop** (`GHRSST_CUBE_REFRESH_TTL_SECONDS`, 0 = disabled) that calls `cube.refresh()` off the
+  request path in an executor, so new delta days appear **without a restart**. Refresh only ever surfaces
+  **validated** days because `append_to_delta` finalizes `attrs['days']` LAST. `/healthz` exposes
+  `cube_refresh_ttl_s`. Tests: `tests/test_phase2_p4s3.py` (visible-after-refresh, TTL guard,
+  validated-only, app background loop).
+Either way the daily-append cron and the reload are ordered: **append → validate → reload** — the TTL
+loop reads only fully-appended days; set the TTL ≲ the daily-append cadence (the PM2 restart-after-append
+short-term fix stays as a belt-and-braces fallback).
 
 ## 7. Ops boundary (hard)
 **Do NOT touch VM24 production, cron, the daily store, base cube, delta cube, deployment scripts, or
