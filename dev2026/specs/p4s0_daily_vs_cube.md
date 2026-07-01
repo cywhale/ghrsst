@@ -60,10 +60,10 @@ daily-recent) → **parity `True` for bbox/point/POST on BOTH base and delta** (
   the P4 spec predicted; **re-chunking the base is off the table** (it's read-optimal for the primary
   point-series workload). ❌
 - **scattered POST /points: DELTA usable / BASE FAIL.** With grouped reads, **recent-day (delta) POST is
-  49 ms warm / 467 ms C8** (vs daily 15 ms) — operationally fine but **exceeds the strict daily+25% bar**
-  (see threshold reconciliation → P4-S1 product decision). **Historical-day (base) POST stays 2.5 s** —
-  same root cause as historical bbox (2 901 tiny `(90,8,8)` chunks × 90 steps). So the blocker is
-  **historical**, not POST per se. ⚠️ delta (usable, bar TBD) / ❌ base.
+  49 ms warm / 467 ms C8** (vs daily 15 ms) — meets the **absolute recent-window POST budget** below.
+  **Historical-day (base) POST stays 2.5 s** — same root
+  cause as historical bbox (2 901 tiny `(90,8,8)` chunks × 90 steps). So the blocker is **historical**,
+  not POST per se. ✅ recent(delta) / ❌ historical(base).
 
 ## The clean split (precise per path)
 - **RECENT days (DELTA tier `s256/t1`): all paths operationally fast, but not identical** —
@@ -74,33 +74,38 @@ daily-recent) → **parity `True` for bbox/point/POST on BOTH base and delta** (
   (~90× read amp + tens of thousands of tiny chunks). The base layout is read-optimal for the PRIMARY
   point-series workload and **must not be re-chunked**.
 
-## Threshold reconciliation — delta POST vs the §3.2 provisional bar
-The P4 spec §3.2 sets "point/POST from cube ≤ daily p95 + 25%". Daily POST warm p95 ≈ **15 ms**, so the
-strict bar is ~19 ms; **delta POST at 49 ms warm / 467 ms C8 FAILS that bar** — while being clearly
-usable in absolute terms. Two readings, flagged as a **product decision for P4-S1**:
-- **(mark)** delta POST is **"usable but exceeds daily+25%"**; keep the strict relative bar and accept
-  this as a known, documented gap; OR
-- **(revise, recommended)** replace the relative POST bar with an **absolute budget** — e.g. **POST warm
-  p95 < 100 ms and C8 p95 bounded (< ~1 s)** — which delta meets. Rationale: daily's ~15 ms is an
-  artifact of its `(1,1024,1024)` layout where all points fall in ONE chunk; that is not a meaningful
-  performance FLOOR to hold the cube to. An absolute interactive budget is the sounder product bar.
-This does not affect the bbox conclusion; it only concerns the recent-day POST bar. **P4-S1 decides.**
+## Threshold reconciliation — delta POST → absolute recent-window budget (RESOLVED)
+The original §3.2 bar was "point/POST from cube ≤ daily p95 + 25%". Daily POST warm p95 ≈ **15 ms** → a
+~19 ms bar, which **delta POST (49 ms warm / 467 ms C8) fails** while being clearly usable. Since the
+adopted policy serves **POST /points from the recent tier only**, the bar is **revised to an absolute
+recent-window budget: POST warm p95 < 100 ms and C8 p95 < ~1 s** — which **delta POST meets**. Rationale:
+daily's ~15 ms is an artifact of its `(1,1024,1024)` single-chunk layout (all points in one chunk), not
+a meaningful FLOOR to hold the cube to. Point GET keeps daily+25% (or absolute < ~50 ms). bbox conclusion
+unaffected.
 
-## Recommendation (evidence only — NOT authorization to prune)
-Lean **Option A (cube authoritative + daily short-term staging) + Option D for the historical-spatial
-blockers**:
-- serve point/range + single-day point (any day) + **all recent/delta-day** bbox & POST from the cube;
-- **constrain/deprecate large HISTORICAL bbox & scattered HISTORICAL POST** (cap size / "recent-only" /
-  WMS for spatial), unless an external requirement justifies a **separate single-day raster store
-  (Option C)** for historical spatial reads;
-- this keeps one growing store (vs two ~2 TB+) while every high-volume path stays fast.
+## Recommendation → adopted policy: Option A + D with `SPATIAL_WINDOW_DAYS = 31`
+Evidence supports one simple rule (evidence only — **NOT authorization to prune**):
+- **Time-cube authoritative**; daily Zarr = short-term staging only.
+- **Full history** for **point time-series / range** and **single-day point GET** (cheap from the cube
+  at any age: ~2–3 ms).
+- **Spatial queries (bbox + POST /points) served only for the latest `SPATIAL_WINDOW_DAYS = 31` days**
+  (recent = bbox-friendly delta + newest base blocks). **Older spatial → clear 4xx** naming the
+  available window. **One date cutoff, no small/large split.**
+- The **historical/base bbox+POST results above are the RATIONALE for the 31-day cutoff** (base `s8/t90`
+  ~90× read amp), **not** a path to optimize (base is read-optimal for the primary point-series).
+- **Option C** (separate single-day raster store) held in reserve only if full-history spatial later
+  becomes a hard external requirement.
+One growing store (vs two ~2 TB+); every high-volume path stays fast. (Design: P4 spec §4.1.)
 
 ## Gate status — what this memo does NOT do
 - It does **not** authorize deleting or pruning the daily store.
-- Numbers are **synthetic + warm + local**; the **P4-S0b VM24 read-only binding gate** must rerun this
-  matrix on the real production base+delta (read-only) and clear §3.2 before any storage-policy commit.
+- Numbers are **synthetic + warm + local**; the **P4-S0b VM24 read-only binding gate** must validate the
+  §4.1 policy on the real production base+delta (read-only): full-history point/range + single-day point,
+  recent-31-day bbox + POST within budget, and that older spatial would be rejected — before any
+  storage-policy commit.
 - P3-S1 `format=grid`/`columnar` stay **experimental**; the frontend contract (P3-S3) stays paused
-  until the storage decision (P4-S1) is made.
+  until the policy sign-off (P4-S1).
 
 ## Next
-**P4-S0b** (VM24 read-only binding gate — needs explicit approval) → **P4-S1** storage-policy decision.
+**P4-S0b** (VM24 read-only binding gate — needs explicit approval; validates the `SPATIAL_WINDOW_DAYS=31`
+policy) → **P4-S1** finalize policy.
