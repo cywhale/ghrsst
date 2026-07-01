@@ -13,6 +13,7 @@ import datetime
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -53,7 +54,7 @@ def _build(tmp, ndays=6):
 class StoreRefresh(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="p4s3_")
-        self.daily, self.base, self.delta, self.days = _build(self.tmp)
+        self.daily, self.base, self.delta, self.days = _build(self.tmp, ndays=9)
 
     def tearDown(self):
         import shutil; shutil.rmtree(self.tmp, ignore_errors=True)
@@ -92,6 +93,38 @@ class StoreRefresh(unittest.TestCase):
         append_to_delta(self.daily, self.delta, self.days[5], spatial_chunk=16, shard_spatial=16)
         d.refresh()
         self.assertEqual(d.days, before + [self.days[5]])           # exactly one fully-appended new day
+
+    def test_concurrency_refresh_stress(self):
+        # readers hammer point_series/covers_days/latest while a writer appends + refresh()es. With the
+        # immutable-snapshot swap there must be NO torn-metadata exceptions and latest stays valid/monotonic.
+        cube = TieredCube(TimeCubeStore(self.base), TimeCubeStore(self.delta))
+        errors: list = []; latests: list = []; stop = threading.Event()
+        order = {d: i for i, d in enumerate(self.days)}
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    cube.covers_days([self.days[4]])
+                    cube.point_series(115.0, 12.0, self.days[:6], ["sst", "sst_anomaly"])
+                    lat = cube.latest
+                    if lat is not None:
+                        latests.append(lat)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(repr(e)); return
+
+        ts = [threading.Thread(target=reader) for _ in range(5)]
+        [t.start() for t in ts]
+        for nd in (self.days[5], self.days[6], self.days[7], self.days[8]):
+            append_to_delta(self.daily, self.delta, nd, spatial_chunk=16, shard_spatial=16)
+            cube.refresh()
+            time.sleep(0.02)
+        stop.set(); [t.join() for t in ts]
+
+        self.assertEqual(errors, [], f"reader errors under refresh: {errors[:3]}")
+        self.assertTrue(set(latests) <= set(self.days[4:9]), f"invalid latest observed: {set(latests)}")
+        # latest never regresses to before the starting day and ends at the last appended day
+        self.assertTrue(all(order[l] >= order[self.days[4]] for l in latests))
+        self.assertEqual(cube.latest, self.days[8])
 
 
 # ---- app background TTL refresh (integration) ----
