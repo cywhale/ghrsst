@@ -40,7 +40,9 @@ dev2026/.venv/bin/python dev2026/bench/p4s0b_readonly_gate.py \
   days across the range); optional API `X-Store-Route: cube`.
 - **B. single-day point GET** — cube vs daily **parity** + latency (cube ≈ or faster than daily).
 - **C. bbox + POST /points on EXISTING delta days** — per delta day: latency (warm p95 + `C8`),
-  `read_amp`/`chunk_count`, and **parity** vs the daily store for that day.
+  `read_amp`/`chunk_count`, and **parity** vs the daily store for that day. (POST points are sampled
+  **within the bbox window** so the daily-parity read stays under the `points_batch` fan-out limit 64 —
+  global-random points would fail by testing rejection instead of parity/perf.)
 - **D. policy dry-run** — delta days are **served**; a historical/base day is **rejected** by the
   spatial policy (`store/spatial_policy.py`, delta-membership). Enforcement is not yet wired into the
   API (P4-S3) — this validates the decision logic.

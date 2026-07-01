@@ -121,7 +121,12 @@ def main():
     i0 = (lat.size - ni) // 2; j0 = (lon.size - nj) // 2
     b = (float(lon[j0]), float(lat[i0]), float(lon[j0 + nj - 1]), float(lat[i0 + ni - 1]))  # ~250k @ prod
     rng = np.random.default_rng(7)
-    pts = [[float(lon[rng.integers(0, lon.size)]), float(lat[rng.integers(0, lat.size)])] for _ in range(1000)]
+    # POST points sampled INSIDE the bbox window (fan-out-bounded; global-random hits the daily
+    # points_batch fan-out limit 64 — Codex P4-S0b).
+    jj0, jj1 = sorted((int(np.searchsorted(lon, b[0])), int(np.searchsorted(lon, b[2]))))
+    ii0, ii1 = sorted((int(np.searchsorted(lat, b[1])), int(np.searchsorted(lat, b[3]))))
+    jj1 = min(jj1, lon.size - 1); ii1 = min(ii1, lat.size - 1)
+    pts = [[float(lon[rng.integers(jj0, jj1 + 1)]), float(lat[rng.integers(ii0, ii1 + 1)])] for _ in range(1000)]
 
     rep = {"gate": "P4-S0b SHADOW retention", "shadow_only": True, "window": N,
            "delta_days": list(delta.days), "delta_build_s": build_s, "per_day": [], "policy": {}}

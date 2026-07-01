@@ -156,7 +156,7 @@ def main():
     # ---- C. bbox + POST on EXISTING delta days (read-only cube prototype) ----
     b = _central_bbox(lon, lat, 500, 500)              # ~250k pts
     rng = np.random.default_rng(7)
-    pts = [[float(lon[rng.integers(0, lon.size)]), float(lat[rng.integers(0, lat.size)])] for _ in range(1000)]
+    pts = _window_points(lon, lat, b, 1000, rng)       # fan-out-bounded (within the bbox window)
     for day in delta_days:
         run_bb = lambda day=day: cube_bbox_arrays(delta, day, *b, VARS)
         lons, lats, cols = run_bb()
@@ -235,6 +235,19 @@ def _central_bbox(lon, lat, ni, nj):
     ni = min(ni, lat.size); nj = min(nj, lon.size)
     i0 = (lat.size - ni) // 2; j0 = (lon.size - nj) // 2
     return float(lon[j0]), float(lat[i0]), float(lon[j0 + nj - 1]), float(lat[i0 + ni - 1])
+
+
+def _window_points(lon, lat, b, n, rng):
+    """Sample n POST points INSIDE the bbox window (Codex P4-S0b): global-random points span >64 daily
+    chunks and hit StoreAccess.points_batch fan-out limit (64) during the daily PARITY read, so the
+    harness would test rejection instead of parity/perf. Window-local points bound the daily fan-out to
+    the few chunks the window spans (the realistic spatial-query case; the scattered worst-case is the
+    documented base-tier blocker in P4-S0)."""
+    lo0, la0, lo1, la1 = b
+    j0, j1 = sorted((int(np.searchsorted(lon, lo0)), int(np.searchsorted(lon, lo1))))
+    i0, i1 = sorted((int(np.searchsorted(lat, la0)), int(np.searchsorted(lat, la1))))
+    j0, j1 = max(0, j0), min(lon.size - 1, j1); i0, i1 = max(0, i0), min(lat.size - 1, i1)
+    return [[float(lon[rng.integers(j0, j1 + 1)]), float(lat[rng.integers(i0, i1 + 1)])] for _ in range(n)]
 
 
 def _rows_eq(a, b):
