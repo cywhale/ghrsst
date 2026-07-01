@@ -1,7 +1,11 @@
 # P4-S2 — compact raster wire format (CoverageJSON-lite) — design spec
 
-Status: **DRAFT for Codex review** (Claude authored; Codex reviews; Claude implements after sign-off).
-**Do not implement yet.** Supersedes the ad-hoc RasterJSON draft in
+Status: **DRAFT — revised per Codex round-1** (Claude authored; Codex reviewed; fixes folded; ready for
+sign-off). **Do not implement yet.** Round-1 fixes: media type = `application/vnd.cov+json` (not
+`prs.coverage+json`), `application/json` first (§2/§7); `cell_ref=center` is a profile convention, NOT
+CRS84 (§1/§2.1/§2.3); absent field OMITS `ranges.<var>` (never `null`) (§2.2); `ghrsst:` prefix + profile
+URIs defined (§2.3); both `format=coveragejson` + `format=raster`; `t` resolved from MUR source (09:00Z);
+units match row `format=json` exactly (§7). Supersedes the ad-hoc RasterJSON draft in
 [`p4_storage_policy_and_bbox_strategy.md`](p4_storage_policy_and_bbox_strategy.md) §5 by aligning it to a
 small, stable **CoverageJSON profile**. Default **`format=json` stays unchanged**; the raster format is
 **opt-in**. Serves the recent-31-day spatial window only (P4 §4.1).
@@ -43,17 +47,21 @@ takes 750k from 240 ms/142 MB to ~57 ms/12 MB, so JSON raster is expected to suf
 A **valid CoverageJSON `Coverage` (Grid) subset** so generic covjson tooling / agents can read it, using:
 - the **compact `start/stop/num`** regular axes (small envelope);
 - `ranges` as **`NdArray`** flat row-major arrays with `null` nodata (the compact win from P3-S0/S1);
-- **CRS84** referencing (lon,lat) — encodes `axis_order=lon,lat` and `cell_ref=center` by standard
-  convention;
+- **CRS84** referencing — this fixes **`axis_order = lon,lat`** (x=lon, y=lat). **`cell_ref = center`** is
+  a **GHRSST profile convention** (documented), NOT implied by CRS84 — the axis values are the MUR
+  grid-point (cell-center) locations;
 - a stable **`"profile":"ghrsst-raster-json-1"`** + **`ghrsst:format_version`** so clients pin behaviour;
 - **`ghrsst:`-prefixed convenience members** (`bbox_requested`/`bbox_actual`/`field_status`) that generic
   readers ignore but our frontend/agents can use directly.
 This is the user's conclusion: **align to CoverageJSON concepts, don't be bound by the full standard.**
 
 ## 2. The `ghrsst-raster-json-1` profile
-Opt-in via **`format=coveragejson`** (canonical; short alias `format=raster` TBD — §7). Media type is
-**`application/json`** for trivial `fetch().json()` (CoverageJSON's registered `application/prs.coverage+json`
-noted as an option — §7). `format=json` (row array) is untouched.
+Opt-in via **`format=coveragejson`** with **`format=raster` as an accepted alias** (both map to this
+profile). **Media type:** serve **`application/json`** initially (trivial `fetch().json()` in the
+browser); the CoverageJSON registered media type is **`application/vnd.cov+json`** (OGC 21-069r2; file
+extension `.covjson`), which also carries an optional **`profile`** parameter per RFC 6906 — so a future
+content-negotiated response can be `Content-Type: application/vnd.cov+json; profile="<profile-URI>"`
+(§7). `format=json` (row array) is untouched.
 
 ```json
 {
@@ -95,8 +103,8 @@ noted as an option — §7). `format=json` (row array) is untouched.
 | `x0` / `y0` | `domain.axes.x.start` / `domain.axes.y.start` (northmost for y) |
 | `dx` / `dy` | derived: `(stop-start)/(num-1)` per axis (y is **negative** → north→south) |
 | `crs` | `domain.referencing[…].system.id` = CRS84 |
-| `axis_order = lon,lat` | implied by **CRS84** (x=lon, y=lat); documented in §3 |
-| `cell_ref = center` | CoverageJSON axis values ARE sample points = **cell centers** (documented) |
+| `axis_order = lon,lat` | fixed by **CRS84** (x=lon, y=lat) |
+| `cell_ref = center` | **GHRSST profile convention** (documented §3) — axis values = MUR grid-point/cell centers; NOT implied by CRS84 |
 | `scan/order/index_formula` | `NdArray.axisNames` order + **row-major** convention + y-descending (documented §3) |
 | `fields:{var:[…]}` | `ranges.<var>.values` (flat row-major, length `nx*ny` per single `t`) |
 | `nodata = null` | `null` inside `values` (CoverageJSON standard) |
@@ -106,11 +114,26 @@ noted as an option — §7). `format=json` (row array) is untouched.
 ### 2.2 Semantics (identical meaning to the row `format=json`, SEMANTIC float32 parity)
 - **flat row-major, length `nx*ny`** per variable (single `t`); `values[k]`, `k = iy*nx + ix`.
 - **missing/masked/land → `null`**, never skipped (positional integrity; every cell present).
-- **whole-field ABSENT** (requested var not present that day) → **omit its `ranges` entry** (or `null`) AND
-  `ghrsst:field_status.<var> = "absent"` — NOT a giant all-null array. A **present-but-all-NaN** var stays
-  a full `NdArray` of `null` with `field_status = "present"` (preserves absent-vs-NaN, as P3-S1).
+- **whole-field ABSENT** (requested var not present that day) → **OMIT its `ranges` entry entirely** (do
+  NOT emit `ranges.<var> = null` — that would be invalid CoverageJSON) AND set
+  `ghrsst:field_status.<var> = "absent"` — never a giant all-null array. A **present-but-all-NaN** var
+  stays a **full `NdArray` of `null`s** with `field_status = "present"` (preserves the absent-vs-NaN
+  distinction, as P3-S1). (`parameters.<var>` may also be omitted for absent vars, or kept for schema
+  stability — §7.)
 - **y axis descends** (`start` = northmost center, `stop` = southmost) → north→south scan.
 - float rendering is orjson shortest-round-trip (same float32 value as the row path; **semantic** parity).
+
+### 2.3 Extension members & profile identity (interoperability — Codex #4)
+CoverageJSON permits custom members, but a compact prefix like `ghrsst:` must be **defined**, not ad-hoc:
+- **`profile`** identifies this document as the **`ghrsst-raster-json-1`** profile. It also has a
+  canonical **profile URI** (e.g. `https://eco.odb.ntu.edu.tw/ns/ghrsst-raster-json-1`) for use as the
+  RFC 6906 `profile=` media-type parameter (§2). Exact URI: §7.
+- **`ghrsst:`** is a **compact-URI prefix defined by this profile**, expanding to a namespace URI
+  (e.g. `https://eco.odb.ntu.edu.tw/ns/ghrsst#`), so `ghrsst:field_status` ≡ `<ns>field_status`. The
+  profile document is the authority that defines the prefix→namespace mapping and each member's meaning.
+- Generic CoverageJSON readers **ignore** unknown members (forward-compatible); profile-aware clients /
+  AI-agents resolve `profile` + `ghrsst:*` per this spec. (A JSON-LD-style `@context` could formalise the
+  mapping later; not required for v1.)
 
 ## 3. Frontend / API / AI-agent parsing guidance
 The payload is self-describing; a client needs only the axes + `ranges`. Reconstruct a coordinate or an
@@ -128,7 +151,8 @@ function value(varName, iy, ix) {                 // null = nodata (land/masked)
 }
 ```
 Guidance points to document for consumers:
-- **CRS84 ⇒ x = longitude, y = latitude** (axis order lon,lat); axis values are **cell centers**.
+- **CRS84 ⇒ x = longitude, y = latitude** (axis order lon,lat). **Axis values are cell CENTERS** — a
+  GHRSST profile convention (matching MUR grid points), not something CRS84 states.
 - **`ranges.<var>.values` is flat row-major**, length `nx*ny`; index `k = iy*nx + ix`.
 - **`null` = nodata**; **`ghrsst:field_status[var]=="absent"`** = variable not available that day (distinct
   from a present variable that is all-null).
@@ -167,8 +191,8 @@ but absent → no range + `field_status="absent"`.
 ## 5. Compatibility notes
 - **Valid CoverageJSON.** The envelope is a conformant CoverageJSON `Coverage` with a `Grid` domain,
   compact axes, CRS84, and `NdArray` ranges — so covjson-reader / leaflet-coverage / agents that know
-  CoverageJSON can parse it. Our extras are **`ghrsst:`-prefixed** custom members (safely ignored by
-  generic readers).
+  CoverageJSON can parse it. Our extras are **`ghrsst:`-prefixed** custom members (defined in §2.3; safely
+  ignored by generic readers).
 - **We do NOT implement the full standard:** single `domainType:"Grid"`, single `t`, three fixed
   parameters, CRS84 only, no `TiledNdArray`/tiling, no categorical encodings. The stable `profile`
   fences that subset.
@@ -185,13 +209,29 @@ but absent → no range + `field_status="absent"`.
   float32, absent/nodata) + a bytes/parse bench via the P3 harness (add a CoverageJSON transform).
 - gated by the P4 spatial-window policy (served only for delta-window days; older → 4xx).
 
-## 7. Open questions
-1. **Param name:** `format=coveragejson` (canonical, self-describing) vs short `format=raster` alias — one
-   or both?
-2. **Media type:** `application/json` (browser-trivial) vs CoverageJSON's `application/prs.coverage+json`
-   (standard-correct) — or content-negotiate?
-3. **`t` time-of-day:** MUR daily analysis nominal time — use `T09:00:00Z`, `T00:00:00Z`, or date-only?
-   (Confirm the correct MUR analysis time to put in `axes.t.values`.)
-4. **Units:** `sea_ice` as fraction (`"1"`) vs percent; confirm `sst`/`sst_anomaly` Kelvin vs °C on the
-   wire (match the row `format=json` values exactly).
-5. **`observedProperty` `id` URIs:** include canonical vocabulary URIs (CF standard names) or labels only?
+## 7. Resolved (this review) + open questions
+**Resolved (Codex round-1):**
+- **Param name:** support **both** `format=coveragejson` (canonical) **and** `format=raster` (alias) → this profile.
+- **Media type:** serve **`application/json`** first (browser `fetch().json()`); add
+  **`application/vnd.cov+json`** (+ RFC 6906 `profile=` param) via content negotiation later — the correct
+  registered type (NOT `application/prs.coverage+json`).
+- **`t` axis:** resolve from the **MUR source metadata/filename**, not a placeholder; MUR's nominal daily
+  analysis time is **`T09:00:00Z`** — encode `axes.t.values = ["<date>T09:00:00Z"]` (confirm against the
+  actual source attribute at implementation).
+- **Units:** emit values that are **byte-for-value identical to the row `format=json`** wire values; the
+  `parameters.<var>.unit` label MUST describe exactly those values (no on-the-wire unit conversion).
+- **Absent field:** OMIT `ranges.<var>` (never `null`); `ghrsst:field_status="absent"` (§2.2).
+- **`cell_ref=center`** is a profile convention, not CRS84 (§2.1/§2.3).
+
+**Still open:**
+1. **Confirm the `t` analysis time** value from MUR source metadata (expected `09:00:00Z`) and the exact
+   wire **units** the row `format=json` currently emits (K vs °C; fraction vs %) so `parameters` match.
+2. **Profile / namespace URIs (§2.3):** confirm the canonical `profile` URI and the `ghrsst:` namespace URI
+   (proposed `https://eco.odb.ntu.edu.tw/ns/ghrsst-raster-json-1` / `…/ns/ghrsst#`).
+3. **`observedProperty.id` URIs:** include canonical vocabulary URIs (CF standard names) or labels only?
+4. **`parameters` for absent vars:** omit, or keep for schema stability (§2.2)?
+
+## Standards references
+- OGC CoverageJSON Community Standard, 21-069r2 (2023-08-22) — https://docs.ogc.org/cs/21-069r2/21-069r2.html
+- OGC API — Coverages — https://ogcapi.ogc.org/coverages/
+- CoverageJSON spec — https://covjson.org/spec/ ; media type `application/vnd.cov+json`, ext `.covjson`.
