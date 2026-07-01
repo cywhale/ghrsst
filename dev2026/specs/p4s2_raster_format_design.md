@@ -1,11 +1,11 @@
 # P4-S2 — compact raster wire format (CoverageJSON-lite) — design spec
 
 Status: **DRAFT — revised per Codex round-1** (Claude authored; Codex reviewed; fixes folded; ready for
-sign-off). **Do not implement yet.** Round-1 fixes: media type = `application/vnd.cov+json` (not
-`prs.coverage+json`), `application/json` first (§2/§7); `cell_ref=center` is a profile convention, NOT
-CRS84 (§1/§2.1/§2.3); absent field OMITS `ranges.<var>` (never `null`) (§2.2); `ghrsst:` prefix + profile
-URIs defined (§2.3); both `format=coveragejson` + `format=raster`; `t` resolved from MUR source (09:00Z);
-units match row `format=json` exactly (§7). Supersedes the ad-hoc RasterJSON draft in
+sign-off). **Do not implement yet.** Round-1 fixes: media type = `application/vnd.cov+json`, served as
+`application/json` first (§2/§7); `cell_ref=center` is a profile convention, NOT CRS84 (§1/§2.1/§2.3);
+absent field OMITS `ranges.<var>` (never `null`) (§2.2); `ghrsst:` prefix + profile URIs defined (§2.3);
+both `format=coveragejson` + `format=raster`; `t` resolved from MUR source (09:00Z); units match row
+`format=json` exactly (§7). Supersedes the ad-hoc RasterJSON draft in
 [`p4_storage_policy_and_bbox_strategy.md`](p4_storage_policy_and_bbox_strategy.md) §5 by aligning it to a
 small, stable **CoverageJSON profile**. Default **`format=json` stays unchanged**; the raster format is
 **opt-in**. Serves the recent-31-day spatial window only (P4 §4.1).
@@ -213,8 +213,8 @@ but absent → no range + `field_status="absent"`.
 **Resolved (Codex round-1):**
 - **Param name:** support **both** `format=coveragejson` (canonical) **and** `format=raster` (alias) → this profile.
 - **Media type:** serve **`application/json`** first (browser `fetch().json()`); add
-  **`application/vnd.cov+json`** (+ RFC 6906 `profile=` param) via content negotiation later — the correct
-  registered type (NOT `application/prs.coverage+json`).
+  **`application/vnd.cov+json`** (the CoverageJSON registered type; + RFC 6906 `profile=` param) via
+  content negotiation later.
 - **`t` axis:** resolve from the **MUR source metadata/filename**, not a placeholder; MUR's nominal daily
   analysis time is **`T09:00:00Z`** — encode `axes.t.values = ["<date>T09:00:00Z"]` (confirm against the
   actual source attribute at implementation).
