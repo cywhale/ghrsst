@@ -59,17 +59,32 @@ daily-recent) → **parity `True` for bbox/point/POST on BOTH base and delta** (
   thousands of tiny chunks → warm 0.3–3.2 s and **C8 up to 26 s** at 750k. This is the structural cost
   the P4 spec predicted; **re-chunking the base is off the table** (it's read-optimal for the primary
   point-series workload). ❌
-- **scattered POST /points: DELTA PASS / BASE FAIL.** With grouped reads, **recent-day (delta) POST is
-  49 ms** (vs daily 15 ms) — fine. **Historical-day (base) POST stays 2.5 s** — same root cause as
-  historical bbox (2 901 tiny `(90,8,8)` chunks × 90 steps). So the blocker is **historical**, not POST
-  per se. ✅ delta / ❌ base.
+- **scattered POST /points: DELTA usable / BASE FAIL.** With grouped reads, **recent-day (delta) POST is
+  49 ms warm / 467 ms C8** (vs daily 15 ms) — operationally fine but **exceeds the strict daily+25% bar**
+  (see threshold reconciliation → P4-S1 product decision). **Historical-day (base) POST stays 2.5 s** —
+  same root cause as historical bbox (2 901 tiny `(90,8,8)` chunks × 90 steps). So the blocker is
+  **historical**, not POST per se. ⚠️ delta (usable, bar TBD) / ❌ base.
 
-## The clean split
-- **RECENT days (DELTA tier `s256/t1`): every path is fast** — point, bbox, POST all ≤ ~130 ms even at
-  750k / C8. A time-cube-authoritative system serves all recent-day queries with no daily store.
+## The clean split (precise per path)
+- **RECENT days (DELTA tier `s256/t1`): all paths operationally fast, but not identical** —
+  point **2.6 ms** warm / 11 ms C8; bbox 750k **18 ms** warm / **133 ms** C8; POST(1000) **49 ms** warm
+  / **467 ms** C8. A cube-authoritative system serves all recent-day queries with no daily store. (POST
+  is the slowest recent path — see threshold reconciliation below.)
 - **HISTORICAL days (BASE tier `s8/t90`): point is fine; bbox and scattered POST are blockers**
   (~90× read amp + tens of thousands of tiny chunks). The base layout is read-optimal for the PRIMARY
   point-series workload and **must not be re-chunked**.
+
+## Threshold reconciliation — delta POST vs the §3.2 provisional bar
+The P4 spec §3.2 sets "point/POST from cube ≤ daily p95 + 25%". Daily POST warm p95 ≈ **15 ms**, so the
+strict bar is ~19 ms; **delta POST at 49 ms warm / 467 ms C8 FAILS that bar** — while being clearly
+usable in absolute terms. Two readings, flagged as a **product decision for P4-S1**:
+- **(mark)** delta POST is **"usable but exceeds daily+25%"**; keep the strict relative bar and accept
+  this as a known, documented gap; OR
+- **(revise, recommended)** replace the relative POST bar with an **absolute budget** — e.g. **POST warm
+  p95 < 100 ms and C8 p95 bounded (< ~1 s)** — which delta meets. Rationale: daily's ~15 ms is an
+  artifact of its `(1,1024,1024)` layout where all points fall in ONE chunk; that is not a meaningful
+  performance FLOOR to hold the cube to. An absolute interactive budget is the sounder product bar.
+This does not affect the bbox conclusion; it only concerns the recent-day POST bar. **P4-S1 decides.**
 
 ## Recommendation (evidence only — NOT authorization to prune)
 Lean **Option A (cube authoritative + daily short-term staging) + Option D for the historical-spatial
