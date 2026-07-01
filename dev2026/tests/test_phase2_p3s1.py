@@ -1,4 +1,6 @@
-"""dev2026 — P3-S1: opt-in bbox `format=grid`/`columnar` over the real API (TestClient).
+"""dev2026 — P3-S1 (legacy): `format=grid`/`columnar` were prototype compact formats, now RETIRED and
+NOT public (superseded by CoverageJSON-lite, P4-S2). This suite checks the API rejects them (400) and
+that the default `format=json` path is unchanged; encoder-level parity lives in test_phase2_p3s0.
 
 Gates: default `format=json` UNCHANGED; compact formats carry the SAME data with SEMANTIC float32
 parity (not byte); absent var -> field_status 'absent'; land NaN -> null; headers (X-Bbox-Format,
@@ -95,22 +97,11 @@ class P3S1Api(unittest.TestCase):
                     out.append((body["lon"][j], body["lat"][i], vals))
         return r, out
 
-    def test_grid_columnar_parity_with_json(self):
-        _, ref = self._recon("json")
-        for fmt in ("columnar", "grid"):
-            _, got = self._recon(fmt)
-            self.assertEqual(len(got), len(ref), fmt)
-            for a, b in zip(ref, got):
-                self.assertTrue(_f32eq(a[0], b[0]) and _f32eq(a[1], b[1]), f"{fmt} lon/lat")
-                for f in ("sst", "sst_anomaly", "sea_ice"):
-                    self.assertTrue(_f32eq(a[2][f], b[2][f]), f"{fmt} {f}: {a[2][f]} != {b[2][f]}")
-
-    def test_absent_var_field_status(self):
-        for fmt in ("columnar", "grid"):
-            body = self._get(format=fmt).json()
-            self.assertIsNone(body["fields"]["sst_anomaly"])          # not a giant null array
-            self.assertEqual(body["field_status"]["sst_anomaly"], "absent")
-            self.assertEqual(body["field_status"]["sst"], "present")
+    def test_grid_columnar_retired_not_public(self):
+        # grid/columnar are legacy P3-S1 prototypes, superseded by CoverageJSON-lite (P4-S2); the public
+        # API no longer accepts them. Encoder-level parity for them is still covered by test_phase2_p3s0.
+        for fmt in ("grid", "columnar"):
+            self.assertEqual(self._get(format=fmt).status_code, 400, fmt)
 
     def test_default_is_json_unchanged(self):
         r = self._get()                                              # no format param
@@ -125,20 +116,6 @@ class P3S1Api(unittest.TestCase):
 
     def test_bad_format(self):
         self.assertEqual(self._get(format="arrow").status_code, 400)
-
-    def test_truncate_parity(self):
-        _, ref = self._recon("json")            # json already truncated below via param
-        rj = self._get(format="json", mode="truncate").json()
-        ref_t = [(row["lon"], row["lat"], {f: row.get(f) for f in ("sst", "sea_ice")}) for row in rj]
-        for fmt in ("columnar", "grid"):
-            body = self._get(format=fmt, mode="truncate").json()
-            # spot-check: all present sst values rounded to 3 dp match the row path
-            if fmt == "grid":
-                vals = [body["fields"]["sst"][i][j] for i in range(body["shape"][0]) for j in range(body["shape"][1])]
-            else:
-                vals = list(body["fields"]["sst"])
-            for a, v in zip(ref_t, vals):
-                self.assertTrue(_f32eq(a[2]["sst"], v), f"{fmt} truncate sst")
 
 
 if __name__ == "__main__":

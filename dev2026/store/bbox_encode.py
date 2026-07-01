@@ -1,15 +1,17 @@
-"""dev2026 — P3-S1 compact bbox response encoders (opt-in `format=grid` / `format=columnar`).
+"""dev2026 — bbox response encoders. FINALIZED compact format: **CoverageJSON-lite** (P4-S2).
 
-EXPERIMENTAL / PROTOTYPE (Codex review of PR #16): these compact wire shapes are MEASUREMENT
-prototypes, NOT a finalized contract. After the VM24 time-cube rebuild + storage review, P4
-(`specs/p4_storage_policy_and_bbox_strategy.md`) will likely REDEFINE the compact format as
-raster-style (explicit bbox_actual/nx/ny/x0/y0/dx/dy/crs/scan/index_formula, flat row-major arrays of
-length nx*ny). Only `format=json` is a stable contract; do not build a frontend contract on `grid`
-yet.
+Public API bbox formats (see PUBLIC_BASE_FORMATS / COVERAGEJSON_FORMATS below):
+  * `format=json`        — the default row array (streaming path in app.py); always public, stable.
+  * `format=coveragejson` / `format=raster` — the finalized compact format (`encode_coveragejson`,
+     profile `ghrsst-raster-json-1`, spec `specs/p4s2_raster_format_design.md`). Opt-in, and gated by
+     `GHRSST_ENABLE_COVERAGEJSON` at the API until P4-S3 wires the spatial-window policy.
 
-ONE canonical implementation shared by the API (`api/app.py`), the benches (`bench/bench_bbox_wire.py`,
-`bench/bench_bbox_http.py`), and the parity tests — so the prototype never drifts. Default
-`format=json` (the row-array streaming path) is untouched and lives in app.py.
+  * `format=grid` / `format=columnar` — **LEGACY experimental prototypes** (P3-S1 measurement work),
+     **NOT public formats** and NOT a stable contract. Superseded by CoverageJSON-lite. Their
+     `encode_grid`/`encode_columnar` remain only for the benches; the API does NOT accept them.
+
+ONE canonical implementation shared by the API (`api/app.py`), the benches, and the parity tests.
+Default `format=json` (the row-array streaming path) is untouched and lives in app.py.
 
 Both compact formats encode straight from the 2-D `cols` arrays (no per-point dicts), so they skip the
 row path's per-point dict construction (the P3-S0 server hot spot). Semantics (P3 spec §3 Tier 1):
@@ -139,7 +141,12 @@ def encode_coveragejson(lons, lats, cols: Dict[str, np.ndarray], fields: Sequenc
 
 
 # `raster` is an accepted alias for `coveragejson` (both -> the ghrsst-raster-json-1 profile).
+# ENCODERS is the internal registry (API + benches). grid/columnar are here for the benches only.
 ENCODERS = {"grid": encode_grid, "columnar": encode_columnar,
             "coveragejson": encode_coveragejson, "raster": encode_coveragejson}
-COMPACT_FORMATS = frozenset(ENCODERS)
-ALL_FORMATS = frozenset({"json"}) | COMPACT_FORMATS
+COMPACT_FORMATS = frozenset(ENCODERS)                 # non-json formats -> buffered Response
+
+# ---- PUBLIC API format contract (grid/columnar are NOT public) ----
+PUBLIC_BASE_FORMATS = frozenset({"json"})             # always accepted
+COVERAGEJSON_FORMATS = frozenset({"coveragejson", "raster"})  # gated by GHRSST_ENABLE_COVERAGEJSON
+CANONICAL_FORMAT = {"raster": "coveragejson"}         # canonicalise the X-Bbox-Format header

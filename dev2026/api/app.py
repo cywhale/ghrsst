@@ -36,7 +36,8 @@ from store.store_access import ALLOWED_FIELDS, StoreAccess  # noqa: E402
 from store.hybrid_router import HybridRouter  # noqa: E402
 from store.time_cube import TimeCubeStore  # noqa: E402
 from store.tiered_cube import TieredCube  # noqa: E402
-from store.bbox_encode import ALL_FORMATS, COMPACT_FORMATS, ENCODERS  # noqa: E402
+from store.bbox_encode import (CANONICAL_FORMAT, COMPACT_FORMATS, COVERAGEJSON_FORMATS,  # noqa: E402
+                               ENCODERS, PUBLIC_BASE_FORMATS)
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -63,6 +64,10 @@ class Cfg:
     # P4-S3: background cube-metadata refresh interval (s) so new delta days appear without a restart.
     # 0 = disabled (rely on restart-after-append). Recommended on VM24 ~ the daily-append cadence.
     CUBE_REFRESH_TTL_SECONDS = _env_int("GHRSST_CUBE_REFRESH_TTL_SECONDS", 0)
+    # P4-S2: enable the opt-in coveragejson/raster bbox format. DEFAULT OFF — do not deploy on until
+    # P4-S3 wires the spatial-window policy into the bbox/POST endpoints (else it would bypass the
+    # recent-31-day-only rule). 0 = disabled (400 for coveragejson/raster).
+    ENABLE_COVERAGEJSON = _env_int("GHRSST_ENABLE_COVERAGEJSON", 0)
 
 
 cfg = Cfg()
@@ -269,8 +274,13 @@ async def read_ghrsst(
     fields = _fields(append)
     modes = _parse_modes(mode)
     fmt = (format or "json").strip().lower()
-    if fmt not in ALL_FORMATS:
-        raise HTTPException(400, f"Unsupported format '{fmt}'. Allowed: {', '.join(sorted(ALL_FORMATS))}")
+    # public formats: json always; coveragejson/raster only when enabled (P4-S2 flag). grid/columnar are
+    # legacy prototypes and NOT public.
+    allowed_formats = set(PUBLIC_BASE_FORMATS)
+    if cfg.ENABLE_COVERAGEJSON:
+        allowed_formats |= COVERAGEJSON_FORMATS
+    if fmt not in allowed_formats:
+        raise HTTPException(400, f"Unsupported format '{fmt}'. Allowed: {', '.join(sorted(allowed_formats))}")
     earliest, latest = store.bounds()
     if not latest:
         raise HTTPException(503, "No available dates.")
@@ -384,7 +394,7 @@ async def read_ghrsst(
         headers = _fixed_cache() if cacheable else _no_store()
         headers["X-Served-Rows"] = str(total)
         headers["X-Stride"] = str(int(sample))
-        headers["X-Bbox-Format"] = fmt
+        headers["X-Bbox-Format"] = CANONICAL_FORMAT.get(fmt, fmt)   # raster -> coveragejson
         headers["X-Read-Ms"] = str(read_ms)
         headers["X-Encode-Ms"] = str(encode_ms)
         return Response(payload, media_type="application/json", headers=headers)

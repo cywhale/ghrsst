@@ -60,19 +60,21 @@ def _axis_vals(ax):
 class P4S2(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._prev = os.environ.get("GHRSST_ZARR_PATH")
+        cls._prev = {k: os.environ.get(k) for k in ("GHRSST_ZARR_PATH", "GHRSST_ENABLE_COVERAGEJSON")}
         os.environ["GHRSST_ZARR_PATH"] = _DAILY
+        os.environ["GHRSST_ENABLE_COVERAGEJSON"] = "1"       # P4-S2 flag ON for these tests
         from fastapi.testclient import TestClient
-        from api.app import app
-        cls.cm = TestClient(app); cls.c = cls.cm.__enter__()
+        import importlib, api.app as appmod
+        importlib.reload(appmod)                             # pick up the env-driven Cfg
+        cls.appmod = appmod
+        cls.cm = TestClient(appmod.app); cls.c = cls.cm.__enter__()
 
     @classmethod
     def tearDownClass(cls):
         cls.cm.__exit__(None, None, None)
-        if cls._prev is None:
-            os.environ.pop("GHRSST_ZARR_PATH", None)
-        else:
-            os.environ["GHRSST_ZARR_PATH"] = cls._prev
+        for k, v in cls._prev.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        import importlib, api.app as appmod; importlib.reload(appmod)
         import shutil; shutil.rmtree(_TMP, ignore_errors=True)
 
     def _get(self, **extra):
@@ -125,16 +127,34 @@ class P4S2(unittest.TestCase):
                     seen_null = seen_null or (got is None and f == "sst")
         self.assertTrue(seen_null, "expected the land-NaN cell to appear as null in both")
 
-    def test_raster_alias(self):
+    def test_raster_alias_canonical_header(self):
         r = self._get(format="raster")
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.headers["x-bbox-format"], "raster")
+        self.assertEqual(r.headers["x-bbox-format"], "coveragejson")   # canonicalised (Codex #3)
         self.assertEqual(r.json()["profile"], "ghrsst-raster-json-1")
 
     def test_default_json_unchanged(self):
         r = self._get()
         self.assertEqual(r.headers["x-bbox-format"], "json")
         self.assertIsInstance(r.json(), list)
+
+    def test_legacy_grid_columnar_not_public(self):
+        for f in ("grid", "columnar"):
+            self.assertEqual(self._get(format=f).status_code, 400, f)   # retired, not public
+
+    def test_disabled_returns_400(self):
+        # with the flag OFF, coveragejson/raster are rejected (deploy-safety until P4-S3)
+        os.environ["GHRSST_ENABLE_COVERAGEJSON"] = "0"
+        try:
+            import importlib, api.app as appmod; importlib.reload(appmod)
+            from fastapi.testclient import TestClient
+            with TestClient(appmod.app) as c:
+                for f in ("coveragejson", "raster"):
+                    self.assertEqual(c.get("/api/ghrsst", params=dict(_BBOX, format=f)).status_code, 400, f)
+                self.assertEqual(c.get("/api/ghrsst", params=dict(_BBOX)).status_code, 200)   # json still ok
+        finally:
+            os.environ["GHRSST_ENABLE_COVERAGEJSON"] = "1"
+            import importlib, api.app as appmod; importlib.reload(appmod)
 
 
 if __name__ == "__main__":
