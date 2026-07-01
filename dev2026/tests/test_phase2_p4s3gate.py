@@ -48,11 +48,15 @@ def _build(tmp):
     return daily, base, delta, days
 
 
-def _client(enforce):
+def _client(enforce, coveragejson="0", with_delta=True):
     tmp = tempfile.mkdtemp(prefix="p4s3g_")
     daily, base, delta, days = _build(tmp)
     os.environ.update({"GHRSST_ZARR_PATH": daily, "GHRSST_TIMECUBE_PATH": base,
-                       "GHRSST_DELTACUBE_PATH": delta, "GHRSST_SPATIAL_WINDOW_ENFORCE": enforce})
+                       "GHRSST_SPATIAL_WINDOW_ENFORCE": enforce, "GHRSST_ENABLE_COVERAGEJSON": coveragejson})
+    if with_delta:
+        os.environ["GHRSST_DELTACUBE_PATH"] = delta
+    else:
+        os.environ.pop("GHRSST_DELTACUBE_PATH", None)   # no delta tier -> gate no-op (transition safety)
     import api.app as appmod
     importlib.reload(appmod)
     from fastapi.testclient import TestClient
@@ -63,7 +67,8 @@ class SpatialGate(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._prev = {k: os.environ.get(k) for k in
-                     ("GHRSST_ZARR_PATH", "GHRSST_TIMECUBE_PATH", "GHRSST_DELTACUBE_PATH", "GHRSST_SPATIAL_WINDOW_ENFORCE")}
+                     ("GHRSST_ZARR_PATH", "GHRSST_TIMECUBE_PATH", "GHRSST_DELTACUBE_PATH",
+                      "GHRSST_SPATIAL_WINDOW_ENFORCE", "GHRSST_ENABLE_COVERAGEJSON")}
 
     @classmethod
     def tearDownClass(cls):
@@ -71,9 +76,11 @@ class SpatialGate(unittest.TestCase):
             os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
         import api.app as appmod; importlib.reload(appmod)
 
-    def _bbox(self, c, day):
-        return c.get("/api/ghrsst", params=dict(lon0=121, lat0=11, lon1=129, lat1=19,
-                                                append="sst,sea_ice", start=day, end=day))
+    def _bbox(self, c, day, fmt=None):
+        p = dict(lon0=121, lat0=11, lon1=129, lat1=19, append="sst,sea_ice", start=day, end=day)
+        if fmt:
+            p["format"] = fmt
+        return c.get("/api/ghrsst", params=p)
 
     def _post(self, c, day):
         return c.post("/api/ghrsst/points", json={"date": day, "points": [[125.0, 15.0]], "append": "sst"})
@@ -97,6 +104,40 @@ class SpatialGate(unittest.TestCase):
                 h = c.get("/healthz").json()
                 self.assertTrue(h["spatial_window_enforce"])
                 self.assertEqual(h["spatial_window"], [days[4], days[5]])
+        finally:
+            import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_coveragejson_respects_the_gate(self):
+        # DEPLOYMENT-RISK PATH: both flags ON. The compact format must NOT bypass the window gate.
+        c, days, tmp = _client("1", coveragejson="1")
+        try:
+            with c:
+                recent, older = days[5], days[1]
+                r = self._bbox(c, recent, "coveragejson")
+                self.assertEqual(r.status_code, 200)                            # delta day -> served
+                self.assertEqual(r.json()["type"], "Coverage")
+                self.assertEqual(r.headers["x-bbox-format"], "coveragejson")
+                r2 = self._bbox(c, older, "coveragejson")
+                self.assertEqual(r2.status_code, 400)                           # older -> gated, not served
+                self.assertIn("available_spatial_window", r2.text)
+                # raster alias is gated too, and canonicalises the header when served
+                self.assertEqual(self._bbox(c, older, "raster").status_code, 400)
+                r4 = self._bbox(c, recent, "raster")
+                self.assertEqual(r4.status_code, 200)
+                self.assertEqual(r4.headers["x-bbox-format"], "coveragejson")
+        finally:
+            import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_transition_safety_no_delta_tier(self):
+        # enforcement ON but NO delta tier loaded -> gate is a no-op (current behaviour preserved)
+        c, days, tmp = _client("1", coveragejson="1", with_delta=False)
+        try:
+            with c:
+                self.assertEqual(self._bbox(c, days[1]).status_code, 200)       # any day still served
+                self.assertEqual(self._post(c, days[1]).status_code, 200)
+                h = c.get("/healthz").json()
+                self.assertTrue(h["spatial_window_enforce"])
+                self.assertIsNone(h["spatial_window"])                          # no delta -> no window
         finally:
             import shutil; shutil.rmtree(tmp, ignore_errors=True)
 
