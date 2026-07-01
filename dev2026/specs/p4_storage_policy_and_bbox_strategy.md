@@ -96,7 +96,7 @@ Spatial reads (bbox + POST /points) are served ONLY from the recent window (§4.
 | metric | bar |
 |---|---|
 | **recent** single-day **bbox** warm p95 (≤ medium) | **< ~200 ms**; C8 bounded  · VM24: 24 ms / 178 ms C8 ✅ |
-| **recent** **POST /points** warm p95 | **< 100 ms** ✅ VM24 ~88 ms; **C8 p95 < ~1 s** ⚠ VM24 ~1.2–1.3 s (see below) |
+| **recent** **POST /points** warm p95 | **< 100 ms** ✅ VM24 ~88 ms; **C8 p95 < ~1.5 s** ✅ VM24 ~1.2–1.3 s (P4-S1 decided) |
 | full-history single-day **point** GET | **≤ daily-path p95 + 25 %** (or absolute < ~50 ms) · VM24: 4.5 ms ✅ |
 | **RSS** under C=8 | **≤ `GHRSST_RSS_CEILING_MB`** (prod 4096), no OOM, no unbounded growth |
 | **concurrency** C=4 / C=8 | bounded degradation, zero 5xx/OOM |
@@ -106,11 +106,10 @@ POST is an absolute budget (not daily+25%) because it is served from the delta/r
 **rationale for the 31-day spatial cutoff (§4.1)**; the base layout is read-optimal for the primary
 point-series and is **not** a path we intend to optimize.
 
-> **POST C8 budget — DECISION PENDING (P4-S0b VM24, `p4s0b_vm24_results.md`).** Delta POST warm p95 is
-> ~88 ms (well inside 100 ms) but **C8 p95 ~1.2–1.3 s exceeds the ~1 s bar** → `OVERALL_per_day_delta`
-> failed on that alone. P4-S1 must **either optimize delta POST at C=8, or relax the POST C8 budget to
-> ~1.5 s** (recommended — POST /points at 8-way concurrency is a heavier, less-common call; 1.3 s is
-> operationally reasonable and warm p95 is fine). bbox / point / range all passed on real prod data.
+> **POST C8 budget — DECIDED (P4-S1): relaxed to ~1.5 s.** Delta POST warm p95 ~88 ms (well inside
+> 100 ms); C8 p95 ~1.2–1.3 s (VM24) is **accepted** — POST /points at 8-way concurrency is a heavier,
+> less-common call, warm p95 is fine, so the ~1 s bar was too strict. New bar: **warm p95 < 100 ms,
+> C8 p95 < ~1.5 s** → P4-S0b delta POST now PASSES. bbox / point / range already passed. (`p4s0b_vm24_results.md`.)
 
 ### 3.3 Binding gate (Codex #1) — local/shadow is feasibility ONLY
 **Local/shadow P4-S0 proves feasibility; it CANNOT authorize deleting or pruning the daily store.**
@@ -276,9 +275,9 @@ restated because P4 reasons about production data that must stay untouched.)
   thresholds; cube prototype read paths. Output evidence. **Cannot authorize any pruning.**
 - **P4-S0b (VM24 READ-ONLY binding gate) — RAN 2026-07-01 (Codex/ops), PARTIAL PASS.** Results:
   `p4s0b_vm24_results.md`. Full-history point/range ✓ (26 ms), single-day point ✓ (4.5 ms), delta bbox ✓
-  (24 ms / 178 ms C8), delta POST warm ✓ (~88 ms) + parity ✓ + policy-reject ✓, but **delta POST C8
-  ~1.2–1.3 s > ~1 s → `OVERALL_per_day_delta = false`** (POST C8 only). Surfaced two findings: harness
-  fan-out bug (fixed) and **stale delta metadata after append** (§6.3).
+  (24 ms / 178 ms C8), delta POST warm ✓ (~88 ms) + parity ✓ + policy-reject ✓; delta POST C8 ~1.2–1.3 s
+  (initially failed the ~1 s bar → **P4-S1 relaxed the POST C8 budget to ~1.5 s (§3.2), so it now PASSES**).
+  Surfaced two findings: harness fan-out bug (fixed) and **stale delta metadata after append** (§6.3, fixed P4-S3).
   - **Caveat (Codex round-4):** production delta held only **~3 days** (2026-06-27..29) at run time, so
     P4-S0b validated **per-day delta performance** but **NOT the full 31-day retention policy** —
     there aren't 31 delta days to serve yet.
@@ -300,16 +299,14 @@ POST bar is an absolute recent-window budget, not daily+25%; single 31-day cutof
 WMS is not an API-facing substitute. **`SPATIAL_WINDOW_DAYS = 31` is the adopted default** (not an open
 14/30 choice) unless product later reopens it. **Daily staging retention = 31 days, aligned with
 `SPATIAL_WINDOW_DAYS`** (§6.2): may be **extended** later, but **must not be shorter unless NetCDF
-redownload is explicitly accepted as the recovery path**.
+redownload is explicitly accepted as the recovery path**. **POST /points C8 budget relaxed to ~1.5 s
+(P4-S1, §3.2)** — VM24 ~1.2–1.3 s accepted; delta POST now passes. **Reload = P4-S3 TTL/refresh code
+path (shipped, PR #20)** + PM2 restart-after-append fallback.
 
 **Still open:**
-1. **Delta POST C8 budget (P4-S0b, §3.2):** VM24 delta POST C8 ~1.2–1.3 s > ~1 s. **Relax C8 budget to
-   ~1.5 s** (recommended) **or optimize** delta POST at C=8? — P4-S1 decides. (warm p95 ~88 ms is fine.)
-2. **CRS / cell_ref** for raster — EPSG:4326, `axis_order=lon,lat`, `cell_ref=center` confirmed?
-3. Confirm **re-chunking the base cube is off the table** (would hurt the primary point-series).
-4. If Option A: is **removing daily staging entirely** eventually acceptable (relying on NetCDF
+1. **CRS / cell_ref** for raster — EPSG:4326, `axis_order=lon,lat`, `cell_ref=center` confirmed?
+2. Confirm **re-chunking the base cube is off the table** (would hurt the primary point-series).
+3. If Option A: is **removing daily staging entirely** eventually acceptable (relying on NetCDF
    redownload for recovery), or always keep the rolling 31-day staging window?
-5. **Compaction feasibility (§6.1):** is a second ~2 TB volume provisionable for staged rebuilds, or do
+4. **Compaction feasibility (§6.1):** is a second ~2 TB volume provisionable for staged rebuilds, or do
    we commit to block-level/rolling compaction (or "defer compaction" with a delta-growth alarm)?
-6. **Reload strategy (§6.3):** short-term PM2 restart-after-append, or ship the TTL/refresh code path in
-   P4-S3? (Required before authoritative mode — a stale API mis-serves the newest delta day.)

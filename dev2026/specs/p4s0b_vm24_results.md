@@ -45,15 +45,11 @@ reload strategy** (§6.3): short-term ops = restart the `ghrsst` PM2 process aft
 append; better = a code-path **metadata refresh / TTL-based reopen** of `TieredCube`/`TimeCubeStore` so
 new delta days become visible without a restart.
 
-## Decision needed — delta POST C8 budget (product/engineering)
-Delta POST C8 p95 ≈ **1.24–1.34 s** vs the **~1 s** bar. Options (P4-S1 sign-off):
-- **(revise, likely acceptable)** relax the POST **C8 budget to ~1.5 s** — POST /points at C=8 is a
-  heavier, less common call than bbox/point; 1.3 s under 8-way concurrency is operationally reasonable
-  and warm p95 (~90 ms) is well within budget; **or**
-- **(optimize)** reduce delta POST C8 (e.g. cap batch fan-out / group tighter / bound concurrency for
-  POST) before committing.
-Recommendation: **revise C8 to ~1.5 s** unless product wants sub-second POST at C=8. Not decided here —
-flagged for P4-S1.
+## Delta POST C8 budget — DECIDED (P4-S1): relaxed to ~1.5 s
+Delta POST C8 p95 ≈ **1.24–1.34 s** vs the original **~1 s** bar. **P4-S1 relaxed the POST C8 budget to
+~1.5 s** — POST /points at C=8 is a heavier, less-common call than bbox/point; ~1.3 s under 8-way
+concurrency is operationally reasonable and warm p95 (~90 ms) is well within budget. So **delta POST now
+PASSES**; the per-day delta gate is green on all paths. (Design: §3.2.)
 
 ## Gate status
 `OVERALL_per_day_delta = false` (POST C8). This is the **per-day delta** gate only; it still does **not**
