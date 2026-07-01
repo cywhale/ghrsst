@@ -38,6 +38,7 @@ from store.time_cube import TimeCubeStore  # noqa: E402
 from store.tiered_cube import TieredCube  # noqa: E402
 from store.bbox_encode import (CANONICAL_FORMAT, COMPACT_FORMATS, COVERAGEJSON_FORMATS,  # noqa: E402
                                ENCODERS, PUBLIC_BASE_FORMATS)
+from store import spatial_policy  # noqa: E402
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -68,6 +69,11 @@ class Cfg:
     # P4-S3 wires the spatial-window policy into the bbox/POST endpoints (else it would bypass the
     # recent-31-day-only rule). 0 = disabled (400 for coveragejson/raster).
     ENABLE_COVERAGEJSON = _env_int("GHRSST_ENABLE_COVERAGEJSON", 0)
+    # P4-S3: enforce the adopted spatial-window policy — spatial queries (bbox + POST /points) served
+    # ONLY for days in the bbox-friendly recent tier (the delta cube); older -> 4xx (spatial_policy).
+    # DEFAULT OFF: current behaviour (daily store serves any day). Turn ON only in time-cube-authoritative
+    # mode, once the delta retains SPATIAL_WINDOW_DAYS days. Format-agnostic (gates the DAY, any format).
+    SPATIAL_WINDOW_ENFORCE = _env_int("GHRSST_SPATIAL_WINDOW_ENFORCE", 0)
 
 
 cfg = Cfg()
@@ -254,6 +260,23 @@ def _available_range_text(store: StoreAccess) -> str:
     return f"available range is {e0}/{e1}"
 
 
+def _spatial_window_gate(app, day: str):
+    """P4-S3: enforce the adopted spatial-window policy for a spatial query (bbox / POST points).
+
+    Spatial availability == delta membership (spec §4.1). When enforcement is ON and a delta tier is
+    loaded, a day NOT in the delta window is rejected with a clear 4xx naming the available window.
+    No-op when GHRSST_SPATIAL_WINDOW_ENFORCE is off (current behaviour: daily store serves any day) or
+    when there is no delta tier to enforce against (transition safety)."""
+    if not cfg.SPATIAL_WINDOW_ENFORCE:
+        return
+    cube = getattr(app.state.router, "cube", None)
+    delta = getattr(cube, "delta", None)
+    if delta is None:
+        return
+    if not spatial_policy.spatial_day_allowed(day, delta.days):
+        raise HTTPException(400, spatial_policy.rejection_payload(day, delta.days))
+
+
 # ---- GET /api/ghrsst (full parity) ---------------------------------------
 @app.get("/api/ghrsst")
 async def read_ghrsst(
@@ -360,6 +383,7 @@ async def read_ghrsst(
     if chosen < earliest or chosen > latest or not store.day_present(chosen):
         raise HTTPException(400, f"BBOX query only allows single-day data. Requested "
                                  f"{chosen} is unavailable; {_available_range_text(store)}.")
+    _spatial_window_gate(request.app, chosen)         # P4-S3: bbox served only in the delta window (if enforced)
     cacheable = (not date_less) and (chosen < latest)
 
     # Hold ONE admission permit for the WHOLE bbox stream lifecycle (read + every
@@ -458,6 +482,7 @@ async def read_points(request: Request, body: PointsRequest):
     earliest, latest = store.bounds()
     if not latest or not store.day_present(day):
         raise HTTPException(400, f"day {day} not available; {_available_range_text(store)}.")
+    _spatial_window_gate(request.app, day)            # P4-S3: POST /points served only in the delta window (if enforced)
     try:
         rows = await bex.run(store.points_batch, body.points, day, fields)
     except ValueError as ve:
@@ -505,4 +530,8 @@ async def healthz(request: Request):
             "delta_latest": (cube.delta.latest if isinstance(cube, TieredCube) and cube.delta else None),
             "delta_day_count": (cube.delta.day_count if isinstance(cube, TieredCube) and cube.delta else 0),
             "cube_refresh_ttl_s": getattr(request.app.state, "cube_refresh_ttl", 0),
+            "coveragejson_enabled": bool(cfg.ENABLE_COVERAGEJSON),
+            "spatial_window_enforce": bool(cfg.SPATIAL_WINDOW_ENFORCE),
+            "spatial_window": (list(spatial_policy.spatial_window_bounds(cube.delta.days))
+                               if isinstance(cube, TieredCube) and cube.delta and cube.delta.days else None),
             "route_counts": dict(router.route_counts)}
