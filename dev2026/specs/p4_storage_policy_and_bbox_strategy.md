@@ -1,8 +1,22 @@
 # P4 — storage policy & bbox strategy (can the system be time-cube authoritative?)
 
-Status: **DRAFT — revised per Codex review round 2** (Claude authored; Codex reviewed; Claude folded
-the 6 patches; ready for P4-S0 once confirmed). The P3-S1 compact-bbox work is prototype/evidence
-([`p3s1_bbox_format.md`](p3s1_bbox_format.md)); the **frontend contract (P3-S3) waits for this decision.**
+Status: **DRAFT — round 3: policy adopted (P4-S0 accepted)** (Claude authored; Codex reviewed 3×).
+P4-S0 local feasibility is accepted; the adopted policy is **Option A + D with
+`SPATIAL_WINDOW_DAYS = 31`** (§4.1), pending P4-S1 sign-off + the P4-S0b VM24 read-only binding gate.
+The P3-S1 compact-bbox work is prototype/evidence ([`p3s1_bbox_format.md`](p3s1_bbox_format.md)); the
+**frontend contract (P3-S3) waits for the policy sign-off.**
+
+> Round-3 patch: **single spatial rule** — bbox + POST /points served only for the latest 31 days,
+> older → clear 4xx (§4.1); **no small/large historical split; no WMS as an API substitute**; **POST bar
+> revised to an absolute recent-window budget** (warm p95 < 100 ms, C8 < ~1 s) since POST is delta-only
+> (§3.2); historical base results kept as the **rationale for the cutoff**, not a path to optimize.
+> Round-4 patch: spatial window is tied to the **bbox-friendly recent tier (delta `t1/s256`), NOT
+> "newest base blocks"** (a newest base block is still `t90/s8` = bbox-hostile) (§4.1); **delta
+> retention invariant** (keep ≥31 days; compaction folds only days older than the window into base,
+> §6.1); daily is **no longer full-history authoritative** — ingest target flow + staging retention
+> aligned to 31 (§6); P4-S0b caveat: prod delta has only ~2 days so it can't validate full 31-day
+> retention — use staging/shadow or an explicitly-approved backfill, never mutate prod under the
+> read-only gate (§8).
 
 > Round-2 patches folded: (1) **VM24 read-only binding gate** required before any pruning — local
 > P4-S0 is feasibility only (§3.3, §8 P4-S0b); (2) gate **expanded to all daily-routed queries**
@@ -77,16 +91,20 @@ spatial slice; single-day point/batch from the cube) are local/shadow only.
 Bound the decision up front (tune with orchestrator in §9):
 | metric | provisional bar |
 |---|---|
-| p95 latency — **delta/recent** single-day bbox (≤ medium) | **≤ ~1.5–2 s warm** (≈ daily today) |
-| p95 latency — **historical/base** single-day bbox | **≤ ~4 s warm**; if ≫ that, base-bbox is "limited" |
-| single-day **point** / **POST points** from cube | **≤ daily-path p95 + 25 %** |
+Spatial reads (bbox + POST /points) are served ONLY from the recent window (§4.1), so their bars are
+**absolute recent-window budgets**, not relative-to-daily:
+| metric | bar |
+|---|---|
+| **recent** single-day **bbox** warm p95 (≤ medium) | **< ~200 ms**; C8 bounded |
+| **recent** **POST /points** warm p95 | **< 100 ms**; **C8 p95 < ~1 s** |
+| full-history single-day **point** GET | **≤ daily-path p95 + 25 %** (or absolute < ~50 ms) |
 | **RSS** under C=8 | **≤ `GHRSST_RSS_CEILING_MB`** (prod 4096), no OOM, no unbounded growth |
-| **max bbox points** servable from cube within budget | report the crossover; informs the cap |
 | **concurrency** C=4 / C=8 | bounded degradation, zero 5xx/OOM |
-**If FAILED** (esp. historical/base bbox): the outcome is **not** "re-chunk the base" — it is
-**constrain/deprecate large historical bbox (Option D)** or **add a separate raster store (Option C)**.
-Recent/delta bbox passing but base failing → "delta-bbox only / historical bbox limited" is an
-acceptable, documented outcome.
+POST is an absolute budget (not daily+25%) because it is served from the delta/recent tier only; daily's
+~15 ms is an artifact of its single-`(1,1024,1024)`-chunk layout, not a meaningful floor. **Historical
+(base) bbox / scattered POST are NOT a threshold to pass** — their ~90× read amp is precisely the
+**rationale for the 31-day spatial cutoff (§4.1)**; the base layout is read-optimal for the primary
+point-series and is **not** a path we intend to optimize.
 
 ### 3.3 Binding gate (Codex #1) — local/shadow is feasibility ONLY
 **Local/shadow P4-S0 proves feasibility; it CANNOT authorize deleting or pruning the daily store.**
@@ -97,18 +115,36 @@ cron/deploy changes) and clear §3.2. Only the binding gate can authorize demoti
 Output `specs/p4s0_daily_vs_cube.md` + `bench/results/p4s0_*.json`; per-query, per-tier verdict:
 **acceptable? (yes / yes-for-delta-only / no)** → feeds §4.
 
-## 4. Storage policy options (decide AFTER the §3 gate) — **P4-S1**
-| opt | architecture | long-term disk | bbox | point/range | notes |
-|---|---|---|---|---|---|
-| **A** | **time-cube authoritative + daily = short-term staging (7/14/30d), then pruned** | **1 store (cube)** | from cube (delta cheap; base read-amp) | native (cube) | smallest sustainable; bbox quality bounded by §3 |
-| B | daily authoritative + rolling/trimmed time-cube | ~2 stores still | from daily | trimmed cube limits long series | doesn't solve disk if daily keeps full history |
-| C | time-cube + **separate single-day bbox/raster store** | cube + smaller raster store | fast (purpose-built) | native (cube) | adds a 3rd store; only if bbox is a hard requirement AND §3 says cube-bbox is unacceptable |
-| **D** | **constrain/deprecate bbox; WMS for spatial; cube for point/range** | **1 store (cube)** | limited/none (small bbox or none) | native (cube) | smallest + simplest; drops/limits external bbox API |
+## 4. Storage policy — ADOPTED: Option A + D with a single spatial-window rule — **P4-S1 finalizes**
+Options considered (P4-S0 evidence in `p4s0_daily_vs_cube.md`): **A** time-cube authoritative + daily
+short-term staging (1 store, sustainable); **B** daily authoritative + rolling cube (still ~2 stores —
+doesn't fix disk); **C** cube + separate single-day raster store (adds a store); **D** cube for
+point/range, spatial reads constrained. P4-S0 showed recent/delta spatial is cheap while historical/base
+spatial is a structural blocker, so:
 
-**Recommendation lean (to confirm with §3 evidence):** **A** if cube-bbox is acceptable at the sizes
-that matter (esp. recent/delta days); **D** if base-cube bbox is unacceptable and bbox isn't worth a
-second store; **C** only if bbox is a hard external requirement that A/D can't satisfy. **B** is
-unlikely (doesn't fix disk). Prioritize sustainability over preserving bbox.
+### 4.1 Adopted policy (pending P4-S1 sign-off) — **`SPATIAL_WINDOW_DAYS = 31`**
+- **Time-cube authoritative** (Option A); daily Zarr = short-term staging only (§6.2 retention window).
+- **Spatial queries = bbox + POST /points.** Both are supported **only for days present in the
+  bbox-friendly recent tier (the delta cube, `t1/s256`)** — currently the latest
+  `SPATIAL_WINDOW_DAYS = 31` days (Codex round-4). **NOT** served from base blocks: even the *newest*
+  base block is `t90/s8` and carries the same ~90× read amplification (§2), so "recent base blocks" are
+  bbox-hostile just like historical ones. **Older spatial queries return a clear 4xx** naming the
+  available spatial window (e.g. "spatial queries limited to the latest 31 days; available window
+  <start>..<end>").
+- **Delta retention invariant (spatial-serving guarantee):**
+  - the delta must **retain at least `SPATIAL_WINDOW_DAYS` (31) days** of the bbox-friendly recent tier;
+  - **compaction may fold ONLY days older than the spatial window into base**; it must **not** remove the
+    latest 31 days from delta **unless an equivalent bbox-friendly recent tier replaces them**;
+  - so the spatial window and the delta's bbox-friendly span are the SAME thing — bbox/POST availability
+    == delta membership.
+- **Single rule, no exceptions:** do **not** split historical bbox into small/large cases — the API rule
+  stays one date cutoff for all spatial requests. (Rationale: base `s8/t90` read amplification, §2/§3.2.)
+- **Full-history is retained** for **point time-series / range** and **single-day point GET** (cheap
+  from the cube at any age — base `t90/s8` is read-optimal for point series; P4-S0: point ≈ 2–3 ms).
+- **Option C** (separate raster store) is held in reserve **only if** full-history spatial later becomes
+  a hard external requirement that the 31-day window can't satisfy. **B** is rejected (doesn't fix disk).
+
+This is the smallest sustainable footprint (one growing store) while every high-volume path stays fast.
 
 ## 5. Compact bbox wire format → RASTER-style (redefine; supersedes the prototype `grid`) — **P4-S2**
 Only finalized once the serving store is chosen (§4). The xarray-like `lon[]`/`lat[]`+2-D `grid` is not
@@ -147,7 +183,13 @@ Rules / clarity (Codex #6):
 
 ## 6. Ingest policy for time-cube-authoritative mode (Option A) — **P4-S3**
 What "authoritative" requires: **the cube (+delta) must reproduce every served query without the daily
-store**; daily staging exists only for a bounded retention window + re-derivation safety.
+store**; **daily Zarr is NO LONGER full-history authoritative once P4 is adopted** — it exists only as a
+bounded staging/re-derivation buffer.
+
+**Target daily flow (Codex round-4):**
+`NetCDF download → append to delta → validate → (optional) daily staging write → prune daily staging
+after retention`. The delta (bbox-friendly recent tier) + base (point-series history) are authoritative;
+daily is transient.
 - **download** NetCDF (MUR) → **append to delta** via the tiled `append_to_delta` (P3 append-opt layout).
 - **validation:** coverage check + per-day/var presence + sanity (range/NaN-fraction) before commit.
 - **retry / resume:** checkpointed (existing per-(day,var,tile) checkpoint); idempotent re-run.
@@ -155,7 +197,11 @@ store**; daily staging exists only for a bounded retention window + re-derivatio
 - **latest metadata:** delta `days`/`latest` advance atomically; `/healthz` reflects tier latest.
 - **rollback:** keep the prior delta (and a base snapshot pointer) until the new day validates; revert
   by pointer swap.
-### 6.1 Compaction under the CURRENT disk reality (Codex #3)
+### 6.1 Compaction under the CURRENT disk reality (Codex #3) + spatial-window constraint
+**Compaction may fold ONLY days older than `SPATIAL_WINDOW_DAYS` (31) into base** — the delta must always
+keep the latest 31 days as the bbox-friendly recent tier (§4.1 retention invariant); folding a recent day
+into base would silently break bbox/POST for that day (base is `t90/s8`, bbox-hostile). So compaction
+lags the window by ≥31 days.
 The P3 `compact()` = **full staged base rebuild**, which needs **~2 TB+ free** for the new base before
 the atomic swap. **After the full cube rebuild that headroom does NOT exist** → **full-rebuild
 compaction is currently a BLOCKER, not a routine op.** Design alternatives, gated on measured free disk:
@@ -184,8 +230,11 @@ Before pruning ANY daily day (only after the §3.3 VM24 binding gate authorizes 
 - **corruption recovery plan:** if the cube is later found corrupt for a pruned span → re-derive from
   re-downloaded NetCDF (primary) or trash/hold (secondary, within the window); the prune manifest
   identifies exactly which spans need re-derivation.
-- **daily staging retention window:** keep daily Zarr for **7 / 14 / 30 days** (open §9) for
-  re-derivation/spot-checks before the above prune path applies to older days.
+- **daily staging retention window:** initial retention is **31 days, aligned with
+  `SPATIAL_WINDOW_DAYS`** (keep daily Zarr for the latest 31 days for re-derivation/spot-checks, prune
+  older). It **may be extended** later, but **must not be shorter than `SPATIAL_WINDOW_DAYS` unless
+  NetCDF redownload is explicitly accepted as the recovery path** — so any spatially-served (delta) day
+  is also re-derivable from staging (or from redownload if the window is deliberately shortened).
 
 ## 7. Ops boundary (hard)
 **Do NOT touch VM24 production, cron, the daily store, base cube, delta cube, deployment scripts, or
@@ -197,24 +246,38 @@ restated because P4 reasons about production data that must stay untouched.)
 - **P4-S0 (local/shadow — allowed now): FEASIBILITY only.** All-daily-routed-query benchmark
   (bbox + single-day point + POST points) daily vs base-cube vs delta-cube, with parity + the §3.2
   thresholds; cube prototype read paths. Output evidence. **Cannot authorize any pruning.**
-- **P4-S0b (VM24 READ-ONLY binding gate — needs explicit approval):** rerun the §3.1 matrix against the
-  **real production base+delta** (read-only; no writes/pruning/cron/deploy). **Only this can authorize
-  demoting the daily store** (Codex #1).
-- **P4-S1** — storage-policy decision (A/B/C/D) from local + binding evidence — orchestrator/Codex sign-off.
-- **P4-S2** — raster wire-format spec finalized for the chosen serving store (§5).
-- **P4-S3** — ingest-policy + compaction-mode + daily-pruning-safety spec for the chosen mode (§6),
-  incl. the compaction-feasibility decision (§6.1) and prune-manifest/parity/recovery (§6.2).
-- **then** P3-S3 frontend contract resumes **iff** bbox is preserved (Option A/C).
+- **P4-S0b (VM24 READ-ONLY binding gate — needs explicit approval):** validate the §4.1 policy against
+  **real production base+delta** (read-only; no writes/pruning/cron/deploy). Confirm on prod:
+  **full-history point/range** ✓, **full-history single-day point GET** ✓, **bbox + POST /points on the
+  EXISTING delta days** within the absolute budget (§3.2), and that **days NOT in the delta would be
+  rejected** by the policy once implemented.
+  - **Caveat (Codex round-4):** production delta currently holds only **~2 days** (2026-06-27..28), so
+    P4-S0b can validate **per-day delta performance** but **NOT the full 31-day retention policy** —
+    there aren't 31 delta days to serve yet.
+  - **To test the full 31-day window** without mutating production: use a **staging/shadow delta** (build
+    31 recent days into a shadow delta and benchmark it) OR an **explicitly-approved prep step** that
+    backfills recent days into delta. **Do NOT backfill/mutate production delta under the read-only
+    gate** — that is a separate, explicitly-approved ingest action, not part of P4-S0b.
+  - **Only P4-S0b (+ the retention state) can authorize demoting the daily store** (Codex #1).
+- **P4-S1** — finalize the §4.1 policy (A + D + `SPATIAL_WINDOW_DAYS=31`; POST absolute budget) from
+  local + binding evidence — orchestrator/Codex sign-off.
+- **P4-S2** — raster wire-format spec finalized (served for recent-31-day spatial only).
+- **P4-S3** — ingest-policy + compaction-mode + daily-pruning-safety spec (§6).
+- **then** P3-S3 frontend contract resumes (recent-31-day spatial + the 4xx window contract).
 
 ## 9. Open questions (for orchestrator / Codex)
-1. **Is bbox a hard external requirement**, or acceptable to constrain/deprecate (Option D), given
-   internal maps use WMS + point series?
-2. **Daily staging retention window:** 7 / 14 / 30 days?
-3. **Confirm/tune the §3.2 provisional thresholds** (delta-bbox ≤ ~1.5–2 s; base-bbox ≤ ~4 s or
-   "limited"; point/batch ≤ daily+25 %; RSS ≤ ceiling) — these are the binding pass bars.
-4. **CRS / cell_ref** for raster — EPSG:4326, `axis_order=lon,lat`, `cell_ref=center` confirmed?
-5. Confirm **re-chunking the base cube is off the table** (would hurt the primary point-series).
-6. If Option A: is **removing daily entirely** acceptable eventually, or always keep a rolling staging
-   window?
-7. **Compaction feasibility (§6.1):** is a second ~2 TB volume provisionable for staged rebuilds, or do
+**Decided:** policy = Option A + D with **`SPATIAL_WINDOW_DAYS = 31`** (spatial = bbox + POST, served
+from the delta tier / recent-31-day only, older → 4xx; full history for point/range + single-day point);
+POST bar is an absolute recent-window budget, not daily+25%; single 31-day cutoff, no small/large split;
+WMS is not an API-facing substitute. **`SPATIAL_WINDOW_DAYS = 31` is the adopted default** (not an open
+14/30 choice) unless product later reopens it. **Daily staging retention = 31 days, aligned with
+`SPATIAL_WINDOW_DAYS`** (§6.2): may be **extended** later, but **must not be shorter unless NetCDF
+redownload is explicitly accepted as the recovery path**.
+
+**Still open:**
+1. **CRS / cell_ref** for raster — EPSG:4326, `axis_order=lon,lat`, `cell_ref=center` confirmed?
+2. Confirm **re-chunking the base cube is off the table** (would hurt the primary point-series).
+3. If Option A: is **removing daily staging entirely** eventually acceptable (relying on NetCDF
+   redownload for recovery), or always keep the rolling 31-day staging window?
+4. **Compaction feasibility (§6.1):** is a second ~2 TB volume provisionable for staged rebuilds, or do
    we commit to block-level/rolling compaction (or "defer compaction" with a delta-growth alarm)?
