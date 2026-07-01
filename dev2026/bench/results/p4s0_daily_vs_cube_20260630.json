@@ -1,0 +1,300 @@
+{
+  "date_tag": "20260630",
+  "grid": 1024,
+  "hist_day": "2026-02-15",
+  "recent_day": "2026-04-01",
+  "chunks": {
+    "daily": [
+      1,
+      1024,
+      1024
+    ],
+    "base": [
+      90,
+      8,
+      8
+    ],
+    "delta": [
+      1,
+      256,
+      256
+    ]
+  },
+  "note": "LOCAL/SHADOW feasibility only \u2014 does NOT authorize pruning daily (needs P4-S0b VM24 binding gate).",
+  "bbox": [
+    {
+      "source": "daily",
+      "size": "small50k",
+      "points": 50176,
+      "parity": true,
+      "chunk_count": 3,
+      "decompressed_bytes": 12582912,
+      "useful_bytes": 602112,
+      "read_amp": 20.9,
+      "chunk_shape": [
+        1,
+        1024,
+        1024
+      ],
+      "warm_p95_ms": 7.8,
+      "c8_p95_ms": 20.6,
+      "c8_rss_mb": 21.9,
+      "json_mb": 7.7,
+      "grid_mb": 1.0
+    },
+    {
+      "source": "base",
+      "size": "small50k",
+      "points": 50176,
+      "parity": true,
+      "chunk_count": 2352,
+      "decompressed_bytes": 54190080,
+      "useful_bytes": 602112,
+      "read_amp": 90.0,
+      "chunk_shape": [
+        90,
+        8,
+        8
+      ],
+      "warm_p95_ms": 365.3,
+      "c8_p95_ms": 2767.2,
+      "c8_rss_mb": 13.5,
+      "json_mb": 7.7,
+      "grid_mb": 1.0
+    },
+    {
+      "source": "delta",
+      "size": "small50k",
+      "points": 50176,
+      "parity": true,
+      "chunk_count": 3,
+      "decompressed_bytes": 786432,
+      "useful_bytes": 602112,
+      "read_amp": 1.3,
+      "chunk_shape": [
+        1,
+        256,
+        256
+      ],
+      "warm_p95_ms": 4.8,
+      "c8_p95_ms": 37.1,
+      "c8_rss_mb": 1.5,
+      "json_mb": 7.7,
+      "grid_mb": 1.0
+    },
+    {
+      "source": "daily",
+      "size": "med250k",
+      "points": 250000,
+      "parity": true,
+      "chunk_count": 3,
+      "decompressed_bytes": 12582912,
+      "useful_bytes": 3000000,
+      "read_amp": 4.2,
+      "chunk_shape": [
+        1,
+        1024,
+        1024
+      ],
+      "warm_p95_ms": 7.8,
+      "c8_p95_ms": 21.8,
+      "c8_rss_mb": 35.9,
+      "json_mb": 38.3,
+      "grid_mb": 4.8
+    },
+    {
+      "source": "base",
+      "size": "med250k",
+      "points": 250000,
+      "parity": true,
+      "chunk_count": 11907,
+      "decompressed_bytes": 274337280,
+      "useful_bytes": 3000000,
+      "read_amp": 91.4,
+      "chunk_shape": [
+        90,
+        8,
+        8
+      ],
+      "warm_p95_ms": 844.5,
+      "c8_p95_ms": 7521.7,
+      "c8_rss_mb": 101.5,
+      "json_mb": 38.3,
+      "grid_mb": 4.8
+    },
+    {
+      "source": "delta",
+      "size": "med250k",
+      "points": 250000,
+      "parity": true,
+      "chunk_count": 12,
+      "decompressed_bytes": 3145728,
+      "useful_bytes": 3000000,
+      "read_amp": 1.0,
+      "chunk_shape": [
+        1,
+        256,
+        256
+      ],
+      "warm_p95_ms": 5.1,
+      "c8_p95_ms": 33.8,
+      "c8_rss_mb": 4.8,
+      "json_mb": 38.3,
+      "grid_mb": 4.8
+    },
+    {
+      "source": "daily",
+      "size": "large750k",
+      "points": 749956,
+      "parity": true,
+      "chunk_count": 3,
+      "decompressed_bytes": 12582912,
+      "useful_bytes": 8999472,
+      "read_amp": 1.4,
+      "chunk_shape": [
+        1,
+        1024,
+        1024
+      ],
+      "warm_p95_ms": 8.3,
+      "c8_p95_ms": 22.2,
+      "c8_rss_mb": 62.6,
+      "json_mb": 114.8,
+      "grid_mb": 14.4
+    },
+    {
+      "source": "base",
+      "size": "large750k",
+      "points": 749956,
+      "parity": true,
+      "chunk_count": 35643,
+      "decompressed_bytes": 821214720,
+      "useful_bytes": 8999472,
+      "read_amp": 91.3,
+      "chunk_shape": [
+        90,
+        8,
+        8
+      ],
+      "warm_p95_ms": 3342.7,
+      "c8_p95_ms": 27658.4,
+      "c8_rss_mb": 61.7,
+      "json_mb": 114.8,
+      "grid_mb": 14.4
+    },
+    {
+      "source": "delta",
+      "size": "large750k",
+      "points": 749956,
+      "parity": true,
+      "chunk_count": 48,
+      "decompressed_bytes": 12582912,
+      "useful_bytes": 8999472,
+      "read_amp": 1.4,
+      "chunk_shape": [
+        1,
+        256,
+        256
+      ],
+      "warm_p95_ms": 17.8,
+      "c8_p95_ms": 133.2,
+      "c8_rss_mb": 3.5,
+      "json_mb": 114.8,
+      "grid_mb": 14.4
+    }
+  ],
+  "point": {
+    "daily": {
+      "parity": true,
+      "chunk_count": 3,
+      "decompressed_bytes": 12582912,
+      "useful_bytes": 12,
+      "read_amp": 1048576.0,
+      "chunk_shape": [
+        1,
+        1024,
+        1024
+      ],
+      "warm_p95_ms": 7.4,
+      "c8_p95_ms": 19.1,
+      "c8_rss_mb": 17.2
+    },
+    "base": {
+      "parity": true,
+      "chunk_count": 3,
+      "decompressed_bytes": 69120,
+      "useful_bytes": 12,
+      "read_amp": 5760.0,
+      "chunk_shape": [
+        90,
+        8,
+        8
+      ],
+      "warm_p95_ms": 2.9,
+      "c8_p95_ms": 13.2,
+      "c8_rss_mb": 0.3
+    },
+    "delta": {
+      "parity": true,
+      "chunk_count": 3,
+      "decompressed_bytes": 786432,
+      "useful_bytes": 12,
+      "read_amp": 65536.0,
+      "chunk_shape": [
+        1,
+        256,
+        256
+      ],
+      "warm_p95_ms": 2.6,
+      "c8_p95_ms": 10.6,
+      "c8_rss_mb": 0.3
+    }
+  },
+  "batch": {
+    "daily": {
+      "parity": true,
+      "chunk_count": 3,
+      "decompressed_bytes": 12582912,
+      "useful_bytes": 12000,
+      "read_amp": 1048.6,
+      "chunk_shape": [
+        1,
+        1024,
+        1024
+      ],
+      "warm_p95_ms": 14.6,
+      "c8_p95_ms": 334.0,
+      "c8_rss_mb": 55.6
+    },
+    "base": {
+      "parity": true,
+      "chunk_count": 2901,
+      "decompressed_bytes": 66839040,
+      "useful_bytes": 12000,
+      "read_amp": 5569.9,
+      "chunk_shape": [
+        90,
+        8,
+        8
+      ],
+      "warm_p95_ms": 2484.3,
+      "c8_p95_ms": 12196.6,
+      "c8_rss_mb": 0.4
+    },
+    "delta": {
+      "parity": true,
+      "chunk_count": 48,
+      "decompressed_bytes": 12582912,
+      "useful_bytes": 12000,
+      "read_amp": 1048.6,
+      "chunk_shape": [
+        1,
+        256,
+        256
+      ],
+      "warm_p95_ms": 48.8,
+      "c8_p95_ms": 466.9,
+      "c8_rss_mb": 0.3
+    }
+  }
+}
