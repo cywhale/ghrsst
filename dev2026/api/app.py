@@ -36,7 +36,9 @@ from store.store_access import ALLOWED_FIELDS, StoreAccess  # noqa: E402
 from store.hybrid_router import HybridRouter  # noqa: E402
 from store.time_cube import TimeCubeStore  # noqa: E402
 from store.tiered_cube import TieredCube  # noqa: E402
-from store.bbox_encode import ALL_FORMATS, COMPACT_FORMATS, ENCODERS  # noqa: E402
+from store.bbox_encode import (CANONICAL_FORMAT, COMPACT_FORMATS, COVERAGEJSON_FORMATS,  # noqa: E402
+                               ENCODERS, PUBLIC_BASE_FORMATS)
+from store import spatial_policy  # noqa: E402
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -63,6 +65,15 @@ class Cfg:
     # P4-S3: background cube-metadata refresh interval (s) so new delta days appear without a restart.
     # 0 = disabled (rely on restart-after-append). Recommended on VM24 ~ the daily-append cadence.
     CUBE_REFRESH_TTL_SECONDS = _env_int("GHRSST_CUBE_REFRESH_TTL_SECONDS", 0)
+    # P4-S2: enable the opt-in coveragejson/raster bbox format. DEFAULT OFF — do not deploy on until
+    # P4-S3 wires the spatial-window policy into the bbox/POST endpoints (else it would bypass the
+    # recent-31-day-only rule). 0 = disabled (400 for coveragejson/raster).
+    ENABLE_COVERAGEJSON = _env_int("GHRSST_ENABLE_COVERAGEJSON", 0)
+    # P4-S3: enforce the adopted spatial-window policy — spatial queries (bbox + POST /points) served
+    # ONLY for days in the bbox-friendly recent tier (the delta cube); older -> 4xx (spatial_policy).
+    # DEFAULT OFF: current behaviour (daily store serves any day). Turn ON only in time-cube-authoritative
+    # mode, once the delta retains SPATIAL_WINDOW_DAYS days. Format-agnostic (gates the DAY, any format).
+    SPATIAL_WINDOW_ENFORCE = _env_int("GHRSST_SPATIAL_WINDOW_ENFORCE", 0)
 
 
 cfg = Cfg()
@@ -249,6 +260,23 @@ def _available_range_text(store: StoreAccess) -> str:
     return f"available range is {e0}/{e1}"
 
 
+def _spatial_window_gate(app, day: str):
+    """P4-S3: enforce the adopted spatial-window policy for a spatial query (bbox / POST points).
+
+    Spatial availability == delta membership (spec §4.1). When enforcement is ON and a delta tier is
+    loaded, a day NOT in the delta window is rejected with a clear 4xx naming the available window.
+    No-op when GHRSST_SPATIAL_WINDOW_ENFORCE is off (current behaviour: daily store serves any day) or
+    when there is no delta tier to enforce against (transition safety)."""
+    if not cfg.SPATIAL_WINDOW_ENFORCE:
+        return
+    cube = getattr(app.state.router, "cube", None)
+    delta = getattr(cube, "delta", None)
+    if delta is None:
+        return
+    if not spatial_policy.spatial_day_allowed(day, delta.days):
+        raise HTTPException(400, spatial_policy.rejection_payload(day, delta.days))
+
+
 # ---- GET /api/ghrsst (full parity) ---------------------------------------
 @app.get("/api/ghrsst")
 async def read_ghrsst(
@@ -269,8 +297,13 @@ async def read_ghrsst(
     fields = _fields(append)
     modes = _parse_modes(mode)
     fmt = (format or "json").strip().lower()
-    if fmt not in ALL_FORMATS:
-        raise HTTPException(400, f"Unsupported format '{fmt}'. Allowed: {', '.join(sorted(ALL_FORMATS))}")
+    # public formats: json always; coveragejson/raster only when enabled (P4-S2 flag). grid/columnar are
+    # legacy prototypes and NOT public.
+    allowed_formats = set(PUBLIC_BASE_FORMATS)
+    if cfg.ENABLE_COVERAGEJSON:
+        allowed_formats |= COVERAGEJSON_FORMATS
+    if fmt not in allowed_formats:
+        raise HTTPException(400, f"Unsupported format '{fmt}'. Allowed: {', '.join(sorted(allowed_formats))}")
     earliest, latest = store.bounds()
     if not latest:
         raise HTTPException(503, "No available dates.")
@@ -350,6 +383,7 @@ async def read_ghrsst(
     if chosen < earliest or chosen > latest or not store.day_present(chosen):
         raise HTTPException(400, f"BBOX query only allows single-day data. Requested "
                                  f"{chosen} is unavailable; {_available_range_text(store)}.")
+    _spatial_window_gate(request.app, chosen)         # P4-S3: bbox served only in the delta window (if enforced)
     cacheable = (not date_less) and (chosen < latest)
 
     # Hold ONE admission permit for the WHOLE bbox stream lifecycle (read + every
@@ -370,11 +404,12 @@ async def read_ghrsst(
         raise
     total = int(lons.size) * int(lats.size)
 
-    # ---- compact opt-in formats (grid / columnar): buffered single Response ----
+    # ---- compact opt-in formats (coveragejson / raster): buffered single Response ----
     if fmt in COMPACT_FORMATS:
         try:
             def _encode_compact() -> bytes:
-                return ENCODERS[fmt](lons, lats, cols, fields, chosen, truncate=("truncate" in modes))
+                return ENCODERS[fmt](lons, lats, cols, fields, chosen, truncate=("truncate" in modes),
+                                     bbox_requested=(lon0, lat0, lon1, lat1))
             _t1 = time.perf_counter()
             payload = await bex.run_ungated(_encode_compact)   # under held permit
             encode_ms = round((time.perf_counter() - _t1) * 1000, 1)
@@ -383,7 +418,7 @@ async def read_ghrsst(
         headers = _fixed_cache() if cacheable else _no_store()
         headers["X-Served-Rows"] = str(total)
         headers["X-Stride"] = str(int(sample))
-        headers["X-Bbox-Format"] = fmt
+        headers["X-Bbox-Format"] = CANONICAL_FORMAT.get(fmt, fmt)   # raster -> coveragejson
         headers["X-Read-Ms"] = str(read_ms)
         headers["X-Encode-Ms"] = str(encode_ms)
         return Response(payload, media_type="application/json", headers=headers)
@@ -447,6 +482,7 @@ async def read_points(request: Request, body: PointsRequest):
     earliest, latest = store.bounds()
     if not latest or not store.day_present(day):
         raise HTTPException(400, f"day {day} not available; {_available_range_text(store)}.")
+    _spatial_window_gate(request.app, day)            # P4-S3: POST /points served only in the delta window (if enforced)
     try:
         rows = await bex.run(store.points_batch, body.points, day, fields)
     except ValueError as ve:
@@ -494,4 +530,8 @@ async def healthz(request: Request):
             "delta_latest": (cube.delta.latest if isinstance(cube, TieredCube) and cube.delta else None),
             "delta_day_count": (cube.delta.day_count if isinstance(cube, TieredCube) and cube.delta else 0),
             "cube_refresh_ttl_s": getattr(request.app.state, "cube_refresh_ttl", 0),
+            "coveragejson_enabled": bool(cfg.ENABLE_COVERAGEJSON),
+            "spatial_window_enforce": bool(cfg.SPATIAL_WINDOW_ENFORCE),
+            "spatial_window": (list(spatial_policy.spatial_window_bounds(cube.delta.days))
+                               if isinstance(cube, TieredCube) and cube.delta and cube.delta.days else None),
             "route_counts": dict(router.route_counts)}
