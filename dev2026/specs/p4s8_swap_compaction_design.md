@@ -1,7 +1,10 @@
 # P4-S8 — atomic swap execution + compaction ordering design (SPEC-ONLY)
 
-Status: **DRAFT — Codex review round 1 patched, awaiting sign-off; UNCOMMITTED until approved** (Claude
-authored). **Design only — no implementation, no live swap, no production mutation.**
+Status: **ACCEPTED (Codex rounds 1–2) + S8a VERDICT FOLDED IN.** (Claude authored.) **No live swap, no
+production mutation.** The §2/§3/§9 swap-posture sections are now **evidence-based**: the S8a
+cached-handle proof test ran and FAILED → S1/S2 are staging/shadow-only; production swap requires request
+quiescence (PM2 restart-under-lock now; serving-disable as future design). See
+[`p4s8a_swap_executor_results.md`](p4s8a_swap_executor_results.md).
 
 > **Round-1 patches folded:** (1) S1 symlink swap downgraded to *candidate*: atomic **path switch ≠
 > application metadata consistency** — production-eligible only after the S8a cached-zarr-handle proof
@@ -51,7 +54,7 @@ answer three hazards:
 
 ## 2. Swap mechanics — two options, one recommended
 
-### Option S1 (candidate): symlink indirection — atomic PATH switch, NOT yet proven metadata-safe
+### Option S1: symlink indirection — **PROOF TEST FAILED → REJECTED for production (S8a verdict)**
 - One-time ops migration (S9/S10, Codex): move the real delta dir to a versioned name
   (`…delta.zarr.v<UTCSTAMP>`) and make `GHRSST_DELTACUBE_PATH` a **symlink** to it. No API code change:
   zarr resolves the symlink per open/read.
@@ -70,24 +73,32 @@ answer three hazards:
 > root captured at open). That is the real torn-read risk: **old `day_index` × new chunk bytes** — worse
 > than ENOENT because it returns *wrong data for the wrong day* silently.
 >
-> **Therefore S1 is production-eligible ONLY after an explicit S8a proof test:** open
-> `TimeCubeStore`/`TieredCube` **through the symlink**, capture `_Meta` + array handles, retarget the
-> symlink to a *different* delta (different day set + distinguishable values), then (a) read **before**
-> `refresh()` and (b) read **after** `refresh()`, asserting no old-meta/new-data mix in (a) — either
-> stable-old (resolved-root behavior, safe) or a detectable error, never silent cross-contamination —
-> and fully-new in (b). If the test shows silent mixing, **S1 is rejected for production** and the swap
-> must use a stronger strategy: temporary serving disable, PM2 restart under the lock, or an explicit
-> admin-refresh + request quiescence (§3 step 7) — not a bare symlink rename.
+> **S8a PROOF TEST RAN — VERDICT: FAILED (silent mixing confirmed).** `tests/test_phase2_p4s8a.py`
+> `TestCachedHandleProof` + `specs/p4s8a_swap_executor_results.md`: with a `TimeCubeStore` opened through
+> the symlink and the symlink atomically retargeted, a **pre-refresh read returned the NEW target's bytes
+> against the OLD `day_index`** (asked for day1 of A = 101.0, got B's 501.0 — no error); retargeting to a
+> **smaller** delta returned **silent `None`** (missing chunk → fill NaN → "absent"), also no error. zarr's
+> LocalStore resolves the path **per chunk read**. Neither outcome is "stable-old or error".
+>
+> **Consequences (binding):** (a) **S1 bare symlink retarget is REJECTED for production**; (b) **S2
+> double-rename shares the same path-reuse defect** plus the ENOENT window — also not production-safe;
+> (c) **both S1 and S2 are retained for staging/shadow/rehearsal only**; (d) **production swap REQUIRES
+> request quiescence**: **PM2 restart-under-lock** (available on VM24 today) or a **serving-disable/drain
+> window** (future design). An admin-refresh endpoint is at most an auxiliary aid — it fixes new-request
+> visibility only and does NOT quiesce in-flight `_Meta` holders, so it is **no longer listed as a
+> standalone acceptable option**. The proof test pins this behavior: a future zarr upgrade that changes
+> path-resolution semantics fails the test loudly and the verdict must be re-derived.
 
 ### Option S2 (fallback): double rename under lock + quiet window
 - `rename(live → live.pre-prune); rename(staging → live)` back-to-back under the ingest lock, run
   **off-peak**; accept the ms-scale ENOENT window (a failed read surfaces as one retryable 5xx).
 - Only acceptable for **shadow/staging** and as a fallback if ops rejects the symlink migration.
 
-**Decision requested from Codex/ops (§9-Q1):** adopt S1 for production **contingent on the S8a
-cached-handle proof test passing**; until then production swap is **blocked on §3-step-7's stronger
-mechanisms** (admin refresh or PM2 restart under lock). S8a implements both modes (the executor takes the
-mode explicitly); S2 stays shadow/staging-only.
+**Decision (§9-Q1, RESOLVED by the S8a proof test):** S1 is **rejected** for production; S2 was never
+production-eligible. The S8a executor implements both modes for **staging/shadow rehearsal only**; the
+production swap posture is **quiescence-based** (§3 step 7): PM2 restart-under-lock now, serving-disable
+as a future design. Production must not reuse the executor without an external quiescence wrapper
+(plugged in via `refresh_fn`).
 
 Both options require **same-filesystem** staging (`os.rename` must not cross devices) — executor prechecks
 `st_dev` of staging vs live parent **[RO]**.
@@ -102,7 +113,7 @@ Both options require **same-filesystem** staging (`os.rename` must not cross dev
 | 4 | **staleness guard:** re-read live `attrs["days"]` under the lock; require **(a) `len(live_days) == len(set(live_days))` (unique, no duplicate days)** and **(b) `set(live_days) == set(keep_days) ∪ set(dropped_days)`** from the plan, **exactly**. Set equality alone misses duplicates (Codex S8-review #4). Any new/absent/duplicate day → **abort, release lock, discard nothing, rebuild plan** | **[RO]** |
 | 5 | re-verify staging: re-run the plan's `validation` block (cheap re-read) + `st_dev` precheck | **[RO]** |
 | 6 | swap (S1 symlink rename, or S2 double rename); record swap manifest line (swap id, UTC, operator, old/new targets, keep/dropped sets, plan digest) | **[MUT-SWAP]** |
-| 7 | metadata refresh — **environment-dependent posture (Codex S8-review #3):** **shadow/staging** may use the TTL-wait path (wait `GHRSST_CUBE_REFRESH_TTL_SECONDS + slack`, poll `/healthz`). **Production MUST NOT rely on TTL-wait**: it holds the ingest lock for minutes (blocking append) and, if the S1 cached-handle behavior is unproven, TTL-wait does nothing about the pre-refresh torn-meta risk. Production requires, **before releasing the lock**, either (a) a **localhost-only admin refresh endpoint** returning an explicit refresh result (§9-Q5 — today **none exists**; only the TTL loop in [`api/app.py`](../api/app.py) `_refresh_loop`), or (b) **PM2 restart under the lock** as the fallback. **Scope caveat (Codex round-2):** admin refresh solves **metadata visibility for NEW requests only** — it does **not quiesce already in-flight reads** that hold a pre-swap `_Meta`. PM2 restart quiesces by construction (process replacement kills in-flight work). So the admin-refresh path is production-eligible **only if the S8a proof test shows pre-refresh reads are stable-old or error, never silently mixed**; if the proof test fails, production must use **serving-disable / request-quiescence (or PM2 restart)**, not merely admin refresh. **Until Q5 is resolved, production swap is BLOCKED** — TTL-wait is not treated as sufficient. | **[RO]/ops** |
+| 7 | refresh + quiescence — **posture RESOLVED by the S8a proof-test verdict (§2):** **shadow/staging** may use the TTL-wait path (wait `GHRSST_CUBE_REFRESH_TTL_SECONDS + slack`, poll `/healthz`) — mixing during a rehearsal is observable, not served to users. **Production MUST quiesce in-flight requests before/at the swap**: (a) **PM2 restart under the still-held lock** — the currently available VM24 posture (process replacement kills in-flight `_Meta` holders AND reopens metadata), or (b) a **serving-disable/drain window** (future design, §9-Q5). An **admin-refresh endpoint is auxiliary only** — it fixes new-request visibility, not in-flight reads — and is NOT a standalone option (proof test: pre-refresh reads silently mix old meta × new bytes). TTL-wait is never sufficient in production. | **[RO]/ops** |
 | 8 | **verify (§4)**; on failure → **rollback (§5)** | **[RO]** |
 | 9 | release lock; move the old delta (backup) into the **hold** area (§7); schedule hard delete only after `HOLD_DAYS` | **[MUT-DEL-to-hold]** |
 
@@ -207,18 +218,18 @@ Since O4 is the standing strategy, S8's guaranteed deliverable is the **alarm**,
 
 ## 9. Open questions (orchestrator / Codex)
 
-1. **S1 symlink migration for production?** — **candidate only, production-eligible ONLY if the S8a
-   cached-handle proof test passes** (§2). Not recommended-by-default. If the proof test fails or ops
-   declines the migration → production swap uses serving-disable / PM2-restart-under-lock (§3 step 7);
-   S2 stays shadow/staging-only.
+1. ~~S1 symlink migration for production?~~ — **RESOLVED: REJECTED.** The S8a cached-handle proof test
+   failed (silent old-meta × new-bytes mixing; silent `None` on a shrunk target — §2). S1/S2 are
+   staging/shadow/rehearsal-only; production swap = quiescence posture (§3 step 7).
 2. **`HOLD_DAYS`** default 14 OK?
 3. **`ALARM_SLACK_DAYS`** default 14 OK (alarm at delta span > 45 days)?
 4. When the alarm fires: provision a second volume (unlocks O1/O3) or fund the O2 §6.1 segmentation
    design? (Decision can wait for the first alarm.)
-5. Add a **localhost-only admin refresh endpoint** (e.g. `POST /admin/refresh`, bound to 127.0.0.1 /
-   guarded by env flag) returning an explicit refresh result? **Production swap is BLOCKED until this is
-   resolved** (§3 step 7): the answer is either this endpoint or PM2-restart-under-lock — TTL-wait is
-   shadow/staging-only.
+5. **Q5 NARROWED by the S8a verdict:** admin-refresh-alone is **off the table** (does not quiesce
+   in-flight reads; §2). The remaining choice is **PM2 restart-under-lock (available on VM24 today —
+   default)** vs **designing a serving-disable/drain mechanism** (only worth it if restart-per-prune is
+   operationally unacceptable, e.g. prune frequency makes brief restarts disruptive). An admin-refresh
+   endpoint may still be added later as an *auxiliary* tool, but it no longer blocks anything.
 6. Should the **public spatial window be capped at exactly 31 days** (gate + `/healthz` from a calendar
    cutoff) instead of the deployed delta-membership semantics that also serves buffer days (§4)? If yes,
    that is a separate reviewed API change to `_spatial_window_gate`/`spatial_policy`, plus a frontend
@@ -226,12 +237,12 @@ Since O4 is the standing strategy, S8's guaranteed deliverable is the **alarm**,
 
 ## 10. Step plan after this spec is signed off
 
-- **S8a** — swap executor implementation, **staging/shadow tests only** (executes real swaps on synthetic
-  copies in temp dirs; S1 + S2 modes; staleness-guard incl. duplicate detection, verify-fail rollback,
-  manifest lines all under test). **Must include the S1 cached-handle proof test (§2):** TimeCubeStore/
-  TieredCube opened through a symlink, `_Meta` + handles captured, symlink retargeted, read-before-refresh
-  and read-after-refresh asserted for no old-meta/new-data mixing — this test's outcome decides S1's
-  production eligibility (§9-Q1). No prod paths, no cron.
+- **S8a — DONE** (`ingest/swap_delta.py` + `tests/test_phase2_p4s8a.py`, 16/16;
+  `specs/p4s8a_swap_executor_results.md`). Executor: staleness guard (unique + exact set), same-fs
+  prechecks incl. hold_dir-vs-live for S2, refresh-exception → rollback (never leaves a swapped live
+  behind; `rollback_failed` status if rollback itself fails), hold + append-only manifest. **Proof test
+  RAN → S1 REJECTED for production (§2 verdict); S1/S2 staging/shadow-only; production posture =
+  quiescence (§3 step 7).** No prod paths, no cron.
 - **S8b** — `--alarm` mode on the audit tool **[RO]** + tests.
 - **P4-S7** — daily-staging prune + manifest impl, conforming to §7 conventions (move-to-hold, dry-run
   default, hard delete out of scope).
