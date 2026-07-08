@@ -389,6 +389,49 @@ class TestDeterminism(Base):
         self.assertEqual(json.dumps(r1, sort_keys=True), json.dumps(r2, sort_keys=True))
 
 
+class TestO4Alarm(Base):
+    """P4-S8b: O4 defer-with-alarm ([RO], S8 design §8). Span > window+slack or low disk -> exit 3
+    under --alarm; report always carries the alarm block; audit stays read-only."""
+
+    def _stores(self, n_delta_days):
+        days = [_iso(2026, 6, d) for d in range(1, n_delta_days + 1)]
+        daily = _mk_daily(self.tmp, days)
+        delta = _mk_delta(self.tmp, daily, days)
+        return daily, delta
+
+    def test_span_alarm_fires_exit_3(self):
+        daily, delta = self._stores(8)                 # 8-day span; window=3 + slack=2 -> limit 5
+        code = _quiet_main(["--daily", daily, "--delta", delta, "--spatial-window-days", "3",
+                            "--alarm", "--alarm-slack-days", "2",
+                            "--alarm-min-free-gb", "0"])   # isolate the SPAN trigger from real disk
+        self.assertEqual(code, 3)
+
+    def test_span_within_limit_exit_0(self):
+        daily, delta = self._stores(5)                 # 5-day span == limit 5 -> not fired
+        code = _quiet_main(["--daily", daily, "--delta", delta, "--spatial-window-days", "3",
+                            "--alarm", "--alarm-slack-days", "2",
+                            "--alarm-min-free-gb", "0"])   # isolate the SPAN trigger from real disk
+        self.assertEqual(code, 0)
+
+    def test_disk_margin_alarm_fires(self):
+        daily, delta = self._stores(3)                 # tiny span; fire via an absurd disk margin
+        code = _quiet_main(["--daily", daily, "--delta", delta, "--spatial-window-days", "3",
+                            "--alarm", "--alarm-slack-days", "30",
+                            "--alarm-min-free-gb", str(10**9)])       # ~1 EiB: always under margin
+        self.assertEqual(code, 3)
+
+    def test_alarm_block_in_report_without_flag(self):
+        daily, delta = self._stores(8)
+        args = _args(daily, None, delta, window=3)     # no --alarm flag -> evaluated, not enforced
+        args.alarm_slack_days = 2                      # span 8 > 3+2 -> deterministic span trigger
+        args.alarm_min_free_gb = 0                     # isolate from the machine's real free disk
+        rep = audit.build_report(args)
+        self.assertTrue(rep["alarm"]["fired"])
+        self.assertFalse(rep["alarm"]["enabled"])      # fired but not enforced (exit stays 0)
+        self.assertTrue(any("delta_span" in r for r in rep["alarm"]["reasons"]))
+        self.assertEqual(rep["alarm"]["span_limit_days"], 5)
+
+
 class TestMissingStoresGraceful(Base):
     """A missing base/delta must not crash — report present=false and keep going (VM24 read-only safety)."""
 

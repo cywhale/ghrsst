@@ -495,9 +495,31 @@ def build_report(args) -> dict:
         manifest_preview(report["staging_keep"], base, delta, args.mode) if window_ok else [])
     # disk is environment-dependent -> kept OUT of the deterministic logic core; placed last
     report["disk"] = disk_report(daily, base, delta, args.measure_sizes)
+    report["alarm"] = _alarm(report, args)
     report["audit_failures"] = _collect_failures(report)
     report["warnings"] = _collect_warnings(report)
     return report
+
+
+def _alarm(report: dict, args) -> dict:
+    """P4-S8b: O4 defer-with-alarm ([RO], design spec §8). Fires when the delta's CALENDAR span exceeds
+    the spatial window + slack (compaction is falling behind) or free disk drops under the hard margin.
+    Evaluated always; drives a nonzero exit only under --alarm. Disk-unknown does not fire (reported)."""
+    slack = getattr(args, "alarm_slack_days", 14)
+    min_free_gb = getattr(args, "alarm_min_free_gb", 200)
+    span = report["stores"]["delta"].get("calendar_span_days", 0)
+    span_limit = args.spatial_window_days + slack
+    fs = report.get("disk", {}).get("filesystems", {})
+    free = min((f["free_bytes"] for f in fs.values()), default=None)
+    reasons = []
+    if span > span_limit:
+        reasons.append(f"delta_span: {span}d > window({args.spatial_window_days}) + slack({slack}) = "
+                       f"{span_limit}d — compaction is falling behind (O4); provision disk or decide §9-Q4")
+    if free is not None and free < min_free_gb * 1024**3:
+        reasons.append(f"free_disk: {round(free / 1024**3, 1)} GiB < hard margin {min_free_gb} GiB")
+    return {"enabled": bool(getattr(args, "alarm", False)), "fired": bool(reasons), "reasons": reasons,
+            "delta_span_days": span, "span_limit_days": span_limit,
+            "min_free_gb": min_free_gb, "free_bytes": free, "free_unknown": free is None}
 
 
 def deterministic_core(report: dict) -> dict:
@@ -523,6 +545,13 @@ def main(argv=None) -> int:
     ap.add_argument("--healthz-url", help="optional API base URL for a read-only /healthz cross-check")
     ap.add_argument("--json-out", help="write the JSON report here (still printed to stdout)")
     ap.add_argument("--strict", action="store_true", help="exit nonzero if there are true audit failures")
+    # P4-S8b: O4 defer-with-alarm ([RO]; design spec §8). Exit 3 when fired — ops cron alerting hook.
+    ap.add_argument("--alarm", action="store_true",
+                    help="exit 3 if the O4 alarm fires (delta span > window+slack, or free disk < margin)")
+    ap.add_argument("--alarm-slack-days", type=int, default=14,
+                    help="alarm when delta calendar span exceeds spatial window + this slack (default 14)")
+    ap.add_argument("--alarm-min-free-gb", type=int, default=200,
+                    help="alarm when the stores' filesystem free space drops below this (GiB, default 200)")
     args = ap.parse_args(argv)
 
     report = build_report(args)
@@ -532,7 +561,9 @@ def main(argv=None) -> int:
         with open(args.json_out, "w") as fh:          # the ONLY write: the user-requested report artifact
             fh.write(text + "\n")
     if args.strict and report["audit_failures"]:
-        return 2
+        return 2                                       # audit failure outranks the alarm
+    if args.alarm and report["alarm"]["fired"]:
+        return 3
     return 0
 
 
