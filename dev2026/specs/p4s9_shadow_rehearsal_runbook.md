@@ -26,10 +26,16 @@ validates the tooling and the operator workflow before any production decision.
 
 ## 0. Code / environment
 
-- Branch: **`dev2026-p4-s8-swap-design`**, commit **`4db3e49`**
-  (`feat: P4-S7 daily staging prune with crash-safe manifest`) — contains the S4–S8b+S7 chain.
-- Runtime worktree: `/home/odbadmin/python/ghrsst-dev2026-phase2` — `git fetch && git checkout
-  dev2026-p4-s8-swap-design && git rev-parse --short HEAD` must print `4db3e49`.
+- **Run the env-setup block below FIRST** (it defines `$ART`, used by every command including the next
+  one).
+- Branch: **`dev2026-p4-s8-swap-design`** at its **tip**, which must **contain** commit `0133f3e`
+  (the S9 runbook; ancestor-check is robust to later doc commits — a fixed pin would go stale):
+  ```bash
+  cd /home/odbadmin/python/ghrsst-dev2026-phase2
+  git fetch && git checkout dev2026-p4-s8-swap-design && git pull --ff-only
+  git merge-base --is-ancestor 0133f3e HEAD && echo "ancestor-check OK" || { echo "NO-GO: branch tip lacks 0133f3e"; exit 1; }
+  git rev-parse HEAD > "$ART/git_head.txt"          # record the ACTUAL commit executed
+  ```
   **Checking out this branch in the worktree does NOT restart or change the production app** (PM2 runs
   the already-loaded process; do not `pm2 restart` for the checkout).
 - Python: `dev2026/.venv/bin/python` in that worktree. Sanity: run the shipped tests once —
@@ -43,20 +49,25 @@ validates the tooling and the operator workflow before any production decision.
 | live daily | `/home/odbadmin/Data/ghrsst/mur.zarr` | **read-only** |
 | live base | `/home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.zarr` | **read-only** |
 | live delta | `/home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.delta.zarr` | **read-only** |
-| shadow root | `/home/odbadmin/Data/ghrsst/shadow_p4s9/` | created by this runbook |
-| shadow delta ("shadow-live") | `shadow_p4s9/delta_live.zarr` | copy; mutated by rehearsal |
-| shadow staging delta | `shadow_p4s9/delta_new.zarr` | built by `prune_delta` |
-| shadow daily subset | `shadow_p4s9/daily_subset.zarr/` | partial copy; mutated by staging-prune real run |
-| hold | `shadow_p4s9/hold/` | rehearsal hold + manifests |
+| shadow root | `/home/odbadmin/Data/ghrsst/shadow_p4s9_<RUN_ID>/` | created fresh per run |
+| shadow delta ("shadow-live") | `$SH/delta_live.zarr` | copy; mutated by rehearsal |
+| shadow staging delta | `$SH/delta_new.zarr` | built by `prune_delta` |
+| shadow daily subset | `$SH/daily_subset.zarr/` | partial copy; mutated by staging-prune real run |
+| hold | `$SH/hold/` | rehearsal hold + manifests |
 | artifacts | `/home/odbadmin/Data/ghrsst/logs/p4s9_<UTCSTAMP>/` | all JSON/log outputs |
 
-Set once per session:
+Set once per session — the shadow root is **UNIQUE PER RUN** (a fixed dir + `mkdir -p` could silently
+mix stale data from a prior rehearsal into this one). Do **not** auto-`rm` old shadow dirs in this
+runbook; leftover `shadow_p4s9_*` dirs are cleaned by ops separately, after review:
 ```bash
 export G=/home/odbadmin/Data/ghrsst
 export WT=/home/odbadmin/python/ghrsst-dev2026-phase2/dev2026
 export PY=$WT/.venv/bin/python
-export SH=$G/shadow_p4s9
-export ART=$G/logs/p4s9_$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$ART"
+export RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
+export SH=$G/shadow_p4s9_$RUN_ID
+export ART=$G/logs/p4s9_$RUN_ID
+test ! -e "$SH" || { echo "NO-GO: $SH already exists"; exit 1; }
+mkdir -p "$SH/hold" "$ART"
 ```
 
 ## 1. Preconditions (all **[RO]**; any failure = NO-GO before anything is copied)
@@ -101,23 +112,32 @@ export ART=$G/logs/p4s9_$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$ART"
 ## 2. Build the shadow copies (**[MUT-SHADOW]** — writes only under `$SH`)
 
 ```bash
-mkdir -p $SH $SH/hold
-# consistency guard: the latest delta-append log must be finished (not mid-run) before copying —
-# check the newest log under $G/logs/delta_append/ ends in a completed append (per its usual format),
-# and we are outside the precondition-4 cron safety windows.
-ls -t $G/logs/delta_append/ | head -3; tail -5 $G/logs/delta_append/$(ls -t $G/logs/delta_append/ | head -1)
-# snapshot attrs['days'] BEFORE the copy
-$PY -c "import zarr,sys; print(sorted(zarr.open_group(sys.argv[1],mode='r').attrs['days'])[-1], \
-len(zarr.open_group(sys.argv[1],mode='r').attrs['days']))" \
-  $G/mur_timecube_s8_t90_sh128.delta.zarr | tee $ART/delta_days_before_copy.txt
-# shadow-live delta = full copy of the live delta
+# --- consistency guard A: the latest delta-append log must show a COMPLETION MARKER (not mid-run) ---
+# NOTE for the operator: the cron script lives only on VM24 — confirm its actual completion marker
+# string first (expected "DONE" or "APPEND_DONE"); adjust the grep if the script uses another wording,
+# and record which marker was required in the PASS/NO-GO summary.
+LOG=$G/logs/delta_append/$(ls -t $G/logs/delta_append/ | head -1)
+tail -20 "$LOG" > "$ART/latest_delta_append_tail.txt"
+grep -Eq "DONE|APPEND_DONE" "$ART/latest_delta_append_tail.txt" \
+  || { echo "NO-GO: newest append log ($LOG) has no completion marker" | tee "$ART/NO_GO_append_log.txt"; exit 1; }
+
+# --- snapshot live delta BEFORE the copy (latest day + count + full day list) ---
+snap() { $PY -c "import zarr,sys,json; d=list(zarr.open_group(sys.argv[1],mode='r').attrs['days']); \
+print(json.dumps({'latest': max(d), 'count': len(d), 'days': sorted(d)}))" "$1"; }
+snap $G/mur_timecube_s8_t90_sh128.delta.zarr > "$ART/delta_days_before_copy.json"
+
+# --- shadow-live delta = full copy of the live delta ---
 cp -a $G/mur_timecube_s8_t90_sh128.delta.zarr $SH/delta_live.zarr
-# snapshot AFTER the copy: latest day + count must be UNCHANGED, else the copy raced an append ->
-# discard $SH/delta_live.zarr and retry outside the cron windows.
-$PY -c "import zarr,sys; print(sorted(zarr.open_group(sys.argv[1],mode='r').attrs['days'])[-1], \
-len(zarr.open_group(sys.argv[1],mode='r').attrs['days']))" \
-  $G/mur_timecube_s8_t90_sh128.delta.zarr | tee $ART/delta_days_after_copy.txt
-diff $ART/delta_days_before_copy.txt $ART/delta_days_after_copy.txt || { echo "DELTA CHANGED MID-COPY — discard shadow, retry"; }
+
+# --- consistency guard B (HARD STOP on mismatch): live-after AND the copied shadow must both equal
+#     the pre-copy live snapshot — a mismatch means the copy raced an append; discard + retry outside
+#     the cron windows. This compares the SHADOW itself, not only live before/after. ---
+snap $G/mur_timecube_s8_t90_sh128.delta.zarr > "$ART/delta_days_after_copy.json"
+snap $SH/delta_live.zarr                     > "$ART/delta_days_shadow_copy.json"
+cmp -s "$ART/delta_days_before_copy.json" "$ART/delta_days_after_copy.json" \
+  && cmp -s "$ART/delta_days_before_copy.json" "$ART/delta_days_shadow_copy.json" \
+  || { echo "NO-GO: delta changed mid-copy (live-before vs live-after vs shadow disagree) — discard \
+$SH/delta_live.zarr and retry outside the cron windows" | tee "$ART/NO_GO_copy_inconsistent.txt"; exit 1; }
 # shadow daily subset: the latest ~45 days only (enough to exceed window+buffer; NEVER the full 2TB)
 $PY - <<'EOF'
 import os, shutil, sys
@@ -131,8 +151,18 @@ for d in days:
 print("copied", len(days), "days:", days[0], "..", days[-1])
 EOF
 ```
-Verify: open both shadow stores read-only and confirm day counts match expectations (the audit tool can
-be pointed at the shadow paths for this — save as `$ART/audit_shadow.json`).
+Verify the shadow stores with the audit tool pointed at the SHADOW paths (live base stays read-only):
+```bash
+cd $WT && $PY ops/p4_retention_audit.py \
+  --daily $SH/daily_subset.zarr \
+  --base  $G/mur_timecube_s8_t90_sh128.zarr \
+  --delta $SH/delta_live.zarr \
+  --json-out $ART/audit_shadow.json
+```
+Confirm in `audit_shadow.json`: shadow delta spans/day-count match `delta_days_shadow_copy.json`;
+`recent_spatial_window.recent_window_contiguous == true`; the daily-subset span covers the intended
+~45 (or enlarged) days. (No `--strict`/`--alarm` here — this is a shape check on copies, not a gate;
+the production gate already ran in step 1.3.)
 
 ## 3. Delta-prune plan against the SHADOW delta (**[MUT-SHADOW]**: writes only `$SH/delta_new.zarr`)
 
@@ -283,22 +313,39 @@ repeat with `dry_run=False` (**still only mutates the shadow daily subset**) →
 
 | artifact | from |
 |---|---|
+| `git_head.txt` (actual commit executed) | §0 |
 | `audit.json` + `audit.exit` (rc; alarm block inside the JSON) | step 1.3 |
-| `audit_shadow.json` + `delta_days_before/after_copy.txt` | step 2 |
+| `latest_delta_append_tail.txt` (+ any `NO_GO_*.txt`) | step 2 guard A |
+| `audit_shadow.json` + `delta_days_{before,after,shadow}_copy.json` | step 2 |
 | `prune_plan.json` | step 3 |
 | `swap_result.json` (may be `status:"skipped"` — a valid outcome) | step 4 |
-| `probes.txt` + `healthz_before.json` + `healthz_shadow.json` + `shadow_uvicorn.log`/`.pid` | steps 1.1 / 5a |
+| `probes.txt` + `healthz_before.json` + `healthz_shadow.json` + `healthz_after.json` + `shadow_uvicorn.log`/`.pid` | steps 1.1 / 5a / §8 |
 | `staging_dryrun.json` / `staging_realrun.json` | step 6 |
 | `$SH/hold/manifest.jsonl` + `manifest.dryrun.jsonl` (copies into `$ART`) | steps 4/6 |
 | **final PASS / NO-GO summary** (one paragraph per step: pass / fail / skipped-and-why) | operator |
 
+**Final untouched-production check (run last, concrete command):**
+```bash
+curl -fsS http://127.0.0.1:8035/healthz > "$ART/healthz_after.json"
+$PY - <<'EOF'
+import json, os
+ART = os.environ["ART"]
+STABLE = ("delta_latest", "delta_day_count", "spatial_window", "cube_latest_in_sync")
+b = json.load(open(os.path.join(ART, "healthz_before.json")))
+a = json.load(open(os.path.join(ART, "healthz_after.json")))
+diff = {k: {"before": b.get(k), "after": a.get(k)} for k in STABLE if b.get(k) != a.get(k)}
+print("STABLE-FIELD MATCH" if not diff else f"STABLE-FIELD MISMATCH: {json.dumps(diff)}")
+# rss_mb / pid / queue depth / route_counts are EXCLUDED by design — they legitimately change.
+EOF
+```
+A mismatch is a NO-GO **unless** a scheduled cron append legitimately ran between the two snapshots —
+in that case `delta_latest`/`delta_day_count` advance by exactly that append; the operator must add an
+explicit note (which cron slot, which day appended) to the PASS/NO-GO summary.
+
 **PASS criteria:** every executed step green (or explicitly skipped via the documented degradation
-paths), zero NO-GO conditions fired, all artifacts present (incl. `shadow_uvicorn.log` and
-`audit.exit`), and the final production `/healthz` matches `healthz_before.json` on the **stable fields
-only**: `delta_latest`, `delta_day_count`, `spatial_window`, `cube_latest_in_sync` — proving the live
-system was untouched. (Do NOT require full-body identity: `rss_mb`, pid, queue depth, and
-`route_counts` legitimately change. Exception: if a scheduled cron append ran between the two snapshots,
-`delta_latest`/`delta_day_count` advance by exactly that append — record it and compare accordingly.)
+paths), zero NO-GO conditions fired, all artifacts present (incl. `shadow_uvicorn.log`, `audit.exit`,
+`git_head.txt`), and the stable-field comparison above passes (or carries the operator's cron-append
+note).
 
 ## 9. After S9
 
