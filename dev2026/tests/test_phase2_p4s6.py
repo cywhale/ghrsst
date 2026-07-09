@@ -13,6 +13,7 @@ Run: dev2026/.venv/bin/python dev2026/tests/test_phase2_p4s6.py
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import sys
 import tempfile
@@ -390,6 +391,124 @@ class TestMixedSourceVarFirstAppears(Base):
         self.assertTrue(np.all(np.isnan(_slab(self.out(), _iso(2026, 6, 2), "sea_ice"))))
         np.testing.assert_array_equal(_slab(self.out(), _iso(2026, 6, 5), "sea_ice"),
                                       _slab(delta, _iso(2026, 6, 5), "sea_ice"))
+
+
+class TestBulkEngineArtifacts(Base):
+    """S9 field-failure hardening: progress/error artifacts + plan-written-only-on-success + resume."""
+
+    def _fixture(self):
+        days = [_iso(2026, 6, d) for d in range(1, 11)]
+        daily = _mk_daily(self.tmp, days)
+        order = days[4:] + list(reversed(days[:4]))            # append-order source delta
+        delta = _mk_delta(self.tmp, daily, order)
+        return days, daily, delta
+
+    def test_progress_and_plan_artifacts(self):
+        days, daily, delta = self._fixture()
+        art = os.path.join(self.tmp, "art"); os.makedirs(art)
+        plan = prune_delta(delta, self.out(), days[3:], source_daily=daily, base_days=days,
+                           spatial_window_days=5, artifacts_dir=art)
+        self.assertEqual(plan["status"], "ok")
+        self.assertEqual(plan["engine"], "bulk")
+        # progress journal: gates -> build_start -> var_done... -> finalized -> validation start/end -> plan
+        with open(os.path.join(art, "prune_delta_progress.jsonl")) as fh:
+            events = [json.loads(x)["event"] for x in fh]
+        for expected in ("gates_passed", "build_start", "var_done", "build_finalized",
+                         "validation_start", "validation_day", "validation_end", "plan_written"):
+            self.assertIn(expected, events, f"missing journal event {expected}")
+        # var_done records carry day/source/target_index/elapsed/status
+        with open(os.path.join(art, "prune_delta_progress.jsonl")) as fh:
+            vd = [json.loads(x) for x in fh if json.loads(x)["event"] == "var_done"]
+        self.assertTrue(all({"day", "var", "source", "target_index", "elapsed_s", "status"} <= set(r)
+                            for r in vd))
+        # plan JSON written by the tool itself, matching the return value's keep set
+        with open(os.path.join(art, "prune_plan.json")) as fh:
+            disk_plan = json.load(fh)
+        self.assertEqual(disk_plan["keep_days"], plan["keep_days"])
+        self.assertFalse(os.path.exists(os.path.join(art, "prune_delta_error.json")))
+
+    def test_refusal_writes_no_plan(self):
+        days, daily, delta = self._fixture()
+        art = os.path.join(self.tmp, "art"); os.makedirs(art)
+        plan = prune_delta(delta, self.out(), days[3:], source_daily=daily, base_days=None,   # refused
+                           spatial_window_days=5, artifacts_dir=art)
+        self.assertEqual(plan["status"], "refused")
+        self.assertFalse(os.path.exists(os.path.join(art, "prune_plan.json")))
+        with open(os.path.join(art, "prune_delta_progress.jsonl")) as fh:
+            events = [json.loads(x)["event"] for x in fh]
+        self.assertIn("refused", events)
+
+    def test_failure_writes_error_artifact_and_resume_completes(self):
+        # Inject a mid-build exception: fail the Nth tile write. The error artifact + progress journal must
+        # suffice to determine state; resume=True then completes the build and validates green.
+        from unittest import mock
+        import ingest.prune_delta as pdmod
+        days, daily, delta = self._fixture()
+        art = os.path.join(self.tmp, "art"); os.makedirs(art)
+        out = self.out()
+        calls = {"n": 0}
+        orig_bulk = pdmod._bulk_build
+
+        def sabotaged_bulk(*a, **kw):
+            # wrap the journal to blow up after the 3rd var_done (mid-build, deterministic)
+            journal = kw["journal"]
+            real_event = journal.event
+            def flaky_event(**ev):
+                real_event(**ev)
+                if ev.get("event") == "var_done":
+                    calls["n"] += 1
+                    if calls["n"] == 3:
+                        raise RuntimeError("injected mid-build failure")
+            journal.event = flaky_event
+            return orig_bulk(*a, **kw)
+
+        with mock.patch.object(pdmod, "_bulk_build", side_effect=sabotaged_bulk):
+            res = prune_delta(delta, out, days[3:], source_daily=daily, base_days=days,
+                              spatial_window_days=5, artifacts_dir=art, workers=1)
+        self.assertEqual(res["status"], "error")
+        self.assertIn("injected", res["reason"])
+        # error artifact: traceback + enough context; progress shows exactly which var-days completed
+        with open(os.path.join(art, "prune_delta_error.json")) as fh:
+            err = json.load(fh)
+        self.assertIn("injected mid-build failure", err["error"])
+        self.assertIn("Traceback", err["traceback"])
+        with open(os.path.join(art, "prune_delta_progress.jsonl")) as fh:
+            recs = [json.loads(x) for x in fh]
+        done_vars = [(r["day"], r["var"]) for r in recs if r["event"] == "var_done"]
+        self.assertEqual(len(done_vars), 3)                     # frontier is exact
+        self.assertEqual(recs[-1]["event"], "error")
+        self.assertFalse(os.path.exists(os.path.join(art, "prune_plan.json")))   # no plan on failure
+        # ---- resume: same out_path + resume=True completes from the checkpoint ----
+        art2 = os.path.join(self.tmp, "art2"); os.makedirs(art2)
+        res2 = prune_delta(delta, out, days[3:], source_daily=daily, base_days=days,
+                           spatial_window_days=5, artifacts_dir=art2, resume=True, workers=1)
+        self.assertEqual(res2["status"], "ok")
+        self.assertTrue(res2["validation"]["all_ok"])
+        self.assertEqual(_days_attr(out), sorted(days[3:]))
+        for d in days[3:]:                                      # values correct by DATE after resume
+            np.testing.assert_array_equal(_slab(out, d, "sst"), _slab(delta, d, "sst"))
+        self.assertTrue(os.path.exists(os.path.join(art2, "prune_plan.json")))
+
+    def test_perday_engine_still_works(self):
+        days, daily, delta = self._fixture()
+        plan = prune_delta(delta, self.out(), days[3:], source_delta=delta, base_days=days,
+                           spatial_window_days=5, engine="perday")
+        self.assertEqual(plan["status"], "ok")
+        self.assertEqual(plan["engine"], "perday")
+        self.assertEqual(_days_attr(self.out()), sorted(days[3:]))
+
+    def test_bulk_no_worker_resize_or_attrs(self):
+        # invariant probe: mid-build (before finalize) the staging arrays already have FULL final shape
+        # and NO days attr — workers never resize, metadata lands last. Checked via the journal ordering:
+        # build_finalized comes strictly after the last var_done.
+        days, daily, delta = self._fixture()
+        art = os.path.join(self.tmp, "art"); os.makedirs(art)
+        prune_delta(delta, self.out(), days[3:], source_daily=daily, base_days=days,
+                    spatial_window_days=5, artifacts_dir=art)
+        with open(os.path.join(art, "prune_delta_progress.jsonl")) as fh:
+            events = [json.loads(x)["event"] for x in fh]
+        self.assertGreater(events.index("build_finalized"), max(i for i, e in enumerate(events)
+                                                                if e == "var_done"))
 
 
 if __name__ == "__main__":

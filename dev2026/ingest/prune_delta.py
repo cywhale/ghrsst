@@ -9,24 +9,42 @@ the stored slabs and silently corrupts every later read (P4-S4 §2). The ONLY sa
     source (daily staging preferred; else the existing delta read BY ``day_index``), validate it, and hand
     the caller an atomic-SWAP PLAN — the swap itself is a later phase.
 
-This module implements that rebuild + validation and returns the plan. It performs **no swap, no production
-mutation, no in-place edit** of the source delta/daily. It writes only the staging ``out_path`` the caller
-supplies (which must differ from the live delta). Compatible with the P4-S5 audit output (consumes its
-``keep_days`` / eligibility) and with the P4-S4 safety model. Production wiring + the atomic swap are P4-S7/S8/S9.
+**S9 field-failure hardening (VM24 step-3 incident):** the original wrapper died silently at production
+scale — the OLD validation materialized FULL GLOBAL slabs (~2.6 GB per var-day at 17999×36000) just to
+sample a few points, so the process was OOM-killed after the build finished, leaving no plan and no error
+artifact. Fixes:
+- **validation is now point-wise** (per-sample scalar reads; never a full slab) — the root-cause fix;
+- **``engine='bulk'`` (default)**: pre-creates the final arrays at full shape ``(len(keep_days), ny, nx)``
+  and writes disjoint (day, var, spatial-tile) units bounded-parallel; workers NEVER resize arrays or
+  touch attrs; ``days``/``var_valid`` are finalized LAST; an append-only checkpoint enables ``resume=True``;
+- **progress/error artifacts** (``artifacts_dir=``): ``prune_delta_progress.jsonl`` (per var-day
+  completion + validation start/end, each line flushed+fsync'd — even a SIGKILL leaves an exact frontier),
+  ``prune_delta_error.json`` (traceback + completed state) on any catchable exception, and
+  ``prune_plan.json`` written by the tool itself ONLY on success.
+- ``engine='perday'`` keeps the original per-day writers (small-scale/tests; its delta-source fallback
+  materializes full slabs — do not use it at production scale).
 
-Spec: ``specs/p4_ingest_prune_retention_design.md`` (§2, §5). Results: ``specs/p4s6_delta_prune_results.md``.
+No swap, no production mutation, no in-place edit of the sources. Compatible with the P4-S5 audit output
+and the P4-S4 safety model. Spec: ``specs/p4_ingest_prune_retention_design.md`` (§2, §5).
 """
 from __future__ import annotations
 
+import json
 import os
-from datetime import date, timedelta
+import threading
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import zarr
 
-from ingest.dual_write import DELTA_SPATIAL_CHUNK, DELTA_SHARD_SPATIAL, append_to_delta, read_daily_day
-from store.zarr_paths import group_exists
+from ingest.dual_write import DELTA_SPATIAL_CHUNK, DELTA_SHARD_SPATIAL, append_to_delta
+from store.zarr_paths import group_exists, group_path
+
+_CK_NAME = "_bulk_prune_ck.jsonl"                    # append-only checkpoint inside out_path
 
 
 # --------------------------------------------------------------------------- calendar helpers (mirror P4-S5 §4.1)
@@ -54,6 +72,44 @@ def recent_window_contiguous(delta_days: Sequence[str], spatial_window_days: int
     return {"contiguous": not missing, "missing": missing, "window_start": start, "window_end": end}
 
 
+# --------------------------------------------------------------------------- progress / error artifacts
+class _Journal:
+    """Append-only progress JSONL; every line is flushed + fsync'd so even a SIGKILL (e.g. the OOM kill
+    that ate the VM24 step-3 run) leaves an exact record of the last completed unit. No-op without a dir."""
+
+    def __init__(self, artifacts_dir: Optional[str]):
+        self._fh = None
+        self._lock = threading.Lock()
+        if artifacts_dir:
+            os.makedirs(artifacts_dir, exist_ok=True)
+            self.path = os.path.join(artifacts_dir, "prune_delta_progress.jsonl")
+            self._fh = open(self.path, "a")
+
+    def event(self, **kw) -> None:
+        if self._fh is None:
+            return
+        kw.setdefault("ts", datetime.now(timezone.utc).isoformat())
+        line = json.dumps(kw, sort_keys=True, default=str)
+        with self._lock:
+            self._fh.write(line + "\n")
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+
+def _write_error(artifacts_dir: Optional[str], exc: BaseException, context: dict) -> None:
+    if not artifacts_dir:
+        return
+    with open(os.path.join(artifacts_dir, "prune_delta_error.json"), "w") as fh:
+        json.dump({"error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc(),
+                   "ts": datetime.now(timezone.utc).isoformat(), **context},
+                  fh, indent=2, sort_keys=True, default=str)
+
+
 # --------------------------------------------------------------------------- read-only source access
 def _open_delta_meta(delta_path: str) -> dict:
     """Read-only snapshot of a delta cube's metadata (physical-order days + day_index + var_valid)."""
@@ -75,10 +131,19 @@ def _open_delta_meta(delta_path: str) -> dict:
     }
 
 
+def _src_present(orig: dict, day_src: dict, day: str, v: str) -> bool:
+    """Is var ``v`` present for ``day`` in its source (daily group, or the old delta BY day_index)?"""
+    kind, gd = day_src[day]
+    if kind == "daily":
+        return v in gd
+    t = orig["day_index"][day]
+    vv = orig["var_valid"].get(v)
+    return (v in orig["group"]) and (bool(vv[t]) if vv is not None else True)
+
+
 def _read_delta_day(meta: dict, day: str) -> Dict[str, Optional[np.ndarray]]:
-    """Read one day's vars from an existing delta, addressed BY ``day_index[day]`` (its PHYSICAL slab) —
-    never by position in any keep list. Absent var (var_valid False) -> None."""
-    t = meta["day_index"][day]                                # physical index, robust to append order
+    """FULL-SLAB read of one day BY day_index (perday engine only — memory-heavy at production scale)."""
+    t = meta["day_index"][day]
     g = meta["group"]
     out: Dict[str, Optional[np.ndarray]] = {}
     for v in meta["vars"]:
@@ -88,14 +153,14 @@ def _read_delta_day(meta: dict, day: str) -> Dict[str, Optional[np.ndarray]]:
     return out
 
 
-# --------------------------------------------------------------------------- staging writer (delta-source path)
+# --------------------------------------------------------------------------- perday writer (legacy engine)
 def _append_prebuilt_day(out_path: str, day: str, data: Dict[str, Optional[np.ndarray]],
                          ny: int, nx: int, lon: np.ndarray, lat: np.ndarray, region: Optional[tuple],
                          spatial_chunk: int, shard_spatial: int) -> None:
     """Append one in-memory day into the staging delta with the SAME var-union convention as append_to_delta,
     so the two writers can be MIXED on the same output: a var first seen on a later day is created with a
     NaN backfill + ``var_valid False`` for the prior days. finalize ``attrs['days']`` LAST; absent var ->
-    NaN slab + valid False. Used for the delta-source fallback (staging/shadow scale)."""
+    NaN slab + valid False. perday engine only (staging/shadow scale)."""
     present_today = [v for v, arr in data.items() if arr is not None]
     if not os.path.isdir(out_path):                           # CREATE (empty, time_chunk=1)
         cy, cx = min(spatial_chunk, ny), min(spatial_chunk, nx)
@@ -104,8 +169,6 @@ def _append_prebuilt_day(out_path: str, day: str, data: Dict[str, Optional[np.nd
         g = zarr.open_group(out_path, mode="w", zarr_format=3)
         g.create_array("lon", shape=(nx,), dtype="float32", chunks=(nx,)); g["lon"][:] = lon.astype(np.float32)
         g.create_array("lat", shape=(ny,), dtype="float32", chunks=(ny,)); g["lat"][:] = lat.astype(np.float32)
-        # create arrays only for vars PRESENT today (matches append_to_delta's create branch); absent-today
-        # vars are added later when they first appear present, with a NaN backfill.
         for v in present_today:
             g.create_array(v, shape=(0, ny, nx), dtype="float32", chunks=(1, cy, cx),
                            shards=(1, sh_y, sh_x), fill_value=float("nan"))
@@ -122,7 +185,6 @@ def _append_prebuilt_day(out_path: str, day: str, data: Dict[str, Optional[np.nd
     var_valid = {k: list(v) for k, v in dict(g.attrs.get("var_valid", {})).items()}
     for v in delta_vars:
         var_valid.setdefault(v, [True] * t)
-    # derive chunk/shard for any NEW var from an existing array (else the create-branch params)
     if delta_vars:
         a0 = g[delta_vars[0]]
         cy, cx = int(a0.chunks[-2]), int(a0.chunks[-1])
@@ -147,6 +209,125 @@ def _append_prebuilt_day(out_path: str, day: str, data: Dict[str, Optional[np.nd
     g.attrs["days"] = days + [day]                            # FINALIZE days LAST (never a half day)
 
 
+# --------------------------------------------------------------------------- bulk engine (default)
+def _bulk_build(orig: dict, out_path: str, keep_sorted: List[str], *,
+                source_daily: Optional[str], region: Optional[tuple],
+                spatial_chunk: int, shard_spatial: int, workers: int,
+                read_block: Optional[int], journal: _Journal, resume: bool) -> dict:
+    """Bulk rebuild: pre-create the final arrays at shape (T, ny, nx), then write disjoint
+    (day, var, spatial-tile) units bounded-parallel. Workers ONLY write array regions — never resize,
+    never touch attrs. ``days``/``vars``/``var_valid`` are finalized LAST (finalize-days-last invariant).
+    Absent vars need NO writes at all (arrays are NaN-filled by fill_value). Append-only checkpoint
+    (one fsync'd line per unit) makes ``resume=True`` skip completed units."""
+    ny, nx = orig["ny"], orig["nx"]
+    lon = np.asarray(orig["group"]["lon"][:]); lat = np.asarray(orig["group"]["lat"][:])
+    reg = region or orig["region"]
+    i0, j0 = (reg[0], reg[2]) if reg else (0, 0)
+
+    # per-day source (daily preferred; else old delta BY day_index) + var union across sources
+    all_vars = list(orig["vars"])
+    day_src: Dict[str, tuple] = {}
+    for day in keep_sorted:
+        if source_daily and group_exists(source_daily, day):
+            gd = zarr.open_group(group_path(source_daily, day), mode="r")
+            for v in gd.array_keys():
+                if v not in ("lon", "lat") and v not in all_vars:
+                    all_vars.append(v)
+            day_src[day] = ("daily", gd)
+        else:
+            day_src[day] = ("delta", None)
+
+    T = len(keep_sorted)
+    if not os.path.isdir(out_path):
+        cy, cx = min(spatial_chunk, ny), min(spatial_chunk, nx)
+        sh_y = min((shard_spatial // cy) * cy or cy, ny)
+        sh_x = min((shard_spatial // cx) * cx or cx, nx)
+        g = zarr.open_group(out_path, mode="w", zarr_format=3)
+        g.create_array("lon", shape=(nx,), dtype="float32", chunks=(nx,)); g["lon"][:] = lon.astype(np.float32)
+        g.create_array("lat", shape=(ny,), dtype="float32", chunks=(ny,)); g["lat"][:] = lat.astype(np.float32)
+        for v in all_vars:                            # FULL final shape up front — workers never resize
+            g.create_array(v, shape=(T, ny, nx), dtype="float32", chunks=(1, cy, cx),
+                           shards=(1, sh_y, sh_x), fill_value=float("nan"))
+        # attrs (days/vars/var_valid) intentionally NOT written yet — finalize LAST.
+    else:                                             # resume: derive layout from the existing arrays
+        g = zarr.open_group(out_path, mode="a")
+        a0 = g[all_vars[0]]
+        if int(a0.shape[0]) != T:
+            raise ValueError(f"resume shape mismatch: existing T={a0.shape[0]} != len(keep_days)={T}")
+        sh_y, sh_x = int(a0.shards[-2]), int(a0.shards[-1])
+
+    rb = read_block or max(1024, sh_y, sh_x)
+    rb_y = min(max(sh_y, (rb // sh_y) * sh_y or sh_y), ((ny + sh_y - 1) // sh_y) * sh_y)
+    rb_x = min(max(sh_x, (rb // sh_x) * sh_x or sh_x), ((nx + sh_x - 1) // sh_x) * sh_x)
+
+    ck_path = os.path.join(out_path, _CK_NAME)
+    done: set = set()
+    if resume and os.path.isfile(ck_path):
+        with open(ck_path) as fh:
+            done = {ln.strip() for ln in fh if ln.strip()}
+    ck = open(ck_path, "a")
+
+    units = [(t, day, v, ti, tj)
+             for t, day in enumerate(keep_sorted)
+             for v in all_vars if _src_present(orig, day_src, day, v)
+             for ti in range(0, ny, rb_y) for tj in range(0, nx, rb_x)
+             if f"{day}|{v}|{ti}|{tj}" not in done]
+    remaining: Dict[tuple, int] = {}
+    for (t, day, v, ti, tj) in units:
+        remaining[(day, v)] = remaining.get((day, v), 0) + 1
+    var_start: Dict[tuple, float] = {}
+    arrs = {v: g[v] for v in all_vars}
+    lock = threading.Lock()
+    src_used = set()
+    journal.event(event="build_start", engine="bulk", days=T, vars=all_vars,
+                  units=len(units), resumed_units=len(done), tile=(rb_y, rb_x))
+
+    def proc(u):
+        t, day, v, ti, tj = u
+        bi, bj = min(ti + rb_y, ny), min(tj + rb_x, nx)
+        kind, gd = day_src[day]
+        with lock:
+            var_start.setdefault((day, v), time.perf_counter())
+        if kind == "daily":                            # read ONLY this tile from the daily group
+            block = np.asarray(gd[v][0, i0 + ti:i0 + bi, j0 + tj:j0 + bj])
+        else:                                          # read ONLY this tile from the old delta BY day_index
+            block = np.asarray(orig["group"][v][orig["day_index"][day], ti:bi, tj:bj])
+        arrs[v][t, ti:bi, tj:bj] = block.astype(np.float32, copy=False)   # disjoint region — no locks
+        with lock:
+            src_used.add(kind)
+            ck.write(f"{day}|{v}|{ti}|{tj}\n"); ck.flush(); os.fsync(ck.fileno())
+            remaining[(day, v)] -= 1
+            fin = (remaining[(day, v)] == 0)
+            elapsed = round(time.perf_counter() - var_start[(day, v)], 3) if fin else None
+        if fin:
+            journal.event(event="var_done", day=day, var=v, source=kind, target_index=t,
+                          elapsed_s=elapsed, status="done")
+
+    try:
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(proc, units))
+        else:
+            for u in units:
+                proc(u)
+    finally:
+        ck.close()
+
+    # ---- finalize metadata LAST (days written last of all) ----
+    var_valid = {v: [bool(_src_present(orig, day_src, day, v)) for day in keep_sorted] for v in all_vars}
+    gf = zarr.open_group(out_path, mode="a")
+    gf.attrs["vars"] = list(all_vars)
+    gf.attrs["var_valid"] = var_valid
+    if reg:
+        gf.attrs["region"] = [int(x) for x in reg]
+    gf.attrs["layout"] = "time_lat_lon"
+    gf.attrs["days"] = list(keep_sorted)               # FINALIZE days LAST
+    if os.path.isfile(ck_path):
+        os.remove(ck_path)
+    journal.event(event="build_finalized", days=T, vars=all_vars)
+    return {"sources": src_used, "day_src": day_src}
+
+
 # --------------------------------------------------------------------------- the helper
 def prune_delta(delta_path: str, out_path: str, keep_days: Sequence[str], *,
                 source_daily: Optional[str] = None, source_delta: Optional[str] = None,
@@ -155,131 +336,178 @@ def prune_delta(delta_path: str, out_path: str, keep_days: Sequence[str], *,
                 audit_recent_window: Optional[dict] = None,
                 region: Optional[tuple] = None,
                 spatial_chunk: int = DELTA_SPATIAL_CHUNK, shard_spatial: int = DELTA_SHARD_SPATIAL,
-                sample_n: int = 32, seed: int = 0, workers: int = 2) -> dict:
+                sample_n: int = 32, seed: int = 0, workers: int = 2,
+                engine: str = "bulk", artifacts_dir: Optional[str] = None,
+                resume: bool = False, read_block: Optional[int] = None) -> dict:
     """Rebuild a delta containing exactly ``keep_days`` (chronological) into the staging ``out_path``, then
     return an atomic-SWAP PLAN. Never swaps, never mutates ``delta_path`` / the sources.
 
-    Sourcing per kept day: ``source_delta`` defaults to ``delta_path``. Prefer ``source_daily`` when it has
-    the day (tiled, production-scale via append_to_delta); else read the old delta BY ``day_index``.
+    ``engine='bulk'`` (default): pre-created full-shape arrays + disjoint (day,var,tile) parallel writes +
+    checkpoint/resume — production-scale path. ``engine='perday'``: original per-day writers (small scale).
+    ``artifacts_dir``: writes ``prune_delta_progress.jsonl`` (fsync'd per event), ``prune_delta_error.json``
+    on exception, and ``prune_plan.json`` ONLY on success.
 
     Fail-closed gates (any failure -> status='refused', NOTHING built/swapped):
     - ``keep_days`` non-empty and a subset of the original delta days;
     - **recent-window contiguity is ALWAYS decided by LOCAL recomputation** on the original delta (P4-S5
-      §4.1). ``audit_recent_window`` (the P4-S5 ``recent_spatial_window`` dict) is OPTIONAL and can only
-      *corroborate*: if it disagrees with the local recompute -> refuse (fail-closed). It can never
+      §4.1). ``audit_recent_window`` may only corroborate — a mismatch refuses (fail-closed); it can never
       force-pass a locally-detected gap. A hole -> refuse.
-    - **base coverage is MANDATORY whenever anything is dropped**: if ``dropped_days`` is non-empty and
-      ``base_days`` is None -> refuse. ``base_days=None`` is allowed ONLY for a pure rebuild/reorder
-      (``dropped_days`` empty). When given, every dropped day must be covered by base.
+    - **keep_days must preserve the ENTIRE active recent spatial window** — else refuse with
+      ``missing_from_keep_window``.
+    - **base coverage is MANDATORY whenever anything is dropped**: ``base_days=None`` is allowed ONLY for a
+      pure rebuild/reorder (``dropped_days`` empty); any uncovered dropped day -> refuse.
     """
+    if engine not in ("bulk", "perday"):
+        raise ValueError(f"engine must be 'bulk' or 'perday', got {engine!r}")
     source_delta = source_delta or delta_path
     if os.path.abspath(out_path) == os.path.abspath(delta_path):
         raise ValueError("out_path must differ from delta_path (never build over the live delta)")
     if os.path.exists(out_path):
-        raise ValueError(f"out_path already exists (use a fresh staging path): {out_path}")
+        # allowed ONLY to resume an interrupted bulk build (checkpoint present)
+        if not (engine == "bulk" and resume and os.path.isfile(os.path.join(out_path, _CK_NAME))):
+            raise ValueError(f"out_path already exists (use a fresh staging path, or engine='bulk' + "
+                             f"resume=True with its checkpoint): {out_path}")
 
-    orig = _open_delta_meta(delta_path)
-    orig_days = set(orig["days"])
-    keep_sorted = sorted(set(keep_days))
-    dropped = sorted(orig_days - set(keep_sorted))
+    journal = _Journal(artifacts_dir)
+    try:
+        orig = _open_delta_meta(delta_path)
+        orig_days = set(orig["days"])
+        keep_sorted = sorted(set(keep_days))
+        dropped = sorted(orig_days - set(keep_sorted))
 
-    def _refuse(reason, **extra):
-        return {"status": "refused", "reason": reason, "delta_path": delta_path, "out_path": out_path,
-                "keep_days": keep_sorted, "dropped_days": dropped, "production_mutation": False,
-                "swap_performed": False, **extra}
+        def _refuse(reason, **extra):
+            journal.event(event="refused", reason=reason)
+            return {"status": "refused", "reason": reason, "delta_path": delta_path, "out_path": out_path,
+                    "keep_days": keep_sorted, "dropped_days": dropped, "production_mutation": False,
+                    "swap_performed": False, **extra}
 
-    if not keep_sorted:
-        return _refuse("keep_days is empty — refusing to build an empty delta")
-    missing_keep = [d for d in keep_sorted if d not in orig_days]
-    if missing_keep:
-        return _refuse(f"keep_days contains days not in the source delta: {missing_keep}")
+        if not keep_sorted:
+            return _refuse("keep_days is empty — refusing to build an empty delta")
+        missing_keep = [d for d in keep_sorted if d not in orig_days]
+        if missing_keep:
+            return _refuse(f"keep_days contains days not in the source delta: {missing_keep}")
 
-    # recent-window gate — LOCAL recompute always decides (never a caller override).
-    rw = recent_window_contiguous(orig["days"], spatial_window_days)
-    if audit_recent_window is not None:
-        # audit may only corroborate; a mismatch is suspicious -> fail-closed.
-        a_contig = audit_recent_window.get("recent_window_contiguous")
-        a_missing = sorted(audit_recent_window.get("missing_in_window", []) or [])
-        if a_contig != rw["contiguous"] or a_missing != sorted(rw["missing"]):
-            return _refuse("audit recent-window disagrees with local recomputation — refusing (fail-closed)",
-                           recent_window=rw, audit_recent_window=audit_recent_window)
-    if not rw["contiguous"]:
-        return _refuse("recent spatial window has holes — repair before pruning (P4-S4 §4.1)",
-                       recent_window=rw)
+        # recent-window gate — LOCAL recompute always decides (never a caller override).
+        rw = recent_window_contiguous(orig["days"], spatial_window_days)
+        if audit_recent_window is not None:
+            a_contig = audit_recent_window.get("recent_window_contiguous")
+            a_missing = sorted(audit_recent_window.get("missing_in_window", []) or [])
+            if a_contig != rw["contiguous"] or a_missing != sorted(rw["missing"]):
+                return _refuse("audit recent-window disagrees with local recomputation — refusing "
+                               "(fail-closed)", recent_window=rw, audit_recent_window=audit_recent_window)
+        if not rw["contiguous"]:
+            return _refuse("recent spatial window has holes — repair before pruning (P4-S4 §4.1)",
+                           recent_window=rw)
 
-    # keep-preserves-window gate — the kept set MUST retain the ENTIRE active recent spatial window
-    # (rw.window_start..rw.window_end). Dropping a day inside the window would break bbox / POST /points for
-    # that day after the P4-S8 swap, even if base covers it (base is bbox-hostile). Fail-closed (P4-S4 §5).
-    required_window = _calendar_range(rw["window_start"], rw["window_end"])
-    keep_set = set(keep_sorted)
-    missing_from_keep_window = [d for d in required_window if d not in keep_set]
-    if missing_from_keep_window:
-        return _refuse("keep_days drops day(s) inside the active recent spatial window — would break the "
-                       "spatial-window policy after swap; refuse (repair the keep-set to retain the window)",
-                       recent_window=rw, missing_from_keep_window=missing_from_keep_window)
+        # keep-preserves-window gate — dropping a day inside the active window would break bbox/POST after
+        # the P4-S8 swap even if base covers it (base is bbox-hostile). Fail-closed (P4-S4 §5).
+        required_window = _calendar_range(rw["window_start"], rw["window_end"])
+        keep_set = set(keep_sorted)
+        missing_from_keep_window = [d for d in required_window if d not in keep_set]
+        if missing_from_keep_window:
+            return _refuse("keep_days drops day(s) inside the active recent spatial window — would break "
+                           "the spatial-window policy after swap; refuse (repair the keep-set)",
+                           recent_window=rw, missing_from_keep_window=missing_from_keep_window)
 
-    # base-coverage gate — MANDATORY when dropping anything. base_days=None only for pure rebuild/reorder.
-    if dropped:
-        if base_days is None:
-            return _refuse("base_days is REQUIRED when dropping days (mandatory base-coverage gate); "
-                           "base_days=None is allowed only for a pure rebuild/reorder with no dropped days")
-        uncovered = [d for d in dropped if d not in set(base_days)]
-        if uncovered:
-            return _refuse("dropped days not covered by base (compaction must run first): "
-                           f"{uncovered}", base_uncovered=uncovered)
+        # base-coverage gate — MANDATORY when dropping anything.
+        if dropped:
+            if base_days is None:
+                return _refuse("base_days is REQUIRED when dropping days (mandatory base-coverage gate); "
+                               "base_days=None is allowed only for a pure rebuild/reorder with no dropped days")
+            uncovered = [d for d in dropped if d not in set(base_days)]
+            if uncovered:
+                return _refuse("dropped days not covered by base (compaction must run first): "
+                               f"{uncovered}", base_uncovered=uncovered)
 
-    # ---- rebuild new_delta chronologically ----
-    daily_has = (lambda day: bool(source_daily) and group_exists(source_daily, day))
-    lon = np.asarray(orig["group"]["lon"][:])
-    lat = np.asarray(orig["group"]["lat"][:])
-    src_used = set()
-    for day in keep_sorted:                                   # CHRONOLOGICAL write order
-        if daily_has(day):
-            append_to_delta(source_daily, out_path, day, region=region,
-                            spatial_chunk=spatial_chunk, shard_spatial=shard_spatial, workers=workers)
-            src_used.add("daily")
-        else:                                                 # fallback: read old delta BY day_index
-            data = _read_delta_day(orig, day)
-            _append_prebuilt_day(out_path, day, data, orig["ny"], orig["nx"], lon, lat,
-                                 orig["region"], spatial_chunk, shard_spatial)
-            src_used.add("delta")
+        journal.event(event="gates_passed", engine=engine, keep=len(keep_sorted),
+                      dropped=dropped, window=[rw["window_start"], rw["window_end"]])
 
-    validation = _validate(out_path, keep_sorted, orig, source_daily, region, sample_n, seed,
-                           spatial_window_days)
-    status = "ok" if validation["all_ok"] else "invalid"
-    return {
-        "status": status,
-        "delta_path": delta_path,
-        "out_path": out_path,
-        "source": ("+".join(sorted(src_used)) if src_used else None),
-        "keep_days": keep_sorted,
-        "dropped_days": dropped,
-        "recent_window": rw,
-        "validation": validation,
-        "swap_plan": {
-            "action": "atomic_swap",
-            "from": out_path,
-            "to": delta_path,
-            "backup": delta_path + ".pre-prune",
-            "performed": False,
-            "note": ("P4-S6 returns the plan ONLY — no swap performed. A later phase (P4-S7/S8/S9) does the "
-                     "atomic swap (keep <to>.pre-prune until /healthz confirms) then triggers cube refresh."),
-        },
-        "production_mutation": False,
-        "swap_performed": False,
-    }
+        # ---- rebuild new_delta chronologically ----
+        if engine == "bulk":
+            build = _bulk_build(orig, out_path, keep_sorted, source_daily=source_daily, region=region,
+                                spatial_chunk=spatial_chunk, shard_spatial=shard_spatial, workers=workers,
+                                read_block=read_block, journal=journal, resume=resume)
+            src_used = build["sources"]
+        else:                                          # perday (legacy; small-scale/tests only)
+            lon = np.asarray(orig["group"]["lon"][:]); lat = np.asarray(orig["group"]["lat"][:])
+            src_used = set()
+            for day in keep_sorted:                    # CHRONOLOGICAL write order
+                t0 = time.perf_counter()
+                if source_daily and group_exists(source_daily, day):
+                    append_to_delta(source_daily, out_path, day, region=region,
+                                    spatial_chunk=spatial_chunk, shard_spatial=shard_spatial,
+                                    workers=workers)
+                    src_used.add("daily"); kind = "daily"
+                else:
+                    data = _read_delta_day(orig, day)
+                    _append_prebuilt_day(out_path, day, data, orig["ny"], orig["nx"], lon, lat,
+                                         orig["region"], spatial_chunk, shard_spatial)
+                    src_used.add("delta"); kind = "delta"
+                journal.event(event="day_done", day=day, source=kind,
+                              elapsed_s=round(time.perf_counter() - t0, 3), status="done")
+
+        journal.event(event="validation_start", days=len(keep_sorted), sample_n=sample_n)
+        validation = _validate(out_path, keep_sorted, orig, source_daily, region, sample_n, seed,
+                               spatial_window_days, journal)
+        journal.event(event="validation_end", all_ok=validation["all_ok"])
+
+        status = "ok" if validation["all_ok"] else "invalid"
+        result = {
+            "status": status,
+            "delta_path": delta_path,
+            "out_path": out_path,
+            "engine": engine,
+            "source": ("+".join(sorted(src_used)) if src_used else None),
+            "keep_days": keep_sorted,
+            "dropped_days": dropped,
+            "recent_window": rw,
+            "validation": validation,
+            "swap_plan": {
+                "action": "atomic_swap",
+                "from": out_path,
+                "to": delta_path,
+                "backup": delta_path + ".pre-prune",
+                "performed": False,
+                "note": ("P4-S6 returns the plan ONLY — no swap performed. A later phase (P4-S7/S8/S9) does "
+                         "the atomic swap (keep <to>.pre-prune until /healthz confirms) then cube refresh."),
+            },
+            "production_mutation": False,
+            "swap_performed": False,
+        }
+        if artifacts_dir and status == "ok":           # the tool writes the plan ONLY on success
+            with open(os.path.join(artifacts_dir, "prune_plan.json"), "w") as fh:
+                json.dump(result, fh, indent=2, sort_keys=True, default=str)
+            journal.event(event="plan_written", path=os.path.join(artifacts_dir, "prune_plan.json"))
+        return result
+    except Exception as exc:                           # SIGKILL can't be caught — the journal covers that
+        journal.event(event="error", error=f"{type(exc).__name__}: {exc}")
+        _write_error(artifacts_dir, exc, {"delta_path": delta_path, "out_path": out_path,
+                                          "keep_days": sorted(set(keep_days)), "engine": engine,
+                                          "hint": "prune_delta_progress.jsonl records completed units; "
+                                                  "engine='bulk' supports resume=True"})
+        return {"status": "error", "reason": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(), "delta_path": delta_path, "out_path": out_path,
+                "engine": engine, "production_mutation": False, "swap_performed": False}
+    finally:
+        journal.close()
 
 
-# --------------------------------------------------------------------------- validation
+# --------------------------------------------------------------------------- validation (POINT-WISE)
 def _validate(out_path: str, keep_sorted: List[str], orig: dict, source_daily: Optional[str],
-              region: Optional[tuple], sample_n: int, seed: int, spatial_window_days: int) -> dict:
+              region: Optional[tuple], sample_n: int, seed: int, spatial_window_days: int,
+              journal: Optional[_Journal] = None) -> dict:
     """Validate the rebuilt delta: day set == keep_sorted (sorted, unique), latest == max(days); the rebuilt
-    delta's own recent spatial window is contiguous (post-build invariant); var_valid preserved (incl.
-    absent-var); sample parity per kept day (float32, NaN-aware) vs source."""
+    delta's own recent spatial window is contiguous; var_valid preserved (incl. absent-var); sample parity
+    per kept day (float32, NaN-aware) vs source.
+
+    **POINT-WISE (S9 root-cause fix):** samples are read as per-cell scalars from BOTH sides — this
+    function never materializes a full (ny, nx) slab. The old full-slab reads (~2.6 GB per var-day at
+    production scale) were what got the VM24 step-3 run OOM-killed after a successful build."""
     ng = zarr.open_group(out_path, mode="r")                 # READ-ONLY
     new_days = list(ng.attrs["days"])
     new_index = {d: i for i, d in enumerate(new_days)}
     new_vv = {v: list(x) for v, x in dict(ng.attrs.get("var_valid", {})).items()}
+    new_vars = list(ng.attrs.get("vars", []))
 
     day_set_ok = (new_days == keep_sorted)                   # written chronologically -> already sorted
     unique = (len(new_days) == len(set(new_days)))
@@ -288,39 +516,50 @@ def _validate(out_path: str, keep_sorted: List[str], orig: dict, source_daily: O
     new_rw = recent_window_contiguous(new_days, spatial_window_days)   # post-build window invariant
     recent_window_ok = new_rw["contiguous"]
 
+    reg = region or orig["region"]
+    i0, j0 = (reg[0], reg[2]) if reg else (0, 0)
     rng = np.random.default_rng(seed)
     var_valid_ok = True
     parity_ok = True
     parity_checked = 0
     for day in keep_sorted:
-        # expected per-var presence from the SOURCE (daily if it has the day, else old delta)
-        if source_daily and group_exists(source_daily, day):
-            src = read_daily_day(source_daily, day, region)  # {v: ndarray|None}
-        else:
-            src = _read_delta_day(orig, day)
+        if day not in new_index:                             # day_set_ok already False; skip sampling
+            continue
         t = new_index[day]
-        for v, sval in src.items():
-            present = sval is not None
+        daily_mode = bool(source_daily) and group_exists(source_daily, day)
+        gd = zarr.open_group(group_path(source_daily, day), mode="r") if daily_mode else None
+        ts = orig["day_index"].get(day)
+        for v in new_vars:
+            if daily_mode:
+                src_present = v in gd
+            else:
+                vv = orig["var_valid"].get(v)
+                src_present = (v in orig["group"]) and (bool(vv[ts]) if vv is not None else True) \
+                    if ts is not None else False
             # var_valid parity (absent var must be recorded False)
             if v in new_vv:
-                if bool(new_vv[v][t]) != present:
+                if bool(new_vv[v][t]) != src_present:
                     var_valid_ok = False
-            elif present:
+            elif src_present:
                 var_valid_ok = False
-            if not present:
+            if not src_present:
                 continue
-            arr = np.asarray(sval, dtype=np.float32)
-            ny, nx = arr.shape
+            arr_new = ng[v]
+            ny, nx = int(arr_new.shape[1]), int(arr_new.shape[2])
             n = min(sample_n, ny * nx)
             flat = rng.choice(ny * nx, size=n, replace=False)
             ii, jj = np.divmod(flat, nx)
-            got = np.asarray(ng[v][t, :, :], dtype=np.float32)[ii, jj]
-            exp = arr[ii, jj]
-            both_nan = np.isnan(got) & np.isnan(exp)
-            eq = both_nan | (got == exp)
-            parity_checked += int(n)
-            if not bool(np.all(eq)):
-                parity_ok = False
+            for a, b in zip(ii.tolist(), jj.tolist()):       # per-cell scalar reads — never a full slab
+                got = np.float32(arr_new[t, a, b])
+                if daily_mode:
+                    exp = np.float32(gd[v][0, i0 + a, j0 + b])
+                else:
+                    exp = np.float32(orig["group"][v][ts, a, b])
+                if not (got == exp or (np.isnan(got) and np.isnan(exp))):
+                    parity_ok = False
+                parity_checked += 1
+        if journal is not None:
+            journal.event(event="validation_day", day=day, status="done")
     all_ok = (day_set_ok and unique and is_sorted and latest_ok and recent_window_ok
               and var_valid_ok and parity_ok)
     return {

@@ -166,9 +166,13 @@ the production gate already ran in step 1.3.)
 
 ## 3. Delta-prune plan against the SHADOW delta (**[MUT-SHADOW]**: writes only `$SH/delta_new.zarr`)
 
+Uses the **bulk engine with progress/error artifacts** (S9 field-failure fix: the original run was
+OOM-killed in full-slab validation, leaving no plan and no error trace). The tool itself now writes
+`$ART/prune_plan.json` **only on success**; `prune_delta_progress.jsonl` is fsync'd per event, so even a
+SIGKILL leaves an exact frontier. **All stdout/stderr land in `$ART/prune_step3.log`.**
 ```bash
-cd $WT && $PY - <<'EOF'
-import json, os, sys
+cd $WT && $PY - <<'EOF' > $ART/prune_step3.log 2>&1
+import os, sys
 sys.path.insert(0, os.environ["WT"])
 import zarr
 from datetime import date, timedelta
@@ -182,16 +186,28 @@ keep_start = (date.fromisoformat(max(dd)) - timedelta(days=W + BUF - 1)).isoform
 keep = [d for d in dd if d >= keep_start]
 plan = prune_delta(shadow, os.path.join(SH, "delta_new.zarr"), keep,
                    source_daily=os.path.join(SH, "daily_subset.zarr"), source_delta=shadow,
-                   base_days=base_days, spatial_window_days=W)
-with open(os.path.join(ART, "prune_plan.json"), "w") as fh:
-    json.dump(plan, fh, indent=2, sort_keys=True)   # the plan dict is plain JSON — step 4 reloads it
-print(plan["status"], "| keep:", len(plan.get("keep_days", [])), "| dropped:", plan.get("dropped_days"))
+                   base_days=base_days, spatial_window_days=W,
+                   engine="bulk", artifacts_dir=ART, workers=4)   # writes prune_plan.json on success ONLY
+print("status:", plan["status"], "| keep:", len(plan.get("keep_days", [])),
+      "| dropped:", plan.get("dropped_days"), "| reason:", plan.get("reason"))
 EOF
+tail -3 $ART/prune_step3.log
 ```
+- **Monitor** a long build from another terminal: `tail -f $ART/prune_delta_progress.jsonl`
+  (`var_done` events carry day/var/source/target_index/elapsed; then `build_finalized` →
+  `validation_start` → per-day `validation_day` → `validation_end` → `plan_written`).
+- **If the process dies** (e.g. OOM SIGKILL): the journal's last line IS the frontier;
+  `prune_delta_error.json` exists for any catchable exception. Do NOT delete `delta_new.zarr` — rerun the
+  same command with `resume=True` added to the `prune_delta(...)` call: the checkpoint
+  (`delta_new.zarr/_bulk_prune_ck.jsonl`) skips completed units.
+- Success is defined by **`$ART/prune_plan.json` existing** (the tool writes it only when
+  `status=="ok"` after validation) — step 4 refuses to run without it.
 - `status == "refused"` at the base-coverage gate ⇒ the compact-free window has closed (see the
-  time-sensitive note): record the refusal as the rehearsal result for this step and continue at step 6.
-- `status == "ok"` ⇒ confirm `validation.all_ok == true`, `dropped_days` all appear in the base day
-  list, and `keep_days` spans the full latest-31 window.
+  time-sensitive note): **no `prune_plan.json` is written** (the refusal is in `prune_step3.log` +
+  the journal's `refused` event); record it as the rehearsal result and continue at step 6. Step 4 is
+  skipped automatically (it requires the plan file).
+- `status == "ok"` ⇒ `prune_plan.json` exists; confirm `validation.all_ok == true`, `dropped_days` all
+  appear in the base day list, and `keep_days` spans the full latest-31 window.
 
 ## 4. Swap rehearsal on the shadow copy (**[MUT-SHADOW]**; S2 mode — shadow paths are plain dirs)
 
@@ -202,7 +218,14 @@ sys.path.insert(0, os.environ["WT"])
 from ingest.swap_delta import execute_swap_plan
 from store.time_cube import TimeCubeStore
 SH, ART = os.environ["SH"], os.environ["ART"]
-with open(os.path.join(ART, "prune_plan.json")) as fh:
+plan_path = os.path.join(ART, "prune_plan.json")
+if not os.path.isfile(plan_path):                 # step 3 refused/failed -> no plan file -> skip cleanly
+    out = {"status": "skipped", "reason": "no prune_plan.json (step 3 refused or failed) — swap "
+           "rehearsal not applicable; see prune_step3.log + prune_delta_progress.jsonl"}
+    with open(os.path.join(ART, "swap_result.json"), "w") as fh:
+        json.dump(out, fh, indent=2, sort_keys=True)
+    print("SKIPPED:", out["reason"]); raise SystemExit(0)
+with open(plan_path) as fh:
     plan = json.load(fh)                          # the step-3 plan, verbatim; the executor re-validates
                                                   # everything under its lock (staleness guard + verifier)
 if plan.get("status") != "ok":                    # step-3 refusal (e.g. compact-free window closed):
@@ -317,7 +340,7 @@ repeat with `dry_run=False` (**still only mutates the shadow daily subset**) →
 | `audit.json` + `audit.exit` (rc; alarm block inside the JSON) | step 1.3 |
 | `latest_delta_append_tail.txt` (+ any `NO_GO_*.txt`) | step 2 guard A |
 | `audit_shadow.json` + `delta_days_{before,after,shadow}_copy.json` | step 2 |
-| `prune_plan.json` | step 3 |
+| `prune_plan.json` (present only on step-3 success) + `prune_step3.log` + `prune_delta_progress.jsonl` (+ `prune_delta_error.json` on failure) | step 3 |
 | `swap_result.json` (may be `status:"skipped"` — a valid outcome) | step 4 |
 | `probes.txt` + `healthz_before.json` + `healthz_shadow.json` + `healthz_after.json` + `shadow_uvicorn.log`/`.pid` | steps 1.1 / 5a / §8 |
 | `staging_dryrun.json` / `staging_realrun.json` | step 6 |

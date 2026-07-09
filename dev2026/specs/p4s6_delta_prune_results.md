@@ -1,5 +1,41 @@
 # P4-S6 — safe delta pruning (rebuild-then-swap): results
 
+> ## S9 field-failure hardening (2026-07-09, after the VM24 step-3 incident)
+> **Incident:** on VM24 the step-3 wrapper vanished silently — `delta_new.zarr` complete (37 GB, 34
+> days, correct metadata) but no `prune_plan.json`, no traceback, no artifact. **Root cause:** the OLD
+> `_validate` materialized FULL GLOBAL slabs — `read_daily_day`/`_read_delta_day` (~8 GB per day, 3 vars
+> × 17999×36000 float32) plus `ng[v][t,:,:]` (~2.6 GB per var-day) — just to sample 32 points. At
+> production scale the process was **OOM-SIGKILLed** after the build succeeded; SIGKILL cannot be
+> caught, hence no error artifact. **Fixes (all tested):**
+> 1. **Point-wise validation** (root cause): samples are per-cell scalar reads on BOTH sides — no full
+>    slab is ever materialized, for either engine.
+> 2. **`engine="bulk"` (new default):** pre-creates the final arrays at shape `(len(keep_days), ny, nx)`
+>    and writes disjoint `(day, var, spatial-tile)` units bounded-parallel. Workers NEVER resize arrays
+>    or write attrs; `days`/`vars`/`var_valid` finalize LAST; absent vars need zero writes (NaN
+>    fill_value). Append-only fsync'd checkpoint (`_bulk_prune_ck.jsonl`) → `resume=True` skips
+>    completed units. All fail-closed gates unchanged; old-delta reads stay BY `day_index`; the plan
+>    schema is unchanged (plus an `engine` field).
+> 3. **Progress/error artifacts** (`artifacts_dir=`): `prune_delta_progress.jsonl` — every event
+>    (gates, `build_start`, per-`(day,var)` `var_done` with day/source/target_index/elapsed/status,
+>    `build_finalized`, `validation_start`/`validation_day`/`validation_end`, `plan_written`/`refused`/
+>    `error`) is written+flushed+**fsync'd**, so even a SIGKILL leaves the exact frontier;
+>    `prune_delta_error.json` (traceback + context) on any catchable exception; **`prune_plan.json` is
+>    written by the tool itself ONLY on success**.
+> 4. `engine="perday"` retained for small-scale/tests (its delta-source fallback is full-slab —
+>    documented as not for production scale).
+>
+> **Benchmark (synthetic):** 2048², 16 days, 3 vars, workers=4 — bulk == perday on speed (7.6 s vs
+> 7.6 s daily-source; 4.5 s vs 4.7 s delta-source). **8192² delta-source (isolated processes): bulk
+> peak RSS 127 MB vs perday 1691 MB** at identical speed — the tile-bounded memory profile is the
+> production-scale win (the reviewer's acceptance bar: "at least same speed, with
+> progress/resume/failure artifacts" — met, plus a 13× memory reduction).
+>
+> **Tests:** suite now **22/22** — all 17 originals pass unchanged under the bulk default (semantic
+> equivalence), plus: journal/plan artifacts + schema, refusal-writes-no-plan, **mid-build failure →
+> error artifact + exact frontier → `resume=True` completes and validates green (values by date)**,
+> perday engine still works, finalize-strictly-after-last-var_done ordering. S9 runbook step 3 updated
+> to the bulk/artifacts path (success == `prune_plan.json` exists; step 4 auto-skips without it).
+
 Status: **DONE (staging/shadow only).** **NO production mutation was performed.** Implements the
 rebuild-then-swap delta-prune primitive from the P4-S4 baseline (§2, §5) as a reusable helper + tests. The
 helper builds a fresh delta and returns an **atomic-swap PLAN** — it never swaps, never touches the live
