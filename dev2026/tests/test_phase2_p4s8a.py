@@ -321,6 +321,63 @@ class TestHoldDirFilesystemPrecheck(_Fixture):
         self.assertEqual(res["status"], "swapped")
 
 
+class TestPreSwapQuiesce(_Fixture):
+    """S10 production posture (Codex S10-review #1): quiescence runs INSIDE the lock, after the
+    staleness guard + prechecks, BEFORE any rename — via the pre_swap_quiesce_fn hook."""
+
+    def test_quiesce_runs_inside_sequence_before_swap(self):
+        plan = self.build()
+        events = []
+        live_days_at_quiesce = {}
+
+        def quiesce():
+            # at quiesce time the live delta must still be the ORIGINAL (nothing renamed yet)
+            live_days_at_quiesce["days"] = sorted(_days_attr(self.live))
+            events.append("quiesce")
+
+        def start():
+            events.append("start")
+
+        def verify(live, keep):
+            events.append("verify")
+            return {"ok": True}
+
+        res = execute_swap_plan(plan, mode="s2", hold_dir=self.hold,
+                                pre_swap_quiesce_fn=quiesce, refresh_fn=start, verifier=verify)
+        self.assertEqual(res["status"], "swapped")
+        self.assertEqual(events, ["quiesce", "start", "verify"])     # quiesce -> swap -> start -> verify
+        self.assertEqual(live_days_at_quiesce["days"], self.days)    # pre-swap: original days intact
+        self.assertEqual(_days_attr(self.live), sorted(self.keep))   # post: swapped
+
+    def test_stale_plan_never_quiesces(self):
+        # a stale plan aborts BEFORE quiescence — the serving app is never stopped for a doomed swap
+        plan = self.build()
+        extra = _iso(2026, 6, 9)
+        d2 = _mk_daily(self.tmp, [extra], base_val=200.0, name="daily_extra")
+        append_to_delta(d2, self.live, extra, spatial_chunk=8, shard_spatial=8)
+        called = []
+        res = execute_swap_plan(plan, mode="s2", hold_dir=self.hold,
+                                pre_swap_quiesce_fn=lambda: called.append(1))
+        self.assertEqual(res["status"], "aborted_stale")
+        self.assertEqual(called, [])                                 # quiesce NOT invoked
+
+    def test_quiesce_failure_touches_nothing(self):
+        plan = self.build()
+
+        def bad_quiesce():
+            raise RuntimeError("pm2 stop failed / port still serving")
+
+        before = sorted(_days_attr(self.live))
+        res = execute_swap_plan(plan, mode="s2", hold_dir=self.hold, pre_swap_quiesce_fn=bad_quiesce)
+        self.assertEqual(res["status"], "quiesce_failed")
+        self.assertFalse(res["swap_performed"])
+        self.assertFalse(res["live_touched"])
+        self.assertEqual(sorted(_days_attr(self.live)), before)      # live intact
+        self.assertTrue(os.path.isdir(self.staging))                 # staging intact for retry
+        lines = _manifest_lines(self.hold)                           # audited
+        self.assertEqual([m["op"] for m in lines], ["swap_quiesce_failed"])
+
+
 class TestRefusals(_Fixture):
     def test_refuses_non_ok_plan(self):
         self.build()

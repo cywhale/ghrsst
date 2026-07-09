@@ -42,6 +42,15 @@ resolution, the test fails loudly and the verdict must be re-derived.
 
 ## The executor (staging/shadow rehearsal + S9 tooling)
 
+> **S10-review addendum (2026-07-09):** the executor gained a **`pre_swap_quiesce_fn` hook** — called
+> INSIDE the lock, after the staleness guard + same-fs prechecks, BEFORE any rename. Production (S10)
+> passes "pm2 stop + verify port down" here so **quiescence and swap share one critical section**
+> (restart-AFTER-swap is rejected: a graceful-shutdown reader can still mix old `_Meta` with new bytes
+> across the switch). A stale plan aborts before quiesce (the app is never stopped for a doomed swap);
+> a quiesce failure returns `status="quiesce_failed"` with nothing touched + a `swap_quiesce_failed`
+> manifest line. Tests: `TestPreSwapQuiesce` (ordering, stale-skips-quiesce, failure-touches-nothing) —
+> suite now **19/19**.
+
 `execute_swap_plan` implements the design-spec §3 ordering; policy refusals return a status dict, never
 raise:
 

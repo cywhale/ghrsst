@@ -7,11 +7,13 @@ refresh → verify → rollback-on-verify-fail → move backup to hold + append-
 
 **Production safety verdict baked in (S8a proof test, `tests/test_phase2_p4s8a.py`):** a cached
 `TimeCubeStore` reading through a retargeted path serves **old `day_index` × new bytes silently** (and a
-shrunk target yields silent `None`, not an error). So **BOTH S1 and S2 are STAGING/SHADOW/REHEARSAL ONLY.**
-Production MUST NOT reuse this executor without an **external request-quiescence wrapper** — PM2
-restart-under-lock (available on VM24 today) or a serving-disable/drain mechanism (future design) — plugged
-in via `refresh_fn`. An admin-refresh endpoint alone is NOT sufficient (new-request visibility only; does
-not quiesce in-flight readers).
+shrunk target yields silent `None`, not an error). So **BOTH S1 and S2 require COMPLETE request quiescence
+BEFORE the path switch** in production. The S10 posture plugs in via TWO hooks, both inside the lock:
+``pre_swap_quiesce_fn`` (= "pm2 stop + verify port down", runs after the staleness guard and BEFORE any
+rename — a reader alive across the switch, even during a graceful shutdown, can still mix old `_Meta`
+with new bytes) and ``refresh_fn`` (= "pm2 start + healthz wait", runs after the swap and again
+best-effort during rollback). Restart-AFTER-swap alone is rejected; TTL/admin refresh alone is rejected
+(new-request visibility only; does not quiesce in-flight readers).
 """
 from __future__ import annotations
 
@@ -66,6 +68,7 @@ def _atomic_retarget(symlink_path: str, new_target: str) -> None:
 def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                       lock_path: Optional[str] = None,
                       refresh_fn: Optional[Callable[[], None]] = None,
+                      pre_swap_quiesce_fn: Optional[Callable[[], None]] = None,
                       verifier: Optional[Callable[[str, List[str]], dict]] = None,
                       hold_days: int = DEFAULT_HOLD_DAYS,
                       operator: Optional[str] = None) -> dict:
@@ -74,9 +77,15 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
     mode: 's1' (live path is a SYMLINK; swap = atomic retarget; backup = old target dir, record-only) or
           's2' (double rename: live -> backup dir in hold, staging -> live; ms-scale ENOENT window —
           shadow/staging only per the design spec).
-    refresh_fn: the step-7 mechanism (tests: cube.refresh; production: quiescence mechanism — see module
-    docstring). verifier: extra post-swap check, called (live_path, keep_sorted) -> {"ok": bool, ...};
-    the built-in local verifier always runs first.
+    pre_swap_quiesce_fn (S10 production posture, Codex review): called INSIDE the lock, AFTER the
+    staleness guard + same-fs prechecks, BEFORE any path switch — production passes "pm2 stop + verify
+    port down" here so quiescence and swap share one critical section (an external stop before this
+    function would sit outside the lock AND deadlock on a nested flock). If it raises, NOTHING has been
+    touched: the executor returns ``status="quiesce_failed"`` (safe state; the caller decides app
+    recovery). Order: lock -> staleness -> prechecks -> quiesce -> swap -> refresh_fn -> verify.
+    refresh_fn: runs AFTER the swap (tests: cube.refresh; production: "pm2 start + healthz wait") and is
+    re-invoked best-effort during rollback. verifier: extra post-swap check, called
+    (live_path, keep_sorted) -> {"ok": bool, ...}; the built-in local verifier always runs first.
     """
     if mode not in ("s1", "s2"):
         raise ValueError(f"mode must be 's1' or 's2', got {mode!r}")
@@ -131,6 +140,20 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
             return {"status": "refused", "reason": "hold_dir is on a different filesystem than live "
                                                    "(s2 renames the old live into hold_dir)",
                     "swap_performed": False}
+
+        # ---- pre-swap quiescence (INSIDE the lock, after staleness+prechecks, BEFORE any rename) ----
+        if pre_swap_quiesce_fn is not None:
+            try:
+                pre_swap_quiesce_fn()
+            except Exception as exc:
+                # SAFE state: no file has been touched. The caller decides app recovery (it may have
+                # half-stopped the serving process) — that is why this is a distinct status.
+                _manifest(hold_dir, {"swap_id": swap_id, "ts": stamp, "op": "swap_quiesce_failed",
+                                     "mode": mode, "from": staging, "to": live, "operator": operator,
+                                     "error": f"{type(exc).__name__}: {exc}"})
+                return {"status": "quiesce_failed",
+                        "reason": f"pre-swap quiescence failed: {type(exc).__name__}: {exc}",
+                        "swap_id": swap_id, "swap_performed": False, "live_touched": False}
 
         # ---- swap ----
         if mode == "s1":
