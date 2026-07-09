@@ -131,14 +131,40 @@ def _open_delta_meta(delta_path: str) -> dict:
     }
 
 
-def _src_present(orig: dict, day_src: dict, day: str, v: str) -> bool:
-    """Is var ``v`` present for ``day`` in its source (daily group, or the old delta BY day_index)?"""
+_COORD_NAMES = ("lon", "lat", "time")               # coordinate/helper arrays — NEVER data vars
+
+
+def _daily_data_var(gd, v: str, i0: int, j0: int, ny: int, nx: int) -> bool:
+    """True iff ``v`` is a REAL 3-D spatial data var in a daily group, covering the target region.
+    Excludes coordinate/helper arrays by NAME (lon/lat/time) AND by SHAPE (must be (t, y, x) with the
+    spatial extent containing the region) — the VM24 S9 failure was a 1-D ``time`` array collected as a
+    data var and then indexed ``[0, y, x]``."""
+    if v in _COORD_NAMES or v not in gd:              # absent var (e.g. sea_ice missing that day) -> False
+        return False
+    arr = gd[v]
+    return (len(arr.shape) == 3
+            and int(arr.shape[-2]) >= i0 + ny and int(arr.shape[-1]) >= j0 + nx)
+
+
+def _delta_data_var(orig: dict, v: str) -> bool:
+    """True iff ``v`` exists in the source delta as a (T, ny, nx) 3-D field (same name+shape filter)."""
+    if v in _COORD_NAMES or v not in orig["group"]:
+        return False
+    arr = orig["group"][v]
+    return len(arr.shape) == 3 and int(arr.shape[-2]) == orig["ny"] and int(arr.shape[-1]) == orig["nx"]
+
+
+def _src_present(orig: dict, day_src: dict, day: str, v: str, i0: int, j0: int) -> bool:
+    """Is var ``v`` present for ``day`` in its source (daily group, or the old delta BY day_index)?
+    Presence implies the source array is a real 3-D spatial field (coord/helper arrays never count)."""
     kind, gd = day_src[day]
     if kind == "daily":
-        return v in gd
+        return _daily_data_var(gd, v, i0, j0, orig["ny"], orig["nx"])
+    if not _delta_data_var(orig, v):
+        return False
     t = orig["day_index"][day]
     vv = orig["var_valid"].get(v)
-    return (v in orig["group"]) and (bool(vv[t]) if vv is not None else True)
+    return bool(vv[t]) if vv is not None else True
 
 
 def _read_delta_day(meta: dict, day: str) -> Dict[str, Optional[np.ndarray]]:
@@ -224,14 +250,17 @@ def _bulk_build(orig: dict, out_path: str, keep_sorted: List[str], *,
     reg = region or orig["region"]
     i0, j0 = (reg[0], reg[2]) if reg else (0, 0)
 
-    # per-day source (daily preferred; else old delta BY day_index) + var union across sources
-    all_vars = list(orig["vars"])
+    # per-day source (daily preferred; else old delta BY day_index) + var union across sources.
+    # DATA-VAR FILTER (VM24 S9 fix): only true 3-D spatial fields join the union — coordinate/helper
+    # arrays (lon/lat/time, or anything not (t,y,x)-shaped over the grid) are never created/written
+    # into the pruned delta.
+    all_vars = [v for v in orig["vars"] if _delta_data_var(orig, v)]
     day_src: Dict[str, tuple] = {}
     for day in keep_sorted:
         if source_daily and group_exists(source_daily, day):
             gd = zarr.open_group(group_path(source_daily, day), mode="r")
             for v in gd.array_keys():
-                if v not in ("lon", "lat") and v not in all_vars:
+                if v not in all_vars and _daily_data_var(gd, v, i0, j0, ny, nx):
                     all_vars.append(v)
             day_src[day] = ("daily", gd)
         else:
@@ -269,7 +298,7 @@ def _bulk_build(orig: dict, out_path: str, keep_sorted: List[str], *,
 
     units = [(t, day, v, ti, tj)
              for t, day in enumerate(keep_sorted)
-             for v in all_vars if _src_present(orig, day_src, day, v)
+             for v in all_vars if _src_present(orig, day_src, day, v, i0, j0)
              for ti in range(0, ny, rb_y) for tj in range(0, nx, rb_x)
              if f"{day}|{v}|{ti}|{tj}" not in done]
     remaining: Dict[tuple, int] = {}
@@ -314,7 +343,7 @@ def _bulk_build(orig: dict, out_path: str, keep_sorted: List[str], *,
         ck.close()
 
     # ---- finalize metadata LAST (days written last of all) ----
-    var_valid = {v: [bool(_src_present(orig, day_src, day, v)) for day in keep_sorted] for v in all_vars}
+    var_valid = {v: [bool(_src_present(orig, day_src, day, v, i0, j0)) for day in keep_sorted] for v in all_vars}
     gf = zarr.open_group(out_path, mode="a")
     gf.attrs["vars"] = list(all_vars)
     gf.attrs["var_valid"] = var_valid
@@ -531,7 +560,9 @@ def _validate(out_path: str, keep_sorted: List[str], orig: dict, source_daily: O
         ts = orig["day_index"].get(day)
         for v in new_vars:
             if daily_mode:
-                src_present = v in gd
+                src_present = _daily_data_var(gd, v, i0, j0,
+                                              int(ng[v].shape[-2]), int(ng[v].shape[-1])) \
+                    if v in ng else (v in gd)         # same data-var filter as the build (Codex note 1)
             else:
                 vv = orig["var_valid"].get(v)
                 src_present = (v in orig["group"]) and (bool(vv[ts]) if vv is not None else True) \

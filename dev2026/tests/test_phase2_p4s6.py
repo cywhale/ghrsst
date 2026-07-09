@@ -37,8 +37,10 @@ def _iso(y, m, d):
     return datetime.date(y, m, d).isoformat()
 
 
-def _mk_daily(tmp, days, absent=None):
-    """absent: optional {day: (var,...)} of vars to OMIT for that day (absent-var case)."""
+def _mk_daily(tmp, days, absent=None, with_time=False):
+    """absent: optional {day: (var,...)} of vars to OMIT for that day (absent-var case).
+    with_time: add a 1-D `time` coordinate array (like the REAL VM24 daily groups) — must never be
+    treated as a data var (the S9 step-3 IndexError)."""
     absent = absent or {}
     daily = os.path.join(tmp, "daily")
     lon = np.linspace(100, 130, NX).astype(np.float32)
@@ -47,6 +49,8 @@ def _mk_daily(tmp, days, absent=None):
         g = zarr.open_group(group_path(daily, d), mode="w", zarr_format=3)
         g.create_array("lon", shape=(NX,), dtype="float32", chunks=(NX,)); g["lon"][:] = lon
         g.create_array("lat", shape=(NY,), dtype="float32", chunks=(NY,)); g["lat"][:] = lat
+        if with_time:                                        # 1-D coord array, like real MUR daily groups
+            g.create_array("time", shape=(1,), dtype="int64", chunks=(1,)); g["time"][:] = [i]
         for v in VARS:
             if v in absent.get(d, ()):                       # omit this var for this day
                 continue
@@ -509,6 +513,61 @@ class TestBulkEngineArtifacts(Base):
             events = [json.loads(x)["event"] for x in fh]
         self.assertGreater(events.index("build_finalized"), max(i for i, e in enumerate(events)
                                                                 if e == "var_done"))
+
+
+class TestCoordVarFilter(Base):
+    """VM24 S9 step-3 fix: a 1-D `time` array in the daily groups (real MUR layout) must be filtered
+    out by the data-var filter — never collected into the var union, never created/written/validated."""
+
+    def _fixture_with_time(self):
+        days = [_iso(2026, 6, d) for d in range(1, 11)]
+        daily = _mk_daily(self.tmp, days, with_time=True)      # daily groups carry a 1-D `time`
+        delta = _mk_delta(self.tmp, daily, days)               # append_to_delta uses its fixed VARS list
+        return days, daily, delta
+
+    def test_bulk_ignores_time_array(self):
+        days, daily, delta = self._fixture_with_time()
+        art = os.path.join(self.tmp, "art"); os.makedirs(art)
+        plan = prune_delta(delta, self.out(), days[3:], source_daily=daily, base_days=days,
+                           spatial_window_days=5, artifacts_dir=art)
+        self.assertEqual(plan["status"], "ok", plan.get("reason"))       # no IndexError, green
+        self.assertTrue(plan["validation"]["all_ok"])
+        # `time` is nowhere in the output: not in attrs["vars"], not an array
+        og = zarr.open_group(self.out(), mode="r")
+        self.assertNotIn("time", list(og.attrs["vars"]))
+        self.assertNotIn("time", list(og.array_keys()))
+        self.assertNotIn("time", og.attrs.get("var_valid", {}))
+        # the journal never logged `time` as a var unit
+        with open(os.path.join(art, "prune_delta_progress.jsonl")) as fh:
+            vd = [json.loads(x) for x in fh if json.loads(x)["event"] == "var_done"]
+        self.assertTrue(all(r["var"] != "time" for r in vd))
+        self.assertEqual(sorted({r["var"] for r in vd}), sorted(VARS))
+        # data values still correct by date
+        for d in days[3:]:
+            np.testing.assert_array_equal(_slab(self.out(), d, "sst"), _slab(delta, d, "sst"))
+
+    def test_perday_engine_with_time_array(self):
+        # perday daily-source path goes through append_to_delta (fixed VARS list) — confirm green too
+        days, daily, delta = self._fixture_with_time()
+        plan = prune_delta(delta, self.out(), days[3:], source_daily=daily, base_days=days,
+                           spatial_window_days=5, engine="perday")
+        self.assertEqual(plan["status"], "ok")
+        og = zarr.open_group(self.out(), mode="r")
+        self.assertNotIn("time", list(og.attrs["vars"]))
+        self.assertNotIn("time", list(og.array_keys()))
+
+    def test_wrong_shape_helper_array_ignored(self):
+        # shape-based filter (not name-only): a 2-D helper array in daily must also be excluded
+        days, daily, delta = self._fixture_with_time()
+        g = zarr.open_group(group_path(daily, days[5]), mode="a")
+        g.create_array("quality_flag", shape=(NY, NX), dtype="float32", chunks=(8, 8))   # 2-D, not (t,y,x)
+        g["quality_flag"][:] = 1.0
+        plan = prune_delta(delta, self.out(), days[3:], source_daily=daily, base_days=days,
+                           spatial_window_days=5)
+        self.assertEqual(plan["status"], "ok", plan.get("reason"))
+        og = zarr.open_group(self.out(), mode="r")
+        self.assertNotIn("quality_flag", list(og.attrs["vars"]))
+        self.assertNotIn("quality_flag", list(og.array_keys()))
 
 
 if __name__ == "__main__":

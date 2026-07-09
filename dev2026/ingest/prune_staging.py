@@ -74,8 +74,11 @@ def _validate_day_vs_tier(daily_path: str, day: str, tier: dict, tier_name: str,
     t = tier["day_index"][day]
     gd = zarr.open_group(group_path(daily_path, day), mode="r")       # READ-ONLY
     # the daily day must not carry a DATA var the tier lacks — pruning would lose daily-only data
-    # (Codex S7-review #2). lon/lat are coordinates, not data.
-    daily_vars = {k for k in gd.array_keys() if k not in ("lon", "lat")}
+    # (Codex S7-review #2). Coordinate/helper arrays (lon/lat/time, or anything not 3-D (t,y,x)) are
+    # NOT data vars — the real VM24 daily groups carry a 1-D `time` array which must not trip this
+    # gate (same data-var filter as prune_delta's bulk engine).
+    daily_vars = {k for k in gd.array_keys()
+                  if k not in ("lon", "lat", "time") and len(gd[k].shape) == 3}
     extra = sorted(daily_vars - set(tier["vars"]))
     if extra:
         return {"ok": False, "reason": f"daily has var(s) not represented in the {tier_name} tier: "

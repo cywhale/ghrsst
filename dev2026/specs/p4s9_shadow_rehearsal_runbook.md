@@ -197,9 +197,12 @@ tail -3 $ART/prune_step3.log
   (`var_done` events carry day/var/source/target_index/elapsed; then `build_finalized` →
   `validation_start` → per-day `validation_day` → `validation_end` → `plan_written`).
 - **If the process dies** (e.g. OOM SIGKILL): the journal's last line IS the frontier;
-  `prune_delta_error.json` exists for any catchable exception. Do NOT delete `delta_new.zarr` — rerun the
-  same command with `resume=True` added to the `prune_delta(...)` call: the checkpoint
-  (`delta_new.zarr/_bulk_prune_ck.jsonl`) skips completed units.
+  `prune_delta_error.json` exists for any catchable exception. **Resume is ONLY for interruptions under
+  the SAME code version** (kill/OOM/recovered disk): rerun the same command with `resume=True` — the
+  checkpoint (`delta_new.zarr/_bulk_prune_ck.jsonl`) skips completed units. **After a CODE FIX, never
+  resume the old staging delta — it may be poisoned by the buggy run** (e.g. the 2026-07-09 `time`
+  IndexError left a stray full-shape `time` array in `delta_new.zarr`): use a **fresh `RUN_ID`**, or
+  delete **only** the shadow `delta_new.zarr`, and rerun step 3 cleanly.
 - Success is defined by **`$ART/prune_plan.json` existing** (the tool writes it only when
   `status=="ok"` after validation) — step 4 refuses to run without it.
 - `status == "refused"` at the base-coverage gate ⇒ the compact-free window has closed (see the

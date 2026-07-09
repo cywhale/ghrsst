@@ -274,6 +274,19 @@ class TestExtraVarProtection(Base):
     """Codex S7-review #2: a daily day carrying a data var the covering tier lacks must be SKIPPED —
     pruning it would lose daily-only data."""
 
+    def test_time_coord_array_does_not_trip_extra_var_gate(self):
+        # Real VM24 daily groups carry a 1-D `time` array. It is a COORDINATE, not a data var — it must
+        # NOT be flagged as "daily-only data" (which would skip EVERY day). Same data-var filter as
+        # prune_delta's bulk engine (name + 3-D shape).
+        days, daily, base, delta = _build(self.tmp)
+        for d in days:                                          # add `time` to every daily group
+            g = zarr.open_group(group_path(daily, d), mode="a")
+            g.create_array("time", shape=(1,), dtype="int64", chunks=(1,)); g["time"][:] = [0]
+        res = self.run_prune(daily, base, delta, dry_run=False)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["pruned"], days[:8])               # nothing skipped because of `time`
+        self.assertEqual(res["skipped"], [])
+
     def test_extra_daily_var_skips_day(self):
         days, daily, base, delta = _build(self.tmp)
         # add a data var to 06-02 AFTER the cubes were built (tier lacks it)

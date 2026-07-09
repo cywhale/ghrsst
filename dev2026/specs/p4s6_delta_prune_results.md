@@ -35,6 +35,21 @@
 > error artifact + exact frontier → `resume=True` completes and validates green (values by date)**,
 > perday engine still works, finalize-strictly-after-last-var_done ordering. S9 runbook step 3 updated
 > to the bulk/artifacts path (success == `prune_plan.json` exists; step 4 auto-skips without it).
+>
+> ### Incident #2 (2026-07-09, VM24 step-3 retry): 1-D `time` coord array collected as a data var
+> The REAL MUR daily groups carry a **1-D `time` array**; the bulk var-union excluded only `lon`/`lat` by
+> name, so `time` joined the union and was read `[0, y, x]` → `IndexError` mid-build. (The new
+> progress/error artifacts worked exactly as designed: the journal showed `vars=[..., "time"]` and the
+> error JSON carried the traceback — this is what made the diagnosis immediate.) **Fix — DATA-VAR
+> FILTER, by name AND shape:** `_daily_data_var` / `_delta_data_var` admit only 3-D `(t, y, x)` fields
+> whose spatial extent covers the target region; `lon`/`lat`/`time` excluded by name; absent vars return
+> False (membership-checked). Applied to the var union, `_src_present`, and validation. **The same
+> latent bug in `prune_staging`'s extra-var gate is fixed too** (a `time` array would have skipped EVERY
+> day in S9 step 6). Tests → **25/25** (S6) + 16/16 (S7): daily fixture with 1-D `time` → bulk + perday
+> green, `time` absent from output attrs/arrays/journal; **2-D helper array also excluded (shape-based,
+> not name-only)**; `time` no longer trips the staging extra-var gate. Runbook: a staging delta from a
+> failed run under OLD code is **poisoned — never resume across a code fix**; fresh `RUN_ID` or delete
+> only `delta_new.zarr`.
 
 Status: **DONE (staging/shadow only).** **NO production mutation was performed.** Implements the
 rebuild-then-swap delta-prune primitive from the P4-S4 baseline (§2, §5) as a reusable helper + tests. The
