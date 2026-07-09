@@ -273,6 +273,21 @@ Probe (save all output to `$ART/probes.txt`): `/healthz` (`delta_latest == max(k
 `delta_day_count == len(keep)`, `spatial_window == [min(keep), max(keep)]`); bbox + POST /points on a
 kept day → 200; bbox on a **dropped** day → **400** with `available_spatial_window`; **point GET on the
 same dropped day → 200** (base serves it); a multi-day range ending `max(keep)` → `X-Store-Route: cube`.
+
+> **⚠ bbox probes MUST select the day with `start=<day>&end=<day>` — NEVER `date=<day>`** (S9 run
+> `20260709T065917Z` finding). The GET endpoint has no `date` parameter; an unknown query param is
+> silently ignored, so a `date=...` bbox probe is served **date-less as the LATEST day** and returns a
+> false 200 — the probe passes without testing anything. (`date` is a **POST /points body field** only.)
+> Concrete probe set (`KEPT` = a day in the keep window, `DROPPED` = a just-dropped day):
+> ```bash
+> B=http://127.0.0.1:8036/api/ghrsst
+> curl -s -o /dev/null -w "kept bbox %{http_code}\n"    "$B?start=$KEPT&end=$KEPT&lon0=135&lat0=15&lon1=136&lat1=16&append=sst"
+> curl -s -w "\ndropped bbox %{http_code}\n"            "$B?start=$DROPPED&end=$DROPPED&lon0=135&lat0=15&lon1=136&lat1=16&append=sst"   # expect 400 + available_spatial_window
+> curl -s -o /dev/null -w "dropped point GET %{http_code}\n" "$B?start=$DROPPED&end=$DROPPED&lon0=135&lat0=15&append=sst"               # expect 200 (base)
+> curl -s -D - -o /dev/null "$B?start=$DROPPED&end=$KEPT&lon0=135&lat0=15&append=sst" | grep -i "x-store-route"                          # expect cube
+> curl -s -X POST -H 'Content-Type: application/json' -w "\nkept POST %{http_code}\n" \
+>   -d "{\"date\":\"$KEPT\",\"points\":[[135,15],[136,16]],\"append\":\"sst\"}" "$B/points"
+> ```
 When done (or on any failure — the trap covers aborts too):
 ```bash
 kill $SHADOW_PID; wait $SHADOW_PID 2>/dev/null; trap - EXIT INT TERM
