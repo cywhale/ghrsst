@@ -140,7 +140,23 @@ async def lifespan(app: FastAPI):
     app.state.bex.shutdown()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="ODB Open API of GHRSST (MUR v4.1)",
+    version="0.3.1",
+    description=(
+        "Open API for daily 1-km GHRSST MUR v4.1 sea-surface temperature data.\n\n"
+        "* Data source: MUR-JPL-L4-GLOB-v4.1, JPL MUR MEASURES Project. 2015. "
+        "GHRSST Level 4 MUR Global Foundation Sea Surface Temperature Analysis, Ver. 4.1. "
+        "PO.DAAC, CA, USA. https://doi.org/10.5067/GHGMR-4FJ04\n"
+        "* Point/range mode supports at most 366 inclusive days; split longer requests.\n"
+        "* Current production data starts at 2023-01-01.\n"
+        "* BBox is single-day only and is limited by the sampled point cap. Use a small BBox "
+        "in Swagger UI to avoid large browser payloads.\n"
+    ),
+    lifespan=lifespan,
+    docs_url="/api/swagger/ghrsst",
+    openapi_url="/api/swagger/ghrsst/openapi.json",
+)
 
 
 def _json(obj, status_code: int = 200, headers: Optional[dict] = None) -> Response:
@@ -216,15 +232,15 @@ def _fixed_cache():
 @app.get("/api/ghrsst")
 async def read_ghrsst(
     request: Request,
-    lon0: float = Query(...),
-    lat0: float = Query(...),
-    lon1: Optional[float] = Query(None),
-    lat1: Optional[float] = Query(None),
-    start: Optional[str] = Query(None),
-    end: Optional[str] = Query(None),
-    append: Optional[str] = Query(None),
-    sample: int = Query(1),
-    mode: Optional[str] = Query(None),
+    lon0: float = Query(..., description="Longitude or minimum longitude, range [-180, 180].", json_schema_extra={"example": -69.0}),
+    lat0: float = Query(..., description="Latitude or minimum latitude, range [-90, 90].", json_schema_extra={"example": 32.0}),
+    lon1: Optional[float] = Query(None, description="Maximum longitude for BBox mode; provide with lat1."),
+    lat1: Optional[float] = Query(None, description="Maximum latitude for BBox mode; provide with lon1."),
+    start: Optional[str] = Query(None, description="Start date YYYY-MM-DD. Point/range requests are capped at 366 days; BBox is single-day.", json_schema_extra={"example": "2026-05-01"}),
+    end: Optional[str] = Query(None, description="End date YYYY-MM-DD. For BBox, use the same date as start.", json_schema_extra={"example": "2026-05-31"}),
+    append: Optional[str] = Query(None, description="Comma-separated fields: sst, sst_anomaly, sea_ice. Default: sst.", json_schema_extra={"example": "sst,sst_anomaly"}),
+    sample: int = Query(1, description="BBox stride; sample=N keeps every Nth grid point. Default 1.", json_schema_extra={"example": 1}),
+    mode: Optional[str] = Query(None, description="Optional mode: truncate rounds coordinates and values for a smaller response.", json_schema_extra={"example": "truncate"}),
 ):
     store: StoreAccess = request.app.state.store
     bex: BoundedExecutor = request.app.state.bex
@@ -354,6 +370,16 @@ async def read_ghrsst(
 
 # ---- POST /api/ghrsst/points (batch) -------------------------------------
 class PointsRequest(BaseModel):
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "date": "2026-05-31",
+                "points": [[-69.0, 32.0], [-68.5, 32.5]],
+                "append": "sst,sst_anomaly",
+            }
+        }
+    }
+
     date: str
     points: List[List[float]]
     append: Optional[str] = None

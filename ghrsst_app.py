@@ -217,12 +217,13 @@ def generate_custom_openapi():
     if app.openapi_schema: return app.openapi_schema
     openapi_schema = get_openapi(
         title="ODB Open API of GHRSST (MUR v4.1)",
-        version="1.0.0",
+        version="0.3.1",
         description=(
             "Open API to query daily 1-km GHRSST MUR v4.1 (SST, SST anomaly, sea ice) data.\n\n"
             "* Data source: MUR-JPL-L4-GLOB-v4.1. JPL MUR MEaSUREs Project. 2015. GHRSST Level 4 MUR Global Foundation Sea Surface Temperature Analysis. Ver. 4.1. PO.DAAC, CA, USA. https://doi.org/10.5067/GHGMR-4FJ04\n"
             "* Point mode (lon0,lat0 only): default latest day or requested range ≤31 days; clamped to available [earliest, latest] with missing days skipped.\n"
             f"* BBox mode (lon0,lat0,lon1,lat1): single-day only (uses provided start/end to choose the day); requested day must exist; limit nx*ny ≤ {cfg.POINT_LIMIT}.\n"
+            "* This pre-P4 release does not include the newer time-cube spatial-window or compact CoverageJSON policy.\n"
         ),
         routes=app.routes,
     )
@@ -251,14 +252,14 @@ class GHRSSTRow(BaseModel):
 
 @app.get("/api/ghrsst", response_model=List[GHRSSTRow], tags=["GHRSST"], summary="Query GHRSST (MUR v4.1, daily 1-km) data")
 async def read_ghrsst(
-    lon0: float = Query(..., description="Longitude (or min lon) [-180,180]"),
-    lat0: float = Query(..., description="Latitude (or min lat) [-90,90]"),
-    lon1: Optional[float] = Query(None, description="Max longitude (BBox mode)"),
-    lat1: Optional[float] = Query(None, description="Max latitude (BBox mode)"),
-    start: Optional[str] = Query(None, description="Start date YYYY-MM-DD (inclusive)"),
-    end: Optional[str] = Query(None, description="End date YYYY-MM-DD (inclusive)"),
-    append: Optional[str] = Query(None, description="Fields: sst,sst_anomaly,sea_ice (default: sst)"),
-    sample: int = Query(1, description="(BBox) re-sample every N points (default 1) to thin the grid"),
+    lon0: float = Query(..., description="Longitude or minimum longitude, range [-180, 180].", json_schema_extra={"example": -69.0}),
+    lat0: float = Query(..., description="Latitude or minimum latitude, range [-90, 90].", json_schema_extra={"example": 32.0}),
+    lon1: Optional[float] = Query(None, description="Maximum longitude for BBox mode; provide with lat1."),
+    lat1: Optional[float] = Query(None, description="Maximum latitude for BBox mode; provide with lon1."),
+    start: Optional[str] = Query(None, description="Start date YYYY-MM-DD (inclusive); point/range cap is 31 days.", json_schema_extra={"example": "2026-05-01"}),
+    end: Optional[str] = Query(None, description="End date YYYY-MM-DD (inclusive); BBox must use a single day.", json_schema_extra={"example": "2026-05-31"}),
+    append: Optional[str] = Query(None, description="Comma-separated fields: sst, sst_anomaly, sea_ice. Default: sst.", json_schema_extra={"example": "sst,sst_anomaly"}),
+    sample: int = Query(1, description="BBox stride; sample=N keeps every Nth grid point. Default 1.", json_schema_extra={"example": 1}),
     mode: Optional[str] = Query(
         None,
         description=(
