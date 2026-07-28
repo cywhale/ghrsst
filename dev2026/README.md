@@ -29,7 +29,7 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_store_access dev2026.tes
 - `uv` 管理 Python(3.13)與 venv。
 - store 路徑一律 `GHRSST_ZARR_PATH`,程式不硬編碼;`bak/` 僅本機部分複本,**仍在持續拷貝/每日增長**,工具須容忍缺日。
 
-## VM24 production deployment (v0.3.0, 2026-06-25)
+## VM24 production deployment (v0.4.1, 2026-07-28)
 
 Production on VM24 now runs the dev2026 API through the existing PM2 app `ghrsst`
 and the existing NGINX upstream `127.0.0.1:8035`. NGINX was not changed.
@@ -52,21 +52,20 @@ GHRSST_RSS_CEILING_MB=4096
 GHRSST_BBOX_POINT_LIMIT=300000
 GHRSST_MAX_DAYS=366
 # P4-S3: background cube-metadata refresh interval (s) so a cron-appended delta day becomes visible
-# WITHOUT a PM2 restart. 0 = disabled. Set ~ the daily-append cadence, e.g. 300 (5 min). Refresh only
-# surfaces validated days (append_to_delta finalizes attrs['days'] last); /healthz shows cube_refresh_ttl_s.
-GHRSST_CUBE_REFRESH_TTL_SECONDS=0
+# WITHOUT a PM2 restart. Refresh only surfaces validated days (append_to_delta finalizes attrs['days'] last);
+# /healthz shows cube_refresh_ttl_s.
+GHRSST_CUBE_REFRESH_TTL_SECONDS=300
 # P4-S3: enforce the spatial-window policy — bbox + POST /points served ONLY for days in the delta
-# window; older -> 4xx. DEFAULT 0 = OFF (daily serves any day). Turn ON only in time-cube-authoritative
-# mode once the delta retains SPATIAL_WINDOW_DAYS. point/range + single-day point GET stay full-history.
-GHRSST_SPATIAL_WINDOW_ENFORCE=0
+# window; older -> 4xx. point/range + single-day point GET stay full-history.
+GHRSST_SPATIAL_WINDOW_ENFORCE=1
 # P4-S2: enable opt-in coveragejson/raster bbox format. DEFAULT 0 = OFF. Enable only AFTER
 # GHRSST_SPATIAL_WINDOW_ENFORCE is on (so the compact format cannot bypass the window rule).
 GHRSST_ENABLE_COVERAGEJSON=0
 ```
 
-Restart current production app:
+Routine restart of the current production app (no path swap):
 ```bash
-pm2 restart ghrsst --update-env
+pm2 restart ghrsst
 curl -fsS http://127.0.0.1:8035/healthz
 ```
 
@@ -75,14 +74,16 @@ Rollback to the pre-dev2026 app:
 cp /home/odbadmin/python/ghrsst/conf/start_app.sh.pre-dev2026 \
    /home/odbadmin/python/ghrsst/conf/start_app.sh
 chmod +x /home/odbadmin/python/ghrsst/conf/start_app.sh
-pm2 restart ghrsst --update-env
+pm2 stop ghrsst
+pm2 start ghrsst
+curl -fsS http://127.0.0.1:8035/healthz
 ```
 
 Operational checks:
 ```bash
 curl -sS http://127.0.0.1:8035/healthz
 curl -sS -D - -o /tmp/ghrsst_365.json \
-  "http://127.0.0.1:8035/api/ghrsst?lon0=121&lat0=24&start=2025-06-24&end=2026-06-23&append=sst,sst_anomaly,sea_ice"
+  "http://127.0.0.1:8035/api/ghrsst?lon0=121&lat0=24&start=2025-07-09&end=2026-07-09&append=sst,sst_anomaly,sea_ice"
 ```
 Expected for multi-day point/range queries: `X-Store-Route: cube`.
 Swagger/OpenAPI:
@@ -92,10 +93,18 @@ https://eco.odb.ntu.edu.tw/api/swagger/ghrsst/openapi.json
 ```
 
 `zarr.json` metadata is maintained by the cube builders/append tools. Do not edit
-it manually. Base cube days are stored in the base root attrs; recent and
-backfilled gap days are stored in the delta root attrs. VM24 production currently
-keeps `2025-06-22`, `2026-06-22`, and `2026-06-23` in delta so ranges crossing
-the base start still route to the cube.
+it manually. Base cube days are stored in the base root attrs; recent days are
+stored in the delta root attrs. Complete production coverage is base plus delta.
+
+Current VM24 serving index (checked 2026-07-28):
+- base cube: `2023-01-01..2026-06-26`
+- delta cube: `2026-06-23..2026-07-26` (34 finalized days; 31-day policy window plus retention buffer)
+- daily store: through `2026-07-26`; retained as ingestion/recovery staging and not yet removed
+
+Delta `attrs["days"]` may be physical append order after backfills, not
+chronological order. Do not sort the metadata by hand unless the underlying time
+axis arrays are also rewritten. The API maps dates through `day_index` and reports
+latest using the chronological max day.
 
 ### Base vs delta operational rule
 
@@ -116,30 +125,70 @@ or years). For a large backfill, rebuild/compact the base cube from the daily
 store with the bulk builder, then reset delta to only days after the chosen base
 cutoff. This keeps routing, metadata, and read performance easy to reason about.
 
-`mur_timecube_s8_t90_sh128.zarr/zarr.json` describes only the base cube. Complete
-production coverage is base plus delta; check `/healthz` (`cube_kind=tiered`,
-`cube_day_count`, `delta_day_count`, `cube_latest_in_sync`) for the served view.
-`/healthz` also exposes raw `earliest/latest` and user-facing
-`primary_earliest/primary_latest`; the latter ignores isolated test days such as
-`2023-03-06` and is used in unavailable-date error messages.
+`mur_timecube_s8_t90_sh128.zarr/zarr.json` describes only the base cube. Check
+`/healthz` (`cube_kind=tiered`, `cube_day_count`, `delta_day_count`,
+`cube_latest_in_sync`, `spatial_window`) for the served view.
 
 Daily delta append cron:
 ```cron
-# Runs after the existing MUR daily retries. Idempotent.
+# The daily fetch itself also runs twice (05:05 and 18:05 Taipei) for the
+# same UTC target day: early availability plus a retry if PO.DAAC is late.
+05 05 * * * /home/odbadmin/python/ghrsst/dev/cron_mur_daily.sh $(date -u -d "yesterday" +\%Y-\%m-\%d)
+05 18 * * * /home/odbadmin/python/ghrsst/dev/cron_mur_daily.sh $(date -u -d "yesterday" +\%Y-\%m-\%d)
+
+# Delta retries the same target after the corresponding daily fetch. A
+# finalized day logs SKIP_ALREADY_VALID and does not rewrite or restart PM2.
 30 20 * * * /home/odbadmin/python/ghrsst-dev2026-phase2/ops/cron_mur_delta_append.sh $(date -u -d "yesterday" +\%Y-\%m-\%d)
 30 07 * * * /home/odbadmin/python/ghrsst-dev2026-phase2/ops/cron_mur_delta_append.sh $(date -u -d "yesterday" +\%Y-\%m-\%d)
 ```
 Logs: `/home/odbadmin/Data/ghrsst/logs/delta_append/append_YYYY-MM-DD.log`.
 
-### Known bbox limitation
+### Spatial query policy (bbox and POST /points)
 
-The v0.3.0 performance work primarily fixes multi-day point/range queries. Bbox
-requests still use the daily store and the existing JSON-array wire format. A
-752,001-point bbox currently produces about 108 MB of row-oriented JSON; VM24 can
-stream it in roughly 4 seconds, but browsers/front-ends may spend much longer
-parsing, formatting, and rendering the payload. Production therefore sets
-`GHRSST_BBOX_POINT_LIMIT=300000` as a safety guard. A deeper bbox redesign should
-be handled as a separate phase; see [`specs/bbox_performance_notes.md`](specs/bbox_performance_notes.md).
+Production v0.4.1 enforces one simple spatial rule:
+
+- `bbox` GET and `POST /api/ghrsst/points` are available only for days in the
+  delta spatial window. The effective dates are the finalized days currently present in delta; retention keeps a minimum 31-calendar-day policy window plus buffer, so `/healthz` may show more than 31 days.
+- Older spatial queries return HTTP 400 with `available_spatial_window`.
+- Point GET and point time-series/range queries remain full-history and should
+  route to the cube.
+
+Examples:
+```bash
+# Recent bbox: 200
+curl -sS "https://eco.odb.ntu.edu.tw/api/ghrsst?start=2026-07-09&end=2026-07-09&lon0=135&lat0=15&lon1=136&lat1=16&append=sst"
+
+# Older bbox: 400, spatial query outside the available window
+curl -sS "https://eco.odb.ntu.edu.tw/api/ghrsst?start=2026-05-29&end=2026-05-29&lon0=135&lat0=15&lon1=136&lat1=16&append=sst"
+
+# Older single-point GET remains valid: 200
+curl -sS "https://eco.odb.ntu.edu.tw/api/ghrsst?start=2026-05-29&end=2026-05-29&lon0=135&lat0=15&append=sst,sst_anomaly"
+
+# Recent POST /points: 200
+curl -sS -H "Content-Type: application/json" \
+  -d '{"date":"2026-07-09","points":[[135,15],[136,16]],"append":"sst,sst_anomaly,sea_ice"}' \
+  "https://eco.odb.ntu.edu.tw/api/ghrsst/points"
+
+# Older POST /points: 400, spatial query outside the available window
+curl -sS -H "Content-Type: application/json" \
+  -d '{"date":"2026-05-29","points":[[135,15]],"append":"sst"}' \
+  "https://eco.odb.ntu.edu.tw/api/ghrsst/points"
+
+# CoverageJSON is implemented but intentionally disabled in production for now: 400
+curl -sS "https://eco.odb.ntu.edu.tw/api/ghrsst?start=2026-07-09&end=2026-07-09&lon0=135&lat0=15&lon1=136&lat1=16&append=sst&format=coveragejson"
+```
+
+CoverageJSON-lite (`format=coveragejson` / `format=raster`) is implemented but
+disabled in production (`GHRSST_ENABLE_COVERAGEJSON=0`) until the front-end/API
+contract is finalized. With the flag off, only the existing row-oriented
+`format=json` is public.
+
+The current JSON-array bbox format can be large. Production keeps
+`GHRSST_BBOX_POINT_LIMIT=300000` as a safety guard. A 752,001-point bbox can
+freeze browsers because the payload is row-oriented JSON; see
+[`specs/bbox_performance_notes.md`](specs/bbox_performance_notes.md),
+[`specs/p3_bbox_performance_design.md`](specs/p3_bbox_performance_design.md),
+and [`specs/p4s2_raster_format_design.md`](specs/p4s2_raster_format_design.md).
 
 ## 現況
 - [x] 診斷 + benchmark harness(`bench/`、`store/zarr_paths.py`)

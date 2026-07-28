@@ -1,0 +1,8 @@
+改善項目,測試條件,舊版 (daily store / pre-dev2026),新版 (time-cube tiered, v0.3.0),改善幅度,資料來源
+多日點時序查詢 p95 (低並發),365天 point series, C=4,14190 ms,50 ms,~284x faster,vm24_p1_binding / p2s7_chunking_selection
+多日點時序查詢 p95 (高並發),365天 point series, C=16,22078 ms,205 ms,~108x faster,vm24_p1_binding / p2s7_chunking_selection
+多日點時序查詢 p50 (基準),365天 point series,5049 ms (C=1),26 ms (C=4),~190x faster,vm24_p1_binding / p2s7_chunking_selection
+VM24 上線 gate 判定,365天 p95 < 4s 目標,NO-GO (p95 14.1 s),GO (p95 <= 0.21 s),通過,vm24_p1_binding_results
+每日 append 單日 (生產實測),global daily ingest,> 80 min/day,分鐘級,大幅縮短,append_strategy_results
+delta 單日 append (受控基準),2048x2048 grid 一天,17.22 s (s8 layout),0.08 s (s256 layout),215x faster,bench_delta_layout
+append 記憶體峰值,global 單日 append,~7.8 GB,~245 MB (VM24),~32x lower,append_strategy_results

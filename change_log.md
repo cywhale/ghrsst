@@ -22,3 +22,25 @@
 - Restored Swagger/OpenAPI under `/api/swagger/ghrsst` and `/api/swagger/ghrsst/openapi.json`.
 - Added the daily-only gap day `2025-06-22` to the delta cube so ranges crossing that day still route to the cube.
 - User-facing unavailable-date errors now report the main contiguous production range, excluding isolated test days such as `2023-03-06`.
+
+#### ver 0.3.1 (2026-07-01)
+- Rebuilt VM24 base time-cube to cover `2023-01-01..2026-06-26` and backfilled the delta cube to a 31-day spatial window (`2026-05-30..2026-06-29` at deployment time).
+- Enabled production spatial-window enforcement: bbox GET and `POST /api/ghrsst/points` are available only for days in the delta window; older spatial requests return HTTP 400 with `available_spatial_window`.
+- Kept point GET and point time-series/range queries full-history through the tiered cube.
+- Enabled cube metadata refresh (`GHRSST_CUBE_REFRESH_TTL_SECONDS=300`) so cron-appended delta days become visible without a routine PM2 restart.
+- Fixed chronological latest handling for append-order delta metadata. Backfilled delta `attrs["days"]` may not be sorted; the API now reports latest using chronological `max(days)` while preserving physical day-to-index mapping.
+- Left CoverageJSON-lite (`format=coveragejson` / `format=raster`) disabled in production until the compact bbox wire-format contract is finalized.
+
+#### ver 0.4.0 (2026-07-10)
+- Completed the P4 time-cube operational rollout on VM24: base time-cube plus append-optimized delta serving, with production point/range queries routed through the cube.
+- Enforced the recent spatial policy for bbox and `POST /api/ghrsst/points`; spatial availability follows finalized delta membership, while point and range queries retain full-history coverage.
+- Added TTL-based cube metadata refresh (`GHRSST_CUBE_REFRESH_TTL_SECONDS=300`) and finalized-day idempotency in the delta cron wrapper: retries skip valid days without rewriting Zarr or restarting PM2.
+- Completed the S10 shadow-to-production swap rehearsal and rollout safety model: fresh audit, lock/staleness guard, stop-before-swap quiescence, healthz verification, rollback/hold artifacts, and no automated hard delete.
+- Retained the full daily Zarr as ingestion/recovery staging for now. It has **not** been removed; daily pruning and long-term compaction remain separate, gated operations.
+- Kept CoverageJSON-lite disabled in production (`GHRSST_ENABLE_COVERAGEJSON=0`) until the frontend/API contract is finalized.
+
+#### ver 0.4.1 (2026-07-28)
+- Added fail-fast `/healthz` verification after the scheduled delta append PM2 reload; a failed recovery is now visible in the append log and exits nonzero.
+- Completed the first production delta prune/swap rehearsal: retained 34 finalized days (`2026-06-23..2026-07-26`), moved the previous delta to the rollback hold area, and verified point/range, recent bbox, historical bbox rejection, and `/healthz`.
+- Recorded measured API downtime during the stop-before-swap sequence: 2.791 seconds from port-down to healthz recovery.
+- Daily Zarr remains the ingestion/recovery staging source; daily staging prune and hard-delete cleanup remain separate future operations.

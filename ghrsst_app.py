@@ -217,12 +217,17 @@ def generate_custom_openapi():
     if app.openapi_schema: return app.openapi_schema
     openapi_schema = get_openapi(
         title="ODB Open API of GHRSST (MUR v4.1)",
-        version="1.0.0",
+        version="0.3.1",
         description=(
-            "Open API to query daily 1-km GHRSST MUR v4.1 (SST, SST anomaly, sea ice) data.\n\n"
-            "* Data source: MUR-JPL-L4-GLOB-v4.1. JPL MUR MEaSUREs Project. 2015. GHRSST Level 4 MUR Global Foundation Sea Surface Temperature Analysis. Ver. 4.1. PO.DAAC, CA, USA. https://doi.org/10.5067/GHGMR-4FJ04\n"
-            "* Point mode (lon0,lat0 only): default latest day or requested range ≤31 days; clamped to available [earliest, latest] with missing days skipped.\n"
-            f"* BBox mode (lon0,lat0,lon1,lat1): single-day only (uses provided start/end to choose the day); requested day must exist; limit nx*ny ≤ {cfg.POINT_LIMIT}.\n"
+            "Open API for daily 1-km GHRSST MUR v4.1 sea-surface temperature data.\n\n"
+            "* Data source: MUR-JPL-L4-GLOB-v4.1, JPL MUR MEaSUREs Project. 2015. "
+            "GHRSST Level 4 MUR Global Foundation Sea Surface Temperature Analysis, Ver. 4.1. "
+            "PO.DAAC, CA, USA. https://doi.org/10.5067/GHGMR-4FJ04\n"
+            f"* Point mode: one point or a date range capped at {cfg.MAX_DAYS} days; "
+            "missing days are skipped.\n"
+            f"* BBox mode: one day only; after sampling, nx × ny must be ≤ {cfg.POINT_LIMIT:,}. "
+            "If both start and end are supplied, use the same date. Use a small bbox in Swagger UI; "
+            "large responses may freeze a browser.\n"
         ),
         routes=app.routes,
     )
@@ -231,11 +236,18 @@ def generate_custom_openapi():
     return app.openapi_schema
 
 @app.get("/api/swagger/ghrsst/openapi.json", include_in_schema=False)
-async def custom_openapi(): return JSONResponse(generate_custom_openapi())
+async def custom_openapi():
+    return JSONResponse(
+        generate_custom_openapi(),
+        headers={"Cache-Control": "no-store"},
+    )
 
 @app.get("/api/swagger/ghrsst", include_in_schema=False)
 async def custom_swagger_ui_html():
-    return get_swagger_ui_html(openapi_url="/api/swagger/ghrsst/openapi.json", title="GHRSST API Docs")
+    return get_swagger_ui_html(
+        openapi_url="/api/swagger/ghrsst/openapi.json?v=0.3.1",
+        title="GHRSST API Docs",
+    )
 
 class GHRSSTRow(BaseModel):
     lon: float
@@ -245,36 +257,83 @@ class GHRSSTRow(BaseModel):
     sst_anomaly: Optional[float] = None
     sea_ice: Optional[float] = None
 
+
+def _query_example(value):
+    """Use the FastAPI/Pydantic-compatible OpenAPI example style."""
+    return {"example": value}
+
 # =========================
 # Endpoint
 # =========================
 
 @app.get("/api/ghrsst", response_model=List[GHRSSTRow], tags=["GHRSST"], summary="Query GHRSST (MUR v4.1, daily 1-km) data")
 async def read_ghrsst(
-    lon0: float = Query(..., description="Longitude (or min lon) [-180,180]"),
-    lat0: float = Query(..., description="Latitude (or min lat) [-90,90]"),
-    lon1: Optional[float] = Query(None, description="Max longitude (BBox mode)"),
-    lat1: Optional[float] = Query(None, description="Max latitude (BBox mode)"),
-    start: Optional[str] = Query(None, description="Start date YYYY-MM-DD (inclusive)"),
-    end: Optional[str] = Query(None, description="End date YYYY-MM-DD (inclusive)"),
-    append: Optional[str] = Query(None, description="Fields: sst,sst_anomaly,sea_ice (default: sst)"),
-    sample: int = Query(1, description="(BBox) re-sample every N points (default 1) to thin the grid"),
+    lon0: float = Query(
+        ...,
+        description="Longitude or minimum longitude, range [-180, 180].",
+        json_schema_extra=_query_example(-69.0),
+    ),
+    lat0: float = Query(
+        ...,
+        description="Latitude or minimum latitude, range [-90, 90].",
+        json_schema_extra=_query_example(32.0),
+    ),
+    lon1: Optional[float] = Query(
+        None,
+        description="Maximum longitude for BBox mode; provide with lat1.",
+        json_schema_extra=_query_example(136.0),
+    ),
+    lat1: Optional[float] = Query(
+        None,
+        description="Maximum latitude for BBox mode; provide with lon1.",
+        json_schema_extra=_query_example(16.0),
+    ),
+    start: Optional[str] = Query(
+        None,
+        description=(
+            f"Start date YYYY-MM-DD (inclusive). Point ranges are capped at {cfg.MAX_DAYS} days; "
+            "BBox mode uses one selected day; if end is also supplied, use the same date."
+        ),
+        json_schema_extra=_query_example("2025-06-01"),
+    ),
+    end: Optional[str] = Query(
+        None,
+        description=(
+            f"End date YYYY-MM-DD (inclusive). Point ranges are capped at {cfg.MAX_DAYS} days; "
+            "BBox mode remains single-day; use the same date as start."
+        ),
+        json_schema_extra=_query_example("2025-06-03"),
+    ),
+    append: Optional[str] = Query(
+        None,
+        description="Comma-separated fields: sst, sst_anomaly, sea_ice. Default: sst.",
+        json_schema_extra=_query_example("sst,sst_anomaly"),
+    ),
+    sample: int = Query(
+        1,
+        description=(
+            f"BBox stride; sample=N keeps every Nth grid point. Default 1. "
+            f"The sampled grid must contain ≤ {cfg.POINT_LIMIT:,} points."
+        ),
+        json_schema_extra=_query_example(5),
+    ),
     mode: Optional[str] = Query(
         None,
         description=(
             "Allowed modes: truncate. Multiple modes can be comma-separated. "
             "The mode 'truncate' rounds lon/lat to 5 decimals and data values to 3 decimals."
         ),
+        json_schema_extra=_query_example("truncate"),
     ),
 ):
     """
     Query global marine SST (sst), SST anomalies (sst_anomaly) and sea ice fraction (sea_ice) from NASA MUR v4.1 by using spatial and temporal filters.
 
     #### Usage
-    * Point query (lon0,lat0 only): single day (default latest) or ≤ 31-day range; clamped to available [earliest, latest]; missing days are skipped.
-    * /api/ghrsst?lon0=-60&lat0=10&append=sst,sst_anomaly (point query, default date).
-    * BBox query (lon0,lat0,lon1,lat1): single day only (uses `start` when both start/end provided, otherwise whichever is supplied, otherwise latest); requested day must exist in the dataset; per-day limit nx*ny ≤ 1,000,000 and supports `sample` stride to thin grids.
-    * /api/ghrsst?lon0=125&lat0=15&lon1=126&lat1=16&start=2025-10-30 (bbox query, specific date).
+    * Point query: one point, default latest day, or a capped date range. Missing days are skipped.
+    * `/api/ghrsst?lon0=-69&lat0=32&start=2025-06-01&end=2025-06-03&append=sst,sst_anomaly` returns three small point records.
+    * BBox query: `lon0,lat0,lon1,lat1` selects one day; provide a small bbox and use `sample` to thin the grid.
+    * `/api/ghrsst?lon0=135&lat0=15&lon1=136&lat1=16&start=2025-06-01&append=sst` returns a small BBox response.
     * Use mode=truncate to round lon/lat (5 dp) and data fields (3 dp) for lighter payloads.
     """
 

@@ -5,3 +5,4 @@ __pycache__/
 
 # P3-S0 large regeneratable bbox payloads (keep result JSONs, drop payloads)
 bench/results/payloads/
+bench/results/*_smoke.json
