@@ -1,9 +1,9 @@
 # P4-S11 — post-prune point-availability regression: root cause + fix
 
-Status: **FIXED locally; tests green; NOT yet deployed.** Found by Codex/ops on VM24 right after the
-first real P4 daily-staging prune (2026-07-28, production v0.4.1). Claude reproduced it locally,
-fixed it, and ran the full regression; **VM24 deployment, rollback and the `hold` lifecycle stay with
-Codex/ops** — Claude touched no production system.
+Status: **FIXED, production-deployed, and edge-gated (2026-07-30, v0.5.0).** Found by Codex/ops on
+VM24 right after the first real P4 daily-staging prune. Claude reproduced it locally, fixed it, and
+ran the full regression. Codex/ops deployed the reviewed source logic from commit `5099613` while
+preserving VM24-specific Swagger documentation. The rollback `hold` remains intact.
 
 ## Symptom (production)
 
@@ -147,11 +147,28 @@ semantics). Full suite: **255 tests, OK (17 pre-existing skips)**.
 - **`hold` must not be hard-deleted** until this fix is deployed and production edge tests pass —
   the 1267 pruned daily groups remain the local re-derivation path if anything else surfaces.
 
-## Deployment (Codex/ops)
+## Production deployment result
 
-Fetch and check out the fix commit on `dev2026-p4-point-availability-fix` (stacked on the v0.4.1
-production tip `9a8d3d4`). After deployment, re-run the production edge checks: the two 400-ing
-historical queries above must return 200 with `X-Store-Route: cube`; the recent range/bbox/POST and
-the older-bbox/POST 400s must be unchanged; `/healthz` must show `earliest` at the true history start
-with `daily_day_count` ≈ 38. Only after that is the `hold` cleanup decision in scope — and it remains
-ops-only, after `hold_until`.
+The fix was deployed on VM24 on 2026-07-30. Because the active runtime is a dirty deployment
+worktree with VM24-specific Swagger edits, Codex/ops applied the minimal
+`9a8d3d4..5099613` four-module patch rather than resetting or checking out the worktree.
+
+Results:
+
+- PM2 `ghrsst` restart-to-health: **1.422 s**; no rollback.
+- historical single-day point: **200 / cube / 87 ms**.
+- historical 365-day range: **200 / 365 rows / cube / 100 ms**.
+- leap-year 366-day range: **200 / 366 rows / cube / 76 ms**.
+- base→delta crossing range: **200 / cube / 219 ms**.
+- recent bbox and POST: **200 / 39 ms and 31 ms**.
+- historical bbox and POST: **400** with the correct `available_spatial_window` payload.
+- `/healthz`: point history `2023-01-01..2026-07-28` (1,305 days), daily staging
+  `2026-06-21..2026-07-28` (38 days), delta 36 days, `cube_latest_in_sync=true`.
+- public NGINX path returned the corrected 365-day result after the configured one-minute cached-400
+  TTL expired.
+
+Artifacts:
+`/home/odbadmin/Data/ghrsst/logs/p4_point_availability_deploy_20260730T064815Z`.
+
+The 1,267 pruned daily groups remain in `hold`. Hard deletion is still an explicit ops decision
+after `hold_until`; it is not part of this release.
