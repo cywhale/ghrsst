@@ -46,6 +46,36 @@ def _nearest_idx(val: float, arr: np.ndarray) -> int:
     return j if abs(arr[j] - val) < abs(arr[j - 1] - val) else j - 1
 
 
+def primary_contiguous_bounds(days: Sequence[str]) -> Tuple[Optional[str], Optional[str]]:
+    """The main contiguous run within `days` (which must be sorted ascending).
+
+    Some stores contain isolated test days before the real production run (for example VM24 has a
+    single 2023-03-06 day). User-facing "available range" messages should not advertise such isolated
+    days as the start of the usable range. Pick the longest contiguous run; if tied, pick the latest.
+
+    Module-level so the DAILY store (`StoreAccess.primary_bounds`) and the tier-agnostic POINT
+    availability (`HybridRouter.point_primary_bounds`, P4 post-prune fix) share ONE implementation.
+    """
+    days = list(days)
+    if not days:
+        return (None, None)
+    best_start = best_end = cur_start = cur_end = date.fromisoformat(days[0])
+    best_len = 1
+    for s in days[1:]:
+        d = date.fromisoformat(s)
+        if d == cur_end + timedelta(days=1):
+            cur_end = d
+        else:
+            cur_len = (cur_end - cur_start).days + 1
+            if cur_len > best_len or (cur_len == best_len and cur_end > best_end):
+                best_start, best_end, best_len = cur_start, cur_end, cur_len
+            cur_start = cur_end = d
+    cur_len = (cur_end - cur_start).days + 1
+    if cur_len > best_len or (cur_len == best_len and cur_end > best_end):
+        best_start, best_end = cur_start, cur_end
+    return (best_start.isoformat(), best_end.isoformat())
+
+
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
@@ -95,31 +125,8 @@ class StoreAccess:
         return (days[0], days[-1]) if days else (None, None)
 
     def primary_bounds(self) -> Tuple[Optional[str], Optional[str]]:
-        """Return the main contiguous production range.
-
-        Some stores contain isolated test days before the real production run
-        (for example VM24 has a single 2023-03-06 day). User-facing "available
-        range" messages should not advertise such isolated days as the start of
-        the usable range. Pick the longest contiguous run; if tied, pick latest.
-        """
-        days = self.existing_days()
-        if not days:
-            return (None, None)
-        best_start = best_end = cur_start = cur_end = date.fromisoformat(days[0])
-        best_len = 1
-        for s in days[1:]:
-            d = date.fromisoformat(s)
-            if d == cur_end + timedelta(days=1):
-                cur_end = d
-            else:
-                cur_len = (cur_end - cur_start).days + 1
-                if cur_len > best_len or (cur_len == best_len and cur_end > best_end):
-                    best_start, best_end, best_len = cur_start, cur_end, cur_len
-                cur_start = cur_end = d
-        cur_len = (cur_end - cur_start).days + 1
-        if cur_len > best_len or (cur_len == best_len and cur_end > best_end):
-            best_start, best_end = cur_start, cur_end
-        return (best_start.isoformat(), best_end.isoformat())
+        """The daily store's main contiguous range (see `primary_contiguous_bounds`)."""
+        return primary_contiguous_bounds(self.existing_days())
 
     def day_present(self, day: str) -> bool:
         # authoritative filesystem check (don't trust a stale day-list for a miss)

@@ -66,11 +66,25 @@ class RouterTests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ---- routing decisions ----
+    # P4 CONTRACT CHANGE: single-day point now routes to the CUBE when the cube covers that day.
+    # Pre-P4 it was pinned to daily (daily was full-history, so it was a free choice). After the P4
+    # daily-staging prune daily holds only a recent window, so pinning single-day to daily made
+    # historical single-day points unserveable (production 400s). Cube single-day is also faster
+    # (P4-S0b VM24: 4.5 ms cube vs 14.7 ms daily). Values are identical either way — asserted here
+    # and in test_parity_single_day_via_cube below.
     def test_route_default_latest_single_day(self):
-        self.assertEqual(self.router.route_point([self.days[-1]]), "daily")
+        self.assertEqual(self.router.route_point([self.days[-1]]), "cube")
 
     def test_route_fixed_single_day(self):
-        self.assertEqual(self.router.route_point([self.days[3]]), "daily")
+        self.assertEqual(self.router.route_point([self.days[3]]), "cube")
+
+    def test_route_single_day_not_in_cube_falls_back_to_daily(self):
+        # a day the cube lacks must still route to daily (transition safety: fresh ingest)
+        partial = os.path.join(self.tmp, "partial_cube_single")
+        build_timecube(self.daily, partial, spatial_chunk=8, time_chunk=4, days=self.days[:5])
+        rp = HybridRouter(self.sa, TimeCubeStore(partial))
+        self.assertEqual(rp.route_point([self.days[2]]), "cube")      # covered
+        self.assertEqual(rp.route_point([self.days[7]]), "daily")     # not in cube -> daily
 
     def test_route_multi_day_range(self):
         self.assertEqual(self.router.route_point(self.days[2:8]), "cube")
@@ -93,9 +107,13 @@ class RouterTests(unittest.TestCase):
             routed = self.router.point_series(lon, lat, self.days, ["sst", "sst_anomaly", "sea_ice"])
             self.assertEqual(routed, p1, f"routed multi-day != P1 at ({lon},{lat})")
 
-    def test_parity_single_day_via_daily(self):
-        r = self.router.point_series(115.0, 12.0, [self.days[2]], ["sst"])
-        self.assertEqual(r, self.sa.point_series(115.0, 12.0, [self.days[2]], ["sst"]))
+    def test_parity_single_day_via_cube(self):
+        # P4: single-day routes to the cube — the routed result must still equal the P1 daily read
+        # EXACTLY (authoritative semantics unchanged by the routing switch).
+        for day in (self.days[2], self.days[3], self.days[-1]):
+            r = self.router.point_series(115.0, 12.0, [day], ["sst", "sst_anomaly", "sea_ice"])
+            self.assertEqual(r, self.sa.point_series(115.0, 12.0, [day],
+                                                     ["sst", "sst_anomaly", "sea_ice"]), day)
 
     def test_parity_batch_and_bbox_route_daily(self):
         pts = [[110.0, 10.0], [120.0, 20.0]]
@@ -146,13 +164,20 @@ class ApiRoutingTests(unittest.TestCase):
         import shutil
         shutil.rmtree(_TMP, ignore_errors=True)
 
-    def test_default_latest_routes_daily(self):
+    # P4: single-day / default-latest route to the CUBE when it covers the day (see RouterTests).
+    def test_default_latest_routes_cube(self):
         r = self.client.get("/api/ghrsst", params={"lon0": 115.0, "lat0": 12.0})
-        self.assertEqual(r.headers["x-store-route"], "daily")
+        self.assertEqual(r.headers["x-store-route"], "cube")
 
-    def test_single_day_routes_daily(self):
-        r = self.client.get("/api/ghrsst", params={"lon0": 115.0, "lat0": 12.0, "start": "2025-02-03"})
-        self.assertEqual(r.headers["x-store-route"], "daily")
+    def test_single_day_routes_cube_with_same_values(self):
+        p = {"lon0": 115.0, "lat0": 12.0, "start": "2025-02-03", "append": "sst,sea_ice"}
+        r = self.client.get("/api/ghrsst", params=p)
+        self.assertEqual(r.headers["x-store-route"], "cube")
+        self.assertEqual(r.status_code, 200)
+        # authoritative semantics preserved: identical to a direct daily read of the same day
+        from store.store_access import StoreAccess as _SA
+        exp = _SA(_DAILY).point_series(115.0, 12.0, ["2025-02-03"], ["sst", "sea_ice"])
+        self.assertEqual(r.json(), exp)
 
     def test_multi_day_routes_cube_and_matches(self):
         r = self.client.get("/api/ghrsst", params={

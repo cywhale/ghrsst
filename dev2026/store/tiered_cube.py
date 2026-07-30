@@ -41,6 +41,18 @@ class TieredCube:
         return max(cands) if cands else None
 
     @property
+    def days(self) -> List[str]:
+        """CHRONOLOGICAL union of base+delta days (deduped).
+
+        Each tier stores its own days in PHYSICAL/append order; this union is the tier-agnostic
+        *availability* view (P4 point-availability fix), so it is sorted. Do NOT use it to index a
+        tier's arrays — index through that tier's own `day_index` (append-order invariant, P4-S4 §2)."""
+        days = set(self.base.days)
+        if self.delta is not None:
+            days |= set(self.delta.days)
+        return sorted(days)
+
+    @property
     def day_count(self) -> int:
         days = set(self.base.days)
         if self.delta:
