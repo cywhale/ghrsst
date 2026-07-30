@@ -255,10 +255,19 @@ class PostPrunePointAvailability(unittest.TestCase):
     # ---- (5)(6)(7) the spatial contract must NOT widen: bbox/POST stay delta-window bound ----
 
     def test_old_bbox_rejected(self):
+        # HIST_DAY is absent from the pruned daily store too. The answer must still be the P4 SPATIAL
+        # policy payload — not the daily staging range (that ordering bug would tell a client the
+        # spatial window is the 38-day staging window).
         r = self.client.get("/api/ghrsst", params={
             "lon0": 110.0, "lat0": 12.0, "lon1": 111.0, "lat1": 13.0,
             "start": HIST_DAY, "end": HIST_DAY, "append": "sst"})
         self.assertEqual(r.status_code, 400, r.text)
+        self.assertNotIn(HIST_DAY, self.daily_days)          # precondition: absent from daily
+        detail = r.json()["detail"]
+        self.assertIsInstance(detail, dict)                  # policy payload, not a plain string
+        self.assertEqual(detail["available_spatial_window"], f"{DELTA_START}..{LATEST}")
+        self.assertEqual(detail["requested_day"], HIST_DAY)
+        self.assertNotIn("available range is", str(detail))  # NOT the daily-staging message
 
     def test_bbox_in_daily_but_outside_delta_rejected(self):
         # 2026-06-21 IS in daily staging but NOT in the delta window -> spatial gate must still reject
@@ -277,9 +286,15 @@ class PostPrunePointAvailability(unittest.TestCase):
         self.assertGreater(len(r.json()), 0)
 
     def test_old_post_points_rejected(self):
+        # same ordering requirement as bbox: spatial policy answers, not daily availability
         r = self.client.post("/api/ghrsst/points", json={
             "date": HIST_DAY, "points": [[110.0, 12.0]], "append": "sst"})
         self.assertEqual(r.status_code, 400, r.text)
+        detail = r.json()["detail"]
+        self.assertIsInstance(detail, dict)
+        self.assertEqual(detail["available_spatial_window"], f"{DELTA_START}..{LATEST}")
+        self.assertEqual(detail["requested_day"], HIST_DAY)
+        self.assertNotIn("not available;", str(detail))      # NOT the daily-availability message
 
     def test_recent_post_points_ok(self):
         r = self.client.post("/api/ghrsst/points", json={
@@ -436,6 +451,21 @@ class NoCubeTransition(unittest.TestCase):
         r2 = self.client.get("/api/ghrsst", params={
             "lon0": 110.0, "lat0": 12.0, "start": "2020-01-01", "end": "2020-01-02"})
         self.assertEqual(r2.status_code, 400)
+
+    def test_transition_no_delta_keeps_daily_availability_message(self):
+        """Enforcement ON but NO delta tier: the gate must stay a no-op, so a missing spatial day
+        still gets the daily-availability message (moving the gate earlier must not change this)."""
+        r = self.client.get("/api/ghrsst", params={
+            "lon0": 110.0, "lat0": 12.0, "lon1": 112.0, "lat1": 14.0,
+            "start": "2020-01-01", "end": "2020-01-01"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIsInstance(r.json()["detail"], str)       # plain message, NOT a policy payload
+        self.assertIn("available range is", r.json()["detail"])
+        r2 = self.client.post("/api/ghrsst/points", json={
+            "date": "2020-01-01", "points": [[110.0, 12.0]], "append": "sst"})
+        self.assertEqual(r2.status_code, 400)
+        self.assertIsInstance(r2.json()["detail"], str)
+        self.assertIn("not available;", r2.json()["detail"])
 
 
 if __name__ == "__main__":

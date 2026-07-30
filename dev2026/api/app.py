@@ -409,10 +409,15 @@ async def read_ghrsst(
     date_less = chosen is None
     if date_less:
         chosen = latest
+    # P4: the spatial-window policy decides FIRST. After the daily prune a historical day is absent
+    # from daily too, so checking daily availability first would answer a spatial request with the
+    # daily *staging* range instead of the adopted rejection payload (available_spatial_window).
+    # The gate is a no-op when enforcement is off or no delta tier is loaded, so the daily-availability
+    # message below is still what those transition configurations return.
+    _spatial_window_gate(request.app, chosen)
     if chosen < earliest or chosen > latest or not store.day_present(chosen):
         raise HTTPException(400, f"BBOX query only allows single-day data. Requested "
                                  f"{chosen} is unavailable; {_available_range_text(store)}.")
-    _spatial_window_gate(request.app, chosen)         # P4-S3: bbox served only in the delta window (if enforced)
     cacheable = (not date_less) and (chosen < latest)
 
     # Hold ONE admission permit for the WHOLE bbox stream lifecycle (read + every
@@ -519,9 +524,12 @@ async def read_points(request: Request, body: PointsRequest):
         if len(p) != 2:
             raise HTTPException(400, "each point must be [lon, lat].")
     earliest, latest = store.bounds()
+    # P4: spatial-window policy first (same ordering rationale as bbox above) — a historical day is
+    # missing from the pruned daily store, and a spatial request must be answered with the spatial
+    # contract, not the daily staging range. No-op when enforcement is off / no delta tier.
+    _spatial_window_gate(request.app, day)
     if not latest or not store.day_present(day):
         raise HTTPException(400, f"day {day} not available; {_available_range_text(store)}.")
-    _spatial_window_gate(request.app, day)            # P4-S3: POST /points served only in the delta window (if enforced)
     try:
         rows = await bex.run(store.points_batch, body.points, day, fields)
     except ValueError as ve:

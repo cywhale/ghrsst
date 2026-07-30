@@ -1,4 +1,4 @@
-"""dev2026 — P4 adopted spatial-window policy (helper; NOT yet wired into the API).
+"""dev2026 — P4 adopted spatial-window policy (WIRED into the API since P4-S3).
 
 Adopted policy (P4 spec §4.1): spatial queries (bbox + POST /points) are served ONLY from days in the
 bbox-friendly recent tier (the delta cube). `SPATIAL_WINDOW_DAYS = 31` is the retention target that keeps
@@ -7,8 +7,17 @@ that tier ~31 days deep. So the enforceable rule is exactly **delta membership**
     spatial served  ⇔  requested day ∈ delta.days
 
 Older / non-delta spatial requests return a clear 4xx naming the available spatial window (= the delta's
-[earliest .. latest]). This module is a pure helper used by the P4-S0b harness to SIMULATE the policy
-(enforcement is not yet implemented in the API); P4-S3 will wire it into `api/app.py`.
+[earliest .. latest]).
+
+Enforcement: `api/app.py::_spatial_window_gate` calls `spatial_day_allowed` / `rejection_payload` on both
+the bbox and `POST /points` paths, behind `GHRSST_SPATIAL_WINDOW_ENFORCE` (production: ON). The gate runs
+BEFORE those paths' daily-availability check, so that after the P4 daily prune a historical day — which
+is absent from the pruned daily store as well — is still answered with THIS policy payload rather than
+the daily staging range. The gate is a no-op when enforcement is off or no delta tier is loaded
+(transition safety), and those configurations keep the daily-availability message.
+
+Point GET / point range are NOT gated here: their availability is the full base+delta+daily union
+(`HybridRouter.point_*`). Spatial availability and point availability are deliberately different scopes.
 """
 from __future__ import annotations
 

@@ -70,6 +70,23 @@ when the daily store does → **mixed** otherwise. Two notes:
   it and the rows are merged in requested order. `X-Store-Route: mixed`, counted in
   `route_counts["mixed"]`.
 
+### Gate ordering on the spatial paths (round-2 review fix)
+
+A second, smaller instance of the same stale assumption survived the first pass: bbox and
+`POST /points` checked **daily availability before** `_spatial_window_gate`. Pre-prune that was
+invisible (daily held every day, so only the gate could reject); post-prune a historical day is
+missing from the pruned daily store too, so the daily check fired first and answered a *spatial*
+request with the **daily staging range** — telling clients the spatial window was
+`2026-06-21/2026-07-28` instead of returning the adopted policy payload with
+`available_spatial_window`.
+
+Both paths now run `_spatial_window_gate` **first**. Because the gate is already a no-op when
+enforcement is off or no delta tier is loaded, transition configurations keep the daily-availability
+message unchanged — asserted by `test_transition_no_delta_keeps_daily_availability_message`.
+`store/spatial_policy.py`'s docstring (still claiming "NOT yet wired … P4-S3 will wire it") was
+corrected to describe the shipped enforcement, this ordering rule, and the point-vs-spatial scope
+split.
+
 ### `/healthz`
 
 `earliest` / `latest` / `primary_*` now describe **public point availability** (the union), so a client
