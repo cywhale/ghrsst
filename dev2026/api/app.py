@@ -262,14 +262,24 @@ def _fixed_cache():
     return {"Cache-Control": f"public, max-age={cfg.LONG_CACHE_SECONDS}"}
 
 
-def _available_range_text(store: StoreAccess) -> str:
-    p0, p1 = store.primary_bounds()
-    e0, e1 = store.bounds()
+def _range_text(p0, p1, e0, e1) -> str:
     if p0 and p1:
         if (p0, p1) != (e0, e1):
             return f"available contiguous range is {p0}/{p1}"
         return f"available range is {p0}/{p1}"
     return f"available range is {e0}/{e1}"
+
+
+def _available_range_text(store: StoreAccess) -> str:
+    """SPATIAL availability (bbox / POST /points): the daily store — those paths are served from it
+    and are additionally gated to the delta window (`_spatial_window_gate`)."""
+    return _range_text(*store.primary_bounds(), *store.bounds())
+
+
+def _point_range_text(router) -> str:
+    """POINT availability: the base+delta+daily union. After the P4 prune the daily store is a recent
+    staging window only, so a point error must advertise the FULL history — not the 38-day window."""
+    return _range_text(*router.point_primary_bounds(), *router.point_bounds())
 
 
 def _spatial_window_gate(app, day: str):
@@ -316,8 +326,13 @@ async def read_ghrsst(
         allowed_formats |= COVERAGEJSON_FORMATS
     if fmt not in allowed_formats:
         raise HTTPException(400, f"Unsupported format '{fmt}'. Allowed: {', '.join(sorted(allowed_formats))}")
-    earliest, latest = store.bounds()
-    if not latest:
+    router = request.app.state.router
+    # TWO availability scopes (P4): point/range = base+delta+daily union (full history); spatial
+    # (bbox / POST points) = the daily store, further gated to the delta window. Conflating them is
+    # what produced the post-prune 400s on historical point queries.
+    point_earliest, point_latest = router.point_bounds()
+    earliest, latest = store.bounds()                 # DAILY bounds — spatial paths only
+    if not point_latest:
         raise HTTPException(503, "No available dates.")
 
     bbox_mode = (lon1 is not None) and (lat1 is not None) and not (lon1 == lon0 and lat1 == lat0)
@@ -332,7 +347,7 @@ async def read_ghrsst(
         e = _parse_date(end)
         date_less = (s is None and e is None)
         if date_less:
-            wanted = [latest]
+            wanted = [point_latest]
             cacheable = False                     # default-latest: must not cache (stale risk)
         else:
             if s and not e:
@@ -352,20 +367,20 @@ async def read_ghrsst(
                     "max_days": cfg.MAX_DAYS, "requested_days": req_days,
                     "hint": f"split into ranges of <= {cfg.MAX_DAYS} days",
                 })
-            if s < earliest:
-                s = earliest
-            if e > latest:
-                e = latest
-            wanted = _daterange(s, e)
+            # clamp to POINT availability (full history), not to the daily staging window
+            if s < point_earliest:
+                s = point_earliest
+            if e > point_latest:
+                e = point_latest
+            wanted = _daterange(s, e) if s <= e else []
             # cacheable only if the upper bound can never be affected by new ingest
-            cacheable = e_req < latest
+            cacheable = e_req < point_latest
 
-        existing = [d for d in wanted if store.day_present(d)]
+        existing = [d for d in wanted if router.point_day_present(d)]
         if not existing:
             raise HTTPException(400, f"Data not exist for requested period; "
-                                     f"{_available_range_text(store)}.")
-        router = request.app.state.router
-        route = router.route_point(existing)             # 'cube' (multi-day) or 'daily'
+                                     f"{_point_range_text(router)}.")
+        route = router.route_point(existing)             # 'cube' | 'daily' | 'mixed'
         rows = await bex.run(router.point_series, lon0, lat0, existing, fields)
         rows = _apply_modes(rows, modes, fields)
         headers = _fixed_cache() if cacheable else _no_store()
@@ -389,13 +404,20 @@ async def read_ghrsst(
         chosen = _parse_date(start or end)
     else:
         chosen = None
+    if not latest:            # spatial is served from the daily store; none present -> unavailable
+        raise HTTPException(503, "No available dates for spatial queries.")
     date_less = chosen is None
     if date_less:
         chosen = latest
+    # P4: the spatial-window policy decides FIRST. After the daily prune a historical day is absent
+    # from daily too, so checking daily availability first would answer a spatial request with the
+    # daily *staging* range instead of the adopted rejection payload (available_spatial_window).
+    # The gate is a no-op when enforcement is off or no delta tier is loaded, so the daily-availability
+    # message below is still what those transition configurations return.
+    _spatial_window_gate(request.app, chosen)
     if chosen < earliest or chosen > latest or not store.day_present(chosen):
         raise HTTPException(400, f"BBOX query only allows single-day data. Requested "
                                  f"{chosen} is unavailable; {_available_range_text(store)}.")
-    _spatial_window_gate(request.app, chosen)         # P4-S3: bbox served only in the delta window (if enforced)
     cacheable = (not date_less) and (chosen < latest)
 
     # Hold ONE admission permit for the WHOLE bbox stream lifecycle (read + every
@@ -502,9 +524,12 @@ async def read_points(request: Request, body: PointsRequest):
         if len(p) != 2:
             raise HTTPException(400, "each point must be [lon, lat].")
     earliest, latest = store.bounds()
+    # P4: spatial-window policy first (same ordering rationale as bbox above) — a historical day is
+    # missing from the pruned daily store, and a spatial request must be answered with the spatial
+    # contract, not the daily staging range. No-op when enforcement is off / no delta tier.
+    _spatial_window_gate(request.app, day)
     if not latest or not store.day_present(day):
         raise HTTPException(400, f"day {day} not available; {_available_range_text(store)}.")
-    _spatial_window_gate(request.app, day)            # P4-S3: POST /points served only in the delta window (if enforced)
     try:
         rows = await bex.run(store.points_batch, body.points, day, fields)
     except ValueError as ve:
@@ -531,13 +556,24 @@ def _rss_mb() -> Optional[float]:
 
 @app.get("/healthz", include_in_schema=False)
 async def healthz(request: Request):
-    e, l = request.app.state.store.bounds()
-    pe, pl = request.app.state.store.primary_bounds()
+    store = request.app.state.store
     bex = request.app.state.bex
     router = request.app.state.router
     cube = router.cube
+    # earliest/latest/primary_* describe PUBLIC POINT availability (base+delta+daily union). Before
+    # the P4 prune fix these mirrored the daily store, so after pruning a client reading /healthz saw
+    # only the 38-day staging window and concluded the history was gone.
+    pt_days = router.point_days()                             # sorted; reused for bounds below
+    e, l = (pt_days[0], pt_days[-1]) if pt_days else (None, None)
+    pe, pl = router.point_primary_bounds()
+    de, dl = store.bounds()                                   # daily staging window (explicit)
     return {"status": "ok", "earliest": e, "latest": l,
             "primary_earliest": pe, "primary_latest": pl,
+            # point availability, named explicitly (same as earliest/latest; unambiguous for clients)
+            "point_earliest": e, "point_latest": l, "point_day_count": len(pt_days),
+            # daily = recent staging only; NOT the availability authority (P4)
+            "daily_earliest": de, "daily_latest": dl,
+            "daily_day_count": len(store.existing_days()),
             "executor_queue_depth": bex.queue_depth(),
             "executor_limit": bex.limit,
             "rss_mb": _rss_mb(),

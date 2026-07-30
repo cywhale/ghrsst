@@ -44,3 +44,12 @@
 - Completed the first production delta prune/swap rehearsal: retained 34 finalized days (`2026-06-23..2026-07-26`), moved the previous delta to the rollback hold area, and verified point/range, recent bbox, historical bbox rejection, and `/healthz`.
 - Recorded measured API downtime during the stop-before-swap sequence: 2.791 seconds from port-down to healthz recovery.
 - Daily Zarr remains the ingestion/recovery staging source; daily staging prune and hard-delete cleanup remain separate future operations.
+
+#### ver 0.5.0 (2026-07-30)
+- Completed the first production daily-staging prune: retained 38 recent daily groups (`2026-06-21..2026-07-28`) and moved 1,267 historical groups to the rollback hold area. No hard delete was performed.
+- Made the tiered time-cube authoritative for full-history point availability. Point GET and ranges now derive bounds and membership from the base+delta+daily union rather than the recent daily staging window.
+- Added cube-first single-day routing and a `mixed` route for the ingest-lag edge case, preventing silent truncation when a range spans cube history plus a daily-only newest day.
+- Preserved the spatial contract: bbox GET and `POST /api/ghrsst/points` remain limited to delta membership. Their policy gate now runs before daily-staging availability checks, so historical requests consistently return `available_spatial_window`.
+- Extended `/healthz` with explicit `point_*` and `daily_*` availability fields. At deployment, point history was `2023-01-01..2026-07-28` (1,305 days), while daily staging was 38 days.
+- Verified VM24 production performance after pruning: historical 365/366-day ranges completed in about 76–100 ms through the cube; base→delta crossing range in about 219 ms; recent bbox in 39 ms; recent `POST /points` in 31 ms.
+- Deployed source logic from commit `5099613` while preserving the VM24-specific Swagger documentation. PM2 recovery took 1.422 seconds. Deployment artifacts are under `/home/odbadmin/Data/ghrsst/logs/p4_point_availability_deploy_20260730T064815Z`.

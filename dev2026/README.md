@@ -29,13 +29,13 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_store_access dev2026.tes
 - `uv` 管理 Python(3.13)與 venv。
 - store 路徑一律 `GHRSST_ZARR_PATH`,程式不硬編碼;`bak/` 僅本機部分複本,**仍在持續拷貝/每日增長**,工具須容忍缺日。
 
-## VM24 production deployment (v0.4.1, 2026-07-28)
+## VM24 production deployment (v0.5.0, 2026-07-30)
 
 Production on VM24 now runs the dev2026 API through the existing PM2 app `ghrsst`
 and the existing NGINX upstream `127.0.0.1:8035`. NGINX was not changed.
 
 Paths:
-- Production daily source of truth: `/home/odbadmin/Data/ghrsst/mur.zarr`
+- Recent daily ingest/recovery staging: `/home/odbadmin/Data/ghrsst/mur.zarr`
 - Base time-cube: `/home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.zarr`
 - Delta cube: `/home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.delta.zarr`
 - Runtime worktree: `/home/odbadmin/python/ghrsst-dev2026-phase2`
@@ -86,6 +86,9 @@ curl -sS -D - -o /tmp/ghrsst_365.json \
   "http://127.0.0.1:8035/api/ghrsst?lon0=121&lat0=24&start=2025-07-09&end=2026-07-09&append=sst,sst_anomaly,sea_ice"
 ```
 Expected for multi-day point/range queries: `X-Store-Route: cube`.
+Single-day historical points also route to `cube`. During the short ingest-lag
+window, a range that includes cube history plus a daily-only newest day may
+return `X-Store-Route: mixed`; this is expected and prevents silent truncation.
 Swagger/OpenAPI:
 ```text
 https://eco.odb.ntu.edu.tw/api/swagger/ghrsst
@@ -96,10 +99,12 @@ https://eco.odb.ntu.edu.tw/api/swagger/ghrsst/openapi.json
 it manually. Base cube days are stored in the base root attrs; recent days are
 stored in the delta root attrs. Complete production coverage is base plus delta.
 
-Current VM24 serving index (checked 2026-07-28):
+Current VM24 serving index (checked 2026-07-30):
 - base cube: `2023-01-01..2026-06-26`
-- delta cube: `2026-06-23..2026-07-26` (34 finalized days; 31-day policy window plus retention buffer)
-- daily store: through `2026-07-26`; retained as ingestion/recovery staging and not yet removed
+- delta cube: `2026-06-23..2026-07-28` (36 finalized days; 31-day policy window plus retention buffer)
+- point availability (base + delta + daily union): `2023-01-01..2026-07-28` (1,305 days)
+- daily staging: `2026-06-21..2026-07-28` (38 groups)
+- rollback hold: 1,267 historical daily groups; no hard delete performed
 
 Delta `attrs["days"]` may be physical append order after backfills, not
 chronological order. Do not sort the metadata by hand unless the underlying time
@@ -108,8 +113,9 @@ latest using the chronological max day.
 
 ### Base vs delta operational rule
 
-The daily store remains the only source of truth. The time-cube is a derived
-serving index split into:
+The tiered time-cube is the full-history serving authority. The daily store is
+recent ingest/recovery staging, while raw NetCDF re-download plus the rollback
+hold remain recovery inputs. The serving index is split into:
 
 - **base cube** (`time_chunk=90`, `spatial_chunk=8`): read-optimized for long
   point/range time series; expensive to update one day at a time.
@@ -128,6 +134,46 @@ cutoff. This keeps routing, metadata, and read performance easy to reason about.
 `mur_timecube_s8_t90_sh128.zarr/zarr.json` describes only the base cube. Check
 `/healthz` (`cube_kind=tiered`, `cube_day_count`, `delta_day_count`,
 `cube_latest_in_sync`, `spatial_window`) for the served view.
+
+### Daily staging prune and point availability
+
+The first production daily prune on 2026-07-30 retained 38 recent groups and
+moved 1,267 historical groups into `/home/odbadmin/Data/ghrsst/hold/`.
+
+Important operational rules:
+
+- Prune is **move-to-hold**, not deletion. A same-filesystem rename is fast and
+  frees no space. Hard delete is a separate, explicitly approved ops action
+  after `hold_until`.
+- Full-history point availability comes from `HybridRouter.point_days()` and
+  the base+delta+daily union. Never clamp or filter point requests using daily
+  bounds alone.
+- Spatial availability is intentionally separate: bbox and `POST /points`
+  remain limited to finalized delta membership.
+- `/healthz.earliest/latest` and `point_*` describe full point history;
+  `daily_*` describes only staging. Different day counts are expected.
+- The initial prune exposed a stale P1/P2 assumption that daily was still the
+  availability authority. The v0.5.0 fix is documented in
+  [`specs/p4s11_point_availability_regression.md`](specs/p4s11_point_availability_regression.md).
+
+Post-deploy VM24 edge results:
+
+| path | result |
+|---|---|
+| historical single-day point | 200, cube, 87 ms |
+| historical 365-day point range | 200, cube, 100 ms |
+| leap-year 366-day point range | 200, cube, 76 ms |
+| base→delta crossing range | 200, cube, 219 ms |
+| recent bbox / `POST /points` | 200, 39 ms / 31 ms |
+| historical bbox / `POST /points` | 400 with `available_spatial_window` |
+
+Deployment artifacts:
+`/home/odbadmin/Data/ghrsst/logs/p4_point_availability_deploy_20260730T064815Z`.
+
+NGINX caches 400/404 responses for one minute in the shared API cache. After a
+behavior fix, an unchanged public URL may briefly show the stale 400 even when
+a cache-busted request reaches the fixed app. Wait for the TTL and recheck;
+do not purge the shared cache globally.
 
 Daily delta append cron:
 ```cron
@@ -209,7 +255,7 @@ and [`specs/p4s2_raster_format_design.md`](specs/p4s2_raster_format_design.md).
 - [x] **P2-S6 dual-write ingest**(`ingest/dual_write.py`:sync_day/upsert idempotent、sync_missing recovery、check_coverage;`/healthz` cube 觀測 + route_counts;`bench/bench_append_scale.py`;`tests/test_phase2_s6.py` 10/10)。append 隨 grid 面積成長;sharding 減 append ~½ 與檔數 40–60×。**(append 驅動的 chunking 結論已被 P2-S7 修正:append 為營運約束,非淘汰 s8 的理由 —— 見下)**。結果 [`specs/p2s6_dual_write_results.md`](specs/p2s6_dual_write_results.md)(部分 superseded by P2-S7)。Full suite 94/94。
 - [~] **P2-S7 chunking selection(read-first)**(`bench/bench_chunking_select.py`)。修正 S6:**不因 append 淘汰小 chunk**;read_amp 為讀取判準(s8=79× vs s64=5050×),warm p95 各 spatial 相近(~4–5ms,絕對遠低於 4s gate);append global est s8~67min/s16~22/s32~9/s64~6 **皆在 3h ingest window 內可行**;**file count 由 shard 大小決定(與 inner chunk 獨立)**→ 調大 shard 降檔數。**read-first 建議:spatial=8/t90/sharded(shard 調大控檔數);窗口緊或檔數不可接受才升 s16/s32 或 regional cube**。結果 [`specs/p2s7_chunking_selection_results.md`](specs/p2s7_chunking_selection_results.md)。
   - [x] **P2-S7 full HTTP gate** done(`s8/t90/shard=128` cube-backed API,loadtest 365-day LR):**p95 50/116/205ms @ C=4/8/16(« 4s,比 daily VM24 14s 快 ~70–280×)**,RSS 74–85MB(/healthz),0 timeout/503,**route_counts {cube:6438, daily:57} 確認多日→cube**。
-- [~] **P2-S8 VM24 runbook authored** → [`specs/p2s8_vm24_runbook.md`](specs/p2s8_vm24_runbook.md)(operational gates:ingest window/file-count tolerance/disk precheck;full 或 tiled cube build(`build_timecube --region`);cold+warm LR/SB loadtest;append/upsert 量測;coverage/healthz;go/no-go + rollback)。**VM24 執行(binding gate + cutover)由 Codex/ops**,Claude 不執行。
+- [x] **P2-S8 VM24 runbook + binding execution completed** → [`specs/p2s8_vm24_runbook.md`](specs/p2s8_vm24_runbook.md)。Production 已使用 base+delta tiered cube；後續 P4 完成 retention、swap、daily-staging prune 與 post-prune availability 修補。
 - [x] **Bulk build fix**(`ingest/build_timecube_bulk.py`,`tests/test_phase2_bulk.py` 6/6)。修正部署時 build 過慢(per-day 寫法每天 RMW 整個 90-step shard,~90× 寫放大 → 20+ 天)。改為 **shard-block 批次寫**(time_block × spatial super-tile,每 shard 寫一次)+ bounded workers + checkpoint/resume + `--latest-days`/`--exclude-latest`。**實測 256² 90 天:41.8s→0.5s(77.7×)**;輸出與 per-day 完全相同(parity 通過)。read chunking(s8/t90/shard128)不變。runbook §2 已改用 bulk。結果 [`specs/bulk_build_results.md`](specs/bulk_build_results.md)。
 - [x] **Append fix(base+delta 生產設計 + bulk_append_day 過渡)**(`store/tiered_cube.py`,`ingest/dual_write.py` append_to_delta/compact,`ingest/build_timecube_bulk.bulk_append_day`,`tests/test_phase2_append.py` 7/7)。部署發現 append >80min(同 RMW 問題:寫一天 RMW 整個 90-step shard)。**生產解:DELTA cube(time_chunk=1,每日 append 寫一個新 shard,無 RMW)+ TieredCube(base+delta 讀)+ 週期 compaction(bulk 重建 base + reset delta)**;app 接 `GHRSST_DELTACUBE_PATH`,`/healthz` cube_kind=tiered。RMW 成本在「讀取量」,global 才顯著(小 grid 1.2×,global ~80min→分鐘級,binding 在 VM24)。bulk_append_day 為過渡(tiled/bounded/streaming/resume,仍 RMW)。**`append_to_delta` 已改為 tiled/streaming**(逐 tile 讀寫,不再 materialize 全域陣列;bounded workers + per-(day,var,tile) checkpoint/resume;cron CLI `ingest/append_delta_day.py`)——2048² benchmark 峰值 RSS +58.9MB→+2.5MB,峰值 block 受 `read_block²` 限制(global ≈ grid 的 1/618),消除觀測到的 ~7.8GB RSS。**delta chunking 與 base 解耦**(PR #13 VM24 follow-up:VM24 記憶體已修好但 append 仍 >2h/day,真正瓶頸是 delta 沿用 base s8 → 每日 global append 寫 ~10M 個 8×8 tiny chunks/var)——base 維持 `s8/shard128/t90`(讀取),delta 改用 append-optimized `s256/shard256`(預設;create 時套用,append 時沿用既有 layout);`bench/bench_delta_layout.py` 顯示 s256 比 s8 **append 快 215×**、檔案最少、point-read 延遲不變(~3.4ms)。結果 [`specs/append_strategy_results.md`](specs/append_strategy_results.md)。Full suite 115/115。
-- [ ] P2-S8 VM24 binding 執行(Codex/ops:bulk build base + delta append + compaction)→ 確認 chunking → cutover
+- [x] P2-S8 VM24 binding execution and cutover
