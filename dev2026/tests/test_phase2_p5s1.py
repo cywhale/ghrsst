@@ -44,8 +44,11 @@ S = 90
 
 def _seg(seg_id, path, start, end, day_count, *, precedence, gaps=(), unknown=(),
          sealed=True, kind="block", boundary_kind="calendar", vars_=fx.VARS,
-         supersedes=None, day_digest=None, time_chunk=None):
-    return {
+         supersedes=None, day_digest=None, time_chunk=None, store_path=None):
+    """Build a segment entry. When `store_path` is given, `layout` / `day_digest` /
+    `fingerprint.metadata` are DERIVED FROM DISK -- the same way S3's builder will produce
+    them -- so a test that then mutates the store or the manifest exercises a real mismatch."""
+    seg = {
         "segment_id": seg_id, "kind": kind, "path": path, "immutable": True,
         "boundary_kind": boundary_kind,
         "start_day": start, "end_day": end,
@@ -54,9 +57,15 @@ def _seg(seg_id, path, start, end, day_count, *, precedence, gaps=(), unknown=()
         "layout": {"time_chunk": time_chunk or min(90, day_count or 1),
                    "spatial_chunk": 8, "shard": [90, 128, 128]},
         "variables": list(vars_),
-        "fingerprint": {"algo": "sha256", "metadata": "x", "day_digest": day_digest or ""},
+        "fingerprint": {"algo": "sha256", "metadata": "x" * 64, "day_digest": day_digest or ""},
         "precedence": precedence, "sealed": sealed, "supersedes": supersedes,
     }
+    if store_path:
+        seg["layout"] = bm.segment_layout(store_path)
+        seg["fingerprint"] = {"algo": "sha256",
+                              "metadata": bm.metadata_fingerprint(store_path),
+                              "day_digest": bm.day_digest(fx.read_days(store_path))}
+    return seg
 
 
 class _Base(unittest.TestCase):
@@ -168,7 +177,7 @@ class TestSchemaGuards(_Base):
     def _one_block(self):
         s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
         path, days = self._block("b0", s0, e0)
-        return _seg("b0", "b0", s0, e0, 90, precedence=1, day_digest=bm.day_digest(days))
+        return _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
 
     def test_round_trip(self):
         m = self._manifest([self._one_block()])
@@ -254,8 +263,8 @@ class TestSnapshotFailsClosed(_Base):
         s1, e1 = bm.block_bounds(ANCHOR, 90, 1)
         p0, d0 = self._block("b0", s0, e0)
         p1, d1 = self._block("b1", s1, e1, seed=50)
-        return [_seg("b0", "b0", s0, e0, 90, precedence=1, day_digest=bm.day_digest(d0)),
-                _seg("b1", "b1", s1, e1, 90, precedence=2, day_digest=bm.day_digest(d1))], d0 + d1
+        return [_seg("b0", "b0", s0, e0, 90, precedence=1, store_path=p0),
+                _seg("b1", "b1", s1, e1, 90, precedence=2, store_path=p1)], d0 + d1
 
     def test_happy_path_snapshot(self):
         segs, all_days = self._two_blocks()
@@ -333,8 +342,8 @@ class TestSnapshotFailsClosed(_Base):
         """§5.1: two live segments may not share a start_day -- a superseding version
         replaces its predecessor, which moves to `superseded`."""
         s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
-        _, d0 = self._block("b0", s0, e0)
-        a = _seg("b0", "b0", s0, e0, 90, precedence=1, day_digest=bm.day_digest(d0))
+        _p, d0 = self._block("b0", s0, e0)
+        a = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=_p)
         b = dict(a, segment_id="b0b", path="b0b", precedence=2)
         with self.assertRaises(bm.ManifestError) as cm:
             bm.validate_manifest(self._manifest([a, b]))
@@ -346,12 +355,12 @@ class TestSnapshotFailsClosed(_Base):
         this test exists to keep honest."""
         s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
         span = fx.calendar_span(s0, e0)
-        _, d0 = self._block("legacy", span[0], span[-1])
-        _, d1 = self._block("b0", span[30], span[-1], seed=77)
+        _pl, d0 = self._block("legacy", span[0], span[-1])
+        _pb, d1 = self._block("b0", span[30], span[-1], seed=77)
         a = _seg("legacy", "legacy", span[0], span[-1], 90, precedence=1,
-                 kind="legacy_base", boundary_kind="legacy", day_digest=bm.day_digest(d0))
+                 kind="legacy_base", boundary_kind="legacy", store_path=_pl)
         b = _seg("b0", "b0", span[30], span[-1], 60, precedence=1,     # EQUAL precedence
-                 boundary_kind="legacy", day_digest=bm.day_digest(d1))
+                 boundary_kind="legacy", store_path=_pb)
         m = self._manifest([a, b])
         bm.validate_manifest(m)                      # schema-valid: start_days differ
         fx.write_json(os.path.join(self.root, "manifest.json"), m)
@@ -367,12 +376,12 @@ class TestSnapshotFailsClosed(_Base):
         rejecting all overlap."""
         s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
         span = fx.calendar_span(s0, e0)
-        _, d0 = self._block("legacy", span[0], span[-1])
-        _, d1 = self._block("b0", span[30], span[-1], seed=77)
+        _pl, d0 = self._block("legacy", span[0], span[-1])
+        _pb, d1 = self._block("b0", span[30], span[-1], seed=77)
         a = _seg("legacy", "legacy", span[0], span[-1], 90, precedence=0,
-                 kind="legacy_base", boundary_kind="legacy", day_digest=bm.day_digest(d0))
+                 kind="legacy_base", boundary_kind="legacy", store_path=_pl)
         b = _seg("b0", "b0", span[30], span[-1], 60, precedence=1,
-                 boundary_kind="legacy", day_digest=bm.day_digest(d1))
+                 boundary_kind="legacy", store_path=_pb)
         self._publish(self._manifest([a, b]))
         store = SegmentedCubeStore(self.root)
         self.assertEqual(store.day_count, 90)
@@ -390,9 +399,9 @@ class TestPrecedenceAndReads(_Base):
         self.new_path, dnew = self._block("b0_v2", self.span0[30], self.span0[-1], seed=500)
         self.segs = [
             _seg("legacy", "legacy", self.span0[0], self.span0[-1], 90, precedence=0,
-                 kind="legacy_base", boundary_kind="legacy", day_digest=bm.day_digest(dold)),
+                 kind="legacy_base", boundary_kind="legacy", store_path=self.old_path),
             _seg("b0_v2", "b0_v2", self.span0[30], self.span0[-1], 60, precedence=5,
-                 boundary_kind="legacy", day_digest=bm.day_digest(dnew)),
+                 boundary_kind="legacy", store_path=self.new_path),
         ]
         self._publish(self._manifest(self.segs))
         self.store = SegmentedCubeStore(self.root)
@@ -442,7 +451,7 @@ class TestNeverTouchesDelta(_Base):
         delta_path = os.path.join(self.tmp, "delta.zarr")
         fx.build_delta(delta_path, delta_days)                      # F3
         self._publish(self._manifest(
-            [_seg("b0", "b0", s0, e0, 90, precedence=1, day_digest=bm.day_digest(d0))]))
+            [_seg("b0", "b0", s0, e0, 90, precedence=1, store_path=p0)]))
 
         opened = []
         real_open = __import__("zarr").open_group
@@ -475,8 +484,8 @@ class TestPublishAndRollback(_Base):
         s1, e1 = bm.block_bounds(ANCHOR, 90, 1)
         p0, self.d0 = self._block("b0", s0, e0)
         p1, self.d1 = self._block("b1", s1, e1, seed=50)
-        self.a = _seg("b0", "b0", s0, e0, 90, precedence=1, day_digest=bm.day_digest(self.d0))
-        self.b = _seg("b1", "b1", s1, e1, 90, precedence=2, day_digest=bm.day_digest(self.d1))
+        self.a = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=p0)
+        self.b = _seg("b1", "b1", s1, e1, 90, precedence=2, store_path=p1)
 
     def test_publish_writes_an_immutable_archive_and_an_atomic_pointer(self):
         bm.publish(self.root, self._gen(1, [self.a]))
@@ -512,7 +521,8 @@ class TestPublishAndRollback(_Base):
         bm.publish(self.root, self._gen(1, [self.a]))
         bm.publish(self.root, self._gen(2, [self.a, self.b]))
         arch = os.path.join(self.root, "manifest.gen000001.json")
-        m = json.load(open(arch))
+        with open(arch) as fh:
+            m = json.load(fh)
         m["manifest_checksum"] = "0" * 64
         fx.write_json(arch, m)
         with self.assertRaises(bm.ManifestError):
@@ -531,6 +541,174 @@ class TestPublishAndRollback(_Base):
         self.assertEqual(store.day_count, 180)
 
 
+# ============================================================ integrity guards (review round 1)
+class TestIntegrityGuards(_Base):
+    """Three ways a malformed manifest reached a SERVING snapshot in the first cut. Each of
+    these is a reproduction of a reported defect, kept as a regression test."""
+
+    def test_day_list_cannot_escape_the_calendar_window(self):
+        """[High] `day_list` was taken verbatim, so a segment could declare a 2026 window and
+        actually serve 2027 days -- splitting the block grid from real availability (G14)."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        span = fx.calendar_span(s0, e0)
+        shifted = [bm.add_days(d, 365) for d in span]          # same count, wrong year
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, shifted)
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        seg["day_list"] = shifted
+        with self.assertRaises(bm.ManifestError) as cm:
+            bm.validate_manifest(self._manifest([seg]))
+        self.assertIn("day_list", str(cm.exception))
+
+    def test_day_list_must_equal_span_minus_gaps_and_unknown(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        span = fx.calendar_span(s0, e0)
+        for bad, why in (
+                (span[:89], "count"),                       # len != day_count
+                (span[:89] + [span[0]], "duplicate"),       # not unique
+                (span[1:] + [span[0]], None),               # equal as a set -> must PASS
+        ):
+            seg = _seg("b0", "b0", s0, e0, 90, precedence=1)
+            seg["day_list"] = bad
+            if why is None:
+                bm.validate_manifest(self._manifest([seg]))
+            else:
+                with self.assertRaises(bm.ManifestError):
+                    bm.validate_manifest(self._manifest([seg]))
+
+    def test_day_list_present_days_cannot_exceed_materialized_through(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        span = fx.calendar_span(s0, e0)
+        seg = _seg("b0", "b0", s0, e0, 30, unknown=span[30:], sealed=False, precedence=1)
+        seg["day_list"] = span[:29] + [span[60]]            # a present day past the frontier
+        with self.assertRaises(bm.ManifestError):
+            bm.validate_manifest(self._manifest([seg]))
+
+    def test_a_segment_path_may_not_point_at_the_delta(self):
+        """[High] The §4.0 guard only checked KEY NAMES, so `path: "../delta.zarr"` on a
+        segment innocently named `not-delta-by-key` was served as base."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        days = fx.calendar_span(s0, e0)
+        delta_path = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(delta_path, days)
+        seg = _seg("not-delta-by-key", "../delta.zarr", s0, e0, 90, precedence=1,
+                   store_path=delta_path)
+        m = self._manifest([seg])
+        fx.write_json(os.path.join(self.root, "manifest.json"), m)
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        self.assertIn("outside", str(cm.exception).lower())
+
+    def test_block_paths_must_stay_inside_the_manifest_root(self):
+        for bad in ("../elsewhere.zarr", "/tmp/absolute.zarr"):
+            with self.subTest(path=bad):
+                s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+                seg = _seg("b", bad, s0, e0, 90, precedence=1)
+                m = self._manifest([seg])
+                fx.write_json(os.path.join(self.root, "manifest.json"), m)
+                with self.assertRaises(SnapshotError):
+                    SegmentedCubeStore(self.root)
+
+    def test_legacy_base_outside_the_root_requires_an_explicit_allowlist(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        days = fx.calendar_span(s0, e0)
+        legacy = os.path.join(self.tmp, "legacy_monolith.zarr")
+        fx.build_block(legacy, days)
+        seg = _seg("legacy", "../legacy_monolith.zarr", s0, e0, 90, precedence=0,
+                   kind="legacy_base", boundary_kind="legacy", store_path=legacy)
+        self._publish(self._manifest([seg]))
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)                       # no allowlist -> refuse
+        self.assertIn("legacy", str(cm.exception).lower())
+        store = SegmentedCubeStore(self.root, allowed_legacy_paths=[legacy])
+        self.assertEqual(store.day_count, 90)
+
+    def test_grid_mismatch_fails_closed(self):
+        """[High] A block built 16x16 loaded happily under a manifest declaring 32x32, so two
+        segments could map the same lon/lat to different physical cells."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        days = fx.calendar_span(s0, e0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, days, ny=16, nx=16)
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        m = self._manifest([seg])                     # manifest grid says 32x32
+        fx.write_json(os.path.join(self.root, "manifest.json"), m)
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        self.assertIn("grid", str(cm.exception).lower())
+
+    def test_segments_must_share_identical_lon_lat_axes(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        s1, e1 = bm.block_bounds(ANCHOR, 90, 1)
+        p0 = os.path.join(self.root, "b0")
+        p1 = os.path.join(self.root, "b1")
+        fx.build_block(p0, fx.calendar_span(s0, e0))
+        fx.build_block(p1, fx.calendar_span(s1, e1))
+        import zarr as _z                              # shift b1's longitude axis
+        g = _z.open_group(p1, mode="a")
+        g["lon"][:] = np.asarray(g["lon"][:]) + 7.0
+        segs = [_seg("b0", "b0", s0, e0, 90, precedence=1, store_path=p0),
+                _seg("b1", "b1", s1, e1, 90, precedence=2, store_path=p1)]
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest(segs))
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        self.assertIn("axes", str(cm.exception).lower())
+
+    def test_layout_mismatch_fails_closed(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        seg["layout"] = dict(seg["layout"], spatial_chunk=64)   # not what is on disk
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        self.assertIn("layout", str(cm.exception).lower())
+
+    def test_metadata_fingerprint_is_required_and_verified(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        seg["fingerprint"]["metadata"] = ""
+        with self.assertRaises(bm.ManifestError):
+            bm.validate_manifest(self._manifest([seg]))
+        seg["fingerprint"]["metadata"] = "0" * 64
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        self.assertIn("metadata fingerprint", str(cm.exception).lower())
+
+    def test_var_valid_length_must_match_day_count(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        import zarr as _z
+        g = _z.open_group(path, mode="a")
+        vv = {k: list(v) for k, v in dict(g.attrs["var_valid"]).items()}
+        vv["sst"] = vv["sst"][:-1]                     # now 89 flags for 90 days
+        g.attrs["var_valid"] = vv
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        self.assertIn("var_valid", str(cm.exception).lower())
+
+    def test_base_segments_are_asserted_disjoint_from_the_delta(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        days = fx.calendar_span(s0, e0)
+        p0 = os.path.join(self.root, "b0")
+        fx.build_block(p0, days)
+        self._publish(self._manifest(
+            [_seg("b0", "b0", s0, e0, 90, precedence=1, store_path=p0)]))
+        store = SegmentedCubeStore(self.root)
+        delta_path = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(delta_path, fx.days_from("2026-09-25", 31))
+        store.assert_disjoint_from(delta_path)                  # different -> fine
+        with self.assertRaises(SnapshotError):
+            store.assert_disjoint_from(p0)                      # same realpath -> refuse
+
+
 # ============================================================ TieredCube drop-in (§6.1)
 class TestTieredCubeComposition(_Base):
     """`SegmentedCubeStore` must be a drop-in for the BASE inside `TieredCube`, with
@@ -543,9 +721,9 @@ class TestTieredCubeComposition(_Base):
 
         s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
         self.base_days = fx.calendar_span(s0, e0)
-        _, d0 = self._block("b0", s0, e0)
+        p0, d0 = self._block("b0", s0, e0)
         self._publish(self._manifest(
-            [_seg("b0", "b0", s0, e0, 90, precedence=1, day_digest=bm.day_digest(d0))]))
+            [_seg("b0", "b0", s0, e0, 90, precedence=1, store_path=p0)]))
 
         # delta overlaps the last 5 base days and extends 26 days beyond
         self.delta_days = self.base_days[-5:] + fx.days_from(bm.next_day(e0), 26)

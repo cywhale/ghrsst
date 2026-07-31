@@ -181,11 +181,42 @@ def _validate_segment(seg: dict, grid: dict, idx: int):
                 raise ManifestError(
                     f"{what}: {d} is past materialized_through but not classified unknown")
 
+    # day_list, when present, is the AUTHORITATIVE present set -- so it must be pinned to the
+    # declared window. Taking it verbatim let a segment declare a 2026 window and serve 2027
+    # days, splitting the block grid from real availability (review finding #1).
+    dl = seg.get("day_list")
+    if dl:
+        dl = list(dl)
+        if len(set(dl)) != len(dl):
+            raise ManifestError(f"{what}: day_list contains duplicate days")
+        outside = sorted(set(dl) - set(span))
+        if outside:
+            raise ManifestError(
+                f"{what}: day_list contains {len(outside)} day(s) outside "
+                f"[{seg['start_day']}, {seg['end_day']}], first {outside[0]}. day_list may "
+                f"never escape the declared calendar window (§5.2/G14).")
+        expected = set(span) - set(gaps) - set(unknown)
+        if set(dl) != expected:
+            raise ManifestError(
+                f"{what}: day_list must equal span - gaps - unknown "
+                f"({len(expected)} day(s)), got {len(set(dl))}")
+        if len(dl) != n:
+            raise ManifestError(f"{what}: len(day_list)={len(dl)} != day_count={n}")
+        late = [d for d in dl if d > seg["materialized_through"]]
+        if late:
+            raise ManifestError(
+                f"{what}: day_list has present day(s) past materialized_through "
+                f"{seg['materialized_through']}, first {late[0]}")
+
     if not isinstance(seg["precedence"], int):
         raise ManifestError(f"{what}: precedence must be an int")
     fp = seg["fingerprint"]
     if not isinstance(fp, dict) or "algo" not in fp or "day_digest" not in fp:
         raise ManifestError(f"{what}: fingerprint must carry algo + day_digest")
+    if not fp.get("metadata"):
+        raise ManifestError(
+            f"{what}: fingerprint.metadata is required -- it is what binds the manifest to "
+            f"the segment's actual grid, axes and chunk layout (§5)")
 
 
 def _validate_superseded(entry: dict, idx: int, generation: int):
@@ -266,11 +297,68 @@ def validate_manifest(manifest: dict) -> dict:
 
 
 def declared_present_days(seg: dict) -> List[str]:
-    """The `present` set a segment declares: day_list if given, else span − gaps − unknown."""
+    """The `present` set a segment declares.
+
+    `day_list` and `span − gaps − unknown` are required to be EQUAL by `_validate_segment`,
+    so either is safe here; the explicit list wins only as documentation of intent."""
     if seg.get("day_list"):
         return sorted(seg["day_list"])
     excluded = set(seg["gaps"]) | set(seg["unknown"])
     return [d for d in calendar_span(seg["start_day"], seg["end_day"]) if d not in excluded]
+
+
+# --------------------------------------------------------------------------- store binding
+def segment_layout(store_path: str) -> dict:
+    """Read the layout a segment ACTUALLY has, in manifest form."""
+    import zarr
+    g = zarr.open_group(store_path, mode="r")
+    vars_ = [v for v in g.attrs.get("vars", []) if v in g]
+    if not vars_:
+        raise ManifestError(f"{store_path}: no data variables")
+    arr = g[vars_[0]]
+    shards = getattr(arr, "shards", None)
+    return {"time_chunk": int(arr.chunks[0]),
+            "spatial_chunk": int(arr.chunks[-1]),
+            "shard": [int(x) for x in shards] if shards else None}
+
+
+def store_axes(store_path: str) -> dict:
+    """ny/nx plus lon/lat digests -- the identity two segments must share, or the same
+    lon/lat would resolve to different physical cells in different blocks."""
+    import numpy as np
+    import zarr
+    g = zarr.open_group(store_path, mode="r")
+    lon = np.asarray(g["lon"][:], dtype="float64")
+    lat = np.asarray(g["lat"][:], dtype="float64")
+    return {"ny": int(lat.size), "nx": int(lon.size),
+            "lon_digest": hashlib.sha256(lon.tobytes()).hexdigest(),
+            "lat_digest": hashlib.sha256(lat.tobytes()).hexdigest(),
+            "region": [int(x) for x in g.attrs.get("region", [])]}
+
+
+def metadata_fingerprint(store_path: str) -> str:
+    """sha256 over a segment's structural metadata: axes, region, variables, per-array
+    shape/chunks/shards/dtype, and `var_valid` lengths.
+
+    This is `fingerprint.metadata` in the manifest. It is what makes a manifest entry
+    falsifiable against the store it names -- a day set alone cannot detect a block that was
+    built on a different grid."""
+    import zarr
+    g = zarr.open_group(store_path, mode="r")
+    vars_ = sorted(v for v in g.attrs.get("vars", []) if v in g)
+    var_valid = {k: list(v) for k, v in dict(g.attrs.get("var_valid", {})).items()}
+    axes = store_axes(store_path)
+    doc = {
+        "axes": axes,
+        "vars": vars_,
+        "arrays": {v: {"shape": [int(x) for x in g[v].shape],
+                       "chunks": [int(x) for x in g[v].chunks],
+                       "shards": ([int(x) for x in g[v].shards]
+                                  if getattr(g[v], "shards", None) else None),
+                       "dtype": str(g[v].dtype)} for v in vars_},
+        "var_valid_len": {v: len(var_valid.get(v, [])) for v in vars_},
+    }
+    return hashlib.sha256(canonical_json(doc).encode()).hexdigest()
 
 
 # --------------------------------------------------------------------------- publish/rollback

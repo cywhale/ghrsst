@@ -48,12 +48,60 @@ class _Meta(NamedTuple):
     vars: List[str]
 
 
+def _within(child: str, parent: str) -> bool:
+    """True iff `child` resolves inside `parent`, after following symlinks."""
+    child, parent = os.path.realpath(child), os.path.realpath(parent)
+    return child == parent or child.startswith(parent + os.sep)
+
+
 class SegmentedCubeStore:
-    def __init__(self, manifest_dir: str):
+    def __init__(self, manifest_dir: str, allowed_legacy_paths: Optional[Sequence[str]] = None):
+        """`allowed_legacy_paths` is the deployment's explicit list of legacy monoliths.
+
+        A `legacy_base` segment legitimately lives OUTSIDE the block root (production's is
+        `../mur_timecube_s8_t90_sh128.zarr`), so `..` cannot simply be banned. Instead the
+        escape must be named by the deployment: any legacy path not on this list is refused.
+        `block` segments are always confined to the block root."""
         self.path = manifest_dir
+        self.allowed_legacy_paths = [os.path.realpath(p) for p in (allowed_legacy_paths or [])]
         self._lock = threading.Lock()
         self._meta = self._build_meta()          # first build: no previous snapshot to keep
         self._last_refresh = time.monotonic()
+
+    # ---- path authority (review finding #2) ----------------------------------
+    def _resolve_segment_path(self, seg: dict) -> str:
+        raw = seg["path"]
+        if os.path.isabs(raw):
+            raise SnapshotError(
+                f"segment {seg['segment_id']!r}: absolute path {raw!r} is not allowed; "
+                f"segment paths are relative to the manifest")
+        resolved = os.path.realpath(os.path.join(self.path, raw))
+        if seg["kind"] == "block":
+            if not _within(resolved, self.path):
+                raise SnapshotError(
+                    f"segment {seg['segment_id']!r}: block path resolves OUTSIDE the block "
+                    f"root ({resolved} not within {os.path.realpath(self.path)}). A block "
+                    f"may not point at the delta, at another store, or through a symlink.")
+        elif seg["kind"] == "legacy_base":
+            if not (_within(resolved, self.path) or resolved in self.allowed_legacy_paths):
+                raise SnapshotError(
+                    f"segment {seg['segment_id']!r}: legacy_base path resolves OUTSIDE the "
+                    f"block root ({resolved}) and is not in the deployment's "
+                    f"allowed_legacy_paths. A legacy monolith outside the root must be named "
+                    f"explicitly by configuration, never accepted from the manifest alone.")
+        else:                                    # unreachable: schema restricts `kind`
+            raise SnapshotError(f"segment {seg['segment_id']!r}: unsupported kind")
+        return resolved
+
+    def assert_disjoint_from(self, other_path: str) -> None:
+        """Assert no base segment resolves to `other_path` (used for the delta at composition
+        time). A base segment that IS the delta would serve delta bytes as immutable base."""
+        target = os.path.realpath(other_path)
+        for sid, store in zip(self._meta.segment_ids, self._meta.stores):
+            if os.path.realpath(store.path) == target:
+                raise SnapshotError(
+                    f"base segment {sid!r} resolves to {target}, which is also the delta "
+                    f"path; base and delta must be disjoint stores (§4.0)")
 
     # ---- snapshot construction (fail-closed) ---------------------------------
     def _build_meta(self) -> _Meta:
@@ -69,8 +117,11 @@ class SegmentedCubeStore:
         chosen: Dict[str, Tuple[int, int, int]] = {}
         vars_: List[str] = []
 
+        grid = manifest["grid"]
+        axes_ref = None
+
         for idx, seg in enumerate(manifest["segments"]):
-            spath = os.path.normpath(os.path.join(self.path, seg["path"]))
+            spath = self._resolve_segment_path(seg)
             if not os.path.isdir(spath):
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r} missing at {spath}; refusing to build a "
@@ -81,7 +132,47 @@ class SegmentedCubeStore:
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r} unreadable at {spath}: {exc}") from exc
 
+            # ---- structural binding (review finding #3): the manifest must describe the
+            # store it names. A day set alone cannot detect a block built on another grid,
+            # which would map the same lon/lat to different physical cells -- silent wrong
+            # data, the failure class this whole phase exists to avoid.
+            axes = bm.store_axes(spath)
+            if (axes["ny"], axes["nx"]) != (int(grid["ny"]), int(grid["nx"])):
+                raise SnapshotError(
+                    f"segment {seg['segment_id']!r} grid mismatch: store is "
+                    f"{axes['ny']}x{axes['nx']}, manifest declares "
+                    f"{grid['ny']}x{grid['nx']}")
+            if grid.get("region") and axes["region"] and \
+                    [int(x) for x in grid["region"]] != axes["region"]:
+                raise SnapshotError(
+                    f"segment {seg['segment_id']!r} region mismatch: store {axes['region']} "
+                    f"vs manifest {grid['region']}")
+            if axes_ref is None:
+                axes_ref = axes
+            elif (axes["lon_digest"], axes["lat_digest"]) != \
+                    (axes_ref["lon_digest"], axes_ref["lat_digest"]):
+                raise SnapshotError(
+                    f"segment {seg['segment_id']!r} has different lon/lat axes from the "
+                    f"first segment; all segments must share identical axes or the same "
+                    f"lon/lat would resolve to different cells per block")
+            actual_layout = bm.segment_layout(spath)
+            if seg["layout"] != actual_layout:
+                raise SnapshotError(
+                    f"segment {seg['segment_id']!r} layout mismatch: store {actual_layout} "
+                    f"vs manifest {seg['layout']}")
+            fp = bm.metadata_fingerprint(spath)
+            if seg["fingerprint"]["metadata"] != fp:
+                raise SnapshotError(
+                    f"segment {seg['segment_id']!r} metadata fingerprint mismatch: "
+                    f"store {fp[:12]}… vs manifest "
+                    f"{str(seg['fingerprint']['metadata'])[:12]}…")
+
             actual = list(store.days)
+            for v, flags in store.var_valid.items():
+                if len(flags) != len(actual):
+                    raise SnapshotError(
+                        f"segment {seg['segment_id']!r} var_valid[{v}] has {len(flags)} "
+                        f"flag(s) for {len(actual)} day(s)")
             declared = bm.declared_present_days(seg)
             if sorted(actual) != sorted(declared):
                 raise SnapshotError(
