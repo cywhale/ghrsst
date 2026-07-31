@@ -694,6 +694,155 @@ class TestIntegrityGuards(_Base):
             SegmentedCubeStore(self.root)
         self.assertIn("var_valid", str(cm.exception).lower())
 
+    # ---- review round 2: the fingerprint was structural, not semantic ----------
+    def test_var_valid_CONTENT_changes_the_fingerprint(self):
+        """[High] Only `var_valid` LENGTHS were fingerprinted. Flipping one flag changes the
+        API from returning `sst` to omitting it, yet the fingerprint was identical and the
+        snapshot was accepted — a silent semantic change inside an 'immutable' block."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        before = bm.metadata_fingerprint(path)
+
+        import zarr as _z
+        g = _z.open_group(path, mode="a")
+        vv = {k: list(v) for k, v in dict(g.attrs["var_valid"]).items()}
+        vv["sst"][0] = False                      # day 0 now reads as ABSENT, not present
+        g.attrs["var_valid"] = vv
+        self.assertNotEqual(before, bm.metadata_fingerprint(path),
+                            "var_valid CONTENT must be fingerprinted, not just its length")
+
+    def test_var_valid_content_mutation_fails_the_snapshot(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        days = fx.calendar_span(s0, e0)
+        fx.build_block(path, days)
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
+        SegmentedCubeStore(self.root)                    # baseline: loads
+
+        import zarr as _z
+        g = _z.open_group(path, mode="a")
+        vv = {k: list(v) for k, v in dict(g.attrs["var_valid"]).items()}
+        vv["sst"][0] = False
+        g.attrs["var_valid"] = vv
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        self.assertIn("metadata fingerprint", str(cm.exception).lower())
+
+    def test_every_variable_is_layout_checked_not_just_the_first(self):
+        """[High] `segment_layout` read `vars_[0]`, so a second variable with a different
+        length loaded fine and then raised IndexError on the last day."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        days = fx.calendar_span(s0, e0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, days)
+
+        import zarr as _z
+        g = _z.open_group(path, mode="a")
+        g["sea_ice"].resize((89, 32, 32))                # 89 days while `days` says 90
+        # derive the manifest AFTER the mutation, so the fingerprint matches by construction
+        # and only an independent per-array check can catch it
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        msg = str(cm.exception)
+        self.assertIn("sea_ice", msg)
+        self.assertIn("89", msg)
+
+    def test_a_variable_with_the_wrong_spatial_shape_is_rejected(self):
+        """`axes` comes from lon/lat, and layout compares chunking, so a variable whose
+        SPATIAL shape disagrees with the axes is caught only by the per-variable check."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        days = fx.calendar_span(s0, e0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, days)
+        import zarr as _z
+        g = _z.open_group(path, mode="a")
+        del g["sea_ice"]
+        g.create_array("sea_ice", shape=(90, 16, 16), dtype="float32",   # lon/lat say 32x32
+                       chunks=(90, 8, 8), shards=(90, 32, 32), fill_value=float("nan"))
+        g["sea_ice"][:] = 1.0
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        msg = str(cm.exception)
+        self.assertIn("sea_ice", msg)
+        self.assertIn("16x16", msg)
+
+    def test_variables_with_inconsistent_layout_are_rejected(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        days = fx.calendar_span(s0, e0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, days)
+        import zarr as _z
+        g = _z.open_group(path, mode="a")
+        del g["sea_ice"]
+        g.create_array("sea_ice", shape=(90, 32, 32), dtype="float32",
+                       chunks=(90, 16, 16), shards=(90, 32, 32),   # different chunking
+                       fill_value=float("nan"))
+        g["sea_ice"][:] = 1.0
+        with self.assertRaises(bm.ManifestError) as cm:
+            bm.segment_layout(path)
+        self.assertIn("layout", str(cm.exception).lower())
+
+    def test_segment_variables_must_equal_the_store_variables(self):
+        """[Medium] A segment could declare `["sst"]` while the store served three."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path, vars_=["sst"])
+        seg["variables"] = ["sst"]
+        m = self._manifest([seg])
+        m["variables"] = ["sst"]
+        m["manifest_checksum"] = ""
+        m["manifest_checksum"] = bm.compute_checksum(m)
+        fx.write_json(os.path.join(self.root, "manifest.json"), m)
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        self.assertIn("variables", str(cm.exception).lower())
+
+    def test_top_level_variables_must_be_the_union_of_segments(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        m = self._manifest([seg])
+        m["variables"] = ["sst", "sst_anomaly", "sea_ice", "phantom"]
+        m["manifest_checksum"] = ""
+        m["manifest_checksum"] = bm.compute_checksum(m)
+        with self.assertRaises(bm.ManifestError) as cm:
+            bm.validate_manifest(m)
+        self.assertIn("union", str(cm.exception).lower())
+
+    def test_region_must_be_verifiable_even_when_the_store_omits_it(self):
+        """[Medium] The region check only fired when BOTH sides had a value, so a manifest
+        could declare any region against a store carrying none."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))     # no attrs["region"]
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        m = self._manifest([seg])
+        m["grid"] = {"ny": 32, "nx": 32, "region": [4, 20, 4, 20]}   # bogus subset
+        m["manifest_checksum"] = ""
+        m["manifest_checksum"] = bm.compute_checksum(m)
+        fx.write_json(os.path.join(self.root, "manifest.json"), m)
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        self.assertIn("region", str(cm.exception).lower())
+
+    def test_store_without_region_is_accepted_only_for_the_full_grid(self):
+        """The migration rule: a legacy store predating `attrs['region']` is admissible only
+        when the manifest declares the FULL grid, which is verifiable from ny/nx."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        self._publish(self._manifest([seg]))               # region [0,32,0,32] == full grid
+        self.assertEqual(SegmentedCubeStore(self.root).day_count, 90)
+
     def test_base_segments_are_asserted_disjoint_from_the_delta(self):
         s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
         days = fx.calendar_span(s0, e0)

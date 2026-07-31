@@ -142,11 +142,24 @@ class SegmentedCubeStore:
                     f"segment {seg['segment_id']!r} grid mismatch: store is "
                     f"{axes['ny']}x{axes['nx']}, manifest declares "
                     f"{grid['ny']}x{grid['nx']}")
-            if grid.get("region") and axes["region"] and \
-                    [int(x) for x in grid["region"]] != axes["region"]:
-                raise SnapshotError(
-                    f"segment {seg['segment_id']!r} region mismatch: store {axes['region']} "
-                    f"vs manifest {grid['region']}")
+            # Region must be verifiable even when the store predates `attrs["region"]`.
+            # Requiring BOTH sides to be present let a manifest declare any region against a
+            # store carrying none. The migration rule is explicit and checkable: no stored
+            # region is admissible ONLY for the full grid, which ny/nx already tells us.
+            if grid.get("region"):
+                declared = [int(x) for x in grid["region"]]
+                if axes["region"]:
+                    if declared != axes["region"]:
+                        raise SnapshotError(
+                            f"segment {seg['segment_id']!r} region mismatch: store "
+                            f"{axes['region']} vs manifest {declared}")
+                else:
+                    full = [0, axes["ny"], 0, axes["nx"]]
+                    if declared != full:
+                        raise SnapshotError(
+                            f"segment {seg['segment_id']!r} declares region {declared} but "
+                            f"the store carries no attrs['region']; a store without a region "
+                            f"is admissible only for the FULL grid {full}")
             if axes_ref is None:
                 axes_ref = axes
             elif (axes["lon_digest"], axes["lat_digest"]) != \
@@ -173,6 +186,24 @@ class SegmentedCubeStore:
                     raise SnapshotError(
                         f"segment {seg['segment_id']!r} var_valid[{v}] has {len(flags)} "
                         f"flag(s) for {len(actual)} day(s)")
+
+            # EVERY variable, not just the first. A short or differently-shaped array loads
+            # fine and then raises IndexError on the day it is missing.
+            store_vars = bm.store_variables(spath)
+            if sorted(seg["variables"]) != store_vars:
+                raise SnapshotError(
+                    f"segment {seg['segment_id']!r} declares variables "
+                    f"{sorted(seg['variables'])} but the store serves {store_vars}")
+            for v, shape in bm.array_shapes(spath).items():
+                if shape[0] != len(actual):
+                    raise SnapshotError(
+                        f"segment {seg['segment_id']!r} variable {v!r} has {shape[0]} time "
+                        f"step(s) but the segment declares {len(actual)} day(s); reading the "
+                        f"missing day would raise IndexError at serve time")
+                if (shape[1], shape[2]) != (axes["ny"], axes["nx"]):
+                    raise SnapshotError(
+                        f"segment {seg['segment_id']!r} variable {v!r} is "
+                        f"{shape[1]}x{shape[2]}, not {axes['ny']}x{axes['nx']}")
             declared = bm.declared_present_days(seg)
             if sorted(actual) != sorted(declared):
                 raise SnapshotError(

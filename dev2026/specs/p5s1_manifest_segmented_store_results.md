@@ -10,8 +10,8 @@ Implements P5-S1 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Manifest: [`../store/block_manifest.py`](../store/block_manifest.py)
 - Segmented store: [`../store/segmented_cube.py`](../store/segmented_cube.py)
 - Fixtures (F1–F3, F6, F11, F12): [`../tests/p5_fixtures.py`](../tests/p5_fixtures.py)
-- Tests: [`../tests/test_phase2_p5s1.py`](../tests/test_phase2_p5s1.py) — **49/49 green**
-- Full local suite: **327 tests OK** (17 skipped), up from 278; no regressions.
+- Tests: [`../tests/test_phase2_p5s1.py`](../tests/test_phase2_p5s1.py) — **58/58 green**
+- Full local suite: **336 tests OK** (17 skipped), up from 278; no regressions.
 
 ## 1. Gate
 
@@ -30,6 +30,16 @@ matters more than the eventual PASS: **the gate conclusion was wrong when first 
 | **`day_list` escaped the calendar window** — it was taken verbatim, so a segment could declare a 2026 window and serve 2027 days, splitting the block grid from real availability (G14) | `DAYLIST_ACCEPTED 2027-06-27 2027-09-24` | rejected at schema validation |
 | **`path: "../delta.zarr"` on a segment innocently named `not-delta-by-key`** — the §4.0 guard only inspected key *names*, never path authority | `DELTA_PATH_ACCEPTED …/delta.zarr` | rejected at snapshot build |
 | **Grid mismatch** — a 16×16 block loaded happily under a manifest declaring 32×32, so two segments could map the same lon/lat to different physical cells | `GRID_MISMATCH_ACCEPTED manifest 32×32 / actual 16×16` | rejected at snapshot build |
+
+A **second** review round then found three more, because the first fix made the fingerprint
+*structural* but not *semantic* — and because a manifest generated from its own store is
+self-consistent by construction, so anything the fingerprint alone guards is untested:
+
+| defect | why the first fix missed it | now |
+|---|---|---|
+| **`var_valid` CONTENT was not fingerprinted** — only its length. Flipping one flag turns a day from "returns `sst`" into "omits `sst`", an API-visible semantic change inside a block that claims to be immutable | the fingerprint recorded `var_valid_len`, so a flip was invisible | `var_valid_digest` per variable; the snapshot rejects the mutated store |
+| **Only `vars_[0]`'s layout was checked** — `sea_ice` shortened to 89 days loaded fine and raised `IndexError` on day 90; a variable with different chunking was also accepted | `segment_layout` summarized the first array and the snapshot compared only that | `segment_layout` **errors** if arrays disagree; the snapshot checks **every** variable's time length and spatial shape |
+| **`variables` and `grid.region` were unbound** — a segment could declare `["sst"]` while serving three, and a manifest could declare any region against a store carrying none | the region check required *both* sides to be present; `variables` was never compared to the store | `segment.variables == store.vars`; top-level `variables == union(segments)`; a store without `attrs["region"]` is admissible **only** for the full grid |
 
 ## 2. What was built
 
@@ -120,6 +130,29 @@ turn and the suite re-run; **every one must fail**.
 | **`fingerprint.metadata` verification** | `test_metadata_fingerprint_is_required_and_verified` | **FAILS** ✅ |
 | **`var_valid` length check** | `test_var_valid_length_must_match_day_count` | **FAILS** ✅ |
 | **`fingerprint.metadata` required** | same | **FAILS** ✅ |
+| **`var_valid` CONTENT in the fingerprint** | `test_var_valid_CONTENT_changes_the_fingerprint` (+1) | **FAILS** ✅ |
+| **cross-variable layout agreement** | `test_variables_with_inconsistent_layout_are_rejected` | **FAILS** ✅ |
+| **per-variable time length** | `test_every_variable_is_layout_checked_not_just_the_first` | **FAILS** ✅ |
+| **per-variable spatial shape** | `test_a_variable_with_the_wrong_spatial_shape_is_rejected` | **FAILS** ✅ |
+| **`segment.variables == store.vars`** | `test_segment_variables_must_equal_the_store_variables` | **FAILS** ✅ |
+| **top-level `variables == union`** | `test_top_level_variables_must_be_the_union_of_segments` | **FAILS** ✅ |
+| **region without a stored region** | `test_region_must_be_verifiable_even_when_the_store_omits_it` | **FAILS** ✅ |
+
+Two mutations survived the first pass and both were instructive. One was a **badly chosen
+mutation** (renaming the fingerprint key changed both sides equally, so the difference test
+still held — re-run by replacing the digest with a constant, which does fail). The other was a
+**genuine gap**: nothing covered a variable whose *spatial* shape disagreed with the lon/lat
+axes, since `axes` comes from the coordinate arrays and `layout` compares chunking. A test was
+added for it.
+
+**A note on why fingerprints alone are not enough.** When a manifest is generated from the
+store it describes — which is exactly what S3's builder will do — `fingerprint.metadata`
+matches by construction. Anything guarded *only* by the fingerprint is therefore untested
+against a store that was wrong from the start. That is why the snapshot now carries
+**independent** checks (grid, axes identity, per-variable shapes, variable sets, region) rather
+than delegating everything to one hash. Also why the day set is deliberately **excluded** from
+`metadata_fingerprint`: including it made the fingerprint fire before the day-set comparison
+and robbed that comparison of its isolating test.
 
 **Two of these tests did not exist until the mutation run exposed them as vacuous**, and that
 is the honest part of this step:
@@ -180,6 +213,10 @@ store or the manifest exercises a genuine mismatch rather than a hand-written co
   snapshot; S2 proves the read path is semantically identical to `TieredCube` on every fixture
   and measures it against the S0 baseline of record.
 - **R1 composite base+delta snapshot** (§17) — S2/S5. S1 proves static composition only.
+- **R1a mandatory disjointness at assembly** (§17) — `assert_disjoint_from` ships here as an
+  *optional* helper; **S2** must make `TieredCube`/`TieredSnapshot` construction call it
+  unconditionally and fail closed. An invariant that relies on an operator remembering is not
+  an invariant.
 - **Sizing.** Untouched. `S`/`C` remain the §10.8 provisional recommendation for **P5-S6** to
   adjudicate on the production calendar anchor.
 

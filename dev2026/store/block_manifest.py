@@ -282,6 +282,13 @@ def validate_manifest(manifest: dict) -> dict:
                     f"{(seg['start_day'], seg['end_day'])} do not match the block grid "
                     f"{want} (anchor {anchor}, block_days {bdays})")
 
+    # top-level `variables` is the union across segments -- not a free-text wish list
+    union = sorted({v for seg in segs for v in seg["variables"]})
+    if sorted(manifest["variables"]) != union:
+        raise ManifestError(
+            f"top-level variables {sorted(manifest['variables'])} != the union of segment "
+            f"variables {union}; it must be exactly that union")
+
     sup = manifest["superseded"]
     if not isinstance(sup, list):
         raise ManifestError("superseded must be a list")
@@ -308,18 +315,48 @@ def declared_present_days(seg: dict) -> List[str]:
 
 
 # --------------------------------------------------------------------------- store binding
-def segment_layout(store_path: str) -> dict:
-    """Read the layout a segment ACTUALLY has, in manifest form."""
-    import zarr
-    g = zarr.open_group(store_path, mode="r")
-    vars_ = [v for v in g.attrs.get("vars", []) if v in g]
-    if not vars_:
-        raise ManifestError(f"{store_path}: no data variables")
-    arr = g[vars_[0]]
+def _array_layout(arr) -> dict:
     shards = getattr(arr, "shards", None)
     return {"time_chunk": int(arr.chunks[0]),
             "spatial_chunk": int(arr.chunks[-1]),
             "shard": [int(x) for x in shards] if shards else None}
+
+
+def segment_layout(store_path: str) -> dict:
+    """The layout a segment ACTUALLY has, in manifest form.
+
+    Reading only the first variable was a real defect: a second variable with different
+    chunking (or a different length) passed unnoticed and then raised `IndexError` on a read.
+    A segment has ONE layout by definition, so disagreement between its arrays is itself an
+    error rather than something to summarize."""
+    import zarr
+    g = zarr.open_group(store_path, mode="r")
+    vars_ = sorted(v for v in g.attrs.get("vars", []) if v in g)
+    if not vars_:
+        raise ManifestError(f"{store_path}: no data variables")
+    layouts = {v: _array_layout(g[v]) for v in vars_}
+    first = layouts[vars_[0]]
+    disagree = {v: l for v, l in layouts.items() if l != first}
+    if disagree:
+        raise ManifestError(
+            f"{store_path}: inconsistent layout across variables — {vars_[0]}={first} vs "
+            f"{ {v: l for v, l in disagree.items()} }. A segment must have one layout.")
+    return first
+
+
+def array_shapes(store_path: str) -> dict:
+    """`{var: [T, ny, nx]}` for every data variable — checked per variable, not just the
+    first, so a short array cannot hide behind its neighbours."""
+    import zarr
+    g = zarr.open_group(store_path, mode="r")
+    return {v: [int(x) for x in g[v].shape]
+            for v in sorted(g.attrs.get("vars", [])) if v in g}
+
+
+def store_variables(store_path: str) -> List[str]:
+    import zarr
+    g = zarr.open_group(store_path, mode="r")
+    return sorted(v for v in g.attrs.get("vars", []) if v in g)
 
 
 def store_axes(store_path: str) -> dict:
@@ -356,7 +393,17 @@ def metadata_fingerprint(store_path: str) -> str:
                        "shards": ([int(x) for x in g[v].shards]
                                   if getattr(g[v], "shards", None) else None),
                        "dtype": str(g[v].dtype)} for v in vars_},
+        # var_valid CONTENT, not just its length. A single flipped flag turns a day from
+        # "returns sst" into "omits sst" -- an API-visible semantic change inside a block
+        # that claims to be immutable. Length alone cannot see it.
+        "var_valid_digest": {v: hashlib.sha256(
+            canonical_json([bool(x) for x in var_valid.get(v, [])]).encode()).hexdigest()
+            for v in vars_},
         "var_valid_len": {v: len(var_valid.get(v, [])) for v in vars_},
+        # NOTE: the day set is deliberately NOT included here. It is covered by
+        # `fingerprint.day_digest` and by the explicit day-set comparison at snapshot build.
+        # Duplicating it would make this fingerprint fire first and rob those checks of their
+        # isolating test -- the same vacuous-test trap that bit the H2 gate earlier.
     }
     return hashlib.sha256(canonical_json(doc).encode()).hexdigest()
 
