@@ -1,0 +1,311 @@
+{
+  "env": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "python": "3.13.11",
+    "zarr": "3.2.1"
+  },
+  "gate": {
+    "checked": [
+      "H1",
+      "H2",
+      "H3"
+    ],
+    "failures": [],
+    "verdict": "PASS"
+  },
+  "grid": [
+    512,
+    512
+  ],
+  "h1": {
+    "amplification_vs_one_day": 90.0,
+    "block_days": 90,
+    "build_bytes": 83681722,
+    "build_files": 18,
+    "bytes_rewritten": 83680539,
+    "geometry": {
+      "chunks": [
+        90,
+        8,
+        8
+      ],
+      "dtype": "float32",
+      "shape": [
+        90,
+        512,
+        512
+      ],
+      "shards": [
+        90,
+        128,
+        128
+      ]
+    },
+    "h1_confirmed": true,
+    "hypothesis": "H1",
+    "note": "H1 holds when a one-day write rewrites every shard spanning the block, i.e. amplification approaches time_chunk.",
+    "one_day_logical_bytes": 929796,
+    "shard_files_rewritten": 16,
+    "shard_files_total": 16,
+    "write_ms": 577.359
+  },
+  "h2": {
+    "h2_confirmed": true,
+    "hypothesis": "H2",
+    "monotonic_in_tail_length": true,
+    "note": "Growing a block one day at a time costs sum(1..S) day-writes ~= (S+1)/2 x the block's final size -- the measured basis for rejecting candidate A.",
+    "projected_day_by_day_block_cost_x": 45.5,
+    "rewrites_whole_partial_shard": true,
+    "rows": [
+      {
+        "amplification_vs_one_day": 1.9,
+        "base_bytes": 1213725,
+        "bytes_rewritten": 2287515,
+        "one_day_logical_bytes": 1213725,
+        "shard_files_rewritten": 17,
+        "tail_len": 1
+      },
+      {
+        "amplification_vs_one_day": 16.2,
+        "base_bytes": 14289719,
+        "bytes_rewritten": 15414478,
+        "one_day_logical_bytes": 952647,
+        "shard_files_rewritten": 17,
+        "tail_len": 15
+      },
+      {
+        "amplification_vs_one_day": 30.6,
+        "base_bytes": 28582839,
+        "bytes_rewritten": 29154404,
+        "one_day_logical_bytes": 952761,
+        "shard_files_rewritten": 17,
+        "tail_len": 30
+      },
+      {
+        "amplification_vs_one_day": 60.5,
+        "base_bytes": 56842015,
+        "bytes_rewritten": 57327370,
+        "one_day_logical_bytes": 947366,
+        "shard_files_rewritten": 17,
+        "tail_len": 60
+      },
+      {
+        "amplification_vs_one_day": 88.0,
+        "base_bytes": 83768955,
+        "bytes_rewritten": 82787772,
+        "one_day_logical_bytes": 941224,
+        "shard_files_rewritten": 17,
+        "tail_len": 89
+      }
+    ]
+  },
+  "h3": {
+    "all_segmentations_return_all_days": true,
+    "block_size_sweep": {
+      "decompressed_bytes_invariant": true,
+      "marginal_ms_per_extra_segment": 0.983,
+      "rows": [
+        {
+          "bytes": 334732223,
+          "chunk_count": 4,
+          "days_per_segment": 90,
+          "decompressed_bytes": 92160,
+          "file_count": 72,
+          "latency": {
+            "max_ms": 4.348,
+            "min_ms": 3.881,
+            "p50_ms": 3.954,
+            "p95_ms": 4.348,
+            "repeats": 15
+          },
+          "segments": 4,
+          "store_reads": 12,
+          "time_chunk": 90,
+          "useful_bytes": 1440,
+          "values_returned": 360
+        },
+        {
+          "bytes": 335692291,
+          "chunk_count": 8,
+          "days_per_segment": 45,
+          "decompressed_bytes": 92160,
+          "file_count": 144,
+          "latency": {
+            "max_ms": 8.291,
+            "min_ms": 7.629,
+            "p50_ms": 7.872,
+            "p95_ms": 8.291,
+            "repeats": 15
+          },
+          "segments": 8,
+          "store_reads": 24,
+          "time_chunk": 45,
+          "useful_bytes": 1440,
+          "values_returned": 360
+        },
+        {
+          "bytes": 336791635,
+          "chunk_count": 12,
+          "days_per_segment": 30,
+          "decompressed_bytes": 92160,
+          "file_count": 216,
+          "latency": {
+            "max_ms": 12.063,
+            "min_ms": 11.5,
+            "p50_ms": 11.82,
+            "p95_ms": 12.063,
+            "repeats": 15
+          },
+          "segments": 12,
+          "store_reads": 36,
+          "time_chunk": 30,
+          "useful_bytes": 1440,
+          "values_returned": 360
+        }
+      ]
+    },
+    "constant_time_chunk": {
+      "chunk_count_invariant": true,
+      "decompressed_bytes_invariant": true,
+      "marginal_ms_per_extra_segment": 0.645,
+      "rows": [
+        {
+          "bytes": 334726520,
+          "chunk_count": 4,
+          "days_per_segment": 360,
+          "decompressed_bytes": 92160,
+          "file_count": 66,
+          "latency": {
+            "max_ms": 2.627,
+            "min_ms": 1.811,
+            "p50_ms": 1.981,
+            "p95_ms": 2.627,
+            "repeats": 15
+          },
+          "segments": 1,
+          "store_reads": 9,
+          "time_chunk": 90,
+          "useful_bytes": 1440,
+          "values_returned": 360
+        },
+        {
+          "bytes": 334727190,
+          "chunk_count": 4,
+          "days_per_segment": 180,
+          "decompressed_bytes": 92160,
+          "file_count": 68,
+          "latency": {
+            "max_ms": 2.579,
+            "min_ms": 2.316,
+            "p50_ms": 2.418,
+            "p95_ms": 2.579,
+            "repeats": 15
+          },
+          "segments": 2,
+          "store_reads": 10,
+          "time_chunk": 90,
+          "useful_bytes": 1440,
+          "values_returned": 360
+        },
+        {
+          "bytes": 334732223,
+          "chunk_count": 4,
+          "days_per_segment": 90,
+          "decompressed_bytes": 92160,
+          "file_count": 72,
+          "latency": {
+            "max_ms": 4.311,
+            "min_ms": 3.84,
+            "p50_ms": 3.916,
+            "p95_ms": 4.311,
+            "repeats": 15
+          },
+          "segments": 4,
+          "store_reads": 12,
+          "time_chunk": 90,
+          "useful_bytes": 1440,
+          "values_returned": 360
+        }
+      ],
+      "time_chunk_constant": true
+    },
+    "h3_supported": true,
+    "hypothesis": "H3",
+    "note": "H3 (refined by this harness): decompressed_bytes is invariant under segmentation in EVERY regime; chunk_count is additionally invariant while the inner time chunk is unchanged. A sub-90-day block shrinks the time chunk, raising chunk_count at constant decompressed_bytes -- the \u00a710.4 sizing trade, not an H3 violation.",
+    "total_days": 360
+  },
+  "h8": {
+    "hypothesis": "H8",
+    "note": "Rectilinear SHARDS force a uniform inner time chunk of 1, which is what costs the point-series read. Re-test when zarr-python 3.3 stabilizes the feature (spec \u00a716-Q7).",
+    "point_series_regression_x": 19.2,
+    "rect_chunks_with_sharding": {
+      "error": "ValueError: Rectilinear chunks with sharding is not supported. Use rectilinear shards instead: chunks=(inner_size, ...), shards=[[shard_sizes], ...]",
+      "supported": false
+    },
+    "rect_shards": {
+      "append_bytes_rewritten": 1156550,
+      "append_files_rewritten": 17,
+      "append_ms": 364.083,
+      "bytes": 139767240,
+      "files": 514,
+      "hist_build_ms": 35182.986,
+      "read_1d": {
+        "max_ms": 1.225,
+        "min_ms": 1.01,
+        "p50_ms": 1.055,
+        "p95_ms": 1.225,
+        "repeats": 15
+      },
+      "read_series": {
+        "max_ms": 28.812,
+        "min_ms": 23.198,
+        "p50_ms": 23.763,
+        "p95_ms": 28.812,
+        "repeats": 15
+      },
+      "supported": true
+    },
+    "regular": {
+      "build_ms": 914.96,
+      "bytes": 112264308,
+      "files": 34,
+      "geometry": {
+        "chunks": [
+          90,
+          8,
+          8
+        ],
+        "dtype": "float32",
+        "shape": [
+          120,
+          512,
+          512
+        ],
+        "shards": [
+          90,
+          128,
+          128
+        ]
+      },
+      "read_1d": {
+        "max_ms": 1.134,
+        "min_ms": 0.956,
+        "p50_ms": 0.987,
+        "p95_ms": 1.134,
+        "repeats": 15
+      },
+      "read_series": {
+        "max_ms": 1.445,
+        "min_ms": 1.168,
+        "p50_ms": 1.238,
+        "p95_ms": 1.445,
+        "repeats": 15
+      }
+    },
+    "verdict": "rectilinear rejected for the base read layout",
+    "zarr_version": "3.2.1"
+  },
+  "harness": "bench_p5_rmw.py",
+  "provenance": "COMMITTED harness, synthetic data, local, warm; supersedes the spec's [PROBE] numbers",
+  "step": "P5-S0"
+}
