@@ -126,88 +126,66 @@ class SegmentedCubeStore:
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r} missing at {spath}; refusing to build a "
                     f"partial snapshot")
+            # ---- ORDER MATTERS: inspect the raw store FIRST, verify everything against
+            # that one validated view, and only then construct the reader. Building the
+            # reader first still failed closed, but it broke the model -- the validator must
+            # be what everything downstream consumes, not a second opinion.
+            implicit = seg.get("var_valid_mode") == "implicit_all_true"
             try:
-                store = TimeCubeStore(spath)
-            except Exception as exc:                       # noqa: BLE001 - surface as snapshot failure
-                raise SnapshotError(
-                    f"segment {seg['segment_id']!r} unreadable at {spath}: {exc}") from exc
-
-            # ---- RAW self-consistency FIRST: every later check reads a derived view, so a
-            # malformed store must be rejected before anything has a chance to launder it.
-            try:
-                raw = bm.verify_store_self_consistency(
-                    spath,
-                    allow_implicit_var_valid=(seg.get("var_valid_mode") == "implicit_all_true"))
+                insp = bm.inspect_store_contract(spath, allow_implicit_var_valid=implicit)
             except bm.ManifestError as exc:
                 raise SnapshotError(f"segment {seg['segment_id']!r}: {exc}") from exc
 
-            # ---- structural binding (review finding #3): the manifest must describe the
-            # store it names. A day set alone cannot detect a block built on another grid,
-            # which would map the same lon/lat to different physical cells -- silent wrong
-            # data, the failure class this whole phase exists to avoid.
-            axes = bm.store_axes(spath)
-            if (axes["ny"], axes["nx"]) != (int(grid["ny"]), int(grid["nx"])):
+            actual = list(insp.days)
+            if (insp.ny, insp.nx) != (int(grid["ny"]), int(grid["nx"])):
                 raise SnapshotError(
-                    f"segment {seg['segment_id']!r} grid mismatch: store is "
-                    f"{axes['ny']}x{axes['nx']}, manifest declares "
-                    f"{grid['ny']}x{grid['nx']}")
-            # Region must be verifiable even when the store predates `attrs["region"]`.
-            # Requiring BOTH sides to be present let a manifest declare any region against a
-            # store carrying none. The migration rule is explicit and checkable: no stored
-            # region is admissible ONLY for the full grid, which ny/nx already tells us.
+                    f"segment {seg['segment_id']!r} grid mismatch: store "
+                    f"{insp.ny}x{insp.nx}, manifest declares {grid['ny']}x{grid['nx']}")
             if grid.get("region"):
                 declared = [int(x) for x in grid["region"]]
-                if axes["region"]:
-                    if declared != axes["region"]:
+                stored = list(insp.region)
+                if stored:
+                    if declared != stored:
                         raise SnapshotError(
-                            f"segment {seg['segment_id']!r} region mismatch: store "
-                            f"{axes['region']} vs manifest {declared}")
+                            f"segment {seg['segment_id']!r} region mismatch: store {stored} "
+                            f"vs manifest {declared}")
                 else:
-                    full = [0, axes["ny"], 0, axes["nx"]]
+                    full = [0, insp.ny, 0, insp.nx]
                     if declared != full:
                         raise SnapshotError(
                             f"segment {seg['segment_id']!r} declares region {declared} but "
                             f"the store carries no attrs['region']; a store without a region "
                             f"is admissible only for the FULL grid {full}")
             if axes_ref is None:
-                axes_ref = axes
-            elif (axes["lon_digest"], axes["lat_digest"]) != \
-                    (axes_ref["lon_digest"], axes_ref["lat_digest"]):
+                axes_ref = (insp.lon_digest, insp.lat_digest)
+            elif (insp.lon_digest, insp.lat_digest) != axes_ref:
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r} has different lon/lat axes from the "
                     f"first segment; all segments must share identical axes or the same "
                     f"lon/lat would resolve to different cells per block")
-            actual_layout = bm.segment_layout(spath)
+
+            actual_layout = bm.segment_layout_from_inspection(insp)
             if seg["layout"] != actual_layout:
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r} layout mismatch: store {actual_layout} "
                     f"vs manifest {seg['layout']}")
-            fp = bm.metadata_fingerprint(spath)
+            fp = bm.metadata_fingerprint_from_inspection(insp)
             if seg["fingerprint"]["metadata"] != fp:
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r} metadata fingerprint mismatch: "
-                    f"store {fp[:12]}… vs manifest "
-                    f"{str(seg['fingerprint']['metadata'])[:12]}…")
+                    f"store {fp[:12]}\u2026 vs manifest "
+                    f"{str(seg['fingerprint']['metadata'])[:12]}\u2026")
 
-            actual = list(raw["days"])
-
-            # EVERY variable, not just the first. A short or differently-shaped array loads
-            # fine and then raises IndexError on the day it is missing.
-            store_vars = sorted(raw["vars"])
-            if sorted(seg["variables"]) != store_vars:
+            if sorted(seg["variables"]) != sorted(insp.vars):
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r} declares variables "
-                    f"{sorted(seg['variables'])} but the store serves {store_vars}")
-            for v, shape in bm.array_shapes(spath).items():
-                if shape[0] != len(actual):
-                    raise SnapshotError(
-                        f"segment {seg['segment_id']!r} variable {v!r} has {shape[0]} time "
-                        f"step(s) but the segment declares {len(actual)} day(s); reading the "
-                        f"missing day would raise IndexError at serve time")
-                if (shape[1], shape[2]) != (axes["ny"], axes["nx"]):
+                    f"{sorted(seg['variables'])} but the store serves {sorted(insp.vars)}")
+            for (v, shape, _c, _s, _d, _f) in insp.arrays:
+                if (shape[1], shape[2]) != (insp.ny, insp.nx):
                     raise SnapshotError(
                         f"segment {seg['segment_id']!r} variable {v!r} is "
-                        f"{shape[1]}x{shape[2]}, not {axes['ny']}x{axes['nx']}")
+                        f"{shape[1]}x{shape[2]}, not {insp.ny}x{insp.nx}")
+
             declared = bm.declared_present_days(seg)
             if sorted(actual) != sorted(declared):
                 raise SnapshotError(
@@ -222,6 +200,17 @@ class SegmentedCubeStore:
             if declared_digest and declared_digest != bm.day_digest(actual):
                 raise SnapshotError(
                     f"STALE MANIFEST: segment {seg['segment_id']!r} day_digest mismatch")
+
+            # ---- only now construct the reader, then assert it agrees with the inspection
+            try:
+                store = TimeCubeStore(spath)
+            except Exception as exc:                   # noqa: BLE001 - surface as snapshot failure
+                raise SnapshotError(
+                    f"segment {seg['segment_id']!r} unreadable at {spath}: {exc}") from exc
+            if list(store.days) != list(insp.days) or sorted(store.vars) != sorted(insp.vars):
+                raise SnapshotError(
+                    f"segment {seg['segment_id']!r}: the reader's metadata disagrees with "
+                    f"the verified inspection (the store changed under us)")
 
             prec = int(seg["precedence"])
             for day in actual:

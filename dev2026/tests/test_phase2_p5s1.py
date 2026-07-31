@@ -44,7 +44,8 @@ S = 90
 
 def _seg(seg_id, path, start, end, day_count, *, precedence, gaps=(), unknown=(),
          sealed=True, kind="block", boundary_kind="calendar", vars_=fx.VARS,
-         supersedes=None, day_digest=None, time_chunk=None, store_path=None):
+         supersedes=None, day_digest=None, time_chunk=None, store_path=None,
+         implicit_var_valid=False):
     """Build a segment entry. When `store_path` is given, `layout` / `day_digest` /
     `fingerprint.metadata` are DERIVED FROM DISK -- the same way S3's builder will produce
     them -- so a test that then mutates the store or the manifest exercises a real mismatch."""
@@ -61,9 +62,10 @@ def _seg(seg_id, path, start, end, day_count, *, precedence, gaps=(), unknown=()
         "precedence": precedence, "sealed": sealed, "supersedes": supersedes,
     }
     if store_path:
-        seg["layout"] = bm.segment_layout(store_path)
+        kw = {"allow_implicit_var_valid": implicit_var_valid}
+        seg["layout"] = bm.segment_layout(store_path, **kw)
         seg["fingerprint"] = {"algo": "sha256",
-                              "metadata": bm.metadata_fingerprint(store_path),
+                              "metadata": bm.metadata_fingerprint(store_path, **kw),
                               "day_digest": bm.day_digest(fx.read_days(store_path))}
     return seg
 
@@ -680,16 +682,11 @@ class TestIntegrityGuards(_Base):
         self.assertIn("metadata fingerprint", str(cm.exception).lower())
 
     def test_var_valid_length_must_match_day_count(self):
-        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
-        path = os.path.join(self.root, "b0")
-        fx.build_block(path, fx.calendar_span(s0, e0))
-        import zarr as _z
-        g = _z.open_group(path, mode="a")
-        vv = {k: list(v) for k, v in dict(g.attrs["var_valid"]).items()}
-        vv["sst"] = vv["sst"][:-1]                     # now 89 flags for 90 days
-        g.attrs["var_valid"] = vv
-        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
-        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
+        def shorten(g):
+            vv = {k: list(v) for k, v in dict(g.attrs["var_valid"]).items()}
+            vv["sst"] = vv["sst"][:-1]                 # now 89 flags for 90 days
+            g.attrs["var_valid"] = vv
+        self._store_with(shorten)
         with self.assertRaises(SnapshotError) as cm:
             SegmentedCubeStore(self.root)
         self.assertIn("var_valid", str(cm.exception).lower())
@@ -738,13 +735,11 @@ class TestIntegrityGuards(_Base):
         path = os.path.join(self.root, "b0")
         fx.build_block(path, days)
 
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
         import zarr as _z
         g = _z.open_group(path, mode="a")
         g["sea_ice"].resize((89, 32, 32))                # 89 days while `days` says 90
-        # derive the manifest AFTER the mutation, so the fingerprint matches by construction
-        # and only an independent per-array check can catch it
-        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
-        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
         with self.assertRaises(SnapshotError) as cm:
             SegmentedCubeStore(self.root)
         msg = str(cm.exception)
@@ -845,13 +840,19 @@ class TestIntegrityGuards(_Base):
 
     # ---- review round 3: validate RAW state, never a coerced/filtered view ----
     def _store_with(self, mutate):
+        """Publish a manifest while the store is INTACT, then mutate it.
+
+        Deriving the manifest AFTER the mutation no longer works -- `metadata_fingerprint`
+        now refuses malformed stores outright, which is the stronger behaviour. These tests
+        therefore exercise the SNAPSHOT path; the builder path is covered separately by
+        `test_metadata_fingerprint_refuses_every_malformed_store`."""
         s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
         path = os.path.join(self.root, "b0")
         fx.build_block(path, fx.calendar_span(s0, e0))
-        import zarr as _z
-        mutate(_z.open_group(path, mode="a"))
         seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
         fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
+        import zarr as _z
+        mutate(_z.open_group(path, mode="a"))
         return path
 
     def test_missing_var_valid_key_is_rejected(self):
@@ -942,7 +943,8 @@ class TestIntegrityGuards(_Base):
         g = _z.open_group(path, mode="a")
         del g.attrs["var_valid"]
 
-        base = dict(kind="legacy_base", boundary_kind="legacy", store_path=path)
+        base = dict(kind="legacy_base", boundary_kind="legacy", store_path=path,
+                    implicit_var_valid=True)
         seg = _seg("legacy", "legacy", s0, e0, 90, precedence=0, **base)
         fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
         with self.assertRaises(SnapshotError) as cm:
@@ -957,12 +959,201 @@ class TestIntegrityGuards(_Base):
 
         # ...but never for a `block`
         seg3 = _seg("b", "legacy", s0, e0, 90, precedence=1, store_path=path,
-                    boundary_kind="legacy")
+                    boundary_kind="legacy", implicit_var_valid=True)
         seg3["var_valid_mode"] = "implicit_all_true"
         fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg3]))
         with self.assertRaises(SnapshotError) as cm:
             SegmentedCubeStore(self.root)
         self.assertIn("legacy_base", str(cm.exception))
+
+    # ---- review round 4: close the two bypasses around the raw validator ----
+    def test_raw_container_types_are_checked_before_any_coercion(self):
+        """[High] `list()`/`dict()` ran BEFORE the type was confirmed, so `var_valid` written
+        as a JSON list-of-pairs was laundered into a dict — and duplicate keys inside it
+        would have been silently resolved to the last one."""
+        def pairs(g):
+            g.attrs["var_valid"] = [["sst", [True] * 90],
+                                    ["sst_anomaly", [True] * 90],
+                                    ["sea_ice", [True] * 90]]
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        import zarr as _z
+        pairs(_z.open_group(path, mode="a"))
+        with self.assertRaises(bm.ManifestError) as cm:
+            bm.inspect_store_contract(path)
+        msg = str(cm.exception).lower()
+        self.assertIn("var_valid", msg)
+        self.assertIn("dict", msg)
+
+    def test_raw_scalar_types_are_checked(self):
+        cases = [
+            (lambda g: g.attrs.__setitem__("days", {"a": 1}), "days"),
+            (lambda g: g.attrs.__setitem__("days", ["2026-06-27", 20260628]), "days"),
+            (lambda g: g.attrs.__setitem__("days", ["2026-06-27", "not-a-date"]), "date"),
+            (lambda g: g.attrs.__setitem__("vars", "sst"), "vars"),
+            (lambda g: g.attrs.__setitem__("vars", ["sst", 7]), "vars"),
+        ]
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        for mutate, needle in cases:
+            with self.subTest(needle=needle):
+                self.setUp()
+                path = os.path.join(self.root, "b0")
+                fx.build_block(path, fx.calendar_span(s0, e0))
+                import zarr as _z
+                mutate(_z.open_group(path, mode="a"))
+                with self.assertRaises(bm.ManifestError) as cm:
+                    bm.inspect_store_contract(path)
+                self.assertIn(needle, str(cm.exception).lower())
+
+    def test_var_valid_flags_must_be_a_list_not_a_string(self):
+        def as_string(g):
+            vv = {k: list(v) for k, v in dict(g.attrs["var_valid"]).items()}
+            vv["sst"] = "TTTTTTTT"                  # iterable, but not a list of bools
+            g.attrs["var_valid"] = vv
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        import zarr as _z
+        as_string(_z.open_group(path, mode="a"))
+        with self.assertRaises(bm.ManifestError) as cm:
+            bm.inspect_store_contract(path)
+        self.assertIn("list", str(cm.exception).lower())
+
+    def test_metadata_fingerprint_refuses_every_malformed_store(self):
+        """[High] The fingerprint path bypassed the validator entirely, so a builder could
+        still mint a manifest for a store with non-boolean `var_valid`, duplicate `vars`, or
+        a non-NaN fill. Only the missing-array case was covered."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        days = fx.calendar_span(s0, e0)
+        import zarr as _z
+
+        def poison_var_valid(g):
+            vv = {k: list(v) for k, v in dict(g.attrs["var_valid"]).items()}
+            vv["sst"][0] = "false"
+            g.attrs["var_valid"] = vv
+
+        def dup_vars(g):
+            g.attrs["vars"] = ["sst", "sst", "sst_anomaly", "sea_ice"]
+
+        def bad_fill(g):
+            del g["sea_ice"]
+            g.create_array("sea_ice", shape=(90, 32, 32), dtype="float32",
+                           chunks=(90, 8, 8), shards=(90, 32, 32), fill_value=0.0)
+            g["sea_ice"][:] = 1.0
+
+        for mutate, label in ((poison_var_valid, "non-boolean var_valid"),
+                              (dup_vars, "duplicate vars"),
+                              (bad_fill, "fill_value=0")):
+            with self.subTest(case=label):
+                self.setUp()
+                path = os.path.join(self.root, "b0")
+                fx.build_block(path, days)
+                mutate(_z.open_group(path, mode="a"))
+                with self.assertRaises(bm.ManifestError):
+                    bm.metadata_fingerprint(path)
+
+    def test_fingerprint_from_inspection_rejects_a_forged_inspection(self):
+        """`metadata_fingerprint_from_inspection` may only consume an inspection produced by
+        `inspect_store_contract` -- otherwise the strict path is trivially side-stepped."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        good = bm.inspect_store_contract(path)
+        self.assertIsInstance(bm.metadata_fingerprint_from_inspection(good), str)
+        forged = good._replace(token=object())
+        with self.assertRaises(bm.ManifestError):
+            bm.metadata_fingerprint_from_inspection(forged)
+
+    def test_legacy_implicit_mode_must_be_passed_to_the_fingerprint(self):
+        """The fingerprint has no segment context of its own, so the legacy allowance must be
+        an explicit argument rather than something it infers."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "legacy")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        import zarr as _z
+        g = _z.open_group(path, mode="a")
+        del g.attrs["var_valid"]
+        with self.assertRaises(bm.ManifestError):
+            bm.metadata_fingerprint(path)                       # not allowed by default
+        self.assertIsInstance(
+            bm.metadata_fingerprint(path, allow_implicit_var_valid=True), str)
+
+    def test_raw_inspection_runs_before_the_store_is_constructed(self):
+        """[Medium] The snapshot built a `TimeCubeStore` first and validated raw state after.
+        It still failed closed, but it broke the model: the raw validator runs FIRST and
+        everything downstream consumes its result."""
+        import store.segmented_cube as sc
+
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
+
+        import zarr as _z
+        gg = _z.open_group(path, mode="a")
+        vv = {k: list(v) for k, v in dict(gg.attrs["var_valid"]).items()}
+        vv["sst"][0] = "false"
+        gg.attrs["var_valid"] = vv
+
+        original = sc.TimeCubeStore
+        constructed = []
+
+        class Tripwire:
+            def __init__(self, *a, **k):
+                constructed.append(a)
+                raise RuntimeError("TimeCubeStore must not be constructed before validation")
+
+        sc.TimeCubeStore = Tripwire
+        try:
+            with self.assertRaises(SnapshotError) as cm:
+                SegmentedCubeStore(self.root)
+            self.assertIn("var_valid", str(cm.exception).lower())
+            self.assertEqual(constructed, [],
+                             "the store was constructed before raw validation ran")
+        finally:
+            sc.TimeCubeStore = original
+
+    def test_reader_disagreeing_with_the_inspection_fails_closed(self):
+        """The final assertion in the ordered build: if the store changes between the
+        verified inspection and the reader's own metadata read, the snapshot must refuse
+        rather than serve a reader nobody validated."""
+        import store.segmented_cube as sc
+
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        self._publish(self._manifest([seg]))
+        SegmentedCubeStore(self.root)                      # baseline: loads
+
+        original = sc.TimeCubeStore
+
+        class Drifted(original):
+            @property
+            def days(self):
+                return ["1999-01-01"]                      # disagrees with the inspection
+
+        sc.TimeCubeStore = Drifted
+        try:
+            with self.assertRaises(SnapshotError) as cm:
+                SegmentedCubeStore(self.root)
+            self.assertIn("disagrees with the verified inspection", str(cm.exception))
+        finally:
+            sc.TimeCubeStore = original
+
+    def test_store_metadata_is_asserted_against_the_verified_inspection(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        self._publish(self._manifest([seg]))
+        store = SegmentedCubeStore(self.root)
+        insp = bm.inspect_store_contract(path)
+        seg_store = store.segment_store("b0")
+        self.assertEqual(list(seg_store.days), list(insp.days))
+        self.assertEqual(sorted(seg_store.vars), sorted(insp.vars))
 
     def test_base_segments_are_asserted_disjoint_from_the_delta(self):
         s0, e0 = bm.block_bounds(ANCHOR, 90, 0)

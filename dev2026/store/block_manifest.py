@@ -25,7 +25,7 @@ import json
 import os
 import shutil
 from datetime import date, timedelta
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, NamedTuple, Optional, Sequence
 
 MANIFEST_FORMAT = "ghrsst.timecube.manifest"
 SCHEMA_VERSION = 1
@@ -355,37 +355,80 @@ def segment_layout(store_path: str) -> dict:
 
 DTYPE = "float32"
 
+# Only `inspect_store_contract` mints this. `metadata_fingerprint_from_inspection` refuses
+# anything else, so the strict path cannot be side-stepped by hand-building a look-alike.
+_INSPECTION_TOKEN = object()
 
-def verify_store_self_consistency(store_path: str, *, allow_implicit_var_valid: bool = False
-                                  ) -> dict:
-    """Validate a segment store's RAW attrs before anything derives a view from them.
 
-    Every helper that filters (`if v in g`) or coerces (`bool(x)`) launders a malformed store
-    into a well-formed one — the store then passes every downstream check because the
-    downstream check is looking at the laundered view. So this runs FIRST, on the raw values,
-    and everything else consumes its output.
+class StoreInspection(NamedTuple):
+    """The ONE validated view of a segment store. Everything downstream consumes this rather
+    than re-reading (and re-laundering) the store's attrs."""
+    token: object
+    path: str
+    days: tuple
+    vars: tuple
+    var_valid: tuple            # ((var, (bool, ...)), ...) -- ordered, hashable, no dict
+    var_valid_implicit: bool
+    arrays: tuple               # ((var, shape, chunks, shards, dtype, fill_is_nan), ...)
+    ny: int
+    nx: int
+    lon_digest: str
+    lat_digest: str
+    region: tuple
 
-    Returns `{"days", "vars", "var_valid", "var_valid_implicit"}`. Raises `ManifestError`.
+
+def _exact(value, typ, what: str):
+    if type(value) is not typ:
+        raise ManifestError(
+            f"{what}: expected {typ.__name__}, got {type(value).__name__}. The type is "
+            f"checked BEFORE any conversion -- calling list()/dict() first would launder a "
+            f"malformed value into a well-formed one.")
+    return value
+
+
+def inspect_store_contract(store_path: str, *, allow_implicit_var_valid: bool = False
+                           ) -> StoreInspection:
+    """Validate a segment store's RAW attrs and arrays, then return the single view every
+    other function consumes.
+
+    Nothing here converts before it checks. `list(attrs["days"])`, `dict(var_valid)` and
+    friends all silently accept the wrong container -- a `var_valid` written as a JSON
+    list-of-pairs was laundered into a dict, and duplicate keys inside it would have been
+    resolved to the last one without a word.
     """
     import numpy as np
     import zarr
     g = zarr.open_group(store_path, mode="r")
-    attrs = dict(g.attrs)
+    attrs = dict(g.attrs)                      # zarr's own mapping -> plain dict, values raw
 
+    # ---- days
     if "days" not in attrs:
         raise ManifestError(f"{store_path}: attrs['days'] is missing")
-    days = list(attrs["days"])
-    if len(set(days)) != len(days):
+    raw_days = _exact(attrs["days"], list, f"{store_path}: attrs['days']")
+    for i, d in enumerate(raw_days):
+        _exact(d, str, f"{store_path}: attrs['days'][{i}]")
+        try:
+            date.fromisoformat(d)
+        except ValueError as exc:
+            raise ManifestError(
+                f"{store_path}: attrs['days'][{i}]={d!r} is not an ISO date") from exc
+    if len(set(raw_days)) != len(raw_days):
         raise ManifestError(f"{store_path}: attrs['days'] contains duplicate days")
 
-    raw_vars = list(attrs.get("vars", []))
+    # ---- vars
+    if "vars" not in attrs:
+        raise ManifestError(f"{store_path}: attrs['vars'] is missing")
+    raw_vars = _exact(attrs["vars"], list, f"{store_path}: attrs['vars']")
     if not raw_vars:
-        raise ManifestError(f"{store_path}: attrs['vars'] is missing or empty")
+        raise ManifestError(f"{store_path}: attrs['vars'] is empty")
+    for i, v in enumerate(raw_vars):
+        _exact(v, str, f"{store_path}: attrs['vars'][{i}]")
     if len(set(raw_vars)) != len(raw_vars):
         dupes = sorted({v for v in raw_vars if raw_vars.count(v) > 1})
         raise ManifestError(f"{store_path}: attrs['vars'] has duplicate entries {dupes}")
 
-    for v in raw_vars:
+    arrays = []
+    for v in sorted(raw_vars):
         if v not in g:
             raise ManifestError(
                 f"{store_path}: attrs['vars'] declares {v!r} but the store has no such "
@@ -396,40 +439,54 @@ def verify_store_self_consistency(store_path: str, *, allow_implicit_var_valid: 
             raise ManifestError(
                 f"{store_path}: variable {v!r} is {arr.ndim}-D, expected a 3-D (t,y,x) "
                 f"data variable")
-        # builder contract (§7.2): float32 with a NaN fill. A non-NaN fill turns an
-        # unwritten or missing chunk from `null` into a real value at the API.
         if str(arr.dtype) != DTYPE:
             raise ManifestError(
                 f"{store_path}: variable {v!r} has dtype {arr.dtype}, expected {DTYPE}")
         fill = arr.fill_value
-        if fill is None or not np.isnan(np.asarray(fill, dtype="float64")):
+        fill_is_nan = fill is not None and bool(np.isnan(np.asarray(fill, dtype="float64")))
+        if not fill_is_nan:
             raise ManifestError(
-                f"{store_path}: variable {v!r} has fill_value {fill!r}, expected NaN — a "
+                f"{store_path}: variable {v!r} has fill_value {fill!r}, expected NaN -- a "
                 f"non-NaN fill makes a missing chunk read as data instead of null")
+        if int(arr.shape[0]) != len(raw_days):
+            raise ManifestError(
+                f"{store_path}: variable {v!r} has {int(arr.shape[0])} time step(s) but "
+                f"attrs['days'] declares {len(raw_days)}")
+        shards = getattr(arr, "shards", None)
+        arrays.append((v, tuple(int(x) for x in arr.shape),
+                       tuple(int(x) for x in arr.chunks),
+                       tuple(int(x) for x in shards) if shards else None,
+                       str(arr.dtype), fill_is_nan))
 
-    raw_vv = attrs.get("var_valid", None)
+    layouts = {a[0]: (a[2][0], a[2][-1], a[3]) for a in arrays}
+    first = layouts[arrays[0][0]]
+    disagree = {v: l for v, l in layouts.items() if l != first}
+    if disagree:
+        raise ManifestError(
+            f"{store_path}: inconsistent layout across variables -- {arrays[0][0]}={first} "
+            f"vs {disagree}. A segment must have one layout.")
+
+    # ---- var_valid
     implicit = False
-    if raw_vv is None:
+    if "var_valid" not in attrs or attrs["var_valid"] is None:
         if not allow_implicit_var_valid:
             raise ManifestError(
                 f"{store_path}: attrs['var_valid'] is missing. It is required; a store "
                 f"predating it is admissible only when the manifest declares "
                 f"var_valid_mode='implicit_all_true' on a legacy_base segment.")
         implicit = True
-        var_valid = {v: [True] * len(days) for v in raw_vars}
+        var_valid = tuple((v, tuple([True] * len(raw_days))) for v in sorted(raw_vars))
     else:
-        raw_vv = dict(raw_vv)
+        raw_vv = _exact(attrs["var_valid"], dict, f"{store_path}: attrs['var_valid']")
         if set(raw_vv) != set(raw_vars):
             missing = sorted(set(raw_vars) - set(raw_vv))
             extra = sorted(set(raw_vv) - set(raw_vars))
             raise ManifestError(
-                f"{store_path}: var_valid keys do not match attrs['vars'] — "
+                f"{store_path}: var_valid keys do not match attrs['vars'] -- "
                 f"missing {missing}, unexpected {extra}")
-        var_valid = {}
-        for v, flags in raw_vv.items():
-            if not isinstance(flags, (list, tuple)):
-                raise ManifestError(f"{store_path}: var_valid[{v!r}] is not a list")
-            flags = list(flags)
+        pairs = []
+        for v in sorted(raw_vv):
+            flags = _exact(raw_vv[v], list, f"{store_path}: var_valid[{v!r}]")
             bad = [(i, x) for i, x in enumerate(flags) if type(x) is not bool]
             if bad:
                 i, x = bad[0]
@@ -437,103 +494,93 @@ def verify_store_self_consistency(store_path: str, *, allow_implicit_var_valid: 
                     f"{store_path}: var_valid[{v!r}][{i}] is {type(x).__name__} {x!r}, not a "
                     f"bool. Coercing it would hide the type error, and the read path tests "
                     f"`is False`, so a truthy string would not behave as the value implies.")
-            if len(flags) != len(days):
+            if len(flags) != len(raw_days):
                 raise ManifestError(
                     f"{store_path}: var_valid[{v!r}] has {len(flags)} flag(s) for "
-                    f"{len(days)} day(s)")
-            var_valid[v] = flags
+                    f"{len(raw_days)} day(s)")
+            pairs.append((v, tuple(flags)))
+        var_valid = tuple(pairs)
 
-    for v in raw_vars:
-        if int(g[v].shape[0]) != len(days):
-            raise ManifestError(
-                f"{store_path}: variable {v!r} has {int(g[v].shape[0])} time step(s) but "
-                f"attrs['days'] declares {len(days)}")
-
-    return {"days": days, "vars": raw_vars, "var_valid": var_valid,
-            "var_valid_implicit": implicit}
-
-
-def array_shapes(store_path: str) -> dict:
-    """`{var: [T, ny, nx]}` for every DECLARED variable. Raises if a declared variable has no
-    array — it must not be silently filtered out."""
-    import zarr
-    g = zarr.open_group(store_path, mode="r")
-    out = {}
-    for v in sorted(g.attrs.get("vars", [])):
-        if v not in g:
-            raise ManifestError(f"{store_path}: declared variable {v!r} has no array")
-        out[v] = [int(x) for x in g[v].shape]
-    return out
-
-
-def store_variables(store_path: str) -> List[str]:
-    """The RAW declared variables, sorted. No `if v in g` filter -- a declared variable with
-    no array is a defect to surface, not one to hide."""
-    import zarr
-    g = zarr.open_group(store_path, mode="r")
-    return sorted(g.attrs.get("vars", []))
-
-
-def store_axes(store_path: str) -> dict:
-    """ny/nx plus lon/lat digests -- the identity two segments must share, or the same
-    lon/lat would resolve to different physical cells in different blocks."""
-    import numpy as np
-    import zarr
-    g = zarr.open_group(store_path, mode="r")
     lon = np.asarray(g["lon"][:], dtype="float64")
     lat = np.asarray(g["lat"][:], dtype="float64")
-    return {"ny": int(lat.size), "nx": int(lon.size),
-            "lon_digest": hashlib.sha256(lon.tobytes()).hexdigest(),
-            "lat_digest": hashlib.sha256(lat.tobytes()).hexdigest(),
-            "region": [int(x) for x in g.attrs.get("region", [])]}
+    region = attrs.get("region", [])
+    if region is not None and type(region) is not list:
+        raise ManifestError(f"{store_path}: attrs['region'] must be a list")
+
+    return StoreInspection(
+        token=_INSPECTION_TOKEN, path=store_path,
+        days=tuple(raw_days), vars=tuple(sorted(raw_vars)), var_valid=var_valid,
+        var_valid_implicit=implicit, arrays=tuple(arrays),
+        ny=int(lat.size), nx=int(lon.size),
+        lon_digest=hashlib.sha256(lon.tobytes()).hexdigest(),
+        lat_digest=hashlib.sha256(lat.tobytes()).hexdigest(),
+        region=tuple(int(x) for x in (region or ())))
 
 
-def metadata_fingerprint(store_path: str) -> str:
-    """sha256 over a segment's structural AND semantic metadata: axes, region, variables,
-    per-array shape/chunks/shards/dtype/fill_value, and a digest of each `var_valid` vector
-    (its CONTENT, not merely its length -- a single flipped flag changes what the API returns
-    for that day).
+def _require_inspection(inspection) -> StoreInspection:
+    if not isinstance(inspection, StoreInspection) or inspection.token is not _INSPECTION_TOKEN:
+        raise ManifestError(
+            "expected a StoreInspection produced by inspect_store_contract(); a hand-built "
+            "look-alike would bypass the strict validation this exists to guarantee")
+    return inspection
 
-    This is `fingerprint.metadata` in the manifest. It is what makes a manifest entry
-    falsifiable against the store it names -- a day set alone cannot detect a block that was
-    built on a different grid."""
-    import numpy as np
-    import zarr
-    g = zarr.open_group(store_path, mode="r")
-    vars_ = sorted(g.attrs.get("vars", []))
-    for v in vars_:
-        if v not in g:
-            raise ManifestError(
-                f"{store_path}: cannot fingerprint -- declared variable {v!r} has no array. "
-                f"A builder must not be able to produce a manifest for a broken store.")
-    var_valid = {k: list(v) for k, v in dict(g.attrs.get("var_valid", {}) or {}).items()}
-    axes = store_axes(store_path)
+
+def segment_layout_from_inspection(inspection) -> dict:
+    insp = _require_inspection(inspection)
+    _, _, chunks, shards, _, _ = insp.arrays[0]
+    return {"time_chunk": int(chunks[0]), "spatial_chunk": int(chunks[-1]),
+            "shard": [int(x) for x in shards] if shards else None}
+
+
+def metadata_fingerprint_from_inspection(inspection) -> str:
+    """sha256 over a VALIDATED segment's structural and semantic metadata: axes, region,
+    variables, per-array shape/chunks/shards/dtype/fill, and each `var_valid` vector's
+    CONTENT (not merely its length -- one flipped flag changes what the API returns)."""
+    insp = _require_inspection(inspection)
     doc = {
-        "axes": axes,
-        "vars": vars_,
-        "arrays": {v: {"shape": [int(x) for x in g[v].shape],
-                       "chunks": [int(x) for x in g[v].chunks],
-                       "shards": ([int(x) for x in g[v].shards]
-                                  if getattr(g[v], "shards", None) else None),
-                       "dtype": str(g[v].dtype),
-                       "fill_is_nan": bool(g[v].fill_value is not None and np.isnan(
-                           np.asarray(g[v].fill_value, dtype="float64")))}
-                   for v in vars_},
-        # var_valid CONTENT, not just its length. A single flipped flag turns a day from
-        # "returns sst" into "omits sst" -- an API-visible semantic change inside a block
-        # that claims to be immutable. Length alone cannot see it.
-        # RAW values, not `bool(x)`: coercing here would make a poisoned entry hash the same
-        # as a correct one, which is precisely how a bad type slips past.
+        "axes": {"ny": insp.ny, "nx": insp.nx, "lon_digest": insp.lon_digest,
+                 "lat_digest": insp.lat_digest, "region": list(insp.region)},
+        "vars": list(insp.vars),
+        "arrays": {v: {"shape": list(shape), "chunks": list(chunks),
+                       "shards": list(shards) if shards else None,
+                       "dtype": dtype, "fill_is_nan": fill_is_nan}
+                   for (v, shape, chunks, shards, dtype, fill_is_nan) in insp.arrays},
         "var_valid_digest": {v: hashlib.sha256(
-            canonical_json(list(var_valid.get(v, []))).encode()).hexdigest()
-            for v in vars_},
-        "var_valid_len": {v: len(var_valid.get(v, [])) for v in vars_},
-        # NOTE: the day set is deliberately NOT included here. It is covered by
-        # `fingerprint.day_digest` and by the explicit day-set comparison at snapshot build.
-        # Duplicating it would make this fingerprint fire first and rob those checks of their
-        # isolating test -- the same vacuous-test trap that bit the H2 gate earlier.
+            canonical_json(list(flags)).encode()).hexdigest() for v, flags in insp.var_valid},
+        "var_valid_len": {v: len(flags) for v, flags in insp.var_valid},
+        "var_valid_implicit": insp.var_valid_implicit,
+        # NOTE: the day set is deliberately NOT included. It is covered by
+        # `fingerprint.day_digest` and the explicit day-set comparison at snapshot build;
+        # duplicating it here would make this fingerprint fire first and rob those checks of
+        # their isolating test.
     }
     return hashlib.sha256(canonical_json(doc).encode()).hexdigest()
+
+
+def segment_layout(store_path: str, *, allow_implicit_var_valid: bool = False) -> dict:
+    """The layout a segment ACTUALLY has -- via the strict inspection, never a direct read."""
+    return segment_layout_from_inspection(
+        inspect_store_contract(store_path,
+                               allow_implicit_var_valid=allow_implicit_var_valid))
+
+
+def metadata_fingerprint(store_path: str, *, allow_implicit_var_valid: bool = False) -> str:
+    """Public entry point: inspect strictly, then fingerprint.
+
+    A builder must not be able to mint a manifest for a store that violates the contract, so
+    this refuses every malformed store rather than only the missing-array case. The legacy
+    allowance is an explicit argument because a fingerprint has no segment context to infer
+    it from."""
+    return metadata_fingerprint_from_inspection(
+        inspect_store_contract(store_path,
+                               allow_implicit_var_valid=allow_implicit_var_valid))
+
+
+def store_axes(store_path: str, *, allow_implicit_var_valid: bool = False) -> dict:
+    insp = inspect_store_contract(store_path,
+                                  allow_implicit_var_valid=allow_implicit_var_valid)
+    return {"ny": insp.ny, "nx": insp.nx, "lon_digest": insp.lon_digest,
+            "lat_digest": insp.lat_digest, "region": list(insp.region)}
 
 
 # --------------------------------------------------------------------------- publish/rollback

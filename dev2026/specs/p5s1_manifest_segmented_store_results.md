@@ -10,8 +10,8 @@ Implements P5-S1 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Manifest: [`../store/block_manifest.py`](../store/block_manifest.py)
 - Segmented store: [`../store/segmented_cube.py`](../store/segmented_cube.py)
 - Fixtures (F1–F3, F6, F11, F12): [`../tests/p5_fixtures.py`](../tests/p5_fixtures.py)
-- Tests: [`../tests/test_phase2_p5s1.py`](../tests/test_phase2_p5s1.py) — **64/64 green**
-- Full local suite: **342 tests OK** (17 skipped), up from 278; no regressions.
+- Tests: [`../tests/test_phase2_p5s1.py`](../tests/test_phase2_p5s1.py) — **73/73 green**
+- Full local suite: **351 tests OK** (17 skipped), up from 278; no regressions.
 
 ## 1. Gate
 
@@ -170,6 +170,25 @@ the finding that actually matters:
 Absent `var_valid` now needs an **explicit, checkable migration mode**: `var_valid_mode:
 "implicit_all_true"`, permitted **only** on a `legacy_base` segment. Silent inference is what
 made a malformed store valid in the first place.
+
+A **fourth** round closed the last two bypasses around the validator — and they are the ones
+that matter, because until they were closed the "single raw-state validator" was not actually
+single:
+
+| bypass | what got through | now |
+|---|---|---|
+| **Container coercion** — `list()` / `dict()` ran before the type was confirmed | `var_valid` written as a JSON **list-of-pairs** was laundered into a dict; duplicate keys inside it would have been resolved to the last one, silently | `_exact()` requires `type(x) is list` / `is dict` / `is str` **before any conversion**; `days` elements must parse as ISO dates; `vars` elements must be `str`; `var_valid` flags must be a `list` |
+| **The fingerprint path skipped the validator entirely** — it read the store directly | a builder could still mint a manifest for non-boolean `var_valid`, duplicate `vars`, or `fill_value=0`; only the missing-array case was covered | one path only: `inspect_store_contract()` → `metadata_fingerprint_from_inspection()`. The public `metadata_fingerprint()` inspects strictly first, and the legacy allowance is an **explicit argument** because a fingerprint has no segment context to infer it from |
+
+`StoreInspection` carries a module-private token that only `inspect_store_contract` sets, and
+`metadata_fingerprint_from_inspection` refuses anything else — a hand-built look-alike cannot
+side-step the strict path.
+
+**Snapshot ordering was also corrected.** The build used to construct a `TimeCubeStore` first
+and validate raw state afterwards. It still failed closed, but it broke the model. The order is
+now: **inspect → verify grid/axes/layout/fingerprint/day-set against that one view → construct
+the reader → assert the reader's metadata equals the inspection.** A test installs a tripwire
+`TimeCubeStore` and requires that it is never constructed for a malformed store.
 
 **A note on why fingerprints alone are not enough.** When a manifest is generated from the
 store it describes — which is exactly what S3's builder will do — `fingerprint.metadata`
