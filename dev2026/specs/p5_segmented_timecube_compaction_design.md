@@ -271,7 +271,7 @@ advance on argument alone; each of these must be measured by a committed harness
 |---|---|---|---|---|
 | **H1** | Rewriting one day inside an existing full 90-day base block rewrites ~100 % of that block's shards (≈ 90× write amplification), because every shard spans the full time block. | shard files rewritten + bytes rewritten for a single-day write into a complete block | S0 | Candidate A becomes viable; re-open §3-A. |
 | **H2** | Appending one day into a **partial** tail shard rewrites the whole partial shard, so growing a block day-by-day from 1→S days costs ≈ `(S+1)/2 ×` the block's final size. | bytes rewritten per append at tail lengths 1, 15, 30, 60, 89 | S0 | Per-day tail append is affordable → §7 simplifies to incremental extension. |
-| **H3** | Segmentation does **not** change `chunk_count` or `decompressed_bytes` for a point/range read; it adds only a **per-segment array-call overhead** that is roughly linear in the number of segments touched. | chunk_count, decompressed_bytes, p50/p95 for a fixed-length point read served from 1/12/24/36 segments | S0, S6 | If decompressed bytes grow with segmentation, block sizes < 90 d are vetoed outright. |
+| **H3** *(refined by P5-S0)* | Segmentation **preserves `decompressed_bytes`** for a point/range read in every regime; **`chunk_count` is invariant only while the inner time chunk is unchanged** (blocks ≥ `time_chunk`). A sub-90-day block necessarily shrinks the inner time chunk, raising `chunk_count` at constant `decompressed_bytes` — the §10.4 sizing trade, **not** an H3 violation. Beyond that, segmentation adds only a **per-segment array-call overhead** roughly linear in the number of segments touched. | chunk_count, decompressed_bytes, p50/p95 for a fixed-length point read served from 1/12/24/36 segments, measured separately in the constant-time-chunk and shrinking-time-chunk regimes | S0, S6 | If **decompressed bytes** grow with segmentation, block sizes < 90 d are vetoed outright. |
 | **H4** | With **immutable versioned block paths**, a reader holding an older snapshot observes **stable-old** values across a manifest generation change — never the S8a silent-mixing or silent-`None` outcome. | adversarial concurrency proof test: reader holds snapshot, publisher publishes generation N+1, reader re-reads pre-refresh | S5 | **P5's central safety claim fails** → segmented publication needs the same PM2 quiescence as a delta swap, and §8's "no-downtime publish" is withdrawn. |
 | **H5** | Point/range latency grows monotonically with **delta span** (delta days in the requested range), so bounding delta span is a read-performance requirement, not only a disk one. | p50/p95 for a 366-day range crossing delta at delta spans 31 / 45 / 64 / 90 / 124 days | S0, S6 | Cadence may be relaxed toward C = S (fewer compactions). |
 | **H6** | Peak compaction temp disk equals **one block + margin**, independent of total base size, and never approaches a second full base. | measured peak staging bytes + `df` delta during a tail-block build | S3 | The whole premise of P5 fails; fall back to O1/O3 + provisioned disk. |
@@ -343,7 +343,10 @@ sizes (929–936 KB/day at 512², i.e. block size does not change storage effici
 | 36 | 30 | 35.40 ms | 37.51 ms | 7.35× | 47.80 ms |
 
 Two readings matter. (i) The tax is **per segment touched**, ≈ **0.65 ms per extra array call** at this
-grid — and total decompressed bytes are unchanged, supporting **H3**. (ii) **Opening the stores per request
+grid — and total decompressed bytes are unchanged, supporting **H3**. (Note the refinement P5-S0 later
+measured: `decompressed_bytes` is preserved in *every* regime, while `chunk_count` is invariant only while
+the inner time chunk is unchanged — the rows above hold the time chunk at 90, so both are invariant here.)
+(ii) **Opening the stores per request
 adds a further ~30–35 %** (12 segments: 12.03 → 16.39 ms) — so the read path **must** cache handles in the
 snapshot and must **never** open a store per day or per request (§6).
 
@@ -1643,10 +1646,13 @@ never run.
 
 ### 10.4 Read-latency projection [MODEL] — the sizing tension
 
-Decompressed bytes for a 366-day point read are essentially invariant to block size (chunk `(S',8,8)` with
+Decompressed bytes for a 366-day point read are invariant to block size (chunk `(S',8,8)` with
 `S' = min(90,S)`: 5 × 23 040 B at S=90, 9 × 11 520 B at S=45, 13 × 7 680 B at S=30 — 115 / 104 / 100 KB per
-var). Only the **number of array calls** changes. Applying the [PROBE] marginal cost of **0.65 ms per extra
-segment call** to the [VM24] 366-day baseline of 76–100 ms, over 3 variables:
+var). Only the **number of array calls** and the **chunk count** change — the H3 refinement (§2) states this
+precisely, and P5-S0 measured it directly: at 90 / 45 / 30-day blocks over the same 360 days,
+`chunk_count` rose 4 → 8 → 12 while `decompressed_bytes` stayed at **exactly 92 160 B**
+([`p5s0_baseline_results.md`](p5s0_baseline_results.md) §4b). Applying the marginal cost of **0.65 ms per
+extra segment call** to the [VM24] 366-day baseline of 76–100 ms, over 3 variables:
 
 | S | extra segment calls (3 vars) | projected added latency | projected regression vs baseline |
 |---|---|---|---|
