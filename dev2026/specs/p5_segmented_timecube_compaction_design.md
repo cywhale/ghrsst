@@ -1930,7 +1930,10 @@ condition. Steps S0–S7 are **local-only**; S8–S10 are the VM24 boundary (§1
   to accept a segmented base **and to capture ONE composite snapshot per request** —
   `TieredSnapshot(base_snapshot, delta_snapshot, day_source_map)`, resolved once at entry, so a base
   manifest refresh or a delta refresh landing mid-request cannot mix generations across tiers (**R1**;
-  P5-S1 proved only *static* composition); fixtures F4–F9, **F18**.
+  P5-S1 proved only *static* composition); fixtures F4–F9, **F18**. **`assert_disjoint_from(delta_path)`
+  must be called by the assembly itself** — `TieredCube`/`TieredSnapshot` construction fails closed if any
+  base segment resolves to the delta path. P5-S1 shipped it as an optional helper, which relies on an
+  operator remembering; an invariant that depends on memory is not an invariant.
 - **Tests:** G1 semantic equality on every fixture; append-order (F4); overlap (F5); gap (F6); absent var
   across a boundary (F7); NaN (F8); `mixed` (F9); **assert one array call per (segment,var)** — a test that
   counts calls and fails on per-day access.
@@ -2100,6 +2103,7 @@ lost between phases — an unowned risk is one that gets rediscovered in product
 
 | # | risk | why it is not settled by any single step | implement | gate / prove | status |
 |---|---|---|---|---|---|
+| **R1a** | **Base/delta disjointness is not enforced at assembly.** `SegmentedCubeStore.assert_disjoint_from(delta_path)` exists (P5-S1) but is an *optional* call. A base segment that resolves to the delta path would serve delta bytes as immutable base, and nothing forces the check. | The store cannot see the delta by design (§4.0), so only the composing layer can enforce it. | **S2** — `TieredCube`/`TieredSnapshot` construction calls it unconditionally and fails closed. | **G1/G12** plus a construction-time negative test. | **OPEN** |
 | **R1** | **Composite base+delta snapshot.** `TieredCube.point_series` consults delta membership and then calls base and delta separately; it never captures **one composite snapshot** for a request. Each tier is individually immutable, but a base manifest refresh *or* a delta refresh landing mid-request could mix generations across tiers. P5-S1 proved only *static* composition (fixed base snapshot + fixed delta snapshot ⇒ correct precedence and order). | Needs a read-path change (S2) **and** an adversarial proof (S5); neither alone closes it. | **S2** — a request-level `TieredSnapshot(base_snapshot, delta_snapshot, day_source_map)` captured once per request. | **S5 / G10** — pause a request, refresh base and/or delta, resume: the result must be a **complete-old** or **complete-new** view, never a mix. | **OPEN** — S1 explicitly does *not* claim this. |
 | **R2** | **Superseded / hold cleanup, and the alarm for forgetting it.** `superseded[]` is cumulative (§5.6) and hard delete is ops-only after `hold_until`. Nothing yet *notices* when entries accumulate past their `release_after_utc` / `hold_until_utc`, so disk silently fills and §7.1c's `pinned_existing` forecast drifts from reality. | The data model is S1/S4; the operational detection is an ops audit; the disk consequence is S6/S7. | **S4** — lifecycle transitions (`referenced → releasable → held`) written on publish. | **G19**, plus an **S8 ops audit** line reporting overdue entries alongside `delta_span` / `free_disk` (§16-Q6, Q11). | **OPEN** |
 | **R3** | **Multi-store RSS / file descriptors / snapshot-open cost.** A segmented base holds N `TimeCubeStore` handles instead of one, and the block tree reaches ~6.6 M files at +10 y (§10.6). Per-request fd churn, snapshot build time on process start, and metadata-scan cost all scale with segment count. | S1 builds the snapshot but measures nothing; the cost only appears at realistic segment counts and concurrency. | **S2** (grouped reads, no per-request opens) | **H7 / G6 / G16** at **S6** (5/13/41/82/122 segments) and **S7** (C=1/4/8/16 under sustained load). | **OPEN** |
