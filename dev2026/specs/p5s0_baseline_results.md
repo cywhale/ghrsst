@@ -10,7 +10,7 @@ Implements P5-S0 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Primitives: [`../bench/p5_cost.py`](../bench/p5_cost.py)
 - Hypothesis harness: [`../bench/bench_p5_rmw.py`](../bench/bench_p5_rmw.py) → [`../bench/results/p5s0_rmw.json`](../bench/results/p5s0_rmw.json)
 - Baseline of record: [`../bench/bench_p5_baseline.py`](../bench/bench_p5_baseline.py) → [`../bench/results/p5s0_baseline.json`](../bench/results/p5s0_baseline.json)
-- Self-tests: [`../tests/test_phase2_p5s0.py`](../tests/test_phase2_p5s0.py) — **17/17 green**
+- Self-tests: [`../tests/test_phase2_p5s0.py`](../tests/test_phase2_p5s0.py) — **20/20 green**
 
 ## 0. Why this step existed
 
@@ -66,14 +66,24 @@ fail certifies nothing.**
 ## 2. H1 — one-day write inside a full block  ✅ REPRODUCED
 
 Geometry read back from disk: `chunks=(90,8,8)`, `shards=(90,128,128)`, 512×512, 90 days.
+**Data shards and metadata are counted separately, and the gate uses data shards only.**
 
 | quantity | measured |
 |---|---|
-| block on disk | 16 shards, 83.68 MB |
-| shards rewritten by a single-day write | **16 / 16 (100 %)** |
-| bytes rewritten | **83.68 MB** |
-| **amplification vs one day's logical bytes** | **90.0×** |
+| block on disk | 16 data shards, 83.68 MB |
+| **data shards rewritten** by a single-day write | **16 / 16 (100 %)** |
+| metadata files changed | **0** (an in-place overwrite does not resize) |
+| **data bytes rewritten** | **83.68 MB** |
+| average **stored** (compressed) bytes/day | 0.930 MB |
+| **logical uncompressed** bytes/var-day | 1.049 MB |
+| **amplification vs the average stored day** | **90.0×** ← gate basis |
+| amplification vs one uncompressed var-day | 79.8× |
 | wall time | 576 ms |
+
+The two amplification bases answer different questions and are both reported:
+`stored_bytes / L` is the average **compressed on-disk** bytes per day, not logical
+uncompressed bytes per day. They differ by the compression ratio (here ~1.13× on
+deliberately incompressible random data; on real MUR the gap is much wider).
 
 Matches the scratch probe exactly (90.0×) and matches the Zarr v3 sharding spec: updating a
 subset of inner chunks requires re-emitting the whole shard, and the byte-range partial-write
@@ -86,17 +96,23 @@ optimization needs **fixed-size (uncompressed)** inner chunks, which we do not h
 Each row builds an `L`-day block that declares the **full** 90-day time block (the
 in-place-growth configuration), then appends day `L+1`.
 
-| tail length | block on disk | bytes rewritten | amplification | shard files rewritten |
-|---|---|---|---|---|
-| 1 d | 1.21 MB | 2.29 MB | 1.9× | 17 |
-| 15 d | 14.29 MB | 15.41 MB | 16.2× | 17 |
-| 30 d | 28.58 MB | 29.15 MB | **30.6×** | 17 |
-| 60 d | 56.84 MB | 57.33 MB | 60.5× | 17 |
-| 89 d | 83.77 MB | 82.79 MB | 88.0× | 17 |
+| tail length | data shards rewritten | metadata changed | data bytes rewritten | amp vs stored day | amp vs uncompressed day |
+|---|---|---|---|---|---|
+| 1 d | 16 / 16 | 1 | 2.29 MB | 1.9× | 2.2× |
+| 15 d | 16 / 16 | 1 | 15.41 MB | 16.2× | 14.7× |
+| 30 d | 16 / 16 | 1 | 29.15 MB | **30.6×** | 27.8× |
+| 60 d | 16 / 16 | 1 | 57.33 MB | 60.5× | 54.7× |
+| 89 d | 16 / 16 | 1 | 82.79 MB | 88.0× | 79.0× |
 
 Amplification tracks the tail length exactly — the append rewrites the whole partial shard
 every time. Growing a 90-day block one day at a time therefore costs `Σ(1..90)` day-writes
 = **45.5×** the block's final size.
+
+> **The metadata column is why this table changed.** An earlier version reported "17 shard
+> files rewritten", which was 16 data shards **plus the resized array's `zarr.json`**. The
+> array `resize()` necessarily rewrites metadata; folding it into the shard count overstates
+> the shard count by one and muddles a data-amplification claim with a metadata write. The
+> two are now separate fields, and **the H1/H2 gates use data-shard metrics only**.
 
 > **Note on scope.** This is the cost of the *rejected* in-place-growth alternative. A
 > **published** unsealed block is created at its materialized size (§7.2), so the steady-state
@@ -164,18 +180,38 @@ zarr-python 3.3 unchanged.
 ## 6. Baseline of record for gate G3
 
 Current `TieredCube` (base `s8/t90/shard128` + delta `t1/s256`), synthetic fixture on
-production chunk geometry, 256×256 grid, 360 base days + 64 delta days, 3 variables, warm.
+production chunk geometry, 256×256 grid, **450 base days** + 64 delta days, 3 variables, warm.
 
-| case | days | p50 | **p95** | chunk_count | read_amp |
-|---|---|---|---|---|---|
-| single historical day point | 1 | 2.28 ms | **2.43 ms** | 3 | — |
-| 366-day range, base only | 360 | 5.64 ms | **6.00 ms** | 12 | 64× |
-| crossing range, delta span 31 d | 366 | 37.5 ms | **39.1 ms** | 93 delta chunks | — |
-| crossing range, delta span 45 d | 366 | 51.2 ms | **56.3 ms** | 135 delta chunks | — |
-| crossing range, delta span 64 d | 366 | 69.5 ms | **70.2 ms** | 192 delta chunks | — |
+| case | days | index window read | p50 | **p95** | chunk_count | read_amp |
+|---|---|---|---|---|---|---|
+| single historical day point | 1 | `[225, 226]` | 2.29 ms | **2.55 ms** | 3 | 5 760× |
+| 366-day range, base only | **366** | `[84, 450]` | 6.78 ms | **7.23 ms** | 15 | 78.7× |
+| crossing range, delta span 31 d | 366 | base `[115, 450]` + delta `[0, 31]` | 37.4 ms | **43.0 ms** | 12 base + 93 delta | — |
+| crossing range, delta span 45 d | 366 | base `[129, 450]` + delta `[0, 45]` | 51.1 ms | **55.3 ms** | 12 base + 135 delta | — |
+| crossing range, delta span 64 d | 366 | base `[148, 450]` + delta `[0, 64]` | 69.1 ms | **71.4 ms** | 12 base + 192 delta | — |
 
 **These three p95 values are the G3 reference** (`g3_reference_p95_ms` in the artifact). The
 segmented store must land within **+25 %** of them on the same fixture.
+
+> **Two measurement corrections changed this table** (they moved the numbers, so the earlier
+> version must not be cited):
+>
+> 1. **The "366-day" case was actually 360 days.** `base_days` defaulted to 360 and the case
+>    took `min(366, base_days)`, so it silently measured 360. `base_days` now defaults to
+>    **450**, the harness **refuses to run below 366**, and the case hard-asserts exactly 366
+>    days requested *and* 366 rows returned.
+> 2. **`_analytic()` measured `t0=0` while every request reads the TAIL.** The pure-base case
+>    reads the last 366 days and the crossing case the last `366 − span`; measuring from index
+>    0 reports the wrong chunk alignment. `_analytic` now takes the exact `t0`/`t1` the request
+>    uses, and the artifact records the `index_window` for every case so the pairing is
+>    auditable.
+>
+> Effect: the base-only case moved from 12 chunks / 5.64 ms p50 to **15 chunks / 6.78 ms p50**,
+> and `read_amplification` from 64.0× to **78.7×**. The direction of every conclusion is
+> unchanged; the magnitudes are now correct. A dedicated test
+> (`test_analytic_tail_window_on_non_aligned_array_matches_observed`) pins the analytic cost
+> against observed chunk keys at five offsets on a **205-day** (non-90-aligned) array,
+> including a clipped final chunk, so an offset or clipping mistake can no longer hide.
 
 ### 6.1 H5 is visible in the baseline
 
@@ -200,7 +236,7 @@ for preferring a smaller `C`.
 
 | stop condition (§14 P5-S0) | outcome |
 |---|---|
-| harness cannot reproduce H1 | **not triggered** — 90.0×, 16/16 shards |
+| harness cannot reproduce H1 | **not triggered** — 90.0× vs the average stored day, 16/16 data shards |
 | harness cannot reproduce H2 | **not triggered** — amplification tracks tail length; 45.5× projected |
 | fixture geometry cannot validate itself | **not triggered** — read back from disk, mismatch raises |
 | counters cannot validate themselves | **not triggered** — analytic == observed chunk keys; two counter defects found and fixed *before* any result was believed |
@@ -230,8 +266,8 @@ dev2026/.venv/bin/python dev2026/bench/bench_p5_baseline.py --out dev2026/bench/
 
 ## 10. For Codex
 
-1. **Spec wording refinement (§2 H3, editorial):** adopt the refined H3 statement in §4 above.
-   Evidence attached; no architecture impact.
+1. **Spec wording refinement (§2 H3, editorial):** the refined H3 statement in §4 above has
+   been applied to the design spec on `dev2026-p5-segmented-compaction-design`.
 2. **Artifacts committed:** `p5s0_rmw.json`, `p5s0_baseline.json` — both carry `provenance`,
    `env` (zarr/python/platform) and the geometry read back from disk.
 3. **Next:** P5-S1 (manifest schema + segmented-store prototype), which is the first step that

@@ -2,20 +2,25 @@
   "cases": {
     "range_366d_base_only": {
       "analytic": {
-        "chunk_count": 12,
-        "decompressed_bytes": 276480,
-        "read_amplification": 64.0,
-        "useful_bytes": 4320
+        "chunk_count": 15,
+        "days": 366,
+        "decompressed_bytes": 345600,
+        "index_window": [
+          84,
+          450
+        ],
+        "read_amplification": 78.7,
+        "useful_bytes": 4392
       },
-      "days": 360,
+      "days": 366,
       "latency": {
-        "max_ms": 5.997,
-        "min_ms": 5.462,
-        "p50_ms": 5.637,
-        "p95_ms": 5.997,
+        "max_ms": 7.229,
+        "min_ms": 6.468,
+        "p50_ms": 6.778,
+        "p95_ms": 7.229,
         "repeats": 15
       },
-      "rows_returned": 360,
+      "rows_returned": 366,
       "tier": "base"
     },
     "range_366d_crossing": {
@@ -23,22 +28,32 @@
         {
           "analytic_base": {
             "chunk_count": 12,
+            "days": 335,
             "decompressed_bytes": 276480,
+            "index_window": [
+              115,
+              450
+            ],
             "read_amplification": 68.8,
             "useful_bytes": 4020
           },
           "analytic_delta": {
             "chunk_count": 93,
+            "days": 31,
             "decompressed_bytes": 24379392,
+            "index_window": [
+              0,
+              31
+            ],
             "read_amplification": 65536.0,
             "useful_bytes": 372
           },
           "delta_span_days": 31,
           "latency": {
-            "max_ms": 39.106,
-            "min_ms": 36.052,
-            "p50_ms": 37.519,
-            "p95_ms": 39.106,
+            "max_ms": 43.033,
+            "min_ms": 35.65,
+            "p50_ms": 37.386,
+            "p95_ms": 43.033,
             "repeats": 15
           },
           "rows_returned": 366,
@@ -47,22 +62,32 @@
         {
           "analytic_base": {
             "chunk_count": 12,
+            "days": 321,
             "decompressed_bytes": 276480,
+            "index_window": [
+              129,
+              450
+            ],
             "read_amplification": 71.8,
             "useful_bytes": 3852
           },
           "analytic_delta": {
             "chunk_count": 135,
+            "days": 45,
             "decompressed_bytes": 35389440,
+            "index_window": [
+              0,
+              45
+            ],
             "read_amplification": 65536.0,
             "useful_bytes": 540
           },
           "delta_span_days": 45,
           "latency": {
-            "max_ms": 56.291,
-            "min_ms": 50.054,
-            "p50_ms": 51.15,
-            "p95_ms": 56.291,
+            "max_ms": 55.281,
+            "min_ms": 50.072,
+            "p50_ms": 51.062,
+            "p95_ms": 55.281,
             "repeats": 15
           },
           "rows_returned": 366,
@@ -71,22 +96,32 @@
         {
           "analytic_base": {
             "chunk_count": 12,
+            "days": 302,
             "decompressed_bytes": 276480,
+            "index_window": [
+              148,
+              450
+            ],
             "read_amplification": 76.3,
             "useful_bytes": 3624
           },
           "analytic_delta": {
             "chunk_count": 192,
+            "days": 64,
             "decompressed_bytes": 50331648,
+            "index_window": [
+              0,
+              64
+            ],
             "read_amplification": 65536.0,
             "useful_bytes": 768
           },
           "delta_span_days": 64,
           "latency": {
-            "max_ms": 70.211,
-            "min_ms": 68.799,
-            "p50_ms": 69.459,
-            "p95_ms": 70.211,
+            "max_ms": 71.411,
+            "min_ms": 68.509,
+            "p50_ms": 69.12,
+            "p95_ms": 71.411,
             "repeats": 15
           },
           "rows_returned": 366,
@@ -98,16 +133,21 @@
     "single_day_point": {
       "analytic": {
         "chunk_count": 3,
+        "days": 1,
         "decompressed_bytes": 69120,
+        "index_window": [
+          225,
+          226
+        ],
         "read_amplification": 5760.0,
         "useful_bytes": 12
       },
       "days": 1,
       "latency": {
-        "max_ms": 2.43,
-        "min_ms": 2.192,
-        "p50_ms": 2.282,
-        "p95_ms": 2.43,
+        "max_ms": 2.548,
+        "min_ms": 2.259,
+        "p50_ms": 2.294,
+        "p95_ms": 2.548,
         "repeats": 15
       },
       "tier": "base"
@@ -119,9 +159,9 @@
     "zarr": "3.2.1"
   },
   "fixture": {
-    "base_bytes": 223025478,
-    "base_days": 360,
-    "base_files": 56,
+    "base_bytes": 278780741,
+    "base_days": 450,
+    "base_files": 68,
     "base_geometry": {
       "sea_ice": {
         "chunks": [
@@ -131,7 +171,7 @@
         ],
         "dtype": "float32",
         "shape": [
-          360,
+          450,
           256,
           256
         ],
@@ -149,7 +189,7 @@
         ],
         "dtype": "float32",
         "shape": [
-          360,
+          450,
           256,
           256
         ],
@@ -167,7 +207,7 @@
         ],
         "dtype": "float32",
         "shape": [
-          360,
+          450,
           256,
           256
         ],
@@ -180,7 +220,7 @@
     },
     "base_span": [
       "2024-01-01",
-      "2024-12-25"
+      "2025-03-25"
     ],
     "delta_bytes": 42371726,
     "delta_days": 64,
@@ -242,8 +282,8 @@
       }
     },
     "delta_span": [
-      "2024-12-26",
-      "2025-02-27"
+      "2025-03-26",
+      "2025-05-28"
     ],
     "grid": [
       256,
@@ -251,9 +291,9 @@
     ]
   },
   "g3_reference_p95_ms": {
-    "range_366d_base_only": 5.997,
-    "range_366d_crossing_min_delta": 39.106,
-    "single_day_point": 2.43
+    "range_366d_base_only": 7.229,
+    "range_366d_crossing_min_delta": 43.033,
+    "single_day_point": 2.548
   },
   "grid_index": [
     127,
@@ -267,8 +307,8 @@
   "provenance": "COMMITTED harness, synthetic fixture on production chunk geometry, local, warm. NOT a VM24 measurement and not binding performance.",
   "role": "BASELINE OF RECORD for gate G3 (point p95 within +25 % of current TieredCube)",
   "rss_mb": {
-    "end": 236.9,
-    "start": 234.9
+    "end": 236.2,
+    "start": 234.8
   },
   "step": "P5-S0"
 }

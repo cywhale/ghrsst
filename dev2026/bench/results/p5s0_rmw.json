@@ -18,11 +18,13 @@
     512
   ],
   "h1": {
-    "amplification_vs_one_day": 90.0,
+    "amplification_vs_average_stored_day": 90.0,
+    "amplification_vs_uncompressed_day": 79.8,
+    "average_stored_bytes_per_day": 929783,
     "block_days": 90,
-    "build_bytes": 83681722,
-    "build_files": 18,
-    "bytes_rewritten": 83680539,
+    "data_bytes_rewritten": 83680539,
+    "data_shard_files_rewritten": 16,
+    "data_shard_files_total": 16,
     "geometry": {
       "chunks": [
         90,
@@ -43,58 +45,78 @@
     },
     "h1_confirmed": true,
     "hypothesis": "H1",
-    "note": "H1 holds when a one-day write rewrites every shard spanning the block, i.e. amplification approaches time_chunk.",
-    "one_day_logical_bytes": 929796,
-    "shard_files_rewritten": 16,
-    "shard_files_total": 16,
-    "write_ms": 577.359
+    "logical_uncompressed_bytes_per_day": 1048576,
+    "metadata_files_changed": 0,
+    "note": "H1 holds when a one-day write rewrites every DATA shard spanning the block, i.e. amplification approaches time_chunk. The gate uses data-shard metrics only; metadata churn is reported separately. Two amplification bases are given because they answer different questions: vs the average STORED (compressed) day, and vs one uncompressed var-day.",
+    "stored_data_bytes": 83680474,
+    "write_ms": 566.669
   },
   "h2": {
     "h2_confirmed": true,
     "hypothesis": "H2",
     "monotonic_in_tail_length": true,
-    "note": "Growing a block one day at a time costs sum(1..S) day-writes ~= (S+1)/2 x the block's final size -- the measured basis for rejecting candidate A.",
+    "note": "Growing a block one day at a time costs sum(1..S) day-writes ~= (S+1)/2 x the block's final size -- the measured basis for rejecting candidate A. The gate uses DATA-shard metrics; the array resize also rewrites `zarr.json`, counted separately as metadata_files_changed.",
     "projected_day_by_day_block_cost_x": 45.5,
     "rewrites_whole_partial_shard": true,
     "rows": [
       {
-        "amplification_vs_one_day": 1.9,
-        "base_bytes": 1213725,
-        "bytes_rewritten": 2287515,
-        "one_day_logical_bytes": 1213725,
-        "shard_files_rewritten": 17,
+        "amplification_vs_average_stored_day": 1.9,
+        "amplification_vs_uncompressed_day": 2.2,
+        "average_stored_bytes_per_day": 1212478,
+        "data_bytes_rewritten": 2286334,
+        "data_shard_files_rewritten": 16,
+        "data_shard_files_total": 16,
+        "logical_uncompressed_bytes_per_day": 1048576,
+        "metadata_files_changed": 1,
+        "stored_data_bytes": 1212478,
         "tail_len": 1
       },
       {
-        "amplification_vs_one_day": 16.2,
-        "base_bytes": 14289719,
-        "bytes_rewritten": 15414478,
-        "one_day_logical_bytes": 952647,
-        "shard_files_rewritten": 17,
+        "amplification_vs_average_stored_day": 16.2,
+        "amplification_vs_uncompressed_day": 14.7,
+        "average_stored_bytes_per_day": 952564,
+        "data_bytes_rewritten": 15413296,
+        "data_shard_files_rewritten": 16,
+        "data_shard_files_total": 16,
+        "logical_uncompressed_bytes_per_day": 1048576,
+        "metadata_files_changed": 1,
+        "stored_data_bytes": 14288471,
         "tail_len": 15
       },
       {
-        "amplification_vs_one_day": 30.6,
-        "base_bytes": 28582839,
-        "bytes_rewritten": 29154404,
-        "one_day_logical_bytes": 952761,
-        "shard_files_rewritten": 17,
+        "amplification_vs_average_stored_day": 30.6,
+        "amplification_vs_uncompressed_day": 27.8,
+        "average_stored_bytes_per_day": 952719,
+        "data_bytes_rewritten": 29153222,
+        "data_shard_files_rewritten": 16,
+        "data_shard_files_total": 16,
+        "logical_uncompressed_bytes_per_day": 1048576,
+        "metadata_files_changed": 1,
+        "stored_data_bytes": 28581591,
         "tail_len": 30
       },
       {
-        "amplification_vs_one_day": 60.5,
-        "base_bytes": 56842015,
-        "bytes_rewritten": 57327370,
-        "one_day_logical_bytes": 947366,
-        "shard_files_rewritten": 17,
+        "amplification_vs_average_stored_day": 60.5,
+        "amplification_vs_uncompressed_day": 54.7,
+        "average_stored_bytes_per_day": 947346,
+        "data_bytes_rewritten": 57326188,
+        "data_shard_files_rewritten": 16,
+        "data_shard_files_total": 16,
+        "logical_uncompressed_bytes_per_day": 1048576,
+        "metadata_files_changed": 1,
+        "stored_data_bytes": 56840767,
         "tail_len": 60
       },
       {
-        "amplification_vs_one_day": 88.0,
-        "base_bytes": 83768955,
-        "bytes_rewritten": 82787772,
-        "one_day_logical_bytes": 941224,
-        "shard_files_rewritten": 17,
+        "amplification_vs_average_stored_day": 88.0,
+        "amplification_vs_uncompressed_day": 79.0,
+        "average_stored_bytes_per_day": 941210,
+        "data_bytes_rewritten": 82786590,
+        "data_shard_files_rewritten": 16,
+        "data_shard_files_total": 16,
+        "logical_uncompressed_bytes_per_day": 1048576,
+        "metadata_files_changed": 1,
+        "stored_data_bytes": 83767707,
         "tail_len": 89
       }
     ]
@@ -103,7 +125,7 @@
     "all_segmentations_return_all_days": true,
     "block_size_sweep": {
       "decompressed_bytes_invariant": true,
-      "marginal_ms_per_extra_segment": 0.983,
+      "marginal_ms_per_extra_segment": 0.975,
       "rows": [
         {
           "bytes": 334732223,
@@ -112,10 +134,10 @@
           "decompressed_bytes": 92160,
           "file_count": 72,
           "latency": {
-            "max_ms": 4.348,
-            "min_ms": 3.881,
-            "p50_ms": 3.954,
-            "p95_ms": 4.348,
+            "max_ms": 4.244,
+            "min_ms": 3.842,
+            "p50_ms": 3.899,
+            "p95_ms": 4.244,
             "repeats": 15
           },
           "segments": 4,
@@ -131,10 +153,10 @@
           "decompressed_bytes": 92160,
           "file_count": 144,
           "latency": {
-            "max_ms": 8.291,
-            "min_ms": 7.629,
-            "p50_ms": 7.872,
-            "p95_ms": 8.291,
+            "max_ms": 8.191,
+            "min_ms": 7.703,
+            "p50_ms": 7.888,
+            "p95_ms": 8.191,
             "repeats": 15
           },
           "segments": 8,
@@ -150,10 +172,10 @@
           "decompressed_bytes": 92160,
           "file_count": 216,
           "latency": {
-            "max_ms": 12.063,
-            "min_ms": 11.5,
-            "p50_ms": 11.82,
-            "p95_ms": 12.063,
+            "max_ms": 11.993,
+            "min_ms": 11.442,
+            "p50_ms": 11.695,
+            "p95_ms": 11.993,
             "repeats": 15
           },
           "segments": 12,
@@ -167,7 +189,7 @@
     "constant_time_chunk": {
       "chunk_count_invariant": true,
       "decompressed_bytes_invariant": true,
-      "marginal_ms_per_extra_segment": 0.645,
+      "marginal_ms_per_extra_segment": 0.669,
       "rows": [
         {
           "bytes": 334726520,
@@ -176,10 +198,10 @@
           "decompressed_bytes": 92160,
           "file_count": 66,
           "latency": {
-            "max_ms": 2.627,
-            "min_ms": 1.811,
-            "p50_ms": 1.981,
-            "p95_ms": 2.627,
+            "max_ms": 2.095,
+            "min_ms": 1.789,
+            "p50_ms": 1.919,
+            "p95_ms": 2.095,
             "repeats": 15
           },
           "segments": 1,
@@ -195,10 +217,10 @@
           "decompressed_bytes": 92160,
           "file_count": 68,
           "latency": {
-            "max_ms": 2.579,
-            "min_ms": 2.316,
-            "p50_ms": 2.418,
-            "p95_ms": 2.579,
+            "max_ms": 2.705,
+            "min_ms": 2.362,
+            "p50_ms": 2.414,
+            "p95_ms": 2.705,
             "repeats": 15
           },
           "segments": 2,
@@ -214,10 +236,10 @@
           "decompressed_bytes": 92160,
           "file_count": 72,
           "latency": {
-            "max_ms": 4.311,
-            "min_ms": 3.84,
-            "p50_ms": 3.916,
-            "p95_ms": 4.311,
+            "max_ms": 4.266,
+            "min_ms": 3.848,
+            "p50_ms": 3.925,
+            "p95_ms": 4.266,
             "repeats": 15
           },
           "segments": 4,
@@ -237,36 +259,37 @@
   "h8": {
     "hypothesis": "H8",
     "note": "Rectilinear SHARDS force a uniform inner time chunk of 1, which is what costs the point-series read. Re-test when zarr-python 3.3 stabilizes the feature (spec \u00a716-Q7).",
-    "point_series_regression_x": 19.2,
+    "point_series_regression_x": 19.3,
     "rect_chunks_with_sharding": {
       "error": "ValueError: Rectilinear chunks with sharding is not supported. Use rectilinear shards instead: chunks=(inner_size, ...), shards=[[shard_sizes], ...]",
       "supported": false
     },
     "rect_shards": {
-      "append_bytes_rewritten": 1156550,
-      "append_files_rewritten": 17,
-      "append_ms": 364.083,
+      "append_data_bytes_rewritten": 1155136,
+      "append_data_files_rewritten": 16,
+      "append_metadata_files_changed": 1,
+      "append_ms": 374.037,
       "bytes": 139767240,
       "files": 514,
-      "hist_build_ms": 35182.986,
+      "hist_build_ms": 35186.839,
       "read_1d": {
-        "max_ms": 1.225,
-        "min_ms": 1.01,
-        "p50_ms": 1.055,
-        "p95_ms": 1.225,
+        "max_ms": 1.154,
+        "min_ms": 1.02,
+        "p50_ms": 1.042,
+        "p95_ms": 1.154,
         "repeats": 15
       },
       "read_series": {
-        "max_ms": 28.812,
-        "min_ms": 23.198,
-        "p50_ms": 23.763,
-        "p95_ms": 28.812,
+        "max_ms": 24.421,
+        "min_ms": 23.174,
+        "p50_ms": 23.743,
+        "p95_ms": 24.421,
         "repeats": 15
       },
       "supported": true
     },
     "regular": {
-      "build_ms": 914.96,
+      "build_ms": 915.253,
       "bytes": 112264308,
       "files": 34,
       "geometry": {
@@ -288,17 +311,17 @@
         ]
       },
       "read_1d": {
-        "max_ms": 1.134,
+        "max_ms": 1.088,
         "min_ms": 0.956,
-        "p50_ms": 0.987,
-        "p95_ms": 1.134,
+        "p50_ms": 0.977,
+        "p95_ms": 1.088,
         "repeats": 15
       },
       "read_series": {
-        "max_ms": 1.445,
-        "min_ms": 1.168,
-        "p50_ms": 1.238,
-        "p95_ms": 1.445,
+        "max_ms": 1.4,
+        "min_ms": 1.131,
+        "p50_ms": 1.232,
+        "p95_ms": 1.4,
         "repeats": 15
       }
     },

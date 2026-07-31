@@ -66,13 +66,48 @@ def changed_files(before: Dict[str, Tuple[str, int]],
 
 
 def tree_size(path: str) -> Tuple[int, int]:
-    """(file_count, total_bytes)."""
+    """(file_count, total_bytes) over everything, data and metadata alike."""
     n = b = 0
     for root, _, files in os.walk(path):
         for f in files:
             n += 1
             b += os.path.getsize(os.path.join(root, f))
     return n, b
+
+
+def is_data_path(rel: str) -> bool:
+    """True for a zarr v3 CHUNK/shard file (`sst/c/0/1/0`), false for metadata.
+
+    Write-amplification claims are about data shards. Counting `zarr.json` alongside them
+    inflates the file count -- an array `resize()` touches metadata, so a 16-shard block
+    reports "17 files rewritten" unless the two are separated."""
+    return "/c/" in rel.replace(os.sep, "/")
+
+
+def changed_split(before: Dict[str, Tuple[str, int]],
+                  after: Dict[str, Tuple[str, int]]) -> dict:
+    """Changed files split into DATA shards vs METADATA."""
+    changed = [k for k, v in after.items() if before.get(k) != v]
+    data = [k for k in changed if is_data_path(k)]
+    meta = [k for k in changed if not is_data_path(k)]
+    return {"data_files": len(data),
+            "data_bytes": sum(after[k][1] for k in data),
+            "metadata_files": len(meta),
+            "metadata_bytes": sum(after[k][1] for k in meta)}
+
+
+def tree_size_split(path: str) -> dict:
+    """{data_files, data_bytes, metadata_files, metadata_bytes} for a store on disk."""
+    out = {"data_files": 0, "data_bytes": 0, "metadata_files": 0, "metadata_bytes": 0}
+    for root, _, files in os.walk(path):
+        for f in files:
+            fp = os.path.join(root, f)
+            rel = os.path.relpath(fp, path)
+            size = os.path.getsize(fp)
+            key = "data" if is_data_path(rel) else "metadata"
+            out[f"{key}_files"] += 1
+            out[f"{key}_bytes"] += size
+    return out
 
 
 # --------------------------------------------------------------------------- store-level observation
@@ -211,7 +246,8 @@ def evaluate_s0_gate(results: dict) -> dict:
     if not h1.get("h1_confirmed"):
         failures.append(
             f"H1 NOT reproduced: single-day overwrite amplification "
-            f"{h1.get('amplification_vs_one_day')} (expected ~time_chunk-fold); "
+            f"{h1.get('amplification_vs_average_stored_day')}x vs the average stored day "
+            f"(expected ~time_chunk-fold, measured on DATA shards only); "
             f"candidate A must be re-opened and spec §3.A rewritten")
     if not h2.get("h2_confirmed"):
         failures.append(

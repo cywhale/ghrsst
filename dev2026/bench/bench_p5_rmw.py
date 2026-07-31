@@ -39,13 +39,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 from p5_cost import (  # noqa: E402
     CountingLocalStore,
     assert_geometry,
-    changed_files,
+    changed_split,
     evaluate_s0_gate,
     point_column_cost,
     read_geometry,
     snapshot_tree,
     timeit_ms,
     tree_size,
+    tree_size_split,
 )
 
 VAR = "sst"
@@ -92,33 +93,38 @@ def measure_h1(workdir: str, *, ny: int = 512, nx: int = 512,
     geom = assert_geometry(path, VAR, chunks=(time_chunk, spatial_chunk, spatial_chunk),
                            shards=(time_chunk, shard, shard), shape=(time_chunk, ny, nx))
 
-    files_total, bytes_total = tree_size(path)
+    size = tree_size_split(path)
     before = snapshot_tree(path)
     t = time_chunk // 2
     write = timeit_ms(lambda: g[VAR].__setitem__((t, slice(None), slice(None)),
                                                  _data(1, ny, nx, seed=2)[0]), repeats=1)
-    n_rw, b_rw = changed_files(before, snapshot_tree(path))
+    ch = changed_split(before, snapshot_tree(path))
 
-    one_day_logical = bytes_total / time_chunk
-    amp = round(b_rw / one_day_logical, 1) if one_day_logical else None
-    # shard files only (exclude zarr.json and friends)
-    shard_files_total = sum(1 for k in before if not k.endswith("zarr.json"))
+    avg_stored_day = size["data_bytes"] / time_chunk
+    logical_day = ny * nx * 4                          # one var-day, float32, uncompressed
+    amp_stored = round(ch["data_bytes"] / avg_stored_day, 1) if avg_stored_day else None
+    amp_logical = round(ch["data_bytes"] / logical_day, 1) if logical_day else None
     return {
         "hypothesis": "H1",
         "geometry": geom,
         "block_days": time_chunk,
-        "build_files": files_total,
-        "build_bytes": bytes_total,
-        "shard_files_total": shard_files_total,
-        "shard_files_rewritten": n_rw,
-        "bytes_rewritten": b_rw,
-        "one_day_logical_bytes": int(one_day_logical),
-        "amplification_vs_one_day": amp,
+        "data_shard_files_total": size["data_files"],
+        "data_shard_files_rewritten": ch["data_files"],
+        "metadata_files_changed": ch["metadata_files"],
+        "stored_data_bytes": size["data_bytes"],
+        "data_bytes_rewritten": ch["data_bytes"],
+        "average_stored_bytes_per_day": int(avg_stored_day),
+        "logical_uncompressed_bytes_per_day": int(logical_day),
+        "amplification_vs_average_stored_day": amp_stored,
+        "amplification_vs_uncompressed_day": amp_logical,
         "write_ms": write["p50_ms"],
-        "h1_confirmed": bool(amp is not None and amp >= time_chunk * 0.5
-                             and n_rw >= shard_files_total),
-        "note": ("H1 holds when a one-day write rewrites every shard spanning the block, "
-                 "i.e. amplification approaches time_chunk."),
+        "h1_confirmed": bool(amp_stored is not None and amp_stored >= time_chunk * 0.5
+                             and ch["data_files"] >= size["data_files"]),
+        "note": ("H1 holds when a one-day write rewrites every DATA shard spanning the "
+                 "block, i.e. amplification approaches time_chunk. The gate uses data-shard "
+                 "metrics only; metadata churn is reported separately. Two amplification "
+                 "bases are given because they answer different questions: vs the average "
+                 "STORED (compressed) day, and vs one uncompressed var-day."),
     }
 
 
@@ -134,23 +140,30 @@ def measure_h2(workdir: str, *, ny: int = 512, nx: int = 512,
         # PARTIAL shard -- the in-place-growth configuration H2 measures.
         g = _create(path, L, ny, nx, time_chunk, shard, spatial_chunk, clamp=False)
         g[VAR][:] = _data(L, ny, nx, seed=10 + L)
-        _, bytes_L = tree_size(path)
+        size = tree_size_split(path)
         before = snapshot_tree(path)
         arr = g[VAR]
         arr.resize((L + 1, ny, nx))
         arr[L, :, :] = _data(1, ny, nx, seed=99)[0]
-        n_rw, b_rw = changed_files(before, snapshot_tree(path))
-        one_day_logical = bytes_L / L
-        rows.append({"tail_len": L,
-                     "base_bytes": bytes_L,
-                     "shard_files_rewritten": n_rw,
-                     "bytes_rewritten": b_rw,
-                     "one_day_logical_bytes": int(one_day_logical),
-                     "amplification_vs_one_day": round(b_rw / one_day_logical, 1)})
-    amps = [r["amplification_vs_one_day"] for r in rows]
+        ch = changed_split(before, snapshot_tree(path))
+        avg_stored_day = size["data_bytes"] / L
+        logical_day = ny * nx * 4
+        rows.append({
+            "tail_len": L,
+            "stored_data_bytes": size["data_bytes"],
+            "data_shard_files_total": size["data_files"],
+            "data_shard_files_rewritten": ch["data_files"],
+            "metadata_files_changed": ch["metadata_files"],
+            "data_bytes_rewritten": ch["data_bytes"],
+            "average_stored_bytes_per_day": int(avg_stored_day),
+            "logical_uncompressed_bytes_per_day": int(logical_day),
+            "amplification_vs_average_stored_day": round(ch["data_bytes"] / avg_stored_day, 1),
+            "amplification_vs_uncompressed_day": round(ch["data_bytes"] / logical_day, 1)})
+    amps = [r["amplification_vs_average_stored_day"] for r in rows]
     grows = all(amps[i] <= amps[i + 1] for i in range(len(amps) - 1))
     # each append should rewrite roughly the whole partial shard => amp ~ tail_len
-    whole_shard = all(r["amplification_vs_one_day"] >= r["tail_len"] * 0.5 for r in rows)
+    whole_shard = all(r["amplification_vs_average_stored_day"] >= r["tail_len"] * 0.5
+                      for r in rows)
     total_cost = sum(range(1, time_chunk + 1))
     return {
         "hypothesis": "H2",
@@ -160,7 +173,9 @@ def measure_h2(workdir: str, *, ny: int = 512, nx: int = 512,
         "h2_confirmed": bool(grows and whole_shard),
         "projected_day_by_day_block_cost_x": round(total_cost / time_chunk, 1),
         "note": ("Growing a block one day at a time costs sum(1..S) day-writes ~= (S+1)/2 x "
-                 "the block's final size -- the measured basis for rejecting candidate A."),
+                 "the block's final size -- the measured basis for rejecting candidate A. "
+                 "The gate uses DATA-shard metrics; the array resize also rewrites "
+                 "`zarr.json`, counted separately as metadata_files_changed."),
     }
 
 
@@ -332,13 +347,15 @@ def measure_h8(workdir: str, *, ny: int = 512, nx: int = 512, hist_days: int = 9
             arr.resize((total + 1, ny, nx))
             app = timeit_ms(lambda: arr.__setitem__(total, _data(1, ny, nx, seed=999)[0]),
                             repeats=1)
-            n_rw, b_rw = changed_files(before, snapshot_tree(p))
+            ch = changed_split(before, snapshot_tree(p))
             gr = zarr.open_group(p, mode="r")
             files, nbytes = tree_size(p)
             rect_shards = {"supported": True,
                            "hist_build_ms": b["p50_ms"], "files": files, "bytes": nbytes,
                            "append_ms": app["p50_ms"],
-                           "append_files_rewritten": n_rw, "append_bytes_rewritten": b_rw,
+                           "append_data_files_rewritten": ch["data_files"],
+                           "append_data_bytes_rewritten": ch["data_bytes"],
+                           "append_metadata_files_changed": ch["metadata_files"],
                            "read_series": timeit_ms(
                                lambda: np.asarray(gr[VAR][0:total, ii, jj]), repeats),
                            "read_1d": timeit_ms(
@@ -417,8 +434,11 @@ def main():
             json.dump(res, fh, indent=2, sort_keys=True)
         print(f"wrote {args.out}")
     print(json.dumps(res["gate"], indent=2))
-    print(f"H1 amplification: {res['h1']['amplification_vs_one_day']}x "
-          f"({res['h1']['shard_files_rewritten']}/{res['h1']['shard_files_total']} shards)")
+    h1 = res["h1"]
+    print(f"H1 amplification: {h1['amplification_vs_average_stored_day']}x stored / "
+          f"{h1['amplification_vs_uncompressed_day']}x uncompressed "
+          f"({h1['data_shard_files_rewritten']}/{h1['data_shard_files_total']} data shards, "
+          f"+{h1['metadata_files_changed']} metadata)")
     print(f"H2 confirmed: {res['h2']['h2_confirmed']} "
           f"(day-by-day block cost ~{res['h2']['projected_day_by_day_block_cost_x']}x)")
     ctc = res["h3"]["constant_time_chunk"]

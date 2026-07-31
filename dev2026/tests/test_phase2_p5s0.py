@@ -140,6 +140,36 @@ class TestCountersReallyCount(unittest.TestCase):
                          f"analytic {cost['chunk_count']} != observed {len(observed)}: {sorted(observed)}")
         self.assertEqual(cost["chunk_count"], 2)        # 180 days / time_chunk 90
 
+    def test_analytic_tail_window_on_non_aligned_array_matches_observed(self):
+        """The offset/clipping trap: a request reads the TAIL of base, not the head, and a
+        base whose length is NOT a multiple of the time chunk has a clipped final chunk.
+        Measuring `t0=0` while the request reads the tail would report the wrong
+        chunk_count and nothing else would catch it. Validated against observed chunk keys
+        at several non-aligned offsets."""
+        path = os.path.join(self.d, "nonaligned")
+        T = 205                                          # 205 = 2*90 + 25 -> clipped tail
+        st = CountingLocalStore(path)
+        g = _mk(path, T, store=st)
+        _fill(g, T)
+        geom = read_geometry(path, "sst")
+        self.assertEqual(geom["shape"][0], T)
+        handle = zarr.open_group(st, mode="r")
+        for t0, t1 in ((T - 100, T), (T - 1, T), (89, 91), (0, T), (100, 190)):
+            with self.subTest(window=(t0, t1)):
+                cost = point_column_cost(geom, t0=t0, t1=t1, ii=5, jj=7)
+                st.reset()
+                vals = np.asarray(handle["sst"][t0:t1, 5, 7])
+                self.assertEqual(vals.size, t1 - t0)
+                self.assertEqual(cost["chunk_count"], len(observed_data_keys(st)),
+                                 f"window {(t0, t1)}: analytic {cost['chunk_count']} != "
+                                 f"observed {len(observed_data_keys(st))}")
+        # the clipped final chunk really is shorter than the others
+        tail = point_column_cost(geom, t0=180, t1=T, ii=5, jj=7)
+        head = point_column_cost(geom, t0=0, t1=25, ii=5, jj=7)
+        self.assertEqual(tail["chunk_count"], head["chunk_count"])
+        self.assertLess(tail["decompressed_bytes"], head["decompressed_bytes"],
+                        "the clipped tail chunk must decompress fewer bytes than a full one")
+
     def test_analytic_cost_matches_hand_computed(self):
         geom = {"shape": (360, NY, NX), "chunks": (90, 8, 8), "shards": SH}
         cost = point_column_cost(geom, t0=0, t1=360, ii=0, jj=0)
@@ -186,21 +216,47 @@ class TestHypothesisMeasurements(unittest.TestCase):
 
     def test_h1_single_day_overwrite_rewrites_the_whole_block(self):
         r = bench_p5_rmw.measure_h1(self.d, ny=NY, nx=NX, time_chunk=90, shard=128)
-        self.assertEqual(r["shard_files_rewritten"], r["shard_files_total"],
-                         "every shard spanning the time block must be rewritten")
-        self.assertGreater(r["amplification_vs_one_day"], 45.0,
+        self.assertEqual(r["data_shard_files_rewritten"], r["data_shard_files_total"],
+                         "every DATA shard spanning the time block must be rewritten")
+        self.assertGreater(r["amplification_vs_average_stored_day"], 45.0,
                            "H1 predicts ~time_chunk-fold amplification")
+        self.assertIsNotNone(r["amplification_vs_uncompressed_day"])
         self.assertTrue(r["h1_confirmed"])
+
+    def test_h1_separates_data_shards_from_metadata(self):
+        """A 4x4-shard block has 16 DATA shards. Counting `zarr.json` with them would
+        report 17 and quietly overstate the shard count."""
+        r = bench_p5_rmw.measure_h1(self.d, ny=256, nx=256, time_chunk=90, shard=128)
+        self.assertEqual(r["data_shard_files_total"], 4)          # 256/128 = 2 -> 2x2
+        self.assertEqual(r["data_shard_files_rewritten"], 4)
+        self.assertNotIn("shard_files_rewritten", r, "the ambiguous field must be gone")
+        self.assertGreater(r["data_bytes_rewritten"], 0)
 
     def test_h2_partial_tail_append_rewrites_the_partial_shard(self):
         r = bench_p5_rmw.measure_h2(self.d, ny=NY, nx=NX, tail_lengths=(10, 30),
                                     time_chunk=90, shard=128)
         for row in r["rows"]:
-            self.assertGreater(row["amplification_vs_one_day"], row["tail_len"] * 0.5,
+            self.assertGreater(row["amplification_vs_average_stored_day"],
+                               row["tail_len"] * 0.5,
                                "appending into a partial shard rewrites the whole shard")
+            # the resize touches zarr.json; it must be reported, but separately
+            self.assertGreaterEqual(row["metadata_files_changed"], 1)
+            self.assertEqual(row["data_shard_files_rewritten"], row["data_shard_files_total"])
         self.assertTrue(r["h2_confirmed"])
-        amps = [row["amplification_vs_one_day"] for row in r["rows"]]
+        amps = [row["amplification_vs_average_stored_day"] for row in r["rows"]]
         self.assertLess(amps[0], amps[1], "amplification must grow with tail length")
+
+    def test_h2_reports_both_amplification_bases(self):
+        """`stored_bytes/L` is the average COMPRESSED stored bytes per day, not logical
+        uncompressed bytes per day. Both are reported, and they are not the same number."""
+        r = bench_p5_rmw.measure_h2(self.d, ny=NY, nx=NX, tail_lengths=(30,),
+                                    time_chunk=90, shard=128)
+        row = r["rows"][0]
+        self.assertEqual(row["logical_uncompressed_bytes_per_day"], NY * NX * 4)
+        self.assertNotEqual(row["average_stored_bytes_per_day"],
+                            row["logical_uncompressed_bytes_per_day"])
+        self.assertGreater(row["amplification_vs_average_stored_day"], 0)
+        self.assertGreater(row["amplification_vs_uncompressed_day"], 0)
 
     def test_h3_constant_time_chunk_preserves_chunk_count_and_bytes(self):
         """H3 as stated: at a CONSTANT inner time chunk (segments >= 90 d), neither
@@ -247,24 +303,27 @@ class TestArtifactsAndGate(unittest.TestCase):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         r = bench_p5_rmw.measure_h1(d, ny=NY, nx=NX, time_chunk=90, shard=128)
-        for key in ("geometry", "shard_files_total", "bytes_rewritten", "amplification_vs_one_day"):
+        for key in ("geometry", "data_shard_files_total", "data_shard_files_rewritten",
+                    "metadata_files_changed", "data_bytes_rewritten",
+                    "average_stored_bytes_per_day", "logical_uncompressed_bytes_per_day",
+                    "amplification_vs_average_stored_day", "amplification_vs_uncompressed_day"):
             self.assertIn(key, r)
         self.assertEqual(tuple(r["geometry"]["chunks"]), CH)
 
     def test_gate_fails_when_h1_is_not_reproduced(self):
         """A fabricated low-amplification H1 must FAIL the gate -- proving the gate bites."""
-        good = {"h1": {"h1_confirmed": True, "amplification_vs_one_day": 90.0},
+        good = {"h1": {"h1_confirmed": True, "amplification_vs_average_stored_day": 90.0},
                 "h2": {"h2_confirmed": True}, "h3": {"h3_supported": True}}
         self.assertEqual(evaluate_s0_gate(good)["verdict"], "PASS")
 
-        bad = {"h1": {"h1_confirmed": False, "amplification_vs_one_day": 1.02},
+        bad = {"h1": {"h1_confirmed": False, "amplification_vs_average_stored_day": 1.02},
                "h2": {"h2_confirmed": True}, "h3": {"h3_supported": True}}
         out = evaluate_s0_gate(bad)
         self.assertEqual(out["verdict"], "FAIL")
         self.assertIn("H1", " ".join(out["failures"]))
 
     def test_gate_fails_when_h2_is_not_reproduced(self):
-        bad = {"h1": {"h1_confirmed": True, "amplification_vs_one_day": 90.0},
+        bad = {"h1": {"h1_confirmed": True, "amplification_vs_average_stored_day": 90.0},
                "h2": {"h2_confirmed": False}, "h3": {"h3_supported": True}}
         out = evaluate_s0_gate(bad)
         self.assertEqual(out["verdict"], "FAIL")

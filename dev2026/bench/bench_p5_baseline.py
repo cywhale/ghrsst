@@ -113,23 +113,34 @@ def _build_delta(path, days, ny, nx):
     return path
 
 
-def _analytic(path, days_requested, ii, jj):
-    """Sum the cache-independent cost across variables for a day range in one tier."""
+def _analytic(path, t0, t1, ii, jj):
+    """Sum the cache-independent cost across variables for the EXACT index window read.
+
+    `t0`/`t1` are mandatory and must be the indices the request actually uses. Hardcoding
+    `t0=0` would silently measure the HEAD of the array while the request reads its TAIL --
+    and on a base whose length is not a multiple of the time chunk, the head and the tail
+    have different chunk alignment and a different clipped final chunk, so the reported
+    chunk_count/decompressed_bytes would be wrong in a way nothing else would catch."""
     total_chunks = 0
     total_bytes = 0
     for v in VARS:
         geom = read_geometry(path, v)
-        c = point_column_cost(geom, t0=0, t1=days_requested, ii=ii, jj=jj)
+        c = point_column_cost(geom, t0=t0, t1=t1, ii=ii, jj=jj)
         total_chunks += c["chunk_count"]
         total_bytes += c["decompressed_bytes"]
-    useful = days_requested * len(VARS) * 4
-    return {"chunk_count": total_chunks, "decompressed_bytes": total_bytes,
+    useful = (t1 - t0) * len(VARS) * 4
+    return {"index_window": [int(t0), int(t1)],
+            "days": int(t1 - t0),
+            "chunk_count": total_chunks, "decompressed_bytes": total_bytes,
             "useful_bytes": useful,
             "read_amplification": round(total_bytes / useful, 1) if useful else None}
 
 
 def run(workdir: str, *, ny: int, nx: int, base_days: int, delta_days: int,
         repeats: int, delta_spans) -> dict:
+    if base_days < 366:
+        raise SystemExit(f"--base-days must be >= 366 (got {base_days}); the 366-day\n"
+                         "case must contain exactly 366 days, not min(366, base_days)")
     if os.path.exists(workdir):
         shutil.rmtree(workdir)
     os.makedirs(workdir, exist_ok=True)
@@ -154,36 +165,43 @@ def run(workdir: str, *, ny: int, nx: int, base_days: int, delta_days: int,
     rss0 = _rss_mb()
     cases = {}
 
-    # 1) single historical day
-    d1 = [all_base[len(all_base) // 2]]
+    # 1) single historical day -- index taken from the SAME lookup the request uses
+    t_single = len(all_base) // 2
+    d1 = [all_base[t_single]]
     cube.point_series(lon, lat, d1, VARS)             # warm
     cases["single_day_point"] = {
         "days": 1, "tier": "base",
         "latency": timeit_ms(lambda: cube.point_series(lon, lat, d1, VARS), repeats),
-        "analytic": _analytic(base_path, 1, ii, jj)}
+        "analytic": _analytic(base_path, t_single, t_single + 1, ii, jj)}
 
-    # 2) 366-day range entirely inside base
-    n366 = min(366, base_days)
-    d366 = all_base[-n366:]
+    # 2) EXACTLY 366 days, entirely inside base -- the TAIL of base, so the analytic window
+    #    must be the tail too (see `_analytic`).
+    assert base_days >= 366, f"base_days={base_days} cannot hold a 366-day range"
+    d366 = all_base[-366:]
+    assert len(d366) == 366, f"expected exactly 366 days, got {len(d366)}"
     cube.point_series(lon, lat, d366, VARS)
     rows = cube.point_series(lon, lat, d366, VARS)
+    assert len(rows) == 366, f"366-day case returned {len(rows)} rows"
     cases["range_366d_base_only"] = {
-        "days": n366, "tier": "base", "rows_returned": len(rows),
+        "days": 366, "tier": "base", "rows_returned": len(rows),
         "latency": timeit_ms(lambda: cube.point_series(lon, lat, d366, VARS), repeats),
-        "analytic": _analytic(base_path, n366, ii, jj)}
+        "analytic": _analytic(base_path, base_days - 366, base_days, ii, jj)}
 
-    # 3) base -> delta crossing range, swept over delta span (H5)
+    # 3) base -> delta crossing range, swept over delta span (H5). Always 366 days total.
     crossing = []
     for span in delta_spans:
         span = min(span, delta_days)
-        dcross = all_base[-(366 - span):] + all_delta[:span]
+        n_base = 366 - span
+        dcross = all_base[-n_base:] + all_delta[:span]
+        assert len(dcross) == 366, f"crossing case has {len(dcross)} days, expected 366"
         cube.point_series(lon, lat, dcross, VARS)
         r = cube.point_series(lon, lat, dcross, VARS)
+        assert len(r) == 366, f"crossing case returned {len(r)} rows"
         crossing.append({
             "delta_span_days": span, "total_days": len(dcross), "rows_returned": len(r),
             "latency": timeit_ms(lambda: cube.point_series(lon, lat, dcross, VARS), repeats),
-            "analytic_base": _analytic(base_path, 366 - span, ii, jj),
-            "analytic_delta": _analytic(delta_path, span, ii, jj)})
+            "analytic_base": _analytic(base_path, base_days - n_base, base_days, ii, jj),
+            "analytic_delta": _analytic(delta_path, 0, span, ii, jj)})
     cases["range_366d_crossing"] = {"tier": "base+delta", "sweep": crossing}
 
     bfiles, bbytes = tree_size(base_path)
@@ -219,7 +237,8 @@ def main():
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--ny", type=int, default=256)
     ap.add_argument("--nx", type=int, default=256)
-    ap.add_argument("--base-days", type=int, default=360, dest="base_days")
+    ap.add_argument("--base-days", type=int, default=450, dest="base_days",
+                    help="must be >= 366 so the 366-day case is exactly 366 days")
     ap.add_argument("--delta-days", type=int, default=64, dest="delta_days")
     ap.add_argument("--delta-spans", default="31,45,64", dest="delta_spans")
     ap.add_argument("--repeats", type=int, default=15)
