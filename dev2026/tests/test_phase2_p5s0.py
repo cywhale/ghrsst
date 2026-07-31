@@ -246,6 +246,23 @@ class TestHypothesisMeasurements(unittest.TestCase):
         amps = [row["amplification_vs_average_stored_day"] for row in r["rows"]]
         self.assertLess(amps[0], amps[1], "amplification must grow with tail length")
 
+    def test_h2_gate_requires_every_data_shard_rewritten(self):
+        """The JSON gate must not PASS on a partial-shard rewrite. Previously only the unit
+        test checked the shard count, so the artifact could disagree with CI."""
+        r = bench_p5_rmw.measure_h2(self.d, ny=NY, nx=NX, tail_lengths=(10, 30),
+                                    time_chunk=90, shard=128)
+        self.assertIn("all_data_shards_rewritten", r)
+        self.assertTrue(r["all_data_shards_rewritten"])
+        self.assertTrue(r["h2_confirmed"])
+        # if a row rewrote only some shards, h2_confirmed must go False
+        doctored = dict(r)
+        doctored["rows"] = [dict(row) for row in r["rows"]]
+        doctored["rows"][0]["data_shard_files_rewritten"] = 1
+        recomputed = all(row["data_shard_files_rewritten"] == row["data_shard_files_total"]
+                         for row in doctored["rows"])
+        self.assertFalse(recomputed,
+                         "the condition folded into h2_confirmed must be able to fail")
+
     def test_h2_reports_both_amplification_bases(self):
         """`stored_bytes/L` is the average COMPRESSED stored bytes per day, not logical
         uncompressed bytes per day. Both are reported, and they are not the same number."""
@@ -288,6 +305,28 @@ class TestHypothesisMeasurements(unittest.TestCase):
         self.assertEqual(sweep[6]["decompressed_bytes"], sweep[2]["decompressed_bytes"])
         self.assertTrue(r["block_size_sweep"]["decompressed_bytes_invariant"])
         self.assertTrue(r["h3_supported"], "a shrinking time chunk must NOT fail H3")
+
+    def test_h3_boundary_bytes_are_not_invariant_off_anchor(self):
+        """The over-extrapolation this test exists to prevent: `measure_h3` shows bytes are
+        invariant for an ALIGNED FULL-SPAN read, which does not generalize. Reading
+        `[84, 450]` touches 5 x 90-day chunks in a monolith (450 day-cells) but 9 x 45-day
+        segments under S=45 (405 day-cells). Bytes move with block size and anchor."""
+        r = bench_p5_rmw.measure_h3_boundary(self.d, ny=128, nx=128, total_days=450,
+                                             block_sizes=(45, 90), anchors=(0,),
+                                             windows=[(0, 450), (84, 450)])
+        self.assertTrue(r["analytic_validated_against_observed"],
+                        "every analytic figure must match observed chunk keys")
+        self.assertTrue(r["bytes_equal_in_aligned_full_span"])
+        by = {(x["block_size"], tuple(x["window"])): x for x in r["rows"]}
+        # aligned full span: equal
+        self.assertEqual(by[(45, (0, 450))]["bytes_ratio_segmented_over_monolith"], 1.0)
+        # the reviewer's counterexample: off-anchor tail read is NOT equal
+        off = by[(45, (84, 450))]
+        self.assertEqual(off["monolith_decompressed_bytes"] // (8 * 8 * 4), 450)
+        self.assertEqual(off["segmented_decompressed_bytes"] // (8 * 8 * 4), 405)
+        self.assertLess(off["bytes_ratio_segmented_over_monolith"], 1.0)
+        self.assertTrue(r["bytes_can_differ_at_boundaries"],
+                        "the harness must REPORT that bytes are not strictly invariant")
 
     def test_h8_rectilinear_is_measured_not_assumed(self):
         r = bench_p5_rmw.measure_h8(self.d, ny=NY, nx=NX)

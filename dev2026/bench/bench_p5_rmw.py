@@ -8,10 +8,13 @@ no P5 step may advance on a scratch probe.
       (~time_chunk-fold write amplification)                       -> spec §3.A, candidate A
   H2  appending into a PARTIAL tail shard rewrites the whole partial shard, so growing a
       block day-by-day costs ~(S+1)/2x its final size              -> spec §3.A, §7
-  H3  segmentation does NOT change chunk_count / decompressed_bytes; it adds only a
-      per-segment store-call overhead                              -> spec §3.B, §10.4
-      (refined here: decompressed_bytes is invariant in every regime, chunk_count while
-       the inner time chunk is unchanged -- see `measure_h3`)
+  H3  segmentation cost                                            -> spec §3.B, §10.4
+      `measure_h3`:          at a CONSTANT inner time chunk, chunk_count and
+                             decompressed_bytes are invariant; a smaller block shrinks the
+                             time chunk, raising chunk_count at constant bytes
+      `measure_h3_boundary`: bytes are equal segmented-vs-monolith ONLY for aligned,
+                             full-span reads. Off-anchor windows change the boundary
+                             over-read, so bytes DO move with block size and anchor.
   H8  Zarr v3 has no production-safe native way to avoid shard RMW for our read layout
       (rectilinear shards trade a point-series regression for cheap appends) -> spec §3.E
 
@@ -41,6 +44,7 @@ from p5_cost import (  # noqa: E402
     assert_geometry,
     changed_split,
     evaluate_s0_gate,
+    observed_data_keys,
     point_column_cost,
     read_geometry,
     snapshot_tree,
@@ -164,13 +168,19 @@ def measure_h2(workdir: str, *, ny: int = 512, nx: int = 512,
     # each append should rewrite roughly the whole partial shard => amp ~ tail_len
     whole_shard = all(r["amplification_vs_average_stored_day"] >= r["tail_len"] * 0.5
                       for r in rows)
+    # ...and it must rewrite EVERY data shard, not merely a lot of bytes. Without this the
+    # JSON gate could PASS on a partial-shard rewrite; only the unit test would have caught
+    # it, so the artifact would disagree with CI.
+    all_data_shards = all(r["data_shard_files_rewritten"] == r["data_shard_files_total"]
+                          for r in rows)
     total_cost = sum(range(1, time_chunk + 1))
     return {
         "hypothesis": "H2",
         "rows": rows,
         "monotonic_in_tail_length": grows,
         "rewrites_whole_partial_shard": whole_shard,
-        "h2_confirmed": bool(grows and whole_shard),
+        "all_data_shards_rewritten": all_data_shards,
+        "h2_confirmed": bool(grows and whole_shard and all_data_shards),
         "projected_day_by_day_block_cost_x": round(total_cost / time_chunk, 1),
         "note": ("Growing a block one day at a time costs sum(1..S) day-writes ~= (S+1)/2 x "
                  "the block's final size -- the measured basis for rejecting candidate A. "
@@ -294,6 +304,129 @@ def measure_h3(workdir: str, *, ny: int = 512, nx: int = 512, total_days: int = 
     }
 
 
+# --------------------------------------------------------------------------- H3 boundary sweep
+def _segment_bounds(T: int, S: int, anchor: int) -> list:
+    """Half-open [start, end) day ranges for S-day blocks anchored at `anchor`.
+
+    `anchor` models the calendar anchor of the block grid (§5.2): days before it form a
+    partial leading block, exactly as the legacy segment's tail does in production."""
+    out = []
+    if anchor > 0:
+        out.append((0, min(anchor, T)))
+    s = anchor
+    while s < T:
+        out.append((s, min(s + S, T)))
+        s += S
+    return [(a, b) for a, b in out if b > a]
+
+
+def measure_h3_boundary(workdir: str, *, ny: int = 128, nx: int = 128, total_days: int = 450,
+                        block_sizes: Sequence[int] = (30, 45, 90),
+                        anchors: Sequence[int] = (0, 13),
+                        windows: Optional[Sequence] = None,
+                        ii: int = 5, jj: int = 7,
+                        shard: int = 128, spatial_chunk: int = 8) -> dict:
+    """Compare decompressed bytes SEGMENTED vs MONOLITH across request offsets and anchors.
+
+    `measure_h3` shows the two cache-independent counters are invariant for an **aligned,
+    full-span** read. That does NOT generalize: a window that starts mid-chunk over-reads a
+    different amount under a different block grid. Reading `[84,450]` of a 450-day archive:
+
+        monolith t90        -> 5 chunks x 90 = 450 day-cells
+        S=45, anchor 0      -> 9 segments x 45 = 405 day-cells
+
+    so bytes are **not** strictly invariant; they move with the boundary geometry. This
+    function measures that directly instead of extrapolating, and validates each analytic
+    figure against the chunk keys a real read touches.
+    """
+    ii, jj = _clamp_point(ii, jj, ny, nx)
+    if windows is None:
+        windows = [(0, total_days), (0, 360), (84, total_days), (225, 226), (100, 190)]
+
+    mono_path = _fresh(os.path.join(workdir, "h3b_mono"))
+    mono_store = CountingLocalStore(mono_path)
+    gm = _create(mono_path, total_days, ny, nx, 90, shard, spatial_chunk, store=mono_store)
+    gm[VAR][:] = _data(total_days, ny, nx, seed=400)
+    mono_geom = read_geometry(mono_path, VAR)
+    mono_handle = zarr.open_group(mono_store, mode="r")
+
+    def observed_for(store, handle, t0, t1):
+        store.reset()
+        vals = np.asarray(handle[VAR][t0:t1, ii, jj])
+        return int(vals.size), len(observed_data_keys(store))
+
+    rows = []
+    for S in block_sizes:
+        for anchor in anchors:
+            bounds = _segment_bounds(total_days, S, anchor)
+            root = _fresh(os.path.join(workdir, f"h3b_S{S}_a{anchor}"))
+            segs = []
+            for k, (a, b) in enumerate(bounds):
+                spath = os.path.join(root, f"seg{k}")
+                st = CountingLocalStore(spath)
+                g = _create(spath, b - a, ny, nx, 90, shard, spatial_chunk, store=st)
+                g[VAR][:] = _data(b - a, ny, nx, seed=500 + k)
+                segs.append({"bounds": (a, b), "path": spath, "store": st,
+                             "handle": zarr.open_group(st, mode="r"),
+                             "geom": read_geometry(spath, VAR)})
+            for (t0, t1) in windows:
+                mono_cost = point_column_cost(mono_geom, t0=t0, t1=t1, ii=ii, jj=jj)
+                m_vals, m_obs = observed_for(mono_store, mono_handle, t0, t1)
+
+                seg_chunks = seg_bytes = 0
+                seg_vals = seg_obs = 0
+                touched = 0
+                for s in segs:
+                    a, b = s["bounds"]
+                    lo, hi = max(t0, a), min(t1, b)
+                    if hi <= lo:
+                        continue
+                    touched += 1
+                    c = point_column_cost(s["geom"], t0=lo - a, t1=hi - a, ii=ii, jj=jj)
+                    seg_chunks += c["chunk_count"]
+                    seg_bytes += c["decompressed_bytes"]
+                    v, o = observed_for(s["store"], s["handle"], lo - a, hi - a)
+                    seg_vals += v
+                    seg_obs += o
+                rows.append({
+                    "block_size": S, "anchor": anchor, "window": [t0, t1],
+                    "days_requested": t1 - t0,
+                    "segments_touched": touched,
+                    "monolith_chunk_count": mono_cost["chunk_count"],
+                    "monolith_decompressed_bytes": mono_cost["decompressed_bytes"],
+                    "monolith_analytic_matches_observed": mono_cost["chunk_count"] == m_obs,
+                    "segmented_chunk_count": seg_chunks,
+                    "segmented_decompressed_bytes": seg_bytes,
+                    "segmented_analytic_matches_observed": seg_chunks == seg_obs,
+                    "values_match": m_vals == seg_vals == (t1 - t0),
+                    "bytes_ratio_segmented_over_monolith": round(
+                        seg_bytes / mono_cost["decompressed_bytes"], 4)
+                    if mono_cost["decompressed_bytes"] else None,
+                })
+
+    ratios = [r["bytes_ratio_segmented_over_monolith"] for r in rows
+              if r["bytes_ratio_segmented_over_monolith"] is not None]
+    aligned = [r for r in rows if r["anchor"] == 0 and r["window"] == [0, total_days]]
+    aligned_equal = all(r["bytes_ratio_segmented_over_monolith"] == 1.0 for r in aligned)
+    all_validated = all(r["monolith_analytic_matches_observed"]
+                        and r["segmented_analytic_matches_observed"]
+                        and r["values_match"] for r in rows)
+    return {
+        "hypothesis": "H3-boundary",
+        "total_days": total_days,
+        "rows": rows,
+        "analytic_validated_against_observed": all_validated,
+        "bytes_equal_in_aligned_full_span": aligned_equal,
+        "bytes_ratio_min": min(ratios) if ratios else None,
+        "bytes_ratio_max": max(ratios) if ratios else None,
+        "bytes_can_differ_at_boundaries": bool(ratios and (min(ratios) < 1.0 or max(ratios) > 1.0)),
+        "note": ("Decompressed bytes are equal segmented-vs-monolith ONLY for aligned, "
+                 "full-span reads. Off-anchor windows change the over-read at the leading "
+                 "and trailing boundary, so bytes move with block size and anchor. S6 must "
+                 "adjudicate on the production calendar anchor and representative windows."),
+    }
+
+
 # --------------------------------------------------------------------------- H8
 def measure_h8(workdir: str, *, ny: int = 512, nx: int = 512, hist_days: int = 90,
                tail_days: int = 30, shard: int = 128, spatial_chunk: int = 8,
@@ -401,6 +534,7 @@ def run_all(workdir: str, *, ny: int, nx: int, total_days: int,
         "h3": measure_h3(workdir, ny=ny, nx=nx, total_days=total_days,
                          segment_counts=segment_counts,
                          block_size_segments=block_size_segments),
+        "h3_boundary": measure_h3_boundary(workdir),
         "h8": measure_h8(workdir, ny=ny, nx=nx),
     }
     results["gate"] = evaluate_s0_gate(results)
@@ -447,9 +581,15 @@ def main():
           f"(+{ctc['marginal_ms_per_extra_segment']} ms per extra segment)")
     bs = res["h3"]["block_size_sweep"]
     if bs["rows"]:
-        print(f"H3 block-size sweep: bytes invariant={bs['decompressed_bytes_invariant']}; "
+        print(f"H3 block-size sweep (same layout, aligned): bytes invariant="
+              f"{bs['decompressed_bytes_invariant']}; "
               + ", ".join(f"{r['days_per_segment']}d->{r['chunk_count']} chunks"
                           f"/{r['latency']['p50_ms']}ms" for r in bs["rows"]))
+    hb = res["h3_boundary"]
+    print(f"H3 boundary sweep: analytic==observed={hb['analytic_validated_against_observed']}; "
+          f"aligned full-span bytes equal={hb['bytes_equal_in_aligned_full_span']}; "
+          f"segmented/monolith byte ratio {hb['bytes_ratio_min']}..{hb['bytes_ratio_max']} "
+          f"(differ at boundaries={hb['bytes_can_differ_at_boundaries']})")
     print(f"H8: {res['h8']['verdict']} (regression {res['h8']['point_series_regression_x']}x)")
     if res["gate"]["verdict"] != "PASS":
         raise SystemExit(2)

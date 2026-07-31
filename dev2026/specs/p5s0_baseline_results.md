@@ -10,7 +10,7 @@ Implements P5-S0 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Primitives: [`../bench/p5_cost.py`](../bench/p5_cost.py)
 - Hypothesis harness: [`../bench/bench_p5_rmw.py`](../bench/bench_p5_rmw.py) → [`../bench/results/p5s0_rmw.json`](../bench/results/p5s0_rmw.json)
 - Baseline of record: [`../bench/bench_p5_baseline.py`](../bench/bench_p5_baseline.py) → [`../bench/results/p5s0_baseline.json`](../bench/results/p5s0_baseline.json)
-- Self-tests: [`../tests/test_phase2_p5s0.py`](../tests/test_phase2_p5s0.py) — **20/20 green**
+- Self-tests: [`../tests/test_phase2_p5s0.py`](../tests/test_phase2_p5s0.py) — **22/22 green**
 
 ## 0. Why this step existed
 
@@ -118,7 +118,7 @@ every time. Growing a 90-day block one day at a time therefore costs `Σ(1..90)`
 > **published** unsealed block is created at its materialized size (§7.2), so the steady-state
 > cost is the §10.2 model `(S/C + 1)/2`, not 45.5×.
 
-## 4. H3 — segmentation cost  ✅ SUPPORTED, and **refined by the harness**
+## 4. H3 — segmentation cost  ✅ SUPPORTED **in a narrower form than originally claimed**
 
 The spec's H3 said segmentation changes *neither* `chunk_count` *nor* `decompressed_bytes`.
 The committed harness showed that statement is **imprecise**, and separated two regimes that an
@@ -145,14 +145,53 @@ Marginal cost ≈ **+0.65 ms per extra segment** at this grid.
 
 `chunk_count` **rises** while `decompressed_bytes` stays **exactly constant**.
 
-> **Refined H3 (recommended spec wording):** *segmentation never changes
-> `decompressed_bytes`; `chunk_count` is additionally invariant while the inner time chunk is
-> unchanged. A sub-90-day block shrinks the time chunk, raising `chunk_count` at constant
-> decompressed bytes — the §10.4 sizing trade, not an H3 violation.*
+**(c) Segmented vs monolith across request offsets and block anchors — the limit of (a)/(b).**
 
-This **strengthens** §10.4 rather than contradicting it: §10.4 already modelled decompressed
-bytes as ~invariant with only call count changing. It is a spec-wording refinement for a later
-editorial pass, not an architecture change — flagged for Codex, not acted on here.
+Regimes (a) and (b) both compare *segmentations of an aligned, full-span read*. That does
+**not** generalize to arbitrary requests, and a second review round was right to say so. A
+window that starts mid-chunk over-reads a different amount under a different block grid.
+`measure_h3_boundary` measures it directly on a 450-day archive, with every analytic figure
+validated against observed chunk keys (`analytic_validated_against_observed: true`).
+Day-cells decompressed (one variable, 8×8 spatial chunk):
+
+| block size | anchor | window | segments touched | monolith | segmented | ratio |
+|---|---|---|---|---|---|---|
+| 90 | 0 | `[0,450]` aligned full span | 5 | 450 | 450 | **1.000** |
+| 45 | 0 | `[0,450]` aligned full span | 10 | 450 | 450 | **1.000** |
+| 30 | 0 | `[0,450]` aligned full span | 15 | 450 | 450 | **1.000** |
+| **45** | **0** | **`[84,450]`** (the 366-day tail) | 9 | **450** | **405** | **0.900** |
+| 30 | 0 | `[84,450]` | 13 | 450 | 390 | 0.867 |
+| 90 | 0 | `[84,450]` | 5 | 450 | 450 | 1.000 |
+| 30 | 13 | `[84,450]` | 13 | 450 | 377 | 0.838 |
+| 90 | 13 | `[0,360]` | 5 | 360 | **373** | **1.036** |
+| 30 | 0 | `[225,226]` single day | 1 | 90 | 30 | 0.333 |
+| 45 | 0 | `[100,190]` | 3 | 180 | 135 | 0.750 |
+
+**Measured ratio range across the sweep: 0.333 – 1.036.** Two directions, both real:
+
+- **Smaller blocks usually decompress FEWER bytes** on a partial window, because the leading
+  and trailing over-read is bounded by the smaller chunk. A single-day read costs 90 day-cells
+  from a `t90` monolith but 30 from a 30-day block.
+- **An off-anchor grid can decompress MORE** — anchor 13 with window `[0,360]` adds a partial
+  leading block, giving 373 vs 360 day-cells (1.036×).
+
+> **Corrected H3 (what the evidence actually supports):**
+> *At a **constant inner time chunk**, segmentation leaves `chunk_count` and
+> `decompressed_bytes` invariant. For an **aligned, full-span** read, `decompressed_bytes` is
+> equal across block sizes while `chunk_count` rises as the time chunk shrinks. **Outside those
+> conditions `decompressed_bytes` is NOT invariant**: it moves with the request offset and the
+> block anchor (measured 0.333× – 1.036×), because boundary over-read depends on the block
+> geometry.*
+
+The earlier wording — "segmentation never changes `decompressed_bytes`" — was **stronger than
+the evidence** and has been corrected in the spec (§2 H3, §3.B, §6.3, §10.4). §10.4's own
+arithmetic already contradicted it (115 / 104 / 100 KB per var at S = 90/45/30), which is the
+sort of internal inconsistency an over-broad claim produces.
+
+**This does not threaten the sizing decision** — smaller blocks mostly *reduce* decompressed
+bytes while raising call count, so the §10.4 tension remains "calls vs blocks", not "bytes".
+But the adjudication must be made on the **production calendar anchor** with representative
+1-day / 366-day / crossing windows, which is **P5-S6**, not S0.
 
 ## 5. H8 — Zarr v3 native append  ✅ REPRODUCED (rectilinear rejected)
 
@@ -266,9 +305,15 @@ dev2026/.venv/bin/python dev2026/bench/bench_p5_baseline.py --out dev2026/bench/
 
 ## 10. For Codex
 
-1. **Spec wording refinement (§2 H3, editorial):** the refined H3 statement in §4 above has
-   been applied to the design spec on `dev2026-p5-segmented-compaction-design`.
+1. **Spec wording corrected (§2 H3, §3.B, §6.3, §10.4):** the corrected H3 statement in §4c
+   above is applied to the design spec on `dev2026-p5-segmented-compaction-design`. The
+   invariance claim now carries its conditions, and the "identical to today's monolith"
+   phrasing in the read-path table is qualified.
 2. **Artifacts committed:** `p5s0_rmw.json`, `p5s0_baseline.json` — both carry `provenance`,
    `env` (zarr/python/platform) and the geometry read back from disk.
-3. **Next:** P5-S1 (manifest schema + segmented-store prototype), which is the first step that
+3. **Deferred to P5-S6, by design:** the boundary sweep here uses a synthetic 450-day archive
+   and a small anchor set. The sizing decision must be adjudicated on the **production calendar
+   anchor** with representative 1-day / 366-day / legacy→block→delta crossing windows. S0
+   establishes that bytes are anchor-sensitive; it does not choose `S`.
+4. **Next:** P5-S1 (manifest schema + segmented-store prototype), which is the first step that
    writes P5 storage code.

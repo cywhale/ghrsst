@@ -49,9 +49,10 @@
     "metadata_files_changed": 0,
     "note": "H1 holds when a one-day write rewrites every DATA shard spanning the block, i.e. amplification approaches time_chunk. The gate uses data-shard metrics only; metadata churn is reported separately. Two amplification bases are given because they answer different questions: vs the average STORED (compressed) day, and vs one uncompressed var-day.",
     "stored_data_bytes": 83680474,
-    "write_ms": 566.669
+    "write_ms": 595.506
   },
   "h2": {
+    "all_data_shards_rewritten": true,
     "h2_confirmed": true,
     "hypothesis": "H2",
     "monotonic_in_tail_length": true,
@@ -125,7 +126,7 @@
     "all_segmentations_return_all_days": true,
     "block_size_sweep": {
       "decompressed_bytes_invariant": true,
-      "marginal_ms_per_extra_segment": 0.975,
+      "marginal_ms_per_extra_segment": 0.96,
       "rows": [
         {
           "bytes": 334732223,
@@ -134,10 +135,10 @@
           "decompressed_bytes": 92160,
           "file_count": 72,
           "latency": {
-            "max_ms": 4.244,
-            "min_ms": 3.842,
-            "p50_ms": 3.899,
-            "p95_ms": 4.244,
+            "max_ms": 4.437,
+            "min_ms": 3.853,
+            "p50_ms": 4.058,
+            "p95_ms": 4.437,
             "repeats": 15
           },
           "segments": 4,
@@ -153,10 +154,10 @@
           "decompressed_bytes": 92160,
           "file_count": 144,
           "latency": {
-            "max_ms": 8.191,
-            "min_ms": 7.703,
-            "p50_ms": 7.888,
-            "p95_ms": 8.191,
+            "max_ms": 8.234,
+            "min_ms": 7.694,
+            "p50_ms": 8.024,
+            "p95_ms": 8.234,
             "repeats": 15
           },
           "segments": 8,
@@ -172,10 +173,10 @@
           "decompressed_bytes": 92160,
           "file_count": 216,
           "latency": {
-            "max_ms": 11.993,
-            "min_ms": 11.442,
-            "p50_ms": 11.695,
-            "p95_ms": 11.993,
+            "max_ms": 12.172,
+            "min_ms": 11.607,
+            "p50_ms": 11.734,
+            "p95_ms": 12.172,
             "repeats": 15
           },
           "segments": 12,
@@ -189,7 +190,7 @@
     "constant_time_chunk": {
       "chunk_count_invariant": true,
       "decompressed_bytes_invariant": true,
-      "marginal_ms_per_extra_segment": 0.669,
+      "marginal_ms_per_extra_segment": 0.726,
       "rows": [
         {
           "bytes": 334726520,
@@ -198,10 +199,10 @@
           "decompressed_bytes": 92160,
           "file_count": 66,
           "latency": {
-            "max_ms": 2.095,
-            "min_ms": 1.789,
-            "p50_ms": 1.919,
-            "p95_ms": 2.095,
+            "max_ms": 2.1,
+            "min_ms": 1.838,
+            "p50_ms": 1.928,
+            "p95_ms": 2.1,
             "repeats": 15
           },
           "segments": 1,
@@ -217,10 +218,10 @@
           "decompressed_bytes": 92160,
           "file_count": 68,
           "latency": {
-            "max_ms": 2.705,
-            "min_ms": 2.362,
-            "p50_ms": 2.414,
-            "p95_ms": 2.705,
+            "max_ms": 2.79,
+            "min_ms": 2.273,
+            "p50_ms": 2.495,
+            "p95_ms": 2.79,
             "repeats": 15
           },
           "segments": 2,
@@ -236,10 +237,10 @@
           "decompressed_bytes": 92160,
           "file_count": 72,
           "latency": {
-            "max_ms": 4.266,
-            "min_ms": 3.848,
-            "p50_ms": 3.925,
-            "p95_ms": 4.266,
+            "max_ms": 4.319,
+            "min_ms": 3.942,
+            "p50_ms": 4.106,
+            "p95_ms": 4.319,
             "repeats": 15
           },
           "segments": 4,
@@ -256,10 +257,562 @@
     "note": "H3 (refined by this harness): decompressed_bytes is invariant under segmentation in EVERY regime; chunk_count is additionally invariant while the inner time chunk is unchanged. A sub-90-day block shrinks the time chunk, raising chunk_count at constant decompressed_bytes -- the \u00a710.4 sizing trade, not an H3 violation.",
     "total_days": 360
   },
+  "h3_boundary": {
+    "analytic_validated_against_observed": true,
+    "bytes_can_differ_at_boundaries": true,
+    "bytes_equal_in_aligned_full_span": true,
+    "bytes_ratio_max": 1.0361,
+    "bytes_ratio_min": 0.3333,
+    "hypothesis": "H3-boundary",
+    "note": "Decompressed bytes are equal segmented-vs-monolith ONLY for aligned, full-span reads. Off-anchor windows change the over-read at the leading and trailing boundary, so bytes move with block size and anchor. S6 must adjudicate on the production calendar anchor and representative windows.",
+    "rows": [
+      {
+        "anchor": 0,
+        "block_size": 30,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 450,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 5,
+        "monolith_decompressed_bytes": 115200,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 15,
+        "segmented_decompressed_bytes": 115200,
+        "segments_touched": 15,
+        "values_match": true,
+        "window": [
+          0,
+          450
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 30,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 360,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 4,
+        "monolith_decompressed_bytes": 92160,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 12,
+        "segmented_decompressed_bytes": 92160,
+        "segments_touched": 12,
+        "values_match": true,
+        "window": [
+          0,
+          360
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 30,
+        "bytes_ratio_segmented_over_monolith": 0.8667,
+        "days_requested": 366,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 5,
+        "monolith_decompressed_bytes": 115200,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 13,
+        "segmented_decompressed_bytes": 99840,
+        "segments_touched": 13,
+        "values_match": true,
+        "window": [
+          84,
+          450
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 30,
+        "bytes_ratio_segmented_over_monolith": 0.3333,
+        "days_requested": 1,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 1,
+        "monolith_decompressed_bytes": 23040,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 1,
+        "segmented_decompressed_bytes": 7680,
+        "segments_touched": 1,
+        "values_match": true,
+        "window": [
+          225,
+          226
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 30,
+        "bytes_ratio_segmented_over_monolith": 0.6667,
+        "days_requested": 90,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 2,
+        "monolith_decompressed_bytes": 46080,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 4,
+        "segmented_decompressed_bytes": 30720,
+        "segments_touched": 4,
+        "values_match": true,
+        "window": [
+          100,
+          190
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 30,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 450,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 5,
+        "monolith_decompressed_bytes": 115200,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 16,
+        "segmented_decompressed_bytes": 115200,
+        "segments_touched": 16,
+        "values_match": true,
+        "window": [
+          0,
+          450
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 30,
+        "bytes_ratio_segmented_over_monolith": 1.0361,
+        "days_requested": 360,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 4,
+        "monolith_decompressed_bytes": 92160,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 13,
+        "segmented_decompressed_bytes": 95488,
+        "segments_touched": 13,
+        "values_match": true,
+        "window": [
+          0,
+          360
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 30,
+        "bytes_ratio_segmented_over_monolith": 0.8378,
+        "days_requested": 366,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 5,
+        "monolith_decompressed_bytes": 115200,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 13,
+        "segmented_decompressed_bytes": 96512,
+        "segments_touched": 13,
+        "values_match": true,
+        "window": [
+          84,
+          450
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 30,
+        "bytes_ratio_segmented_over_monolith": 0.3333,
+        "days_requested": 1,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 1,
+        "monolith_decompressed_bytes": 23040,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 1,
+        "segmented_decompressed_bytes": 7680,
+        "segments_touched": 1,
+        "values_match": true,
+        "window": [
+          225,
+          226
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 30,
+        "bytes_ratio_segmented_over_monolith": 0.6667,
+        "days_requested": 90,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 2,
+        "monolith_decompressed_bytes": 46080,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 4,
+        "segmented_decompressed_bytes": 30720,
+        "segments_touched": 4,
+        "values_match": true,
+        "window": [
+          100,
+          190
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 45,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 450,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 5,
+        "monolith_decompressed_bytes": 115200,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 10,
+        "segmented_decompressed_bytes": 115200,
+        "segments_touched": 10,
+        "values_match": true,
+        "window": [
+          0,
+          450
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 45,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 360,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 4,
+        "monolith_decompressed_bytes": 92160,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 8,
+        "segmented_decompressed_bytes": 92160,
+        "segments_touched": 8,
+        "values_match": true,
+        "window": [
+          0,
+          360
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 45,
+        "bytes_ratio_segmented_over_monolith": 0.9,
+        "days_requested": 366,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 5,
+        "monolith_decompressed_bytes": 115200,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 9,
+        "segmented_decompressed_bytes": 103680,
+        "segments_touched": 9,
+        "values_match": true,
+        "window": [
+          84,
+          450
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 45,
+        "bytes_ratio_segmented_over_monolith": 0.5,
+        "days_requested": 1,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 1,
+        "monolith_decompressed_bytes": 23040,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 1,
+        "segmented_decompressed_bytes": 11520,
+        "segments_touched": 1,
+        "values_match": true,
+        "window": [
+          225,
+          226
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 45,
+        "bytes_ratio_segmented_over_monolith": 0.75,
+        "days_requested": 90,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 2,
+        "monolith_decompressed_bytes": 46080,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 3,
+        "segmented_decompressed_bytes": 34560,
+        "segments_touched": 3,
+        "values_match": true,
+        "window": [
+          100,
+          190
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 45,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 450,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 5,
+        "monolith_decompressed_bytes": 115200,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 11,
+        "segmented_decompressed_bytes": 115200,
+        "segments_touched": 11,
+        "values_match": true,
+        "window": [
+          0,
+          450
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 45,
+        "bytes_ratio_segmented_over_monolith": 1.0361,
+        "days_requested": 360,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 4,
+        "monolith_decompressed_bytes": 92160,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 9,
+        "segmented_decompressed_bytes": 95488,
+        "segments_touched": 9,
+        "values_match": true,
+        "window": [
+          0,
+          360
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 45,
+        "bytes_ratio_segmented_over_monolith": 0.8711,
+        "days_requested": 366,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 5,
+        "monolith_decompressed_bytes": 115200,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 9,
+        "segmented_decompressed_bytes": 100352,
+        "segments_touched": 9,
+        "values_match": true,
+        "window": [
+          84,
+          450
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 45,
+        "bytes_ratio_segmented_over_monolith": 0.5,
+        "days_requested": 1,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 1,
+        "monolith_decompressed_bytes": 23040,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 1,
+        "segmented_decompressed_bytes": 11520,
+        "segments_touched": 1,
+        "values_match": true,
+        "window": [
+          225,
+          226
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 45,
+        "bytes_ratio_segmented_over_monolith": 0.75,
+        "days_requested": 90,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 2,
+        "monolith_decompressed_bytes": 46080,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 3,
+        "segmented_decompressed_bytes": 34560,
+        "segments_touched": 3,
+        "values_match": true,
+        "window": [
+          100,
+          190
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 90,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 450,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 5,
+        "monolith_decompressed_bytes": 115200,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 5,
+        "segmented_decompressed_bytes": 115200,
+        "segments_touched": 5,
+        "values_match": true,
+        "window": [
+          0,
+          450
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 90,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 360,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 4,
+        "monolith_decompressed_bytes": 92160,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 4,
+        "segmented_decompressed_bytes": 92160,
+        "segments_touched": 4,
+        "values_match": true,
+        "window": [
+          0,
+          360
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 90,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 366,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 5,
+        "monolith_decompressed_bytes": 115200,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 5,
+        "segmented_decompressed_bytes": 115200,
+        "segments_touched": 5,
+        "values_match": true,
+        "window": [
+          84,
+          450
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 90,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 1,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 1,
+        "monolith_decompressed_bytes": 23040,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 1,
+        "segmented_decompressed_bytes": 23040,
+        "segments_touched": 1,
+        "values_match": true,
+        "window": [
+          225,
+          226
+        ]
+      },
+      {
+        "anchor": 0,
+        "block_size": 90,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 90,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 2,
+        "monolith_decompressed_bytes": 46080,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 2,
+        "segmented_decompressed_bytes": 46080,
+        "segments_touched": 2,
+        "values_match": true,
+        "window": [
+          100,
+          190
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 90,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 450,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 5,
+        "monolith_decompressed_bytes": 115200,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 6,
+        "segmented_decompressed_bytes": 115200,
+        "segments_touched": 6,
+        "values_match": true,
+        "window": [
+          0,
+          450
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 90,
+        "bytes_ratio_segmented_over_monolith": 1.0361,
+        "days_requested": 360,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 4,
+        "monolith_decompressed_bytes": 92160,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 5,
+        "segmented_decompressed_bytes": 95488,
+        "segments_touched": 5,
+        "values_match": true,
+        "window": [
+          0,
+          360
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 90,
+        "bytes_ratio_segmented_over_monolith": 0.9711,
+        "days_requested": 366,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 5,
+        "monolith_decompressed_bytes": 115200,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 5,
+        "segmented_decompressed_bytes": 111872,
+        "segments_touched": 5,
+        "values_match": true,
+        "window": [
+          84,
+          450
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 90,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 1,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 1,
+        "monolith_decompressed_bytes": 23040,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 1,
+        "segmented_decompressed_bytes": 23040,
+        "segments_touched": 1,
+        "values_match": true,
+        "window": [
+          225,
+          226
+        ]
+      },
+      {
+        "anchor": 13,
+        "block_size": 90,
+        "bytes_ratio_segmented_over_monolith": 1.0,
+        "days_requested": 90,
+        "monolith_analytic_matches_observed": true,
+        "monolith_chunk_count": 2,
+        "monolith_decompressed_bytes": 46080,
+        "segmented_analytic_matches_observed": true,
+        "segmented_chunk_count": 2,
+        "segmented_decompressed_bytes": 46080,
+        "segments_touched": 2,
+        "values_match": true,
+        "window": [
+          100,
+          190
+        ]
+      }
+    ],
+    "total_days": 450
+  },
   "h8": {
     "hypothesis": "H8",
     "note": "Rectilinear SHARDS force a uniform inner time chunk of 1, which is what costs the point-series read. Re-test when zarr-python 3.3 stabilizes the feature (spec \u00a716-Q7).",
-    "point_series_regression_x": 19.3,
+    "point_series_regression_x": 19.6,
     "rect_chunks_with_sharding": {
       "error": "ValueError: Rectilinear chunks with sharding is not supported. Use rectilinear shards instead: chunks=(inner_size, ...), shards=[[shard_sizes], ...]",
       "supported": false
@@ -268,28 +821,28 @@
       "append_data_bytes_rewritten": 1155136,
       "append_data_files_rewritten": 16,
       "append_metadata_files_changed": 1,
-      "append_ms": 374.037,
+      "append_ms": 369.702,
       "bytes": 139767240,
       "files": 514,
-      "hist_build_ms": 35186.839,
+      "hist_build_ms": 35652.846,
       "read_1d": {
-        "max_ms": 1.154,
-        "min_ms": 1.02,
-        "p50_ms": 1.042,
-        "p95_ms": 1.154,
+        "max_ms": 1.262,
+        "min_ms": 1.047,
+        "p50_ms": 1.111,
+        "p95_ms": 1.262,
         "repeats": 15
       },
       "read_series": {
-        "max_ms": 24.421,
-        "min_ms": 23.174,
-        "p50_ms": 23.743,
-        "p95_ms": 24.421,
+        "max_ms": 28.985,
+        "min_ms": 23.339,
+        "p50_ms": 24.284,
+        "p95_ms": 28.985,
         "repeats": 15
       },
       "supported": true
     },
     "regular": {
-      "build_ms": 915.253,
+      "build_ms": 917.551,
       "bytes": 112264308,
       "files": 34,
       "geometry": {
@@ -311,17 +864,17 @@
         ]
       },
       "read_1d": {
-        "max_ms": 1.088,
-        "min_ms": 0.956,
-        "p50_ms": 0.977,
-        "p95_ms": 1.088,
+        "max_ms": 1.153,
+        "min_ms": 0.966,
+        "p50_ms": 0.974,
+        "p95_ms": 1.153,
         "repeats": 15
       },
       "read_series": {
-        "max_ms": 1.4,
-        "min_ms": 1.131,
-        "p50_ms": 1.232,
-        "p95_ms": 1.4,
+        "max_ms": 1.406,
+        "min_ms": 1.162,
+        "p50_ms": 1.238,
+        "p95_ms": 1.406,
         "repeats": 15
       }
     },
