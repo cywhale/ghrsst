@@ -1,9 +1,10 @@
 # P5 — segmented time-cube / block-level compaction (DESIGN SPEC — SPEC-ONLY, NO IMPLEMENTATION)
 
-Status: **v8 — ARCHITECTURE APPROVED (Codex, round-7); round-8 consistency cleanups applied.** Claude
-authored. **No code was written,
-no test was added, no file other than this spec was created or modified, nothing was committed, and no VM24
-path was touched.**
+Status: **v8 — ARCHITECTURE SIGNED OFF (Codex, round-7); round-8 consistency cleanups applied.** Claude
+authored. **This spec file is committed** (`9cf4c07`, branch `dev2026-p5-segmented-compaction-design`,
+based on `14f26db` = v0.5.0). **No implementation code and no tests have been written for P5, no other file
+has been created or modified by this design work, and no VM24 path has been touched.** Implementation
+begins at P5-S0 (§14), which is local, read-only benchmark harness work only.
 
 > **Round-8 cleanups (consistency only; no architecture review required).** (1) **Writers validate the
 > complete existing WAL before appending** (§7.5a-1 write protocol step 2): under `LOCK_EX`, run the same
@@ -17,8 +18,9 @@ path was touched.**
 > authorizing evidence** for pruning a repaired day, its serialization and parser semantics are now part of
 > the contract — **§7.5a-1**: dedicated **`p5_repairs.lock`** (distinct from the ingest and compaction
 > locks) serializing appends and allocating a **monotonic, gap-free `seq`** under the lock (`repair_id` may
-> be UUID + seq); every record carries `seq` + `record_checksum` and optionally `prev_checksum` to chain the
-> log; **append + flush + fsync per record**, plus a **parent-directory fsync on creation**; **exactly one
+> be UUID + seq); every record carries `seq` + `record_checksum` and a **mandatory `prev_checksum` chain**
+> (`null` only at `seq 1`, otherwise equal to `seq-1`'s `record_checksum` — made mandatory in round-8);
+> **append + flush + fsync per record**, plus a **parent-directory fsync on creation**; **exactly one
 > terminal state per intent**, with **identical terminal replay idempotent** and any **committed-vs-aborted
 > conflict invalid**; and a **strict, whole-file, fail-closed parser** — malformed/truncated JSON, checksum
 > failure, `seq` gap, or duplicate conflicting `seq`/`repair_id` each **disable the affected prune and are
@@ -2110,7 +2112,7 @@ condition. Steps S0–S7 are **local-only**; S8–S10 are the VM24 boundary (§1
   post-prune**; the pre-prune public GET is recorded as a delta-precedence check, never as block proof
   (§7.6, §7.8, §7.8a, F13d, G20).
 - ✅ **Round-7:** WAL serialization and parser semantics specified — dedicated lock, monotonic gap-free
-  `seq`, per-record checksum + optional chaining, fsync per record and on directory creation, one terminal
+  `seq`, per-record checksum + **mandatory `prev_checksum` chain**, fsync per record and on directory creation, one terminal
   state per intent, idempotent identical replay, invalid conflicting terminals, and a strict fail-closed
   parser that never skips a bad record (§7.5a-1, F13f, G22, Q17(c)).
 - ✅ **Round-8:** writers validate the whole WAL before appending and refuse to append after a corrupt tail;
