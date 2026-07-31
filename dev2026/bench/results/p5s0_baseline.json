@@ -1,0 +1,314 @@
+{
+  "cases": {
+    "range_366d_base_only": {
+      "analytic": {
+        "chunk_count": 15,
+        "days": 366,
+        "decompressed_bytes": 345600,
+        "index_window": [
+          84,
+          450
+        ],
+        "read_amplification": 78.7,
+        "useful_bytes": 4392
+      },
+      "days": 366,
+      "latency": {
+        "max_ms": 7.229,
+        "min_ms": 6.468,
+        "p50_ms": 6.778,
+        "p95_ms": 7.229,
+        "repeats": 15
+      },
+      "rows_returned": 366,
+      "tier": "base"
+    },
+    "range_366d_crossing": {
+      "sweep": [
+        {
+          "analytic_base": {
+            "chunk_count": 12,
+            "days": 335,
+            "decompressed_bytes": 276480,
+            "index_window": [
+              115,
+              450
+            ],
+            "read_amplification": 68.8,
+            "useful_bytes": 4020
+          },
+          "analytic_delta": {
+            "chunk_count": 93,
+            "days": 31,
+            "decompressed_bytes": 24379392,
+            "index_window": [
+              0,
+              31
+            ],
+            "read_amplification": 65536.0,
+            "useful_bytes": 372
+          },
+          "delta_span_days": 31,
+          "latency": {
+            "max_ms": 43.033,
+            "min_ms": 35.65,
+            "p50_ms": 37.386,
+            "p95_ms": 43.033,
+            "repeats": 15
+          },
+          "rows_returned": 366,
+          "total_days": 366
+        },
+        {
+          "analytic_base": {
+            "chunk_count": 12,
+            "days": 321,
+            "decompressed_bytes": 276480,
+            "index_window": [
+              129,
+              450
+            ],
+            "read_amplification": 71.8,
+            "useful_bytes": 3852
+          },
+          "analytic_delta": {
+            "chunk_count": 135,
+            "days": 45,
+            "decompressed_bytes": 35389440,
+            "index_window": [
+              0,
+              45
+            ],
+            "read_amplification": 65536.0,
+            "useful_bytes": 540
+          },
+          "delta_span_days": 45,
+          "latency": {
+            "max_ms": 55.281,
+            "min_ms": 50.072,
+            "p50_ms": 51.062,
+            "p95_ms": 55.281,
+            "repeats": 15
+          },
+          "rows_returned": 366,
+          "total_days": 366
+        },
+        {
+          "analytic_base": {
+            "chunk_count": 12,
+            "days": 302,
+            "decompressed_bytes": 276480,
+            "index_window": [
+              148,
+              450
+            ],
+            "read_amplification": 76.3,
+            "useful_bytes": 3624
+          },
+          "analytic_delta": {
+            "chunk_count": 192,
+            "days": 64,
+            "decompressed_bytes": 50331648,
+            "index_window": [
+              0,
+              64
+            ],
+            "read_amplification": 65536.0,
+            "useful_bytes": 768
+          },
+          "delta_span_days": 64,
+          "latency": {
+            "max_ms": 71.411,
+            "min_ms": 68.509,
+            "p50_ms": 69.12,
+            "p95_ms": 71.411,
+            "repeats": 15
+          },
+          "rows_returned": 366,
+          "total_days": 366
+        }
+      ],
+      "tier": "base+delta"
+    },
+    "single_day_point": {
+      "analytic": {
+        "chunk_count": 3,
+        "days": 1,
+        "decompressed_bytes": 69120,
+        "index_window": [
+          225,
+          226
+        ],
+        "read_amplification": 5760.0,
+        "useful_bytes": 12
+      },
+      "days": 1,
+      "latency": {
+        "max_ms": 2.548,
+        "min_ms": 2.259,
+        "p50_ms": 2.294,
+        "p95_ms": 2.548,
+        "repeats": 15
+      },
+      "tier": "base"
+    }
+  },
+  "env": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "python": "3.13.11",
+    "zarr": "3.2.1"
+  },
+  "fixture": {
+    "base_bytes": 278780741,
+    "base_days": 450,
+    "base_files": 68,
+    "base_geometry": {
+      "sea_ice": {
+        "chunks": [
+          90,
+          8,
+          8
+        ],
+        "dtype": "float32",
+        "shape": [
+          450,
+          256,
+          256
+        ],
+        "shards": [
+          90,
+          128,
+          128
+        ]
+      },
+      "sst": {
+        "chunks": [
+          90,
+          8,
+          8
+        ],
+        "dtype": "float32",
+        "shape": [
+          450,
+          256,
+          256
+        ],
+        "shards": [
+          90,
+          128,
+          128
+        ]
+      },
+      "sst_anomaly": {
+        "chunks": [
+          90,
+          8,
+          8
+        ],
+        "dtype": "float32",
+        "shape": [
+          450,
+          256,
+          256
+        ],
+        "shards": [
+          90,
+          128,
+          128
+        ]
+      }
+    },
+    "base_span": [
+      "2024-01-01",
+      "2025-03-25"
+    ],
+    "delta_bytes": 42371726,
+    "delta_days": 64,
+    "delta_files": 200,
+    "delta_geometry": {
+      "sea_ice": {
+        "chunks": [
+          1,
+          256,
+          256
+        ],
+        "dtype": "float32",
+        "shape": [
+          64,
+          256,
+          256
+        ],
+        "shards": [
+          1,
+          256,
+          256
+        ]
+      },
+      "sst": {
+        "chunks": [
+          1,
+          256,
+          256
+        ],
+        "dtype": "float32",
+        "shape": [
+          64,
+          256,
+          256
+        ],
+        "shards": [
+          1,
+          256,
+          256
+        ]
+      },
+      "sst_anomaly": {
+        "chunks": [
+          1,
+          256,
+          256
+        ],
+        "dtype": "float32",
+        "shape": [
+          64,
+          256,
+          256
+        ],
+        "shards": [
+          1,
+          256,
+          256
+        ]
+      }
+    },
+    "delta_span": [
+      "2025-03-26",
+      "2025-05-28"
+    ],
+    "grid": [
+      256,
+      256
+    ]
+  },
+  "g3_reference_p95_ms": {
+    "range_366d_base_only": 7.229,
+    "range_366d_crossing_min_delta": 43.033,
+    "single_day_point": 2.548
+  },
+  "grid_index": [
+    127,
+    127
+  ],
+  "harness": "bench_p5_baseline.py",
+  "point": [
+    130.0,
+    20.0
+  ],
+  "provenance": "COMMITTED harness, synthetic fixture on production chunk geometry, local, warm. NOT a VM24 measurement and not binding performance.",
+  "role": "BASELINE OF RECORD for gate G3 (point p95 within +25 % of current TieredCube)",
+  "rss_mb": {
+    "end": 236.2,
+    "start": 234.8
+  },
+  "step": "P5-S0"
+}
