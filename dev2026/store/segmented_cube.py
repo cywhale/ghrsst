@@ -207,10 +207,18 @@ class SegmentedCubeStore:
             except Exception as exc:                   # noqa: BLE001 - surface as snapshot failure
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r} unreadable at {spath}: {exc}") from exc
-            if list(store.days) != list(insp.days) or sorted(store.vars) != sorted(insp.vars):
+            # Bind the WHOLE inspection to the reader, not just days+vars. Anything left out
+            # of this comparison is a TOCTOU hole: a change landing between the inspection
+            # and the reader's metadata capture would be installed unvalidated. A `var_valid`
+            # flip is the sharpest example — it silently changes what the API returns.
+            want = bm.inspection_binding(insp)
+            got = bm.reader_binding(store, insp)
+            if got != want:
+                differing = sorted(k for k in want if want[k] != got.get(k))
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r}: the reader's metadata disagrees with "
-                    f"the verified inspection (the store changed under us)")
+                    f"the verified inspection on {differing} (the store changed under us "
+                    f"between inspection and open)")
 
             prec = int(seg["precedence"])
             for day in actual:

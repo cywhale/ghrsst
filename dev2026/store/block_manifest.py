@@ -355,8 +355,10 @@ def segment_layout(store_path: str) -> dict:
 
 DTYPE = "float32"
 
-# Only `inspect_store_contract` mints this. `metadata_fingerprint_from_inspection` refuses
-# anything else, so the strict path cannot be side-stepped by hand-building a look-alike.
+# Only `inspect_store_contract` sets this. `metadata_fingerprint_from_inspection` refuses
+# anything else, which prevents ACCIDENTAL bypass (a hand-built look-alike, a stale dict from
+# an older code path). It is a module-private convention, not a security boundary: a caller
+# that reaches for `bm._INSPECTION_TOKEN` can forge one, and nothing here pretends otherwise.
 _INSPECTION_TOKEN = object()
 
 
@@ -375,6 +377,34 @@ class StoreInspection(NamedTuple):
     lon_digest: str
     lat_digest: str
     region: tuple
+
+
+def _axis(g, name: str, store_path: str):
+    """Validate a coordinate axis against what the READ PATH actually requires.
+
+    `TimeCubeStore._nearest_idx` resolves a point with `np.searchsorted`, which is only
+    correct on a 1-D, strictly INCREASING axis. A 2-D `lon` blew up inside the read, and a
+    descending one silently returned the wrong grid cell (asking for lon 100 resolved to
+    131). Relaxing this later means changing the index resolver first, not the validator."""
+    import numpy as np
+    if name not in g:
+        raise ManifestError(f"{store_path}: coordinate array {name!r} is missing")
+    raw = g[name]
+    if raw.ndim != 1:
+        raise ManifestError(
+            f"{store_path}: {name!r} is {raw.ndim}-D, expected 1-D — the read path indexes "
+            f"it as a 1-D axis")
+    arr = np.asarray(raw[:], dtype="float64")
+    if arr.size == 0:
+        raise ManifestError(f"{store_path}: {name!r} is empty")
+    if not np.all(np.isfinite(arr)):
+        raise ManifestError(f"{store_path}: {name!r} contains non-finite values")
+    if arr.size > 1 and not np.all(np.diff(arr) > 0):
+        raise ManifestError(
+            f"{store_path}: {name!r} is not strictly increasing. The read path uses "
+            f"np.searchsorted, which requires an ascending axis; a descending one resolves "
+            f"to the wrong cell without any error.")
+    return arr
 
 
 def _exact(value, typ, what: str):
@@ -501,11 +531,29 @@ def inspect_store_contract(store_path: str, *, allow_implicit_var_valid: bool = 
             pairs.append((v, tuple(flags)))
         var_valid = tuple(pairs)
 
-    lon = np.asarray(g["lon"][:], dtype="float64")
-    lat = np.asarray(g["lat"][:], dtype="float64")
-    region = attrs.get("region", [])
-    if region is not None and type(region) is not list:
-        raise ManifestError(f"{store_path}: attrs['region'] must be a list")
+    lon = _axis(g, "lon", store_path)
+    lat = _axis(g, "lat", store_path)
+
+    # ---- region: exactly four RAW ints, consistent with the grid
+    region = attrs.get("region", None)
+    if region is not None:
+        _exact(region, list, f"{store_path}: attrs['region']")
+        if len(region) != 4:
+            raise ManifestError(
+                f"{store_path}: attrs['region'] must have exactly four entries "
+                f"[i0,i1,j0,j1], got {len(region)}")
+        for i, x in enumerate(region):
+            if type(x) is not int or isinstance(x, bool):
+                raise ManifestError(
+                    f"{store_path}: attrs['region'][{i}]={x!r} is "
+                    f"{type(x).__name__}, expected int. int(x) would launder a string or a "
+                    f"float into a bound.")
+        i0, i1, j0, j1 = region
+        ny_, nx_ = int(lat.size), int(lon.size)
+        if not (0 <= i0 < i1 <= ny_) or not (0 <= j0 < j1 <= nx_):
+            raise ManifestError(
+                f"{store_path}: attrs['region']={region} is out of order or outside the "
+                f"grid {ny_}x{nx_} (need 0 <= i0 < i1 <= ny and 0 <= j0 < j1 <= nx)")
 
     return StoreInspection(
         token=_INSPECTION_TOKEN, path=store_path,
@@ -515,6 +563,57 @@ def inspect_store_contract(store_path: str, *, allow_implicit_var_valid: bool = 
         lon_digest=hashlib.sha256(lon.tobytes()).hexdigest(),
         lat_digest=hashlib.sha256(lat.tobytes()).hexdigest(),
         region=tuple(int(x) for x in (region or ())))
+
+
+def effective_var_valid(insp: StoreInspection) -> dict:
+    """`{var: [bool, ...]}` as the READ PATH will see it, with the legacy implicit case
+    normalized to all-true so the two sides are comparable."""
+    return {v: list(flags) for v, flags in insp.var_valid}
+
+
+def reader_binding(store, insp: StoreInspection) -> dict:
+    """The reader's OWN captured metadata, in the same shape as `inspection_binding`.
+
+    Comparing only `days` and `vars` left a TOCTOU window: a `var_valid` flip landing between
+    the inspection and the reader's capture was installed unvalidated, and it changes what the
+    API returns for that day."""
+    import hashlib as _h
+    import numpy as np
+    m = store._meta
+    vv = {v: list(flags) for v, flags in dict(m.var_valid).items()}
+    if insp.var_valid_implicit and not vv:
+        vv = {v: [True] * len(m.days) for v in m.vars}
+    arrays = {}
+    for v in sorted(m.vars):
+        arr = m.arr.get(v)
+        if arr is None:
+            continue
+        shards = getattr(arr, "shards", None)
+        fill = arr.fill_value
+        arrays[v] = {"shape": [int(x) for x in arr.shape],
+                     "chunks": [int(x) for x in arr.chunks],
+                     "shards": [int(x) for x in shards] if shards else None,
+                     "dtype": str(arr.dtype),
+                     "fill_is_nan": bool(fill is not None and np.isnan(
+                         np.asarray(fill, dtype="float64")))}
+    return {
+        "days": list(m.days), "vars": sorted(m.vars), "var_valid": vv, "arrays": arrays,
+        "lon_digest": _h.sha256(np.asarray(m.lon, dtype="float64").tobytes()).hexdigest(),
+        "lat_digest": _h.sha256(np.asarray(m.lat, dtype="float64").tobytes()).hexdigest(),
+    }
+
+
+def inspection_binding(inspection) -> dict:
+    insp = _require_inspection(inspection)
+    return {
+        "days": list(insp.days), "vars": sorted(insp.vars),
+        "var_valid": effective_var_valid(insp),
+        "arrays": {v: {"shape": list(shape), "chunks": list(chunks),
+                       "shards": list(shards) if shards else None,
+                       "dtype": dtype, "fill_is_nan": fill_is_nan}
+                   for (v, shape, chunks, shards, dtype, fill_is_nan) in insp.arrays},
+        "lon_digest": insp.lon_digest, "lat_digest": insp.lat_digest,
+    }
 
 
 def _require_inspection(inspection) -> StoreInspection:

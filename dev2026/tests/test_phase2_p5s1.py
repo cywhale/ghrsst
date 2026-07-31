@@ -1131,15 +1131,18 @@ class TestIntegrityGuards(_Base):
         original = sc.TimeCubeStore
 
         class Drifted(original):
-            @property
-            def days(self):
-                return ["1999-01-01"]                      # disagrees with the inspection
+            def __init__(self, p, *a, **k):
+                super().__init__(p, *a, **k)
+                # drift the CAPTURED snapshot -- that is what the binding compares, and it
+                # is what a concurrent write would actually change
+                self._meta = self._meta._replace(days=["1999-01-01"])
 
         sc.TimeCubeStore = Drifted
         try:
             with self.assertRaises(SnapshotError) as cm:
                 SegmentedCubeStore(self.root)
             self.assertIn("disagrees with the verified inspection", str(cm.exception))
+            self.assertIn("days", str(cm.exception))
         finally:
             sc.TimeCubeStore = original
 
@@ -1154,6 +1157,136 @@ class TestIntegrityGuards(_Base):
         seg_store = store.segment_store("b0")
         self.assertEqual(list(seg_store.days), list(insp.days))
         self.assertEqual(sorted(seg_store.vars), sorted(insp.vars))
+
+    # ---- review round 5: bind the whole inspection, and pin the axes contract ----
+    def test_var_valid_changing_between_inspection_and_reader_fails_closed(self):
+        """[High] TOCTOU. The closing assertion compared only `days` and `vars`, so a
+        `var_valid` flip landing between the verified inspection and the reader's own
+        metadata read was installed unvalidated — and it changes what the API returns."""
+        import store.segmented_cube as sc
+
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        self._publish(self._manifest([seg]))
+        SegmentedCubeStore(self.root)                      # baseline: loads
+
+        original = sc.TimeCubeStore
+
+        class FlipsOnOpen(original):
+            def __init__(self, p, *a, **k):
+                import zarr as _z
+                g = _z.open_group(p, mode="a")
+                vv = {kk: list(v) for kk, v in dict(g.attrs["var_valid"]).items()}
+                vv["sst"][0] = False                       # after inspection, before capture
+                g.attrs["var_valid"] = vv
+                super().__init__(p, *a, **k)
+
+        sc.TimeCubeStore = FlipsOnOpen
+        try:
+            with self.assertRaises(SnapshotError) as cm:
+                SegmentedCubeStore(self.root)
+            self.assertIn("disagrees with the verified inspection", str(cm.exception))
+        finally:
+            sc.TimeCubeStore = original
+
+    def test_axes_must_be_one_dimensional(self):
+        """[High] The read path resolves a point with `np.searchsorted`, which assumes a 1-D
+        ascending axis. A 2-D `lon` was accepted and then blew up inside the read."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        import zarr as _z
+        g = _z.open_group(path, mode="a")
+        del g["lon"]
+        g.create_array("lon", shape=(1, 32), dtype="float32", chunks=(1, 32))
+        g["lon"][:] = np.linspace(100.0, 131.0, 32, dtype=np.float32)[None, :]
+        with self.assertRaises(bm.ManifestError) as cm:
+            bm.inspect_store_contract(path)
+        self.assertIn("1-d", str(cm.exception).lower())
+
+    def test_axes_must_be_strictly_increasing(self):
+        """A descending axis silently returned the wrong grid cell: asking for lon 100
+        resolved to 131."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        import zarr as _z
+        g = _z.open_group(path, mode="a")
+        g["lon"][:] = np.linspace(131.0, 100.0, 32, dtype=np.float32)   # descending
+        with self.assertRaises(bm.ManifestError) as cm:
+            bm.inspect_store_contract(path)
+        msg = str(cm.exception).lower()
+        self.assertIn("increasing", msg)
+        self.assertIn("searchsorted", msg)
+
+    def test_axes_must_be_finite_and_non_empty(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        import zarr as _z
+        for label, mutate in (
+            # +inf is STRICTLY INCREASING, so only the finiteness check can catch it --
+            # a NaN would have been caught by the monotonicity check instead, leaving the
+            # finiteness check untested.
+            ("inf", lambda g: g["lat"].__setitem__(slice(None),
+                np.concatenate([np.linspace(0, 30, 31), [np.inf]]).astype(np.float32))),
+            ("empty", None),
+        ):
+            with self.subTest(case=label):
+                self.setUp()
+                path = os.path.join(self.root, "b0")
+                fx.build_block(path, fx.calendar_span(s0, e0))
+                g = _z.open_group(path, mode="a")
+                if mutate is None:
+                    del g["lat"]
+                    g.create_array("lat", shape=(0,), dtype="float32", chunks=(1,))
+                else:
+                    mutate(g)
+                with self.assertRaises(bm.ManifestError):
+                    bm.inspect_store_contract(path)
+
+    def test_missing_axis_array_is_rejected(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        import zarr as _z
+        g = _z.open_group(path, mode="a")
+        del g["lon"]
+        with self.assertRaises(bm.ManifestError) as cm:
+            bm.inspect_store_contract(path)
+        self.assertIn("lon", str(cm.exception))
+
+    def test_region_must_be_four_raw_ints_within_the_grid(self):
+        """`int(x)` would launder `"0"` or `0.5` into a valid bound, so the raw type is
+        checked and the bounds must be consistent with ny/nx."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        import zarr as _z
+        bad = [
+            ([0, 32, 0], "four"),
+            (["0", 32, 0, 32], "int"),
+            ([0.0, 32, 0, 32], "int"),
+            ([0, 33, 0, 32], "grid"),
+            ([20, 4, 0, 32], "order"),
+        ]
+        for value, needle in bad:
+            with self.subTest(region=value):
+                self.setUp()
+                path = os.path.join(self.root, "b0")
+                fx.build_block(path, fx.calendar_span(s0, e0))
+                g = _z.open_group(path, mode="a")
+                g.attrs["region"] = value
+                with self.assertRaises(bm.ManifestError) as cm:
+                    bm.inspect_store_contract(path)
+                self.assertIn(needle, str(cm.exception).lower())
+
+    def test_valid_region_is_accepted(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        import zarr as _z
+        _z.open_group(path, mode="a").attrs["region"] = [0, 32, 0, 32]
+        insp = bm.inspect_store_contract(path)
+        self.assertEqual(list(insp.region), [0, 32, 0, 32])
 
     def test_base_segments_are_asserted_disjoint_from_the_delta(self):
         s0, e0 = bm.block_bounds(ANCHOR, 90, 0)

@@ -10,8 +10,8 @@ Implements P5-S1 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Manifest: [`../store/block_manifest.py`](../store/block_manifest.py)
 - Segmented store: [`../store/segmented_cube.py`](../store/segmented_cube.py)
 - Fixtures (F1–F3, F6, F11, F12): [`../tests/p5_fixtures.py`](../tests/p5_fixtures.py)
-- Tests: [`../tests/test_phase2_p5s1.py`](../tests/test_phase2_p5s1.py) — **73/73 green**
-- Full local suite: **351 tests OK** (17 skipped), up from 278; no regressions.
+- Tests: [`../tests/test_phase2_p5s1.py`](../tests/test_phase2_p5s1.py) — **80/80 green**
+- Full local suite: **358 tests OK** (17 skipped), up from 278; no regressions.
 
 ## 1. Gate
 
@@ -189,6 +189,23 @@ and validate raw state afterwards. It still failed closed, but it broke the mode
 now: **inspect → verify grid/axes/layout/fingerprint/day-set against that one view → construct
 the reader → assert the reader's metadata equals the inspection.** A test installs a tripwire
 `TimeCubeStore` and requires that it is never constructed for a malformed store.
+
+A **fifth** round closed the last two, and both were on surfaces the previous rounds had not
+reached:
+
+| defect | what got through | now |
+|---|---|---|
+| **The reader↔inspection binding was partial** — it compared only `days` and `vars` | a `var_valid` flip landing **between** the verified inspection and the reader's metadata capture was installed unvalidated, omitting `sst` on day 0 while the fingerprint attested to the *old* inspection. Textbook TOCTOU, and it changes API semantics | the **whole** inspection is bound: `days`, `vars`, effective `var_valid` (legacy implicit normalized to all-true), lon/lat digests, and every array's shape/chunks/shards/dtype/`fill_is_nan`. The error names which keys differ |
+| **Coordinate axes had no contract** while the read path assumes one | `lon.shape = (1,32)` was accepted and blew up inside the read; a **descending** axis was accepted and silently resolved lon `100` to grid lon `131` | axes must exist, be **1-D**, non-empty, all-finite and **strictly increasing** — because `TimeCubeStore._nearest_idx` uses `np.searchsorted`. The error says so, so relaxing it later means changing the index resolver first, not the validator |
+
+`region` is validated at the same time: exactly **four raw `int`s** (no `int(x)` laundering a
+`"0"` or a `0.5`), ordered, and inside `ny`/`nx`.
+
+**Correction to an earlier overclaim.** `_INSPECTION_TOKEN` was described as making a forged
+inspection impossible. It does not: it is a module-private convention that prevents
+**accidental** bypass — a stale dict from an older code path, a hand-built look-alike — and a
+caller who reaches for `bm._INSPECTION_TOKEN` can forge one. It is not a security boundary and
+the code no longer claims otherwise.
 
 **A note on why fingerprints alone are not enough.** When a manifest is generated from the
 store it describes — which is exactly what S3's builder will do — `fingerprint.metadata`
