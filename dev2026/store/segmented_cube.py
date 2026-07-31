@@ -132,6 +132,15 @@ class SegmentedCubeStore:
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r} unreadable at {spath}: {exc}") from exc
 
+            # ---- RAW self-consistency FIRST: every later check reads a derived view, so a
+            # malformed store must be rejected before anything has a chance to launder it.
+            try:
+                raw = bm.verify_store_self_consistency(
+                    spath,
+                    allow_implicit_var_valid=(seg.get("var_valid_mode") == "implicit_all_true"))
+            except bm.ManifestError as exc:
+                raise SnapshotError(f"segment {seg['segment_id']!r}: {exc}") from exc
+
             # ---- structural binding (review finding #3): the manifest must describe the
             # store it names. A day set alone cannot detect a block built on another grid,
             # which would map the same lon/lat to different physical cells -- silent wrong
@@ -180,16 +189,11 @@ class SegmentedCubeStore:
                     f"store {fp[:12]}… vs manifest "
                     f"{str(seg['fingerprint']['metadata'])[:12]}…")
 
-            actual = list(store.days)
-            for v, flags in store.var_valid.items():
-                if len(flags) != len(actual):
-                    raise SnapshotError(
-                        f"segment {seg['segment_id']!r} var_valid[{v}] has {len(flags)} "
-                        f"flag(s) for {len(actual)} day(s)")
+            actual = list(raw["days"])
 
             # EVERY variable, not just the first. A short or differently-shaped array loads
             # fine and then raises IndexError on the day it is missing.
-            store_vars = bm.store_variables(spath)
+            store_vars = sorted(raw["vars"])
             if sorted(seg["variables"]) != store_vars:
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r} declares variables "

@@ -843,6 +843,127 @@ class TestIntegrityGuards(_Base):
         self._publish(self._manifest([seg]))               # region [0,32,0,32] == full grid
         self.assertEqual(SegmentedCubeStore(self.root).day_count, 90)
 
+    # ---- review round 3: validate RAW state, never a coerced/filtered view ----
+    def _store_with(self, mutate):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        import zarr as _z
+        mutate(_z.open_group(path, mode="a"))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
+        return path
+
+    def test_missing_var_valid_key_is_rejected(self):
+        """[High] Only the LENGTHS of existing entries were checked, so deleting a key made
+        the variable silently 'valid on every day'."""
+        def drop(g):
+            vv = {k: list(v) for k, v in dict(g.attrs["var_valid"]).items()}
+            del vv["sst"]
+            g.attrs["var_valid"] = vv
+        self._store_with(drop)
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        self.assertIn("var_valid", str(cm.exception).lower())
+        self.assertIn("sst", str(cm.exception))
+
+    def test_non_boolean_var_valid_entry_is_rejected(self):
+        """[High] `bool(x)` was applied BEFORE validation, laundering a bad type into a good
+        one. Runtime uses `is False`, so a string would not behave like the fingerprint."""
+        def poison(g):
+            vv = {k: list(v) for k, v in dict(g.attrs["var_valid"]).items()}
+            vv["sst"][0] = "false"                  # truthy string, not a bool
+            g.attrs["var_valid"] = vv
+        self._store_with(poison)
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        msg = str(cm.exception).lower()
+        self.assertIn("var_valid", msg)
+        self.assertTrue("bool" in msg or "type" in msg, msg)
+
+    def test_declared_var_without_a_real_array_is_rejected(self):
+        """[High] `store_variables()` filtered with `if v in g`, so a store declaring a
+        variable it does not have became a 'valid' store: point reads silently omitted it
+        while `.vars` still advertised it. Both directions are asserted -- a broken store can
+        no longer be fingerprinted at all, and a manifest built while it was intact fails
+        closed once the array disappears."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)   # while intact
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
+
+        import zarr as _z
+        g = _z.open_group(path, mode="a")
+        del g["sea_ice"]                            # attrs['vars'] still lists it
+
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        msg = str(cm.exception)
+        self.assertIn("sea_ice", msg)
+        self.assertIn("no such array", msg.lower())
+
+        # a builder must not be able to mint a manifest for the broken store either
+        with self.assertRaises(bm.ManifestError):
+            bm.metadata_fingerprint(path)
+
+    def test_raw_declared_vars_must_be_unique_and_three_dimensional(self):
+        def dup(g):
+            g.attrs["vars"] = ["sst", "sst", "sst_anomaly", "sea_ice"]
+        self._store_with(dup)
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        self.assertIn("duplicate", str(cm.exception).lower())
+
+    def test_non_float32_or_non_nan_fill_variable_is_rejected(self):
+        """[Medium] The builder contract is float32 + fill_value NaN. A float64 array with
+        fill_value 0 turns an unwritten or missing chunk from `null` into a real 0.0."""
+        for dtype, fill, needle in (("float64", float("nan"), "dtype"),
+                                    ("float32", 0.0, "fill_value")):
+            with self.subTest(dtype=dtype, fill=fill):
+                self.setUp()
+                def rebuild(g, _d=dtype, _f=fill):
+                    del g["sea_ice"]
+                    g.create_array("sea_ice", shape=(90, 32, 32), dtype=_d,
+                                   chunks=(90, 8, 8), shards=(90, 32, 32), fill_value=_f)
+                    g["sea_ice"][:] = 1.0
+                self._store_with(rebuild)
+                with self.assertRaises(SnapshotError) as cm:
+                    SegmentedCubeStore(self.root)
+                self.assertIn(needle, str(cm.exception).lower())
+
+    def test_absent_var_valid_requires_an_explicit_legacy_migration_mode(self):
+        """A store predating `var_valid` is admissible only when the manifest SAYS SO, and
+        only for `legacy_base`. Silent inference is what turned a malformed store valid."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "legacy")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        import zarr as _z
+        g = _z.open_group(path, mode="a")
+        del g.attrs["var_valid"]
+
+        base = dict(kind="legacy_base", boundary_kind="legacy", store_path=path)
+        seg = _seg("legacy", "legacy", s0, e0, 90, precedence=0, **base)
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg]))
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)                    # no declared mode -> refuse
+        self.assertIn("var_valid", str(cm.exception).lower())
+
+        seg2 = _seg("legacy", "legacy", s0, e0, 90, precedence=0, **base)
+        seg2["var_valid_mode"] = "implicit_all_true"
+        self._publish(self._manifest([seg2]))
+        store = SegmentedCubeStore(self.root)                # declared -> accepted
+        self.assertEqual(store.day_count, 90)
+
+        # ...but never for a `block`
+        seg3 = _seg("b", "legacy", s0, e0, 90, precedence=1, store_path=path,
+                    boundary_kind="legacy")
+        seg3["var_valid_mode"] = "implicit_all_true"
+        fx.write_json(os.path.join(self.root, "manifest.json"), self._manifest([seg3]))
+        with self.assertRaises(SnapshotError) as cm:
+            SegmentedCubeStore(self.root)
+        self.assertIn("legacy_base", str(cm.exception))
+
     def test_base_segments_are_asserted_disjoint_from_the_delta(self):
         s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
         days = fx.calendar_span(s0, e0)

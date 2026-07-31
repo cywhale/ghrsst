@@ -40,7 +40,7 @@ _SEG_REQUIRED = ("segment_id", "kind", "path", "immutable", "boundary_kind",
                  "start_day", "end_day", "materialized_through", "day_count", "gaps",
                  "unknown", "day_list", "layout", "variables", "fingerprint",
                  "precedence", "sealed", "supersedes")
-_SEG_OPTIONAL = ("build_provenance",)
+_SEG_OPTIONAL = ("build_provenance", "var_valid_mode")
 _SUP_REQUIRED = ("segment_id", "path", "superseded_at_generation", "release_after_utc",
                  "hold_until_utc", "status", "current_path", "bytes", "fingerprint")
 _SUP_STATUS = ("referenced", "releasable", "held")
@@ -213,6 +213,15 @@ def _validate_segment(seg: dict, grid: dict, idx: int):
     fp = seg["fingerprint"]
     if not isinstance(fp, dict) or "algo" not in fp or "day_digest" not in fp:
         raise ManifestError(f"{what}: fingerprint must carry algo + day_digest")
+    mode = seg.get("var_valid_mode", "explicit")
+    if mode not in ("explicit", "implicit_all_true"):
+        raise ManifestError(
+            f"{what}: var_valid_mode must be explicit|implicit_all_true, got {mode!r}")
+    if mode == "implicit_all_true" and seg["kind"] != "legacy_base":
+        raise ManifestError(
+            f"{what}: var_valid_mode='implicit_all_true' is allowed only on a legacy_base "
+            f"segment; a block is built by us and must carry an explicit var_valid")
+
     if not fp.get("metadata"):
         raise ManifestError(
             f"{what}: fingerprint.metadata is required -- it is what binds the manifest to "
@@ -344,19 +353,125 @@ def segment_layout(store_path: str) -> dict:
     return first
 
 
-def array_shapes(store_path: str) -> dict:
-    """`{var: [T, ny, nx]}` for every data variable — checked per variable, not just the
-    first, so a short array cannot hide behind its neighbours."""
+DTYPE = "float32"
+
+
+def verify_store_self_consistency(store_path: str, *, allow_implicit_var_valid: bool = False
+                                  ) -> dict:
+    """Validate a segment store's RAW attrs before anything derives a view from them.
+
+    Every helper that filters (`if v in g`) or coerces (`bool(x)`) launders a malformed store
+    into a well-formed one — the store then passes every downstream check because the
+    downstream check is looking at the laundered view. So this runs FIRST, on the raw values,
+    and everything else consumes its output.
+
+    Returns `{"days", "vars", "var_valid", "var_valid_implicit"}`. Raises `ManifestError`.
+    """
+    import numpy as np
     import zarr
     g = zarr.open_group(store_path, mode="r")
-    return {v: [int(x) for x in g[v].shape]
-            for v in sorted(g.attrs.get("vars", [])) if v in g}
+    attrs = dict(g.attrs)
+
+    if "days" not in attrs:
+        raise ManifestError(f"{store_path}: attrs['days'] is missing")
+    days = list(attrs["days"])
+    if len(set(days)) != len(days):
+        raise ManifestError(f"{store_path}: attrs['days'] contains duplicate days")
+
+    raw_vars = list(attrs.get("vars", []))
+    if not raw_vars:
+        raise ManifestError(f"{store_path}: attrs['vars'] is missing or empty")
+    if len(set(raw_vars)) != len(raw_vars):
+        dupes = sorted({v for v in raw_vars if raw_vars.count(v) > 1})
+        raise ManifestError(f"{store_path}: attrs['vars'] has duplicate entries {dupes}")
+
+    for v in raw_vars:
+        if v not in g:
+            raise ManifestError(
+                f"{store_path}: attrs['vars'] declares {v!r} but the store has no such "
+                f"array. Filtering it out would turn a malformed store into a valid one "
+                f"while reads silently omit the variable.")
+        arr = g[v]
+        if arr.ndim != 3:
+            raise ManifestError(
+                f"{store_path}: variable {v!r} is {arr.ndim}-D, expected a 3-D (t,y,x) "
+                f"data variable")
+        # builder contract (§7.2): float32 with a NaN fill. A non-NaN fill turns an
+        # unwritten or missing chunk from `null` into a real value at the API.
+        if str(arr.dtype) != DTYPE:
+            raise ManifestError(
+                f"{store_path}: variable {v!r} has dtype {arr.dtype}, expected {DTYPE}")
+        fill = arr.fill_value
+        if fill is None or not np.isnan(np.asarray(fill, dtype="float64")):
+            raise ManifestError(
+                f"{store_path}: variable {v!r} has fill_value {fill!r}, expected NaN — a "
+                f"non-NaN fill makes a missing chunk read as data instead of null")
+
+    raw_vv = attrs.get("var_valid", None)
+    implicit = False
+    if raw_vv is None:
+        if not allow_implicit_var_valid:
+            raise ManifestError(
+                f"{store_path}: attrs['var_valid'] is missing. It is required; a store "
+                f"predating it is admissible only when the manifest declares "
+                f"var_valid_mode='implicit_all_true' on a legacy_base segment.")
+        implicit = True
+        var_valid = {v: [True] * len(days) for v in raw_vars}
+    else:
+        raw_vv = dict(raw_vv)
+        if set(raw_vv) != set(raw_vars):
+            missing = sorted(set(raw_vars) - set(raw_vv))
+            extra = sorted(set(raw_vv) - set(raw_vars))
+            raise ManifestError(
+                f"{store_path}: var_valid keys do not match attrs['vars'] — "
+                f"missing {missing}, unexpected {extra}")
+        var_valid = {}
+        for v, flags in raw_vv.items():
+            if not isinstance(flags, (list, tuple)):
+                raise ManifestError(f"{store_path}: var_valid[{v!r}] is not a list")
+            flags = list(flags)
+            bad = [(i, x) for i, x in enumerate(flags) if type(x) is not bool]
+            if bad:
+                i, x = bad[0]
+                raise ManifestError(
+                    f"{store_path}: var_valid[{v!r}][{i}] is {type(x).__name__} {x!r}, not a "
+                    f"bool. Coercing it would hide the type error, and the read path tests "
+                    f"`is False`, so a truthy string would not behave as the value implies.")
+            if len(flags) != len(days):
+                raise ManifestError(
+                    f"{store_path}: var_valid[{v!r}] has {len(flags)} flag(s) for "
+                    f"{len(days)} day(s)")
+            var_valid[v] = flags
+
+    for v in raw_vars:
+        if int(g[v].shape[0]) != len(days):
+            raise ManifestError(
+                f"{store_path}: variable {v!r} has {int(g[v].shape[0])} time step(s) but "
+                f"attrs['days'] declares {len(days)}")
+
+    return {"days": days, "vars": raw_vars, "var_valid": var_valid,
+            "var_valid_implicit": implicit}
+
+
+def array_shapes(store_path: str) -> dict:
+    """`{var: [T, ny, nx]}` for every DECLARED variable. Raises if a declared variable has no
+    array — it must not be silently filtered out."""
+    import zarr
+    g = zarr.open_group(store_path, mode="r")
+    out = {}
+    for v in sorted(g.attrs.get("vars", [])):
+        if v not in g:
+            raise ManifestError(f"{store_path}: declared variable {v!r} has no array")
+        out[v] = [int(x) for x in g[v].shape]
+    return out
 
 
 def store_variables(store_path: str) -> List[str]:
+    """The RAW declared variables, sorted. No `if v in g` filter -- a declared variable with
+    no array is a defect to surface, not one to hide."""
     import zarr
     g = zarr.open_group(store_path, mode="r")
-    return sorted(v for v in g.attrs.get("vars", []) if v in g)
+    return sorted(g.attrs.get("vars", []))
 
 
 def store_axes(store_path: str) -> dict:
@@ -374,16 +489,24 @@ def store_axes(store_path: str) -> dict:
 
 
 def metadata_fingerprint(store_path: str) -> str:
-    """sha256 over a segment's structural metadata: axes, region, variables, per-array
-    shape/chunks/shards/dtype, and `var_valid` lengths.
+    """sha256 over a segment's structural AND semantic metadata: axes, region, variables,
+    per-array shape/chunks/shards/dtype/fill_value, and a digest of each `var_valid` vector
+    (its CONTENT, not merely its length -- a single flipped flag changes what the API returns
+    for that day).
 
     This is `fingerprint.metadata` in the manifest. It is what makes a manifest entry
     falsifiable against the store it names -- a day set alone cannot detect a block that was
     built on a different grid."""
+    import numpy as np
     import zarr
     g = zarr.open_group(store_path, mode="r")
-    vars_ = sorted(v for v in g.attrs.get("vars", []) if v in g)
-    var_valid = {k: list(v) for k, v in dict(g.attrs.get("var_valid", {})).items()}
+    vars_ = sorted(g.attrs.get("vars", []))
+    for v in vars_:
+        if v not in g:
+            raise ManifestError(
+                f"{store_path}: cannot fingerprint -- declared variable {v!r} has no array. "
+                f"A builder must not be able to produce a manifest for a broken store.")
+    var_valid = {k: list(v) for k, v in dict(g.attrs.get("var_valid", {}) or {}).items()}
     axes = store_axes(store_path)
     doc = {
         "axes": axes,
@@ -392,12 +515,17 @@ def metadata_fingerprint(store_path: str) -> str:
                        "chunks": [int(x) for x in g[v].chunks],
                        "shards": ([int(x) for x in g[v].shards]
                                   if getattr(g[v], "shards", None) else None),
-                       "dtype": str(g[v].dtype)} for v in vars_},
+                       "dtype": str(g[v].dtype),
+                       "fill_is_nan": bool(g[v].fill_value is not None and np.isnan(
+                           np.asarray(g[v].fill_value, dtype="float64")))}
+                   for v in vars_},
         # var_valid CONTENT, not just its length. A single flipped flag turns a day from
         # "returns sst" into "omits sst" -- an API-visible semantic change inside a block
         # that claims to be immutable. Length alone cannot see it.
+        # RAW values, not `bool(x)`: coercing here would make a poisoned entry hash the same
+        # as a correct one, which is precisely how a bad type slips past.
         "var_valid_digest": {v: hashlib.sha256(
-            canonical_json([bool(x) for x in var_valid.get(v, [])]).encode()).hexdigest()
+            canonical_json(list(var_valid.get(v, []))).encode()).hexdigest()
             for v in vars_},
         "var_valid_len": {v: len(var_valid.get(v, [])) for v in vars_},
         # NOTE: the day set is deliberately NOT included here. It is covered by

@@ -10,8 +10,8 @@ Implements P5-S1 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Manifest: [`../store/block_manifest.py`](../store/block_manifest.py)
 - Segmented store: [`../store/segmented_cube.py`](../store/segmented_cube.py)
 - Fixtures (F1–F3, F6, F11, F12): [`../tests/p5_fixtures.py`](../tests/p5_fixtures.py)
-- Tests: [`../tests/test_phase2_p5s1.py`](../tests/test_phase2_p5s1.py) — **58/58 green**
-- Full local suite: **336 tests OK** (17 skipped), up from 278; no regressions.
+- Tests: [`../tests/test_phase2_p5s1.py`](../tests/test_phase2_p5s1.py) — **64/64 green**
+- Full local suite: **342 tests OK** (17 skipped), up from 278; no regressions.
 
 ## 1. Gate
 
@@ -137,6 +137,15 @@ turn and the suite re-run; **every one must fail**.
 | **`segment.variables == store.vars`** | `test_segment_variables_must_equal_the_store_variables` | **FAILS** ✅ |
 | **top-level `variables == union`** | `test_top_level_variables_must_be_the_union_of_segments` | **FAILS** ✅ |
 | **region without a stored region** | `test_region_must_be_verifiable_even_when_the_store_omits_it` | **FAILS** ✅ |
+| **`var_valid` keys == `vars`** | `test_missing_var_valid_key_is_rejected` | **FAILS** ✅ |
+| **`var_valid` strict `bool` type** | `test_non_boolean_var_valid_entry_is_rejected` | **FAILS** ✅ |
+| **`var_valid` length** | same | **FAILS** ✅ |
+| **declared var has a real array** | `test_declared_var_without_a_real_array_is_rejected` | **FAILS** ✅ |
+| **`vars` uniqueness** | `test_raw_declared_vars_must_be_unique_and_three_dimensional` | **FAILS** ✅ |
+| **`dtype == float32`** | `test_non_float32_or_non_nan_fill_variable_is_rejected` | **FAILS** ✅ |
+| **`fill_value` is NaN** | same | **FAILS** ✅ |
+| **implicit `var_valid` needs a declared mode** | `test_absent_var_valid_requires_an_explicit_legacy_migration_mode` | **FAILS** ✅ |
+| **implicit mode is `legacy_base` only** | same | **FAILS** ✅ |
 
 Two mutations survived the first pass and both were instructive. One was a **badly chosen
 mutation** (renaming the fingerprint key changed both sides equally, so the difference test
@@ -144,6 +153,23 @@ still held — re-run by replacing the digest with a constant, which does fail).
 **genuine gap**: nothing covered a variable whose *spatial* shape disagreed with the lon/lat
 axes, since `axes` comes from the coordinate arrays and `layout` compares chunking. A test was
 added for it.
+
+A **third** round found three more, and they share one shape with the first two — which is
+the finding that actually matters:
+
+> **Validation must read RAW state. Every helper that filters (`if v in g`) or coerces
+> (`bool(x)`) launders a malformed store into a well-formed one, and every downstream check
+> then passes because it is looking at the laundered view.**
+
+| defect | how the laundering worked | now |
+|---|---|---|
+| **`var_valid` was not validated as a complete boolean vector** — deleting a key made the variable silently "valid on every day"; a string `"false"` was accepted, while the read path tests `is False` so it would not behave as its value implies | only the *lengths of existing entries* were checked, and `bool(x)` ran **before** validation | keys must equal `attrs["vars"]`; every entry a `list`; every item `type(x) is bool`; every length `== len(days)`; **no coercion before validation** |
+| **`attrs["vars"]` could name an array that does not exist** — `.vars` still advertised `sea_ice` while point reads silently omitted it | `store_variables()` filtered with `if v in g`, so a self-inconsistent store became a "valid" one | raw `vars` validated first: unique, every declared variable has a real **3-D** array; `metadata_fingerprint` now **refuses to fingerprint** a broken store, so a builder cannot mint a manifest for one either |
+| **dtype and fill-value were only in the self-derived fingerprint** — a `float64` / `fill_value=0` array was accepted, turning an unwritten or missing chunk from `null` into a real `0.0` at the API | the fingerprint matched by construction; nothing checked the builder contract independently | per variable: `dtype == float32` and `fill_value` is NaN, verified independently (and `fill_is_nan` added to the fingerprint) |
+
+Absent `var_valid` now needs an **explicit, checkable migration mode**: `var_valid_mode:
+"implicit_all_true"`, permitted **only** on a `legacy_base` segment. Silent inference is what
+made a malformed store valid in the first place.
 
 **A note on why fingerprints alone are not enough.** When a manifest is generated from the
 store it describes — which is exactly what S3's builder will do — `fingerprint.metadata`
