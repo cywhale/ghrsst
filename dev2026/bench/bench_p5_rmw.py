@@ -133,6 +133,28 @@ def measure_h1(workdir: str, *, ny: int = 512, nx: int = 512,
 
 
 # --------------------------------------------------------------------------- H2
+def _h2_verdict(rows: Sequence[dict]) -> dict:
+    """THE H2 verdict, factored out so the negative test can exercise the real calculation.
+
+    A test that re-implements the condition on doctored rows proves nothing: deleting a
+    clause from the production path would leave it green. `tests/test_phase2_p5s0.py` calls
+    THIS function with a doctored row set and requires `h2_confirmed is False`."""
+    amps = [r["amplification_vs_average_stored_day"] for r in rows]
+    grows = all(amps[i] <= amps[i + 1] for i in range(len(amps) - 1))
+    # each append should rewrite roughly the whole partial shard => amp ~ tail_len
+    whole_shard = all(r["amplification_vs_average_stored_day"] >= r["tail_len"] * 0.5
+                      for r in rows)
+    # ...and it must rewrite EVERY data shard, not merely a lot of bytes. Without this the
+    # JSON gate could PASS on a partial-shard rewrite while only the unit test caught it,
+    # so the artifact would disagree with CI.
+    all_data_shards = all(r["data_shard_files_rewritten"] == r["data_shard_files_total"]
+                          for r in rows)
+    return {"monotonic_in_tail_length": grows,
+            "rewrites_whole_partial_shard": whole_shard,
+            "all_data_shards_rewritten": all_data_shards,
+            "h2_confirmed": bool(grows and whole_shard and all_data_shards)}
+
+
 def measure_h2(workdir: str, *, ny: int = 512, nx: int = 512,
                tail_lengths: Sequence[int] = (1, 15, 30, 60, 89),
                time_chunk: int = 90, shard: int = 128, spatial_chunk: int = 8) -> dict:
@@ -163,24 +185,11 @@ def measure_h2(workdir: str, *, ny: int = 512, nx: int = 512,
             "logical_uncompressed_bytes_per_day": int(logical_day),
             "amplification_vs_average_stored_day": round(ch["data_bytes"] / avg_stored_day, 1),
             "amplification_vs_uncompressed_day": round(ch["data_bytes"] / logical_day, 1)})
-    amps = [r["amplification_vs_average_stored_day"] for r in rows]
-    grows = all(amps[i] <= amps[i + 1] for i in range(len(amps) - 1))
-    # each append should rewrite roughly the whole partial shard => amp ~ tail_len
-    whole_shard = all(r["amplification_vs_average_stored_day"] >= r["tail_len"] * 0.5
-                      for r in rows)
-    # ...and it must rewrite EVERY data shard, not merely a lot of bytes. Without this the
-    # JSON gate could PASS on a partial-shard rewrite; only the unit test would have caught
-    # it, so the artifact would disagree with CI.
-    all_data_shards = all(r["data_shard_files_rewritten"] == r["data_shard_files_total"]
-                          for r in rows)
     total_cost = sum(range(1, time_chunk + 1))
     return {
         "hypothesis": "H2",
         "rows": rows,
-        "monotonic_in_tail_length": grows,
-        "rewrites_whole_partial_shard": whole_shard,
-        "all_data_shards_rewritten": all_data_shards,
-        "h2_confirmed": bool(grows and whole_shard and all_data_shards),
+        **_h2_verdict(rows),
         "projected_day_by_day_block_cost_x": round(total_cost / time_chunk, 1),
         "note": ("Growing a block one day at a time costs sum(1..S) day-writes ~= (S+1)/2 x "
                  "the block's final size -- the measured basis for rejecting candidate A. "
@@ -296,11 +305,15 @@ def measure_h3(workdir: str, *, ny: int = 512, nx: int = 512, total_days: int = 
         "all_segmentations_return_all_days": all_complete,
         "h3_supported": bool(const_tc and same_chunks and same_bytes and all_complete
                              and (sweep_bytes_invariant in (None, True))),
-        "note": ("H3 (refined by this harness): decompressed_bytes is invariant under "
-                 "segmentation in EVERY regime; chunk_count is additionally invariant while "
-                 "the inner time chunk is unchanged. A sub-90-day block shrinks the time "
-                 "chunk, raising chunk_count at constant decompressed_bytes -- the §10.4 "
-                 "sizing trade, not an H3 violation."),
+        "scope": ("ALIGNED, FULL-SPAN reads only. Both regimes below start at index 0 and "
+                  "consume the whole array, so they say nothing about off-anchor or partial "
+                  "windows -- see `h3_boundary`, which measures those and finds bytes are "
+                  "NOT invariant there (0.333x-1.036x)."),
+        "note": ("Within this scope: at a CONSTANT inner time chunk both chunk_count and "
+                 "decompressed_bytes are invariant; for an aligned full-span read a "
+                 "sub-90-day block shrinks the time chunk, raising chunk_count at constant "
+                 "decompressed_bytes -- the §10.4 sizing trade, not an H3 violation. This "
+                 "does NOT generalize to arbitrary request offsets or block anchors."),
     }
 
 

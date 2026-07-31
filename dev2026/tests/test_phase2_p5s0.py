@@ -254,14 +254,21 @@ class TestHypothesisMeasurements(unittest.TestCase):
         self.assertIn("all_data_shards_rewritten", r)
         self.assertTrue(r["all_data_shards_rewritten"])
         self.assertTrue(r["h2_confirmed"])
-        # if a row rewrote only some shards, h2_confirmed must go False
-        doctored = dict(r)
-        doctored["rows"] = [dict(row) for row in r["rows"]]
-        doctored["rows"][0]["data_shard_files_rewritten"] = 1
-        recomputed = all(row["data_shard_files_rewritten"] == row["data_shard_files_total"]
-                         for row in doctored["rows"])
-        self.assertFalse(recomputed,
-                         "the condition folded into h2_confirmed must be able to fail")
+
+        # Feed doctored rows back through the PRODUCTION verdict function. Re-implementing
+        # the condition here would prove nothing -- deleting the clause from `_h2_verdict`
+        # would leave such a test green.
+        doctored = [dict(row) for row in r["rows"]]
+        doctored[0]["data_shard_files_rewritten"] = 1        # partial-shard rewrite
+        verdict = bench_p5_rmw._h2_verdict(doctored)
+        self.assertFalse(verdict["all_data_shards_rewritten"])
+        self.assertFalse(verdict["h2_confirmed"],
+                         "a partial-shard rewrite must make the production verdict FAIL")
+        # the other clauses are unaffected, so this really is the shard-coverage clause
+        self.assertTrue(verdict["monotonic_in_tail_length"])
+        self.assertTrue(verdict["rewrites_whole_partial_shard"])
+        # and the unmodified rows still pass through the same function
+        self.assertTrue(bench_p5_rmw._h2_verdict(r["rows"])["h2_confirmed"])
 
     def test_h2_reports_both_amplification_bases(self):
         """`stored_bytes/L` is the average COMPRESSED stored bytes per day, not logical

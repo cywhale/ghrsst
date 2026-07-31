@@ -49,7 +49,7 @@
     "metadata_files_changed": 0,
     "note": "H1 holds when a one-day write rewrites every DATA shard spanning the block, i.e. amplification approaches time_chunk. The gate uses data-shard metrics only; metadata churn is reported separately. Two amplification bases are given because they answer different questions: vs the average STORED (compressed) day, and vs one uncompressed var-day.",
     "stored_data_bytes": 83680474,
-    "write_ms": 595.506
+    "write_ms": 582.442
   },
   "h2": {
     "all_data_shards_rewritten": true,
@@ -126,7 +126,7 @@
     "all_segmentations_return_all_days": true,
     "block_size_sweep": {
       "decompressed_bytes_invariant": true,
-      "marginal_ms_per_extra_segment": 0.96,
+      "marginal_ms_per_extra_segment": 0.972,
       "rows": [
         {
           "bytes": 334732223,
@@ -135,10 +135,10 @@
           "decompressed_bytes": 92160,
           "file_count": 72,
           "latency": {
-            "max_ms": 4.437,
-            "min_ms": 3.853,
-            "p50_ms": 4.058,
-            "p95_ms": 4.437,
+            "max_ms": 4.835,
+            "min_ms": 3.903,
+            "p50_ms": 4.045,
+            "p95_ms": 4.835,
             "repeats": 15
           },
           "segments": 4,
@@ -154,10 +154,10 @@
           "decompressed_bytes": 92160,
           "file_count": 144,
           "latency": {
-            "max_ms": 8.234,
-            "min_ms": 7.694,
-            "p50_ms": 8.024,
-            "p95_ms": 8.234,
+            "max_ms": 8.296,
+            "min_ms": 7.789,
+            "p50_ms": 8.074,
+            "p95_ms": 8.296,
             "repeats": 15
           },
           "segments": 8,
@@ -173,10 +173,10 @@
           "decompressed_bytes": 92160,
           "file_count": 216,
           "latency": {
-            "max_ms": 12.172,
-            "min_ms": 11.607,
-            "p50_ms": 11.734,
-            "p95_ms": 12.172,
+            "max_ms": 12.132,
+            "min_ms": 11.566,
+            "p50_ms": 11.821,
+            "p95_ms": 12.132,
             "repeats": 15
           },
           "segments": 12,
@@ -190,7 +190,7 @@
     "constant_time_chunk": {
       "chunk_count_invariant": true,
       "decompressed_bytes_invariant": true,
-      "marginal_ms_per_extra_segment": 0.726,
+      "marginal_ms_per_extra_segment": 0.729,
       "rows": [
         {
           "bytes": 334726520,
@@ -199,10 +199,10 @@
           "decompressed_bytes": 92160,
           "file_count": 66,
           "latency": {
-            "max_ms": 2.1,
-            "min_ms": 1.838,
-            "p50_ms": 1.928,
-            "p95_ms": 2.1,
+            "max_ms": 2.047,
+            "min_ms": 1.817,
+            "p50_ms": 1.904,
+            "p95_ms": 2.047,
             "repeats": 15
           },
           "segments": 1,
@@ -218,10 +218,10 @@
           "decompressed_bytes": 92160,
           "file_count": 68,
           "latency": {
-            "max_ms": 2.79,
-            "min_ms": 2.273,
-            "p50_ms": 2.495,
-            "p95_ms": 2.79,
+            "max_ms": 2.751,
+            "min_ms": 2.33,
+            "p50_ms": 2.417,
+            "p95_ms": 2.751,
             "repeats": 15
           },
           "segments": 2,
@@ -237,10 +237,10 @@
           "decompressed_bytes": 92160,
           "file_count": 72,
           "latency": {
-            "max_ms": 4.319,
-            "min_ms": 3.942,
-            "p50_ms": 4.106,
-            "p95_ms": 4.319,
+            "max_ms": 4.176,
+            "min_ms": 3.899,
+            "p50_ms": 4.092,
+            "p95_ms": 4.176,
             "repeats": 15
           },
           "segments": 4,
@@ -254,7 +254,8 @@
     },
     "h3_supported": true,
     "hypothesis": "H3",
-    "note": "H3 (refined by this harness): decompressed_bytes is invariant under segmentation in EVERY regime; chunk_count is additionally invariant while the inner time chunk is unchanged. A sub-90-day block shrinks the time chunk, raising chunk_count at constant decompressed_bytes -- the \u00a710.4 sizing trade, not an H3 violation.",
+    "note": "Within this scope: at a CONSTANT inner time chunk both chunk_count and decompressed_bytes are invariant; for an aligned full-span read a sub-90-day block shrinks the time chunk, raising chunk_count at constant decompressed_bytes -- the \u00a710.4 sizing trade, not an H3 violation. This does NOT generalize to arbitrary request offsets or block anchors.",
+    "scope": "ALIGNED, FULL-SPAN reads only. Both regimes below start at index 0 and consume the whole array, so they say nothing about off-anchor or partial windows -- see `h3_boundary`, which measures those and finds bytes are NOT invariant there (0.333x-1.036x).",
     "total_days": 360
   },
   "h3_boundary": {
@@ -812,7 +813,7 @@
   "h8": {
     "hypothesis": "H8",
     "note": "Rectilinear SHARDS force a uniform inner time chunk of 1, which is what costs the point-series read. Re-test when zarr-python 3.3 stabilizes the feature (spec \u00a716-Q7).",
-    "point_series_regression_x": 19.6,
+    "point_series_regression_x": 19.0,
     "rect_chunks_with_sharding": {
       "error": "ValueError: Rectilinear chunks with sharding is not supported. Use rectilinear shards instead: chunks=(inner_size, ...), shards=[[shard_sizes], ...]",
       "supported": false
@@ -821,28 +822,28 @@
       "append_data_bytes_rewritten": 1155136,
       "append_data_files_rewritten": 16,
       "append_metadata_files_changed": 1,
-      "append_ms": 369.702,
+      "append_ms": 381.06,
       "bytes": 139767240,
       "files": 514,
-      "hist_build_ms": 35652.846,
+      "hist_build_ms": 35851.892,
       "read_1d": {
-        "max_ms": 1.262,
-        "min_ms": 1.047,
-        "p50_ms": 1.111,
-        "p95_ms": 1.262,
+        "max_ms": 1.287,
+        "min_ms": 1.042,
+        "p50_ms": 1.085,
+        "p95_ms": 1.287,
         "repeats": 15
       },
       "read_series": {
-        "max_ms": 28.985,
-        "min_ms": 23.339,
-        "p50_ms": 24.284,
-        "p95_ms": 28.985,
+        "max_ms": 25.77,
+        "min_ms": 23.643,
+        "p50_ms": 24.361,
+        "p95_ms": 25.77,
         "repeats": 15
       },
       "supported": true
     },
     "regular": {
-      "build_ms": 917.551,
+      "build_ms": 933.302,
       "bytes": 112264308,
       "files": 34,
       "geometry": {
@@ -864,17 +865,17 @@
         ]
       },
       "read_1d": {
-        "max_ms": 1.153,
-        "min_ms": 0.966,
-        "p50_ms": 0.974,
-        "p95_ms": 1.153,
+        "max_ms": 1.141,
+        "min_ms": 0.967,
+        "p50_ms": 1.018,
+        "p95_ms": 1.141,
         "repeats": 15
       },
       "read_series": {
-        "max_ms": 1.406,
-        "min_ms": 1.162,
-        "p50_ms": 1.238,
-        "p95_ms": 1.406,
+        "max_ms": 1.48,
+        "min_ms": 1.189,
+        "p50_ms": 1.283,
+        "p95_ms": 1.48,
         "repeats": 15
       }
     },
