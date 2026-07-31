@@ -271,7 +271,7 @@ advance on argument alone; each of these must be measured by a committed harness
 |---|---|---|---|---|
 | **H1** | Rewriting one day inside an existing full 90-day base block rewrites ~100 % of that block's shards (≈ 90× write amplification), because every shard spans the full time block. | shard files rewritten + bytes rewritten for a single-day write into a complete block | S0 | Candidate A becomes viable; re-open §3-A. |
 | **H2** | Appending one day into a **partial** tail shard rewrites the whole partial shard, so growing a block day-by-day from 1→S days costs ≈ `(S+1)/2 ×` the block's final size. | bytes rewritten per append at tail lengths 1, 15, 30, 60, 89 | S0 | Per-day tail append is affordable → §7 simplifies to incremental extension. |
-| **H3** *(refined by P5-S0)* | Segmentation **preserves `decompressed_bytes`** for a point/range read in every regime; **`chunk_count` is invariant only while the inner time chunk is unchanged** (blocks ≥ `time_chunk`). A sub-90-day block necessarily shrinks the inner time chunk, raising `chunk_count` at constant `decompressed_bytes` — the §10.4 sizing trade, **not** an H3 violation. Beyond that, segmentation adds only a **per-segment array-call overhead** roughly linear in the number of segments touched. | chunk_count, decompressed_bytes, p50/p95 for a fixed-length point read served from 1/12/24/36 segments, measured separately in the constant-time-chunk and shrinking-time-chunk regimes | S0, S6 | If **decompressed bytes** grow with segmentation, block sizes < 90 d are vetoed outright. |
+| **H3** *(scoped by P5-S0 — read the conditions)* | **(i)** At a **constant inner time chunk**, segmentation leaves both `chunk_count` and `decompressed_bytes` invariant. **(ii)** For an **aligned, full-span** read, `decompressed_bytes` is equal across block sizes while `chunk_count` rises as the time chunk shrinks (the §10.4 sizing trade, not a violation). **(iii) Outside (i)/(ii), `decompressed_bytes` is NOT invariant** — it moves with the **request offset** and the **block anchor**, because boundary over-read depends on block geometry. P5-S0 measured **0.333× – 1.036×** segmented/monolith across offsets and anchors: smaller blocks usually decompress *fewer* bytes on a partial window, while an off-anchor grid can decompress *more*. Beyond that, segmentation adds a **per-segment array-call overhead** roughly linear in segments touched. | chunk_count, decompressed_bytes, p50/p95, measured separately in the constant-time-chunk regime, the shrinking-time-chunk regime, **and a segmented-vs-monolith sweep over request offsets × block anchors × S ∈ {30,45,90}** | S0 *(synthetic; establishes anchor-sensitivity)*, **S6 *(adjudicates on the production calendar anchor with representative 1-day / 366-day / crossing windows)*** | If **decompressed bytes** grow materially with segmentation at the production anchor, block sizes < 90 d are vetoed. Note the S0 sweep found the common direction is a *reduction*, so the veto is unlikely to bind — but it must be decided on real anchors, not extrapolated. |
 | **H4** | With **immutable versioned block paths**, a reader holding an older snapshot observes **stable-old** values across a manifest generation change — never the S8a silent-mixing or silent-`None` outcome. | adversarial concurrency proof test: reader holds snapshot, publisher publishes generation N+1, reader re-reads pre-refresh | S5 | **P5's central safety claim fails** → segmented publication needs the same PM2 quiescence as a delta swap, and §8's "no-downtime publish" is withdrawn. |
 | **H5** | Point/range latency grows monotonically with **delta span** (delta days in the requested range), so bounding delta span is a read-performance requirement, not only a disk one. | p50/p95 for a 366-day range crossing delta at delta spans 31 / 45 / 64 / 90 / 124 days | S0, S6 | Cadence may be relaxed toward C = S (fewer compactions). |
 | **H6** | Peak compaction temp disk equals **one block + margin**, independent of total base size, and never approaches a second full base. | measured peak staging bytes + `df` delta during a tail-block build | S3 | The whole premise of P5 fails; fall back to O1/O3 + provisioned disk. |
@@ -343,9 +343,10 @@ sizes (929–936 KB/day at 512², i.e. block size does not change storage effici
 | 36 | 30 | 35.40 ms | 37.51 ms | 7.35× | 47.80 ms |
 
 Two readings matter. (i) The tax is **per segment touched**, ≈ **0.65 ms per extra array call** at this
-grid — and total decompressed bytes are unchanged, supporting **H3**. (Note the refinement P5-S0 later
-measured: `decompressed_bytes` is preserved in *every* regime, while `chunk_count` is invariant only while
-the inner time chunk is unchanged — the rows above hold the time chunk at 90, so both are invariant here.)
+grid — and total decompressed bytes are unchanged, supporting **H3** *under this measurement's conditions*.
+(These rows read the **full span** with the time chunk held at 90, which is exactly case (i)/(ii) of the
+scoped H3 in §2. P5-S0 later measured that an **off-anchor or partial** window breaks the byte equality —
+0.333×–1.036× — so this row must not be read as unconditional invariance.)
 (ii) **Opening the stores per request
 adds a further ~30–35 %** (12 segments: 12.03 → 16.39 ms) — so the read path **must** cache handles in the
 snapshot and must **never** open a store per day or per request (§6).
@@ -840,8 +841,8 @@ when the segments are opened per request (+36 %); a per-day open would be ~90× 
 
 | case | resolution |
 |---|---|
-| **single historical point** | one map lookup → one segment → one `point_series` call. Must remain `X-Store-Route: cube`. Chunk count and decompressed bytes identical to today's monolith [H3]. |
-| **366-day range inside one block** | one segment, one call per var — identical to today. |
+| **single historical point** | one map lookup → one segment → one `point_series` call. Must remain `X-Store-Route: cube`. **Chunk count identical to today's monolith; decompressed bytes are ≤ the monolith's** and depend on the block's time chunk — a single day costs 90 day-cells from a `t90` monolith but `S'` from an `S'`-day block (P5-S0 measured 90 → 30 at S=30). Not "identical" [H3(iii)]. |
+| **366-day range inside one block** | one segment, one call per var. Byte cost equals the monolith's only when the window is aligned and full-span; an off-anchor window differs (§2 H3(iii)). |
 | **366-day range spanning several blocks** | days grouped by segment; ≤ `ceil(366/S) + 1` segments touched (5 + delta at S=90); rows merged **in requested order**, delta precedence applied. |
 | **legacy → extension block → delta crossing range** | three precedence levels in one request; resolution is by precedence per day, not by tier order; result order is the requested order. |
 | **newest day present only in daily staging (ingest lag)** | unchanged: `HybridRouter.route_point` returns `mixed` and merges cube days with daily days. Segmentation is invisible to this path. |
@@ -1646,13 +1647,17 @@ never run.
 
 ### 10.4 Read-latency projection [MODEL] — the sizing tension
 
-Decompressed bytes for a 366-day point read are invariant to block size (chunk `(S',8,8)` with
-`S' = min(90,S)`: 5 × 23 040 B at S=90, 9 × 11 520 B at S=45, 13 × 7 680 B at S=30 — 115 / 104 / 100 KB per
-var). Only the **number of array calls** and the **chunk count** change — the H3 refinement (§2) states this
-precisely, and P5-S0 measured it directly: at 90 / 45 / 30-day blocks over the same 360 days,
-`chunk_count` rose 4 → 8 → 12 while `decompressed_bytes` stayed at **exactly 92 160 B**
-([`p5s0_baseline_results.md`](p5s0_baseline_results.md) §4b). Applying the marginal cost of **0.65 ms per
-extra segment call** to the [VM24] 366-day baseline of 76–100 ms, over 3 variables:
+Decompressed bytes for a 366-day point read are **close to, but not exactly, invariant** to block size —
+chunk `(S',8,8)` with `S' = min(90,S)` gives 5 × 23 040 B at S=90, 9 × 11 520 B at S=45, 13 × 7 680 B at
+S=30 = **115 / 104 / 100 KB per var**. Those three numbers are *not* equal, and an earlier draft that called
+them "invariant" contradicted its own arithmetic. The precise statement is §2's scoped **H3**: bytes are
+equal only for an **aligned, full-span** read; a 366-day window landing off the block anchor differs, and
+P5-S0 measured the spread at **0.333× – 1.036×** segmented/monolith across offsets and anchors
+([`p5s0_baseline_results.md`](p5s0_baseline_results.md) §4c). The dominant, *systematic* cost that scales
+with block size is therefore the **number of array calls** (and the chunk count) — bytes move by tens of
+percent and usually **downward** for smaller blocks, which is why sizing is a calls-vs-blocks trade rather
+than a bytes trade. Applying the marginal cost of **0.65 ms per extra segment call** to the [VM24] 366-day
+baseline of 76–100 ms, over 3 variables:
 
 | S | extra segment calls (3 vars) | projected added latency | projected regression vs baseline |
 |---|---|---|---|
@@ -1895,7 +1900,9 @@ condition. Steps S0–S7 are **local-only**; S8–S10 are the VM24 boundary (§1
 - **In:** existing base/delta fixtures; production geometry constants.
 - **Out:** `bench/bench_p5_baseline.py`, `bench/bench_p5_rmw.py`; results doc `p5s0_baseline_results.md`.
 - **Tests:** harness self-tests (the fixture really has the declared geometry; the counters really count).
-- **Measures:** H1, H2, H3, H8 — reproducing every **[PROBE]** number in §3 with a **committed** harness,
+- **Measures:** H1, H2, H3 (all three cases, **including a segmented-vs-monolith sweep over request
+  offsets × block anchors × S ∈ {30,45,90}** — the case that shows byte equality is conditional), H8 —
+  reproducing every **[PROBE]** number in §3 with a **committed** harness,
   plus current `TieredCube` point/range p50/p95, chunk_count, decompressed_bytes as the **baseline of
   record** for G3.
 - **Artifacts:** `bench/results/p5s0_*.json`.
@@ -1998,7 +2005,10 @@ condition. Steps S0–S7 are **local-only**; S8–S10 are the VM24 boundary (§1
 
 ### P5-S6 — 30/45/90 block-size & cadence decision benchmark  **[RO]/[MUT-STG]**
 - **Out:** `bench/bench_p5_sizing.py`; results doc `p5s6_sizing_results.md`; a **recorded decision**.
-- **Measures:** H3, H5, H7 at S = 30/45/90 and C = 30/45/90 — segments per request, point/range p50/p95,
+- **Measures:** H3, H5, H7 at S = 30/45/90 and C = 30/45/90 — **on the production calendar anchor**
+  (`block_grid.anchor_day`, §5.2) with representative **1-day / 366-day / legacy→block→delta crossing**
+  windows, since P5-S0 established that decompressed bytes are **anchor- and offset-sensitive** and S0's
+  synthetic sweep does not settle the real geometry — segments per request, point/range p50/p95,
   crossing-range p95 vs delta span, build/rebuild time, peak temp disk, open handles, snapshot build cost at
   the +3/+5/+10-year segment horizons, **plus the §10.6 inode / metadata-scan / snapshot-open gates (G16)**
   and the **tail-rebuild** cost including carry-forward from the predecessor block.
