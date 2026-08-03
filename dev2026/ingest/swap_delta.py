@@ -21,10 +21,14 @@ import fcntl
 import json
 import os
 import shutil
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Callable, List, Optional, Sequence
 
 import zarr
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from store.compaction_lock import refuse_if_compaction_running  # noqa: E402
 
 DEFAULT_HOLD_DAYS = 14
 
@@ -71,6 +75,7 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                       pre_swap_quiesce_fn: Optional[Callable[[], None]] = None,
                       verifier: Optional[Callable[[str, List[str]], dict]] = None,
                       hold_days: int = DEFAULT_HOLD_DAYS,
+                      compaction_lock_path: Optional[str] = None,
                       operator: Optional[str] = None) -> dict:
     """Execute a prune_delta swap plan. Returns a result dict; never raises for policy refusals.
 
@@ -87,6 +92,12 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
     re-invoked best-effort during rollback. verifier: extra post-swap check, called
     (live_path, keep_sorted) -> {"ok": bool, ...}; the built-in local verifier always runs first.
     """
+    # P5-S3 §7.1b: same gate as prune_delta. A swap retargets the delta path, and a block
+    # build may be reading it right now; the wrong bytes would become permanent history.
+    if compaction_lock_path:
+        busy = refuse_if_compaction_running(compaction_lock_path, operation="execute_swap_plan")
+        if busy:
+            return busy
     if mode not in ("s1", "s2"):
         raise ValueError(f"mode must be 's1' or 's2', got {mode!r}")
     if plan.get("status") != "ok":

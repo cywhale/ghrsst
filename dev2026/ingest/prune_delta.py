@@ -42,6 +42,7 @@ import numpy as np
 import zarr
 
 from ingest.dual_write import DELTA_SPATIAL_CHUNK, DELTA_SHARD_SPATIAL, append_to_delta
+from store.compaction_lock import refuse_if_compaction_running  # noqa: E402
 from store.zarr_paths import group_exists, group_path
 
 _CK_NAME = "_bulk_prune_ck.jsonl"                    # append-only checkpoint inside out_path
@@ -359,6 +360,7 @@ def _bulk_build(orig: dict, out_path: str, keep_sorted: List[str], *,
 
 # --------------------------------------------------------------------------- the helper
 def prune_delta(delta_path: str, out_path: str, keep_days: Sequence[str], *,
+                compaction_lock_path: Optional[str] = None,
                 source_daily: Optional[str] = None, source_delta: Optional[str] = None,
                 base_days: Optional[Sequence[str]] = None,
                 spatial_window_days: int = 31,
@@ -388,6 +390,14 @@ def prune_delta(delta_path: str, out_path: str, keep_days: Sequence[str], *,
     """
     if engine not in ("bulk", "perday"):
         raise ValueError(f"engine must be 'bulk' or 'perday', got {engine!r}")
+    # P5-S3 §7.1b: a block build may be reading the live delta right now. Retargeting the
+    # delta path under it would freeze wrong bytes into a NEW IMMUTABLE BLOCK -- the P4-S8a
+    # failure with a permanent consequence. Refuse, never wait: a prune blocking for hours
+    # looks like a hang, and the operator needs to reschedule.
+    if compaction_lock_path:
+        busy = refuse_if_compaction_running(compaction_lock_path, operation="prune_delta")
+        if busy:
+            return busy
     source_delta = source_delta or delta_path
     if os.path.abspath(out_path) == os.path.abspath(delta_path):
         raise ValueError("out_path must differ from delta_path (never build over the live delta)")
