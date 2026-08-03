@@ -209,7 +209,35 @@ class TestSnapshotCaptureIsAtomic(_Base):
 
         return Interleaving()
 
-    def test_refresh_between_the_two_captures_is_detected(self):
+    def test_a_mixed_generation_pair_IS_accepted_this_is_the_contract(self):
+        """The limit of what identity double-reading can promise — pinned deliberately.
+
+        `b1 is b2 and d1 is d2` proves each tier was STABLE across the capture. It does not
+        prove the pair is contemporaneous: a delta refresh completing before `d1` is read
+        yields old-base + new-delta, both stable, and the capture accepts it.
+
+        That is **correct for normal operation** — the delta cron appends a day many times
+        between compactions and the base is legitimately older. The one pair that would lose
+        data is a *pre-publish* base with a *post-prune* delta, where folded days exist in
+        neither tier. That cannot reach a reader: §7.5 orders publish → verify → prune, and
+        the delta prune retargets the delta path, which runs under request quiescence
+        (pm2 stop → swap → start), so no reader is alive across it.
+
+        This test exists so the weaker guarantee is recorded rather than assumed away."""
+        cube = TieredCube(self.base, self.delta)
+        old_delta_meta = self.delta._meta
+        fx.append_delta_day(self.delta_path, "2027-04-04")
+        self.delta.refresh()                       # delta moves on; base does not
+        snap = cube.snapshot()
+
+        self.assertIsNot(snap.delta_meta, old_delta_meta, "delta is the NEW generation")
+        self.assertIs(snap.base_meta, self.base._meta, "base is its OWN, older generation")
+        self.assertIn("2027-04-04", snap.days)
+        # each half is internally consistent, which is what the capture actually guarantees
+        self.assertEqual(set(snap.delta_days), set(snap.delta_meta.days))
+        self.assertEqual(set(snap.base_days), set(snap.base_meta.days))
+
+    def test_refresh_between_the_two_captures_leaves_each_tier_self_consistent(self):
         fired = {"n": 0}
 
         def refresh_delta_once(n):
@@ -337,6 +365,53 @@ class TestRequestLevelSnapshot(_Base):
 
         fresh = router.query_snapshot()                        # a NEW request does see it
         self.assertTrue(fresh.point_day_present("2027-03-03"))
+
+    def test_bbox_does_not_depend_on_the_cube_snapshot(self):
+        """A bbox request reads the DAILY store only. Building a cube `QuerySnapshot` before
+        the bbox/point split coupled bbox to cube health: a manifest that will not settle
+        would fail a bbox that daily could have served perfectly well."""
+        from store.hybrid_router import HybridRouter
+        from store.store_access import StoreAccess
+        from store.tiered_cube import TierCompositionError
+
+        base, base_days = self._two_blocks()
+        delta, _ = self._delta(fx.days_from("2026-12-24", 10))
+        daily_root = os.path.join(self.tmp, "mur.zarr")
+        fx.build_daily(daily_root, ["2027-05-05"], seed=700)
+        cube = TieredCube(base, delta)
+        router = HybridRouter(StoreAccess(daily_root), cube)
+
+        def wont_settle():
+            raise TierCompositionError("cube metadata will not settle")
+        cube.snapshot = wont_settle
+
+        with self.assertRaises(TierCompositionError):
+            router.query_snapshot()                    # point/range path is affected
+        # ...but the daily-only surface still works
+        self.assertTrue(router.daily.day_present("2027-05-05"))
+        rows = router.points_batch([(105.0, 5.0)], "2027-05-05", ["sst"])
+        self.assertEqual(len(rows), 1)
+
+    def test_query_snapshot_freezes_daily_MEMBERSHIP_not_daily_DATA(self):
+        """Documented limitation: the daily day-set is captured, the daily VALUES are read
+        live. Freezing daily data would mean copying it; the contract is narrowed instead of
+        overclaimed, and P4 already forbids a live overwrite of a visible day."""
+        from store.hybrid_router import HybridRouter
+        from store.store_access import StoreAccess
+
+        base, _ = self._two_blocks()
+        daily_root = os.path.join(self.tmp, "mur.zarr")
+        fx.build_daily(daily_root, ["2027-05-05"], seed=700)
+        router = HybridRouter(StoreAccess(daily_root), TieredCube(base, None))
+
+        qs = router.query_snapshot()
+        self.assertTrue(qs.point_day_present("2027-05-05"))
+        fx.build_daily(daily_root, ["2027-06-06"], seed=701)      # a new day appears
+        self.assertFalse(qs.point_day_present("2027-06-06"),
+                         "membership IS frozen for the request")
+        router.daily.existing_days(force=True)                    # past the day-scan TTL
+        self.assertTrue(router.query_snapshot().point_day_present("2027-06-06"),
+                        "a NEW request picks it up")
 
     def test_route_and_read_agree_within_one_snapshot(self):
         from store.hybrid_router import HybridRouter

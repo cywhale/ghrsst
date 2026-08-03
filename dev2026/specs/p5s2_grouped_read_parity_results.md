@@ -10,14 +10,34 @@ Implements P5-S2 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Meta-explicit reads: [`../store/time_cube.py`](../store/time_cube.py),
   [`../store/segmented_cube.py`](../store/segmented_cube.py) (`point_series_from`)
 - Fixtures F4–F9, F18: [`../tests/p5_fixtures.py`](../tests/p5_fixtures.py)
-- Tests: [`../tests/test_phase2_p5s2.py`](../tests/test_phase2_p5s2.py) — **25/25 green**
+- Tests: [`../tests/test_phase2_p5s2.py`](../tests/test_phase2_p5s2.py) — **28/28 green**
 - Bench: [`../bench/bench_p5_segmented_read.py`](../bench/bench_p5_segmented_read.py) →
   [`../bench/results/p5s2_segmented_read.json`](../bench/results/p5s2_segmented_read.json)
-- Full local suite: **387 tests OK** (17 skipped), up from 362.
+- Full local suite: **390 tests OK** (17 skipped), up from 362.
 - Request-level snapshot: [`../store/hybrid_router.py`](../store/hybrid_router.py)
   (`QuerySnapshot`), consumed by [`../api/app.py`](../api/app.py)
 
-## 1. R1 — one composite snapshot per request
+## 1. R1 — one snapshot per tier per request, and the limit of that claim
+
+**Corrected in round 2.** The first version claimed a request sees "complete-old or
+complete-new, never a mix". That is **not what the mechanism provides**, and the test that
+appeared to show it only proved each half was internally consistent.
+
+Identity double-reading shows each tier was **stable across the capture**. It cannot show the
+pair is contemporaneous — and capture *order* cannot fix it either, because a tier's freshness
+depends on when **its own** `refresh()` last ran, not on when this code reads the attribute. So
+`snapshot()` can return an older base with a newer delta, and a test now **pins that** rather
+than implying otherwise.
+
+**Why that is nonetheless safe.** An older base with a newer delta is the normal steady state —
+the delta cron appends days many times between compactions. The single pair that would lose
+data is a **pre-publish base with a post-prune delta**, where folded days sit in neither tier.
+That cannot reach a reader: §7.5 orders **publish → verify → prune**, and the delta prune
+retargets the delta path under **request quiescence** (pm2 stop → swap → start), so no reader is
+alive across it. The guarantee comes from the compaction protocol, **not** from this capture.
+Whether a shared generation/epoch fence should replace that reliance is **R1, for S5/G10**.
+
+## 1a. What the snapshot does provide
 
 Each tier was already individually immutable, but **consulting them at different moments is
 not**. The previous `TieredCube.point_series` asked delta for membership, then read base, then
@@ -45,6 +65,9 @@ idea applied at one level but not carried up or down:
 |---|---|
 | snapshot identity + immutability | `snap.base_meta is base._meta`; the `NamedTuple` cannot be mutated |
 | **delta refresh mid-flight** | appending a day and refreshing delta leaves a captured snapshot's values **and** day set unchanged; a *new* snapshot sees the day |
+| **a mixed-generation pair IS accepted** | older base + newer delta is returned, each half self-consistent — the documented limit, pinned so it cannot be assumed away |
+| **bbox does not depend on the cube snapshot** | with `cube.snapshot()` forced to fail, the daily-only surface still serves |
+| **daily MEMBERSHIP is frozen, daily DATA is not** | the day-set is fixed for the request; values are read live — narrowed contract, recorded rather than overclaimed |
 | **base generation change mid-flight** | publishing generation 2 and refreshing the base does not grow a captured snapshot |
 | **reads never re-consult the live store** | both `store._meta` are replaced with a sentinel object and the snapshot still reads correctly |
 | **a refresh interleaved between the two captures** | a callback fires a delta refresh *during* the capture; the returned snapshot is still self-consistent (`delta_days == delta_meta.days`) |
@@ -110,8 +133,7 @@ Measured, monolith vs segmented on **identical days** (**400 stored days, a genu
 | 4 | 4 | 2.84 ms | **15.11 ms** | **2.06×** | 50.1 ms | 26.8 ms |
 | 12 | 11 | 2.59 ms | **26.43 ms** | **3.61×** | 58.1 ms | 83.4 ms |
 
-**Added cost per extra array call: 0.751 ms** — consistent with P5-S0's independently measured
-0.65 ms per extra segment.
+**Added cost per extra array call: 0.751 ms** — the same order as P5-S0's independently measured 0.65 ms.
 
 On its face that is a G3 failure. It is not reported as one, because **a ratio is not portable
 between fixtures**: it is the added per-call cost divided by the baseline's absolute magnitude.
@@ -126,7 +148,7 @@ per-call cost. It does not — measured at 64², 256² and 512² the ratio staye
 and `nx`, so enlarging the grid does not enlarge the work either.
 
 What does change the ratio is the **baseline's absolute magnitude**, which on VM24 is **76–100
-ms** for a 366-day range (v0.5.0). The same absolute overhead — ~12 extra calls × 0.545 ms ≈
+ms** for a 366-day range (v0.5.0). The same absolute overhead — ~12 extra calls × 0.751 ms ≈
 **+9 ms** at S = 90 — projects to roughly **+9–12 %** there. That is a projection, not a
 measurement, and it is exactly the adjudication **S6/S7** own on production geometry.
 
@@ -138,16 +160,30 @@ So this step records:
 - The S2 gate the fixture *can* decide — zero store opens in the read path, bounded fd growth —
   which is what the harness exits non-zero on.
 
-**Snapshot-open cost** (7.5 → 26.5 → 84.1 ms for 1 → 4 → 12 segments) is roughly linear in
+**Snapshot-open cost** (7.4 → 26.8 → 83.4 ms for 1 → 4 → 12 segments) is roughly linear in
 segment count and is R3/G16 groundwork: it runs on process start and on each generation change,
 not per request, and must stay well inside the refresh TTL. At the +10-year horizon (41 segments
 at S = 90) this projects to ~0.3 s — comfortable, but S6 must measure it rather than extrapolate.
+
+## 6a. Two narrowed contracts (round 2)
+
+Both were overclaims, and both are now recorded as limits rather than quietly relied upon:
+
+- **bbox is decoupled from the cube again.** `QuerySnapshot` is built **inside the point/range
+  branch**. Building it before the bbox/point split made a bbox request depend on cube health —
+  a manifest that would not settle could fail a bbox the daily store could serve perfectly
+  well. That was a behaviour change I introduced and did not notice.
+- **`QuerySnapshot` freezes daily MEMBERSHIP, not daily DATA.** The day-set is captured once;
+  values are still read live through `StoreAccess`. Freezing the data would mean copying it.
+  The residual exposure is a daily prune/repair landing mid-request, which P4-S4 §7.1 already
+  constrains (no live overwrite of a visible day; repairs go through rebuild-then-swap). Stated
+  as a limitation, with a test pinning the actual behaviour.
 
 ## 7. Risk register
 
 | risk | status after S2 |
 |---|---|
-| **R1** composite base+delta snapshot | **implemented** at all three levels (cross-tier capture, segment metas, request-level `QuerySnapshot`); the adversarial pause/refresh/resume proof is **S5/G10**, so it stays `OPEN` until then |
+| **R1** composite base+delta snapshot | per-tier capture **implemented** at all three levels (cross-tier, segment metas, request-level `QuerySnapshot`). Cross-tier *contemporaneity* is **explicitly not provided** and relies on §7.5's publish-before-prune ordering plus the delta prune's quiescence; whether a shared epoch/fence should replace that reliance is **S5/G10**. Stays `OPEN`. |
 | **R1a** disjointness at assembly | **CLOSED** — realpath comparison in `TieredCube` for **any** base shape, `TimeCubeStore` and symlink cases tested |
 | **R3** multi-store RSS/FD/snapshot-open | groundwork recorded (fd growth 0, snapshot-open curve); the gates are **S6/S7** |
 | **R4** outage + bulk backfill | fixture **F18** exists and passes; the compaction-ordering half needs **S3** |

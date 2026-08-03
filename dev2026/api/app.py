@@ -331,16 +331,15 @@ async def read_ghrsst(
     # TWO availability scopes (P4): point/range = base+delta+daily union (full history); spatial
     # (bbox / POST points) = the daily store, further gated to the delta window. Conflating them is
     # what produced the post-prune 400s on historical point queries.
-    # ONE view for this whole request: availability, routing, the read and the route header
-    # are all answered from it (P5-S2, risk R1). Deriving them separately let a refresh land
-    # between "is it available?" and "read it".
-    qs = router.query_snapshot()
-    point_earliest, point_latest = qs.point_bounds()
     earliest, latest = store.bounds()                 # DAILY bounds — spatial paths only
-    if not point_latest:
-        raise HTTPException(503, "No available dates.")
-
     bbox_mode = (lon1 is not None) and (lat1 is not None) and not (lon1 == lon0 and lat1 == lat0)
+    # The point/range QuerySnapshot is built INSIDE the point branch, deliberately. Building it
+    # before the split coupled bbox — which reads the daily store only — to cube health: a
+    # manifest that would not settle could fail a bbox that daily could serve perfectly well.
+    qs = router.query_snapshot() if not bbox_mode else None
+    point_earliest, point_latest = qs.point_bounds() if qs else (None, None)
+    if not bbox_mode and not point_latest:
+        raise HTTPException(503, "No available dates.")
     if not bbox_mode and sample != 1:
         raise HTTPException(400, "Parameter 'sample' is only supported in BBox mode.")
     if not bbox_mode and fmt != "json":

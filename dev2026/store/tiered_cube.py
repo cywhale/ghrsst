@@ -11,14 +11,32 @@ immutable versioned blocks + manifest). Nothing above this class changes: `Hybri
 one cube either way, and delta precedence is applied here, in code — the manifest never
 describes the delta (design spec §4.0).
 
-## One composite snapshot per request (P5-S2, risk R1)
+## One snapshot per tier, per request (P5-S2, risk R1) — and what that does NOT promise
 
 Each tier is individually immutable, but consulting them at different moments is not. The
-earlier implementation asked delta for membership, then read base, then read delta — so a base
-manifest refresh or a delta refresh landing *between* those steps produced a result mixing
-generations across tiers. `snapshot()` now captures **both tiers' metadata together, once**,
-and every read goes through `point_series_from` against exactly those. A request therefore sees
-a **complete-old or complete-new** view, never a mix.
+earlier implementation asked delta for membership, then read base, then read delta, so a
+refresh landing *between* those steps changed the answer mid-read. `snapshot()` captures each
+tier's metadata **once** and every read goes through `point_series_from` against exactly those,
+so a request never re-reads a tier.
+
+**What is guaranteed:** one stable snapshot per tier for the whole request; each half is
+internally consistent; no live re-read.
+
+**What is NOT guaranteed — stated plainly:** the two halves are not proven contemporaneous.
+Identity double-reading shows each tier was stable across the capture; it cannot show the pair
+belongs to the same instant, and capture ORDER cannot fix that either, because a tier's
+freshness depends on when *its own* `refresh()` last ran, not on when this code reads the
+attribute. So `snapshot()` may legitimately return an older base with a newer delta.
+
+**Why that is safe here.** An older base with a newer delta is the *normal* steady state: the
+delta cron appends days many times between compactions. The single pair that would lose data is
+a **pre-publish base with a post-prune delta**, where folded days sit in neither tier. That
+combination cannot reach a reader: the design spec §7.5 orders **publish → verify → prune**, and
+the delta prune retargets the delta path, which runs under **request quiescence** (pm2 stop →
+swap → start), so no reader is alive across it. The guarantee comes from the compaction protocol
+and the quiescence posture, not from this capture — and this docstring exists so that is not
+mistaken for something the snapshot mechanism provides on its own. Whether a shared
+generation/epoch fence should replace that reliance is **risk R1, adjudicated at S5/G10**.
 
 ## Base/delta disjointness is enforced here (risk R1a)
 
@@ -57,8 +75,10 @@ def _store_paths(store) -> List[str]:
 class TieredSnapshot(NamedTuple):
     """An immutable, cross-tier view captured once and read from thereafter.
 
-    `base_meta` / `delta_meta` are the tiers' own immutable snapshots, taken together. Reads
-    use them explicitly, so nothing here re-consults a live store mid-request."""
+    `base_meta` / `delta_meta` are the tiers' own immutable snapshots. Reads use them
+    explicitly, so nothing here re-consults a live store mid-request. The pair is not proven
+    contemporaneous — see the module docstring for exactly what that does and does not
+    promise."""
     base: object
     base_meta: object
     delta: Optional[object]
@@ -136,12 +156,15 @@ class TieredCube:
     def snapshot(self) -> TieredSnapshot:
         """Capture BOTH tiers' metadata as ONE consistent pair.
 
-        Reading `base._meta` and then `delta._meta` is two reads: a refresh landing between
-        them yields base-old + delta-new. The composite lock serializes refreshes made through
-        this object, but a tier can also be refreshed directly (the TTL loop, the delta cron),
-        so the capture is additionally verified by a double read: take both, take both again,
-        and accept only when neither moved. If metadata keeps moving we **refuse** — a mixed
-        cross-tier view is worse than an error, which is the P4-S8a lesson.
+        The composite lock serializes refreshes made through this object; the double read
+        (take both, take both again, accept only when neither moved) additionally ensures each
+        captured meta was **stable across the capture** even when a tier is refreshed directly
+        by the TTL loop or the delta cron. If metadata never settles, **refuse** rather than
+        hand back something churning underneath the caller.
+
+        This does NOT make the two halves contemporaneous — see the module docstring. An older
+        base with a newer delta is accepted, is normal, and is safe under §7.5's
+        publish-before-prune ordering plus the delta prune's request quiescence.
         """
         with self._lock:
             for _ in range(self.SNAPSHOT_ATTEMPTS):
@@ -152,8 +175,8 @@ class TieredCube:
                 if b1 is b2 and d1 is d2:
                     return self._compose(b1, d1)
         raise TierCompositionError(
-            f"could not capture a stable base+delta view in {self.SNAPSHOT_ATTEMPTS} "
-            f"attempts; refusing to return a snapshot that may mix generations across tiers")
+            f"could not capture stable per-tier metadata in {self.SNAPSHOT_ATTEMPTS} attempts; "
+            f"refusing to hand back a view that is churning underneath the caller")
 
     def _compose(self, base_meta, delta_meta) -> TieredSnapshot:
         base_days = frozenset(base_meta.days)
