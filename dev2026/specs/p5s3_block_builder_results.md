@@ -319,6 +319,15 @@ Now: `source_map_record()` per day carries all three fields; `source_map_digest(
 **canonicalized whole map**; the map appears both in `build_provenance.sources` and on the plan
 as `source_map`.
 
+**What the digest does not prove** (review round 4 sign-off caveat, recorded here and at
+`source_map_digest` so it is read where it would be misused): it digests the source *locator*
+map, not the bytes. An illegal in-place overwrite at a recorded `(source_path,
+source_day_index)` leaves it unchanged. It answers "which store and which physical slot did
+this block read", never "and the contents were these". So it **must not be used on its own to
+authorize pruning a corrected day** — that authorization is identity-based and belongs to the
+repair WAL and the §7.5a prune gate (§7.1), with immutable block paths and the §7.8 corrective
+refold supplying the rest. All three are still undelivered.
+
 `source_path` is stored **resolved** (`realpath`). The delta path is a stable alias that swap
 retargets, so the alias records what we were *pointed at* while the resolved path records what
 we actually *read* — and an audit that cannot tell two swaps of the same alias apart is not an

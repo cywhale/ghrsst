@@ -176,7 +176,17 @@ def source_map_digest(sources: Dict[str, dict]) -> str:
     """sha256 over the canonicalized WHOLE map (§5 `build_provenance.source_map_digest`).
 
     Digesting `day:source_kind` made two builds that read different bytes hash identically,
-    which defeats the only purpose the digest has."""
+    which defeats the only purpose the digest has.
+
+    **What this does NOT prove.** It is a digest of the source *locator* map, not a checksum of
+    the bytes read. If the store at a recorded `(source_path, source_day_index)` is illegally
+    overwritten in place, this digest is unchanged and will not notice. It answers "which store
+    and which physical slot did this block read", never "and the contents were these".
+
+    Consequently it **must not be used on its own to authorize pruning a corrected day**. That
+    authorization is identity-based and belongs to the repair WAL and the §7.5a prune gate,
+    neither of which exists yet; immutable block paths and the §7.8 corrective refold supply
+    the rest. Until those land, a stronger reading of this digest than the one above is wrong."""
     return hashlib.sha256(bm.canonical_json(
         {d: dict(sorted(rec.items())) for d, rec in sorted(sources.items())}).encode()
     ).hexdigest()
