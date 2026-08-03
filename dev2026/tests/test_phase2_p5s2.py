@@ -693,5 +693,75 @@ class TestOutageThenBulkBackfill(_Base):
         self.assertEqual(len(rows), len(set(r["date"] for r in rows)))
 
 
+# ============================================================ doc ↔ artifact consistency
+class TestResultsDocMatchesArtifact(unittest.TestCase):
+    """The committed results document must quote the committed artifact — nothing else.
+
+    Transcription drift was the review finding on four consecutive rounds. Generating the
+    table fixed the *generator*; this fixes the *guard*, which until now existed only as a
+    command I happened to run. A check that lives in someone's shell history is exactly the
+    kind of invariant that depends on memory, which is not an invariant.
+
+    Anyone hand-editing either file now fails the suite.
+    """
+
+    ARTIFACT = os.path.join(HERE, "..", "bench", "results", "p5s2_segmented_read.json")
+    DOC = os.path.join(HERE, "..", "specs", "p5s2_grouped_read_parity_results.md")
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        with open(cls.ARTIFACT) as fh:
+            cls.art = json.load(fh)
+        with open(cls.DOC) as fh:
+            cls.doc = fh.read()
+
+    def test_run_digest_is_reproducible_from_the_rows(self):
+        """The digest must be derived from the rows, not merely stored beside them —
+        otherwise a hand-edited artifact would still look self-consistent."""
+        import hashlib
+        import json
+        recomputed = hashlib.sha256(
+            json.dumps(self.art["rows"], sort_keys=True).encode()).hexdigest()[:16]
+        self.assertEqual(recomputed, self.art["run_digest"],
+                         "artifact rows do not hash to the stored run_digest")
+
+    def test_doc_cites_the_artifact_run_digest(self):
+        self.assertIn(self.art["run_digest"], self.doc,
+                      "the results doc does not name the artifact run it quotes")
+
+    def test_doc_contains_the_generated_table_verbatim(self):
+        self.assertIn(self.art["markdown_table"], self.doc,
+                      "the results table was edited by hand instead of copied from the "
+                      "harness output")
+
+    def test_doc_quotes_the_artifact_numbers(self):
+        art = self.art
+        checks = [
+            (str(art["added_ms_per_extra_array_call"]), "per-call median"),
+            (str(art["added_ms_per_extra_array_call_band"]), "per-call band"),
+            (f"{art['projected_added_ms_at_s90']} ms", "projected added ms at S=90"),
+            (f"{art['rows'][0]['range_366d']['p95_ms']:.1f} ms", "baseline 366-day p95"),
+        ]
+        lo, hi = art["projected_regression_pct_at_s90"]
+        checks.append((f"+{lo}–{hi} %", "projection band"))
+        for row in art["rows"]:
+            checks.append((f"{row['crossing']['p95_ms']:.1f} ms",
+                           f"crossing p95 @ {row['segments']} segments"))
+            checks.append((f"{row['snapshot_open_ms']['p95_ms']:.1f}",
+                           f"snapshot-open p95 @ {row['segments']} segments"))
+        for needle, what in checks:
+            with self.subTest(value=what):
+                self.assertIn(needle, self.doc, f"{what}: {needle!r} not in the results doc")
+
+    def test_g3_is_not_claimed_as_passed_anywhere(self):
+        """A standing guard: G3 must stay deferred until S6/S7 measures it on production
+        geometry. The synthetic ratio must never be promoted to a pass by a later edit."""
+        self.assertFalse(self.art["g3_adjudicable_here"])
+        self.assertIn("DEFERRED", self.art["g3_verdict"])
+        self.assertNotIn("g3_pass", self.art)
+        self.assertIn("DEFERRED", self.doc)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
