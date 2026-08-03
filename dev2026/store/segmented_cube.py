@@ -137,12 +137,12 @@ class SegmentedCubeStore:
                 raise SnapshotError(f"segment {seg['segment_id']!r}: {exc}") from exc
 
             actual = list(insp.days)
-            if (insp.ny, insp.nx) != (int(grid["ny"]), int(grid["nx"])):
+            if (insp.ny, insp.nx) != (grid["ny"], grid["nx"]):
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r} grid mismatch: store "
                     f"{insp.ny}x{insp.nx}, manifest declares {grid['ny']}x{grid['nx']}")
             if grid.get("region"):
-                declared = [int(x) for x in grid["region"]]
+                declared = list(grid["region"])      # validated as raw ints by the schema
                 stored = list(insp.region)
                 if stored:
                     if declared != stored:

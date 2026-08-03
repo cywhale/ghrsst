@@ -257,6 +257,29 @@ def validate_manifest(manifest: dict) -> dict:
     if gen > 1 and (pred is None or int(pred) >= gen):
         raise ManifestError("predecessor_generation must be set and < generation")
 
+    grid = manifest["grid"]
+    _require_keys(grid, ("ny", "nx"), ("region",), "grid")
+    for k in ("ny", "nx"):
+        if type(grid[k]) is not int or isinstance(grid[k], bool) or grid[k] <= 0:
+            raise ManifestError(
+                f"grid.{k}={grid[k]!r} must be a positive int (raw -- int(x) would launder a "
+                f"string or a float, and the store side already refuses that)")
+    if "region" in grid and grid["region"] is not None:
+        reg = grid["region"]
+        _exact(reg, list, "grid.region")
+        if len(reg) != 4:
+            raise ManifestError(
+                f"grid.region must have exactly four entries [i0,i1,j0,j1], got {len(reg)}")
+        for i, x in enumerate(reg):
+            if type(x) is not int or isinstance(x, bool):
+                raise ManifestError(
+                    f"grid.region[{i}]={x!r} is {type(x).__name__}, expected int")
+        i0, i1, j0, j1 = reg
+        if not (0 <= i0 < i1 <= grid["ny"]) or not (0 <= j0 < j1 <= grid["nx"]):
+            raise ManifestError(
+                f"grid.region={reg} is out of order or outside the grid "
+                f"{grid['ny']}x{grid['nx']}")
+
     bgrid = manifest["block_grid"]
     _require_keys(bgrid, ("anchor_day", "block_days"), (), "block_grid")
     anchor, bdays = bgrid["anchor_day"], int(bgrid["block_days"])
@@ -376,6 +399,13 @@ class StoreInspection(NamedTuple):
     nx: int
     lon_digest: str
     lat_digest: str
+    # A digest is computed over BYTES and therefore cannot distinguish (32,) from (1,32)
+    # holding identical values -- and `.size` reports 32 either way. Shape and dtype must be
+    # carried explicitly or a post-inspection reshape slips through every comparison.
+    lon_shape: tuple
+    lat_shape: tuple
+    lon_dtype: str
+    lat_dtype: str
     region: tuple
 
 
@@ -404,7 +434,7 @@ def _axis(g, name: str, store_path: str):
             f"{store_path}: {name!r} is not strictly increasing. The read path uses "
             f"np.searchsorted, which requires an ascending axis; a descending one resolves "
             f"to the wrong cell without any error.")
-    return arr
+    return arr, tuple(int(x) for x in raw.shape), str(raw.dtype)
 
 
 def _exact(value, typ, what: str):
@@ -531,8 +561,8 @@ def inspect_store_contract(store_path: str, *, allow_implicit_var_valid: bool = 
             pairs.append((v, tuple(flags)))
         var_valid = tuple(pairs)
 
-    lon = _axis(g, "lon", store_path)
-    lat = _axis(g, "lat", store_path)
+    lon, lon_shape, lon_dtype = _axis(g, "lon", store_path)
+    lat, lat_shape, lat_dtype = _axis(g, "lat", store_path)
 
     # ---- region: exactly four RAW ints, consistent with the grid
     region = attrs.get("region", None)
@@ -562,7 +592,9 @@ def inspect_store_contract(store_path: str, *, allow_implicit_var_valid: bool = 
         ny=int(lat.size), nx=int(lon.size),
         lon_digest=hashlib.sha256(lon.tobytes()).hexdigest(),
         lat_digest=hashlib.sha256(lat.tobytes()).hexdigest(),
-        region=tuple(int(x) for x in (region or ())))
+        lon_shape=lon_shape, lat_shape=lat_shape,
+        lon_dtype=lon_dtype, lat_dtype=lat_dtype,
+        region=tuple(region or ()))
 
 
 def effective_var_valid(insp: StoreInspection) -> dict:
@@ -600,6 +632,9 @@ def reader_binding(store, insp: StoreInspection) -> dict:
         "days": list(m.days), "vars": sorted(m.vars), "var_valid": vv, "arrays": arrays,
         "lon_digest": _h.sha256(np.asarray(m.lon, dtype="float64").tobytes()).hexdigest(),
         "lat_digest": _h.sha256(np.asarray(m.lat, dtype="float64").tobytes()).hexdigest(),
+        "lon_shape": [int(x) for x in np.shape(m.lon)],
+        "lat_shape": [int(x) for x in np.shape(m.lat)],
+        "lon_dtype": str(np.asarray(m.lon).dtype), "lat_dtype": str(np.asarray(m.lat).dtype),
     }
 
 
@@ -613,6 +648,8 @@ def inspection_binding(inspection) -> dict:
                        "dtype": dtype, "fill_is_nan": fill_is_nan}
                    for (v, shape, chunks, shards, dtype, fill_is_nan) in insp.arrays},
         "lon_digest": insp.lon_digest, "lat_digest": insp.lat_digest,
+        "lon_shape": list(insp.lon_shape), "lat_shape": list(insp.lat_shape),
+        "lon_dtype": insp.lon_dtype, "lat_dtype": insp.lat_dtype,
     }
 
 
@@ -637,8 +674,11 @@ def metadata_fingerprint_from_inspection(inspection) -> str:
     CONTENT (not merely its length -- one flipped flag changes what the API returns)."""
     insp = _require_inspection(inspection)
     doc = {
-        "axes": {"ny": insp.ny, "nx": insp.nx, "lon_digest": insp.lon_digest,
-                 "lat_digest": insp.lat_digest, "region": list(insp.region)},
+        "axes": {"ny": insp.ny, "nx": insp.nx,
+                 "lon_digest": insp.lon_digest, "lat_digest": insp.lat_digest,
+                 "lon_shape": list(insp.lon_shape), "lat_shape": list(insp.lat_shape),
+                 "lon_dtype": insp.lon_dtype, "lat_dtype": insp.lat_dtype,
+                 "region": list(insp.region)},
         "vars": list(insp.vars),
         "arrays": {v: {"shape": list(shape), "chunks": list(chunks),
                        "shards": list(shards) if shards else None,

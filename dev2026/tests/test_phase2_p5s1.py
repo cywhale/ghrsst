@@ -1288,6 +1288,95 @@ class TestIntegrityGuards(_Base):
         insp = bm.inspect_store_contract(path)
         self.assertEqual(list(insp.region), [0, 32, 0, 32])
 
+    # ---- review round 6: a digest does not carry shape ----
+    def test_axis_reshaped_after_inspection_fails_closed(self):
+        """[High] The binding compared lon/lat by DIGEST only. Reshaping `lon` from `(32,)`
+        to `(1,32)` with identical values leaves the float64 bytes — and therefore the
+        digest — untouched, and `.size` still reports 32, so `ny/nx` matched too. The
+        snapshot was installed and `searchsorted` then raised inside the read."""
+        import store.segmented_cube as sc
+
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        self._publish(self._manifest([seg]))
+        SegmentedCubeStore(self.root)                      # baseline: loads
+
+        original = sc.TimeCubeStore
+
+        class ReshapesOnOpen(original):
+            def __init__(self, p, *a, **k):
+                import zarr as _z
+                g = _z.open_group(p, mode="a")
+                vals = np.asarray(g["lon"][:], dtype="float32")
+                del g["lon"]
+                g.create_array("lon", shape=(1, vals.size), dtype="float32",
+                               chunks=(1, vals.size))
+                g["lon"][:] = vals[None, :]                # same values, same bytes
+                super().__init__(p, *a, **k)
+
+        sc.TimeCubeStore = ReshapesOnOpen
+        try:
+            with self.assertRaises(SnapshotError) as cm:
+                SegmentedCubeStore(self.root)
+            msg = str(cm.exception)
+            self.assertIn("disagrees with the verified inspection", msg)
+            self.assertIn("lon_shape", msg)
+        finally:
+            sc.TimeCubeStore = original
+
+    def test_reshape_preserves_the_digest_but_not_the_binding(self):
+        """Pins the reason the previous test is necessary: the digest really is shape-blind,
+        so shape has to be carried explicitly."""
+        import hashlib
+        vals = np.linspace(100.0, 131.0, 32, dtype=np.float32)
+        flat = hashlib.sha256(np.asarray(vals, dtype="float64").tobytes()).hexdigest()
+        two_d = hashlib.sha256(
+            np.asarray(vals[None, :], dtype="float64").tobytes()).hexdigest()
+        self.assertEqual(flat, two_d, "a digest cannot distinguish (32,) from (1,32)")
+
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        binding = bm.inspection_binding(bm.inspect_store_contract(path))
+        self.assertEqual(binding["lon_shape"], [32])
+        self.assertEqual(binding["lat_shape"], [32])
+        self.assertIn("lon_dtype", binding)
+
+    def test_manifest_region_must_be_four_raw_ints(self):
+        """[Low] Store attrs required raw ints, but the manifest's `grid.region` was still
+        run through `int(x)`. Same policy on both sides, or the raw-state claim is uneven."""
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        for region, needle in ((["0", 32, 0, 32], "int"),
+                               ([0.0, 32, 0, 32], "int"),
+                               ([0, 32, 0], "four"),
+                               ([0, 33, 0, 32], "grid")):
+            with self.subTest(region=region):
+                m = self._manifest([seg])
+                m["grid"] = {"ny": 32, "nx": 32, "region": region}
+                m["manifest_checksum"] = ""
+                m["manifest_checksum"] = bm.compute_checksum(m)
+                with self.assertRaises(bm.ManifestError) as cm:
+                    bm.validate_manifest(m)
+                self.assertIn(needle, str(cm.exception).lower())
+
+    def test_manifest_grid_dims_must_be_raw_ints(self):
+        s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
+        path = os.path.join(self.root, "b0")
+        fx.build_block(path, fx.calendar_span(s0, e0))
+        seg = _seg("b0", "b0", s0, e0, 90, precedence=1, store_path=path)
+        m = self._manifest([seg])
+        m["grid"] = {"ny": "32", "nx": 32, "region": [0, 32, 0, 32]}
+        m["manifest_checksum"] = ""
+        m["manifest_checksum"] = bm.compute_checksum(m)
+        with self.assertRaises(bm.ManifestError) as cm:
+            bm.validate_manifest(m)
+        self.assertIn("int", str(cm.exception).lower())
+
     def test_base_segments_are_asserted_disjoint_from_the_delta(self):
         s0, e0 = bm.block_bounds(ANCHOR, 90, 0)
         days = fx.calendar_span(s0, e0)

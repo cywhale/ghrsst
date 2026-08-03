@@ -10,8 +10,8 @@ Implements P5-S1 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Manifest: [`../store/block_manifest.py`](../store/block_manifest.py)
 - Segmented store: [`../store/segmented_cube.py`](../store/segmented_cube.py)
 - Fixtures (F1–F3, F6, F11, F12): [`../tests/p5_fixtures.py`](../tests/p5_fixtures.py)
-- Tests: [`../tests/test_phase2_p5s1.py`](../tests/test_phase2_p5s1.py) — **80/80 green**
-- Full local suite: **358 tests OK** (17 skipped), up from 278; no regressions.
+- Tests: [`../tests/test_phase2_p5s1.py`](../tests/test_phase2_p5s1.py) — **84/84 green**
+- Full local suite: **362 tests OK** (17 skipped), up from 278; no regressions.
 
 ## 1. Gate
 
@@ -206,6 +206,18 @@ inspection impossible. It does not: it is a module-private convention that preve
 **accidental** bypass — a stale dict from an older code path, a hand-built look-alike — and a
 caller who reaches for `bm._INSPECTION_TOKEN` can forge one. It is not a security boundary and
 the code no longer claims otherwise.
+
+A **sixth** round found one more TOCTOU on the same binding, from a direction worth stating
+plainly: **a digest is computed over bytes and therefore carries no shape.**
+
+| defect | what got through | now |
+|---|---|---|
+| **The binding compared axes by digest only** | reshaping `lon` from `(32,)` to `(1,32)` with identical values leaves the float64 bytes — and the digest — untouched, and `.size` still reports 32 so `ny`/`nx` matched too. The snapshot installed, then `searchsorted` raised inside the read | `lon_shape` / `lat_shape` / `lon_dtype` / `lat_dtype` are carried in `StoreInspection`, in the fingerprint and in both bindings |
+| **Manifest `grid.region` was still coerced** with `int(x)` while store attrs required raw ints | `"region": ["0", 32, 0, 32]` was accepted on the manifest side — uneven policy rather than a data fault | `validate_manifest` requires `grid.ny`/`grid.nx` and all four region entries to be **raw `int`s**, ordered and inside the grid; `segmented_cube` no longer calls `int()` on them |
+
+A companion test pins *why* the first fix is needed rather than just that it works: it asserts
+the two digests really are equal for `(32,)` and `(1,32)`, so the shape has to travel
+separately.
 
 **A note on why fingerprints alone are not enough.** When a manifest is generated from the
 store it describes — which is exactly what S3's builder will do — `fingerprint.metadata`
