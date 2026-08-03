@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import shutil
@@ -52,6 +53,8 @@ except Exception:                                     # pragma: no cover
 ANCHOR = "2026-06-27"
 LON, LAT = 105.0, 5.0
 FIELDS = ("sst", "sst_anomaly", "sea_ice")
+#: [VM24] v0.5.0 measured 366-day point-range p95 band (README edge results).
+VM24_BASELINE_MS = (76.0, 100.0)
 
 
 def _rss_mb():
@@ -181,7 +184,17 @@ def measure(workdir: str, *, total_days: int, segment_counts, ny: int, nx: int,
         if extra_calls > 0:
             per_call.append((r["range_366d"]["p95_ms"] - base_row["range_366d"]["p95_ms"])
                             / extra_calls)
-    added_ms_per_call = round(sum(per_call) / len(per_call), 4) if per_call else None
+    # Report the SPREAD, not a single figure. Repeated runs of this harness produced
+    # 0.47-0.75 ms for the same quantity; quoting one value to four decimals would be false
+    # precision, and any document citing it would be stale on the next run.
+    per_call = sorted(round(x, 3) for x in per_call)
+    added_ms_per_call = per_call[len(per_call) // 2] if per_call else None
+    per_call_band = [per_call[0], per_call[-1]] if per_call else None
+    # Projection to production: at S=90 a 366-day request touches ceil(366/90)=5 segments,
+    # i.e. 4 extra vs a monolith, across every variable.
+    recommended_extra_calls = (math.ceil(366 / 90) - 1) * len(FIELDS)
+    projected_added_ms = (added_ms_per_call or 0.0) * recommended_extra_calls
+    projected_pct = tuple(100.0 * projected_added_ms / b for b in VM24_BASELINE_MS)
     fd_growth = None
     if all(r["open_fds_after"] is not None for r in rows):
         fd_growth = max(r["open_fds_after"] - r["open_fds_before"] for r in rows)
@@ -195,20 +208,35 @@ def measure(workdir: str, *, total_days: int, segment_counts, ny: int, nx: int,
         "rows": rows,
         "worst_range_366d_regression_x": worst,
         "added_ms_per_extra_array_call": added_ms_per_call,
+        "added_ms_per_extra_array_call_samples": per_call,
+        "added_ms_per_extra_array_call_band": per_call_band,
         "g3_bar_x": 1.25,
         "g3_ratio_on_this_fixture": worst,
         "g3_adjudicable_here": False,
         "g3_verdict": "DEFERRED to S6/S7 (production geometry)",
+        # Computed from THIS run, never hardcoded: a prose constant here silently goes
+        # stale the moment the fixture changes, and then the artifact contradicts the results
+        # doc that quotes it.
         "g3_reason": (
-            "A RATIO is not portable between fixtures: it is the added per-call cost divided "
-            "by the baseline's absolute magnitude. On this synthetic fixture a 366-day "
-            "3-variable read costs ~6 ms, so ~2 ms/call of Python+zarr call overhead IS "
-            "essentially the whole measurement and the ratio approaches the call-count ratio. "
-            "Grid size does not change this -- a point read touches one chunk per time block "
-            "regardless of ny/nx -- which was measured: the ratio stayed ~1.7-1.8x at 64, 256 "
-            "and 512. The same ABSOLUTE overhead against the [VM24] 366-day baseline of "
-            "76-100 ms projects to roughly +5-15%. G3 must therefore be adjudicated against "
-            "the real baseline, which is S6/S7's job, not asserted here."),
+            f"A RATIO is not portable between fixtures: it is the added per-call cost divided "
+            f"by the baseline's absolute magnitude. On this synthetic fixture a "
+            f"{len(FIELDS)}-variable 366-day read costs "
+            f"{base_row['range_366d']['p95_ms']:.1f} ms p95, so the per-call overhead IS "
+            f"essentially the whole measurement and the ratio approaches the call-count "
+            f"ratio. Grid size does not change this -- a point read touches one chunk per "
+            f"time block regardless of ny/nx. Against the [VM24] 366-day baseline of "
+            f"{VM24_BASELINE_MS[0]}-{VM24_BASELINE_MS[1]} ms, the same absolute overhead "
+            f"({recommended_extra_calls} extra calls x {added_ms_per_call} ms median = "
+            f"{projected_added_ms:.1f} ms at S=90; per-call samples this run "
+            f"{per_call_band}, and repeated runs of this harness span roughly 0.45-0.80 ms) "
+            f"projects to roughly +{projected_pct[1]:.0f}-{projected_pct[0]:.0f}%. "
+            f"G3 must therefore be "
+            f"adjudicated against the real baseline, which is S6/S7's job, not asserted "
+            f"here."),
+        "vm24_baseline_ms": list(VM24_BASELINE_MS),
+        "projected_added_ms_at_s90": round(projected_added_ms, 2),
+        "projected_regression_pct_at_s90": [round(projected_pct[1], 1),
+                                            round(projected_pct[0], 1)],
         "no_store_opens_in_read_path": all(r["stores_opened_during_read"] == 0 for r in rows),
         "max_fd_growth_on_open": fd_growth,
         # What S2 CAN decide on its own fixtures:
@@ -228,7 +256,8 @@ def main():
                     help="must be >= 366 so the 366-day case is really 366 days")
     ap.add_argument("--segments", default="1,4,12")
     ap.add_argument("--delta-days", type=int, default=31, dest="delta_days")
-    ap.add_argument("--repeats", type=int, default=15)
+    ap.add_argument("--repeats", type=int, default=31,
+                    help="raised from 15: p95 on a laptop is noisy at 15")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -249,7 +278,8 @@ def main():
               f"crossing p95={r['crossing']['p95_ms']:>8} "
               f"snapshot_open p95={r['snapshot_open_ms']['p95_ms']:>7} "
               f"opens_in_read={r['stores_opened_during_read']}")
-    print(f"added cost per extra array call: {res['added_ms_per_extra_array_call']} ms")
+    print(f"added cost per extra array call: {res['added_ms_per_extra_array_call']} ms "
+          f"(median; samples {res['added_ms_per_extra_array_call_samples']})")
     print(f"G3: {res['g3_verdict']} -- ratio here {res['g3_ratio_on_this_fixture']}x "
           f"(bar {res['g3_bar_x']}x), NOT adjudicable on a synthetic fixture")
     print(f"S2 gate: {res['s2_gate_pass']} | no opens in read path: "

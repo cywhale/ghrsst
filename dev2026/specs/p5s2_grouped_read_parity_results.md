@@ -10,10 +10,10 @@ Implements P5-S2 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Meta-explicit reads: [`../store/time_cube.py`](../store/time_cube.py),
   [`../store/segmented_cube.py`](../store/segmented_cube.py) (`point_series_from`)
 - Fixtures F4–F9, F18: [`../tests/p5_fixtures.py`](../tests/p5_fixtures.py)
-- Tests: [`../tests/test_phase2_p5s2.py`](../tests/test_phase2_p5s2.py) — **28/28 green**
+- Tests: [`../tests/test_phase2_p5s2.py`](../tests/test_phase2_p5s2.py) — **29/29 green**
 - Bench: [`../bench/bench_p5_segmented_read.py`](../bench/bench_p5_segmented_read.py) →
   [`../bench/results/p5s2_segmented_read.json`](../bench/results/p5s2_segmented_read.json)
-- Full local suite: **390 tests OK** (17 skipped), up from 362.
+- Full local suite: **391 tests OK** (17 skipped), up from 362.
 - Request-level snapshot: [`../store/hybrid_router.py`](../store/hybrid_router.py)
   (`QuerySnapshot`), consumed by [`../api/app.py`](../api/app.py)
 
@@ -129,15 +129,15 @@ Measured, monolith vs segmented on **identical days** (**400 stored days, a genu
 
 | segments | segments touched | 1-day p95 | 366-day p95 | vs monolith | crossing p95 | snapshot open p95 |
 |---|---|---|---|---|---|---|
-| 1 | 1 | 2.61 ms | **7.33 ms** | 1.00× | 38.9 ms | 7.4 ms |
-| 4 | 4 | 2.84 ms | **15.11 ms** | **2.06×** | 50.1 ms | 26.8 ms |
-| 12 | 11 | 2.59 ms | **26.43 ms** | **3.61×** | 58.1 ms | 83.4 ms |
+| 1 | 1 | 2.59 ms | **7.55 ms** | 1.00× | 41.7 ms | 7.4 ms |
+| 4 | 4 | 2.59 ms | **13.27 ms** | **1.76×** | 44.5 ms | 26.9 ms |
+| 12 | 11 | 2.57 ms | **26.47 ms** | **3.51×** | 58.1 ms | 77.1 ms |
 
-**Added cost per extra array call: 0.751 ms** — the same order as P5-S0's independently measured 0.65 ms.
+**Added cost per extra array call: ≈ 0.63–0.71 ms** (median 0.636 in the committed run) — the same order as P5-S0's independently measured 0.65 ms.
 
 On its face that is a G3 failure. It is not reported as one, because **a ratio is not portable
 between fixtures**: it is the added per-call cost divided by the baseline's absolute magnitude.
-On this synthetic fixture a 366-day 3-variable read costs ~7.3 ms, so ~2 ms/call of Python+zarr
+On this synthetic fixture a 366-day 3-variable read costs ~7.5 ms, so ~2 ms/call of Python+zarr
 call overhead *is essentially the whole measurement*, and the ratio approaches the call-count
 ratio.
 
@@ -148,8 +148,8 @@ per-call cost. It does not — measured at 64², 256² and 512² the ratio staye
 and `nx`, so enlarging the grid does not enlarge the work either.
 
 What does change the ratio is the **baseline's absolute magnitude**, which on VM24 is **76–100
-ms** for a 366-day range (v0.5.0). The same absolute overhead — ~12 extra calls × 0.751 ms ≈
-**+9 ms** at S = 90 — projects to roughly **+9–12 %** there. That is a projection, not a
+ms** for a 366-day range (v0.5.0). The same absolute overhead — 12 extra calls × ≈0.64 ms ≈
+**≈ 7.6 ms** at S = 90 — projects to roughly **+7.6–10 %** there. That is a projection, not a
 measurement, and it is exactly the adjudication **S6/S7** own on production geometry.
 
 So this step records:
@@ -160,7 +160,7 @@ So this step records:
 - The S2 gate the fixture *can* decide — zero store opens in the read path, bounded fd growth —
   which is what the harness exits non-zero on.
 
-**Snapshot-open cost** (7.4 → 26.8 → 83.4 ms for 1 → 4 → 12 segments) is roughly linear in
+**Snapshot-open cost** (7.4 → 26.9 → 77.1 ms for 1 → 4 → 12 segments) is roughly linear in
 segment count and is R3/G16 groundwork: it runs on process start and on each generation change,
 not per request, and must stay well inside the refresh TTL. At the +10-year horizon (41 segments
 at S = 90) this projects to ~0.3 s — comfortable, but S6 must measure it rather than extrapolate.
@@ -172,7 +172,12 @@ Both were overclaims, and both are now recorded as limits rather than quietly re
 - **bbox is decoupled from the cube again.** `QuerySnapshot` is built **inside the point/range
   branch**. Building it before the bbox/point split made a bbox request depend on cube health —
   a manifest that would not settle could fail a bbox the daily store could serve perfectly
-  well. That was a behaviour change I introduced and did not notice.
+  well. That was a behaviour change I introduced and did not notice. The regression test now
+  drives the **real HTTP endpoint** through `TestClient` with `cube.snapshot()` raising: bbox
+  returns 200 with data, while the point path — which legitimately depends on the cube — still
+  fails. A router-level test could not have caught a change to `app.py`'s branch order, because
+  it never enters `read_ghrsst`; mutation-checked by restoring the eager snapshot, which fails
+  the test.
 - **`QuerySnapshot` freezes daily MEMBERSHIP, not daily DATA.** The day-set is captured once;
   values are still read live through `StoreAccess`. Freezing the data would mean copying it.
   The residual exposure is a daily prune/repair landing mid-request, which P4-S4 §7.1 already

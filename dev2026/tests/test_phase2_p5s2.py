@@ -392,6 +392,52 @@ class TestRequestLevelSnapshot(_Base):
         rows = router.points_batch([(105.0, 5.0)], "2027-05-05", ["sst"])
         self.assertEqual(len(rows), 1)
 
+    def test_bbox_HTTP_endpoint_still_serves_when_the_cube_snapshot_fails(self):
+        """The router-level test above cannot catch a regression in `app.py`'s branch ORDER —
+        it never enters `read_ghrsst`. This drives the real HTTP path: with `cube.snapshot()`
+        raising, a bbox request must still return data from the daily store."""
+        from fastapi.testclient import TestClient
+
+        from api.app import app
+        from store.tiered_cube import TierCompositionError
+
+        daily_root = os.path.join(self.tmp, "mur.zarr")
+        day = "2027-05-05"
+        fx.build_daily(daily_root, [day], seed=700)
+
+        prev = os.environ.get("GHRSST_ZARR_PATH")
+        os.environ["GHRSST_ZARR_PATH"] = daily_root
+        os.environ.pop("GHRSST_TIMECUBE_PATH", None)
+        os.environ.pop("GHRSST_DELTACUBE_PATH", None)
+        try:
+            with TestClient(app) as client:
+                base, _ = self._two_blocks()
+                delta, _ = self._delta(fx.days_from("2026-12-24", 10))
+                cube = TieredCube(base, delta)
+
+                def wont_settle():
+                    raise TierCompositionError("cube metadata will not settle")
+                cube.snapshot = wont_settle
+                app.state.router.cube = cube          # a cube that cannot be snapshotted
+
+                r = client.get("/api/ghrsst", params={
+                    "lon0": 100.0, "lat0": 0.0, "lon1": 103.0, "lat1": 3.0,
+                    "start": day, "end": day, "append": "sst"})
+                self.assertEqual(r.status_code, 200,
+                                 f"bbox must not depend on cube health: {r.text[:200]}")
+                self.assertGreater(len(r.json()), 0)
+
+                # ...and the point path, which legitimately depends on the cube, still fails
+                with self.assertRaises(TierCompositionError):
+                    client.get("/api/ghrsst", params={
+                        "lon0": 100.0, "lat0": 0.0, "start": day, "end": day,
+                        "append": "sst"})
+        finally:
+            if prev is None:
+                os.environ.pop("GHRSST_ZARR_PATH", None)
+            else:
+                os.environ["GHRSST_ZARR_PATH"] = prev
+
     def test_query_snapshot_freezes_daily_MEMBERSHIP_not_daily_DATA(self):
         """Documented limitation: the daily day-set is captured, the daily VALUES are read
         live. Freezing daily data would mean copying it; the contract is narrowed instead of
