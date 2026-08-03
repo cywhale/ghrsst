@@ -29,8 +29,22 @@ sys.path.insert(0, HERE)
 
 import p5_fixtures as fx  # noqa: E402
 from ingest.build_block import (  # noqa: E402
-    BuildRefused, build_block, disk_precheck, resolve_source_map,
+    BuildRefused, disk_precheck, inspect_daily_day, resolve_source_map,
 )
+from ingest.build_block import build_block as build_block_strict  # noqa: E402
+
+
+def build_block(*a, **kw):
+    """Test shim: waive the isolation requirement for the cases that are not about it.
+
+    `build_block_strict` requires a held `CompactionLock` and a positive `hard_reserve_bytes`.
+    Tests below that exercise sealing, sources, resume, memory etc. are not about isolation, so
+    they waive it explicitly here — in ONE named place, rather than each silently passing
+    `lock=None`. `TestIsolationIsMandatory` calls `build_block_strict` directly."""
+    kw.setdefault("lock", None)
+    kw.setdefault("hard_reserve_bytes", 0)
+    kw.setdefault("unsafe_skip_isolation", True)
+    return build_block_strict(*a, **kw)
 from store import block_manifest as bm  # noqa: E402
 from store.compaction_lock import (  # noqa: E402
     CompactionLock, CompactionLockBusy, CompactionLockError, refuse_if_compaction_running,
@@ -442,3 +456,214 @@ class TestSemanticsAndMemory(_Base):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ============================================================ finding 2: isolation is mandatory
+class TestIsolationIsMandatory(_Base):
+    """`lock` and `hard_reserve_bytes` used to default to `None` and `0`. The guards existed,
+    but a caller who forgot them got no isolation and a disabled disk gate, silently."""
+
+    def setUp(self):
+        super().setUp()
+        self.delta = self._delta(self.span[:10])
+        self.lock_path = os.path.join(self.tmp, "p5_compaction.lock")
+
+    def _kw(self, **over):
+        kw = dict(start_day=self.s0, end_day=self.e0,
+                  classification_target=self.span[:10], delta_path=self.delta,
+                  artifacts_dir=self.tmp)
+        kw.update(over)
+        return kw
+
+    def test_both_arguments_are_required_not_defaulted(self):
+        with self.assertRaises(TypeError):
+            build_block_strict(self._out("b"), **self._kw())
+        with self.assertRaises(TypeError):
+            build_block_strict(self._out("b"), lock=None, **self._kw())
+
+    def test_no_lock_refuses_and_writes_nothing(self):
+        out = self._out("b")
+        with self.assertRaises(BuildRefused) as cm:
+            build_block_strict(out, lock=None, hard_reserve_bytes=1 << 20, **self._kw())
+        self.assertIn("CompactionLock", str(cm.exception))
+        self.assertFalse(os.path.exists(out))
+        self.assertFalse(os.path.isfile(os.path.join(self.tmp, "p5_block_plan.json")))
+
+    def test_a_released_lock_is_not_a_held_lock(self):
+        lock = CompactionLock(self.lock_path)
+        lock.acquire()
+        lock.release()
+        with self.assertRaises(BuildRefused) as cm:
+            build_block_strict(self._out("b"), lock=lock, hard_reserve_bytes=1 << 20,
+                               **self._kw())
+        self.assertIn("CompactionLock", str(cm.exception))
+
+    def test_zero_or_negative_reserve_refuses(self):
+        with CompactionLock(self.lock_path) as lock:
+            for bad in (0, -1):
+                out = self._out(f"b{bad}")
+                with self.assertRaises(BuildRefused) as cm:
+                    build_block_strict(out, lock=lock, hard_reserve_bytes=bad, **self._kw())
+                self.assertIn("hard_reserve_bytes", str(cm.exception))
+                self.assertFalse(os.path.exists(out))
+
+    def test_the_lock_is_asserted_before_the_first_write_not_only_at_publish(self):
+        """Deleting the lock file must be caught before any byte lands, not after hours."""
+        with CompactionLock(self.lock_path) as lock:
+            os.remove(self.lock_path)
+            out = self._out("b")
+            with self.assertRaises(CompactionLockError):
+                build_block_strict(out, lock=lock, hard_reserve_bytes=1 << 20, **self._kw())
+            self.assertFalse(os.path.exists(out), "no bytes may be written without the lock")
+
+    def test_the_fully_guarded_path_still_builds(self):
+        """The mandatory path is not merely refusing everything."""
+        with CompactionLock(self.lock_path) as lock:
+            plan = build_block_strict(self._out("ok"), lock=lock, hard_reserve_bytes=1 << 20,
+                                      **self._kw())
+        self.assertEqual(plan["segment"]["day_count"], 10)
+
+
+# ============================================================ finding 1: handle caching
+class TestSourceHandlesAreCached(_Base):
+    """Re-opening the source group per tile was roughly `days x vars x tiles` opens — about
+    2.7M for a 90-day block at production geometry, which would put compaction back into the
+    hours it exists to avoid."""
+
+    def test_open_count_is_per_source_not_per_tile(self):
+        delta = self._delta(self.span[:6])
+        plan = build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                           classification_target=self.span[:6], delta_path=delta,
+                           artifacts_dir=self.tmp, tile=4)
+        opens = plan["source_group_opens"]
+        self.assertEqual(opens, 1, f"one delta source must be opened once, got {opens}")
+
+    def test_open_count_does_not_grow_when_the_tile_shrinks(self):
+        """The regression this closes: opens scaled with the tile count."""
+        counts = {}
+        for tile in (4, 64):
+            delta = self._delta(self.span[:6], name=f"d{tile}.zarr")
+            plan = build_block(self._out(f"b{tile}"), start_day=self.s0, end_day=self.e0,
+                               classification_target=self.span[:6], delta_path=delta,
+                               artifacts_dir=self.tmp, tile=tile)
+            counts[tile] = plan["source_group_opens"]
+        self.assertEqual(counts[4], counts[64],
+                         f"opens must not depend on tile size, got {counts}")
+
+    def test_opens_at_production_geometry_stay_bounded(self):
+        """The number the review cited: ~2.7M opens for one 90-day fold.
+
+        A wall-clock ratio gate was tried here first and removed. At fixture scale (32x32,
+        64 tiles vs 1) tile=4 is ~33x slower than tile=64 even with handles cached, because
+        per-slice overhead dominates — so a time ratio cannot attribute a regression to opens
+        and would have failed on correct code. The open count is exact, causal, and is what
+        actually turns into hours. It is measured on the real builder and projected here."""
+        delta = self._delta(self.span[:6])
+        plan = build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                           classification_target=self.span[:6], delta_path=delta,
+                           artifacts_dir=self.tmp, tile=4)
+        ny = nx = 32
+        tiles = ((ny + 3) // 4) * ((nx + 3) // 4)
+        self.assertEqual(tiles, 64)                    # the fixture really is multi-tile
+        per_tile_regression = 6 * 3 * tiles            # days x vars x tiles, the old behaviour
+        self.assertLess(plan["source_group_opens"], per_tile_regression / 100)
+
+        # production geometry, one 90-day fold from a single delta source
+        prod_tiles = ((17999 + 255) // 256) * ((36000 + 255) // 256)
+        self.assertGreater(90 * 3 * prod_tiles, 2_000_000)   # what it WAS
+        self.assertEqual(plan["source_group_opens"], 1)      # what it is: O(sources)
+
+    def test_mixed_sources_open_once_each(self):
+        delta = self._delta(self.span[3:6])
+        daily = self._daily(self.span[:3])
+        plan = build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                           classification_target=self.span[:6], delta_path=delta,
+                           daily_root=daily, artifacts_dir=self.tmp, tile=4)
+        # one delta group + one group per daily day
+        self.assertEqual(plan["source_group_opens"], 4)
+
+
+# ============================================================ finding 3: source inspection
+class TestSourceContractIsInspected(_Base):
+    """An OUTPUT inspection proves the output is structurally valid. It says nothing about
+    whether the INPUT was sound — a corrupt source is copied faithfully into a block that then
+    inspects perfectly clean."""
+
+    def _corrupt(self, path, fn):
+        g = zarr.open_group(path, mode="a")
+        fn(g)
+
+    def test_a_delta_with_a_descending_axis_refuses(self):
+        delta = self._delta(self.span[:6])
+        g = zarr.open_group(delta, mode="a")
+        nx = g["lon"].shape[0]
+        g["lon"][:] = np.linspace(131.0, 100.0, nx, dtype=np.float32)
+        out = self._out("b0")
+        with self.assertRaises(BuildRefused) as cm:
+            build_block(out, start_day=self.s0, end_day=self.e0,
+                        classification_target=self.span[:6], delta_path=delta,
+                        artifacts_dir=self.tmp)
+        self.assertIn("source store violates its contract", str(cm.exception))
+        self.assertFalse(os.path.exists(out))
+
+    def test_a_daily_day_with_a_wrong_dtype_refuses(self):
+        daily = self._daily(self.span[:3])
+        y, m, d = self.span[0].split("-")
+        dpath = os.path.join(daily, y, m, d)
+        g = zarr.open_group(dpath, mode="a")
+        ny, nx = g["sst"].shape[1:]
+        del g["sst"]
+        g.create_array("sst", shape=(1, ny, nx), dtype="float64")
+        with self.assertRaises(BuildRefused) as cm:
+            build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                        classification_target=self.span[:3], daily_root=daily,
+                        artifacts_dir=self.tmp)
+        self.assertIn("float32", str(cm.exception))
+
+    def test_a_daily_day_with_a_non_finite_axis_refuses(self):
+        daily = self._daily(self.span[:3])
+        y, m, d = self.span[0].split("-")
+        g = zarr.open_group(os.path.join(daily, y, m, d), mode="a")
+        lat = np.asarray(g["lat"][:])
+        lat[0] = np.nan
+        g["lat"][:] = lat
+        with self.assertRaises(BuildRefused) as cm:
+            build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                        classification_target=self.span[:3], daily_root=daily,
+                        artifacts_dir=self.tmp)
+        self.assertIn("non-finite", str(cm.exception))
+
+    def test_sources_on_different_grids_refuse(self):
+        """A block has ONE axis pair. Two grids would interleave geographies day by day and
+        the output guard, which sees only one axis, would pass it."""
+        delta = self._delta(self.span[3:6])
+        daily = self._daily(self.span[:3], ny=8, nx=9)
+        with self.assertRaises(BuildRefused) as cm:
+            build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                        classification_target=self.span[:6], delta_path=delta,
+                        daily_root=daily, artifacts_dir=self.tmp)
+        self.assertIn("disagree on the grid", str(cm.exception))
+
+    def test_inspect_daily_day_accepts_a_sound_day(self):
+        daily = self._daily(self.span[:2])
+        meta = inspect_daily_day(daily, self.span[0])
+        self.assertIn("sst", meta["vars"])
+        self.assertGreater(meta["ny"], 0)
+
+
+# ============================================================ finding 4: netcdf undelivered
+class TestNetcdfIsNotAdvertised(_Base):
+    def test_source_order_does_not_list_an_unimplemented_kind(self):
+        """`netcdf` was listed in `SOURCE_ORDER` with no resolver. Advertising a kind that can
+        never resolve makes a missing FEATURE look like a missing DAY."""
+        from ingest.build_block import SOURCE_ORDER
+        self.assertNotIn("netcdf", SOURCE_ORDER)
+        self.assertEqual(SOURCE_ORDER, ("delta", "block", "daily", "hold"))
+
+    def test_a_day_only_netcdf_could_supply_refuses_loudly(self):
+        delta = self._delta(self.span[:3])
+        with self.assertRaises(BuildRefused) as cm:
+            build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                        classification_target=self.span[:4], delta_path=delta,
+                        artifacts_dir=self.tmp)
+        self.assertIn(self.span[3], str(cm.exception))

@@ -64,8 +64,12 @@ PROGRESS = "p5_block_build_progress.jsonl"
 ERROR_JSON = "p5_block_build_error.json"
 PLAN_JSON = "p5_block_plan.json"
 
-#: source kinds, in the order §7.1a resolves them
-SOURCE_ORDER = ("delta", "block", "daily", "hold", "netcdf")
+#: Source kinds, in the order §7.1a resolves them.
+#: NOTE: `netcdf` is deliberately ABSENT. The spec lists it as the deep recovery backstop, but
+#: no resolver or reader exists here, and advertising a kind that cannot be resolved would make
+#: "unresolved -> refuse" look like a missing day rather than a missing feature. Declared as
+#: not delivered in the results doc; a day only NetCDF could supply refuses, loudly.
+SOURCE_ORDER = ("delta", "block", "daily", "hold")
 
 
 class BuildRefused(Exception):
@@ -171,36 +175,127 @@ def disk_precheck(out_path: str, *, block_bytes_estimate: int, hard_reserve_byte
             "ok": bool(projected >= hard_reserve_bytes)}
 
 
-# --------------------------------------------------------------------------- reads
-def _read_tile(source: dict, var: str, i0: int, i1: int, j0: int, j1: int):
-    """Read ONE spatial tile of one (day, var). Never a whole slab."""
-    kind, path, t = source["source_kind"], source["source_path"], source["source_day_index"]
-    if kind in ("daily", "hold"):
-        y, m, d = source["day"].split("-")
-        g = zarr.open_group(os.path.join(path, y, m, d), mode="r")
-        if var not in g:
+# --------------------------------------------------------------------------- sources
+def inspect_daily_day(root: str, day: str) -> dict:
+    """Strict contract check for ONE daily-group day.
+
+    `inspect_store_contract` does not fit a daily group (no `days` attr, shape `(1,ny,nx)`),
+    but the same principle applies: an OUTPUT inspection proves the output is structurally
+    valid, never that the INPUT was semantically sound. A source with a corrupt dtype, shape
+    or axis would otherwise be copied faithfully into a block that then inspects clean."""
+    y, m, d = day.split("-")
+    path = os.path.join(root, y, m, d)
+    if not os.path.isdir(path):
+        raise bm.ManifestError(f"{path}: daily group missing")
+    g = zarr.open_group(path, mode="r")
+    for axis in ("lon", "lat"):
+        if axis not in g:
+            raise bm.ManifestError(f"{path}: coordinate {axis!r} missing")
+        a = np.asarray(g[axis][:], dtype="float64")
+        if g[axis].ndim != 1 or a.size == 0:
+            raise bm.ManifestError(f"{path}: {axis!r} must be a non-empty 1-D axis")
+        if not np.all(np.isfinite(a)):
+            raise bm.ManifestError(f"{path}: {axis!r} contains non-finite values")
+        if a.size > 1 and not np.all(np.diff(a) > 0):
+            raise bm.ManifestError(f"{path}: {axis!r} is not strictly increasing")
+    ny, nx = int(np.asarray(g["lat"][:]).size), int(np.asarray(g["lon"][:]).size)
+    present = []
+    for v in VARS:
+        if v not in g:
+            continue
+        arr = g[v]
+        if arr.ndim != 3 or arr.shape[0] != 1:
+            raise bm.ManifestError(f"{path}: {v!r} must be (1, ny, nx), got {arr.shape}")
+        if (arr.shape[1], arr.shape[2]) != (ny, nx):
+            raise bm.ManifestError(
+                f"{path}: {v!r} is {arr.shape[1]}x{arr.shape[2]}, axes say {ny}x{nx}")
+        if str(arr.dtype) != "float32":
+            raise bm.ManifestError(f"{path}: {v!r} has dtype {arr.dtype}, expected float32")
+        present.append(v)
+    if not present:
+        raise bm.ManifestError(f"{path}: no data variables")
+    return {"ny": ny, "nx": nx, "vars": present}
+
+
+class _SourceReader:
+    """Opens every distinct source ONCE, strictly, and holds the handles.
+
+    Two defects this closes. **Performance:** re-opening a group per tile meant roughly
+    `days x vars x tiles` opens — about 2.7 million for a 90-day block at production geometry
+    (17999x36000, 256-tiles, 3 vars), which would put compaction back into the hours it exists
+    to avoid. **Correctness:** each open also re-read `var_valid` raw and coerced it, which is
+    the laundering pattern the read side spent five review rounds removing.
+    """
+
+    def __init__(self):
+        self._groups: Dict[str, object] = {}
+        self._cube_valid: Dict[str, Dict[str, list]] = {}
+        self._daily_meta: Dict[str, dict] = {}
+        self._grids: Dict[str, tuple] = {}   # source label -> (ny, nx)
+        self.opens = 0                      # observable, so a gate can assert it stays small
+
+    def _group(self, path: str):
+        g = self._groups.get(path)
+        if g is None:
+            g = zarr.open_group(path, mode="r")
+            self._groups[path] = g
+            self.opens += 1
+        return g
+
+    def inspect_cube(self, path: str) -> None:
+        """Strict inspection of a delta / predecessor-block source, once per path."""
+        if path in self._cube_valid:
+            return
+        insp = bm.inspect_store_contract(path)          # raises on any contract violation
+        self._cube_valid[path] = {v: list(flags) for v, flags in insp.var_valid}
+        self._grids[path] = (insp.lat_shape[0], insp.lon_shape[0])
+        self._group(path)
+
+    def inspect_daily(self, root: str, day: str) -> None:
+        key = f"{root}|{day}"
+        if key not in self._daily_meta:
+            meta = inspect_daily_day(root, day)
+            self._daily_meta[key] = meta
+            self._grids[key] = (meta["ny"], meta["nx"])
+            y, m, d = day.split("-")
+            self._group(os.path.join(root, y, m, d))
+
+    def assert_uniform_grid(self) -> None:
+        """Every source must be on the SAME grid.
+
+        A block has one `lon`/`lat` axis pair. Sources on different grids would each write
+        their own tiles into it, and the result inspects perfectly clean while interleaving
+        two geographies day by day — invisible to the output guard, which only sees one axis."""
+        seen = sorted(set(self._grids.values()))
+        if len(seen) > 1:
+            detail = ", ".join(f"{k} -> {v[0]}x{v[1]}" for k, v in sorted(self._grids.items()))
+            raise bm.ManifestError(
+                f"sources disagree on the grid ({seen}); a block has ONE axis pair, so folding "
+                f"these together would interleave geographies day by day: {detail}")
+
+    def grid(self) -> tuple:
+        return next(iter(self._grids.values()))
+
+    def has_var(self, source: dict, var: str) -> bool:
+        kind, path, t = source["source_kind"], source["source_path"], source["source_day_index"]
+        if kind in ("daily", "hold"):
+            return var in self._daily_meta[f"{path}|{source['day']}"]["vars"]
+        valid = self._cube_valid[path]
+        if var not in valid:
+            return False
+        flag = valid[var][t]
+        return flag is True                 # strict: validated as a real bool by the inspection
+
+    def read_tile(self, source: dict, var: str, i0, i1, j0, j1):
+        """ONE spatial tile of one (day, var). Never a whole slab, never a fresh open."""
+        kind, path, t = source["source_kind"], source["source_path"], source["source_day_index"]
+        if kind in ("daily", "hold"):
+            y, m, d = source["day"].split("-")
+            g = self._group(os.path.join(path, y, m, d))
+            return None if var not in g else np.asarray(g[var][0, i0:i1, j0:j1])
+        if not self.has_var(source, var):
             return None
-        return np.asarray(g[var][0, i0:i1, j0:j1])
-    g = zarr.open_group(path, mode="r")
-    if var not in g:
-        return None
-    valid = dict(g.attrs.get("var_valid", {}))
-    if var in valid and not valid[var][t]:
-        return None                                  # absent on that day -> stays absent
-    return np.asarray(g[var][t, i0:i1, j0:j1])
-
-
-def _source_has_var(source: dict, var: str) -> bool:
-    kind, path, t = source["source_kind"], source["source_path"], source["source_day_index"]
-    if kind in ("daily", "hold"):
-        y, m, d = source["day"].split("-")
-        g = zarr.open_group(os.path.join(path, y, m, d), mode="r")
-        return var in g
-    g = zarr.open_group(path, mode="r")
-    if var not in g:
-        return False
-    valid = dict(g.attrs.get("var_valid", {}))
-    return bool(valid[var][t]) if var in valid else True
+        return np.asarray(self._group(path)[var][t, i0:i1, j0:j1])
 
 
 # --------------------------------------------------------------------------- the builder
@@ -214,16 +309,30 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
                 confirmed_missing: Sequence[str] = (),
                 spatial_window_days: int = 31,
                 window_latest_day: Optional[str] = None,
-                lock: Optional[CompactionLock] = None,
+                lock: Optional[CompactionLock],
+                hard_reserve_bytes: int,
                 artifacts_dir: Optional[str] = None,
                 tile: int = 256, resume: bool = False,
-                hard_reserve_bytes: int = 0,
-                sealed: Optional[bool] = None) -> dict:
+                sealed: Optional[bool] = None,
+                unsafe_skip_isolation: bool = False) -> dict:
     """Build one immutable block into `out_path` and return a publish plan.
 
-    Refuses (writing nothing) when: the target path exists without a resumable checkpoint; a
-    day in `rebuild_source_set` has no source; a day falls inside the protected spatial
-    window; or the disk precheck fails.
+    `lock` and `hard_reserve_bytes` are **required positional-by-keyword** arguments with no
+    defaults. They used to default to `None` and `0`, which meant a caller who simply forgot
+    them got a build with **no isolation and a disabled disk gate** — the guards existed but
+    were opt-in, and the failure mode was silence. Now:
+
+    * `lock` must be a **currently-held** `CompactionLock`, asserted BEFORE the first write as
+      well as before the plan is emitted;
+    * `hard_reserve_bytes` must be **> 0**.
+
+    `unsafe_skip_isolation=True` is the only way past either, is named so it cannot be typed by
+    accident, and is greppable. Tests that are not exercising isolation use it; nothing else
+    should.
+
+    Refuses (writing nothing) when: isolation is missing; the target path exists without a
+    resumable checkpoint; a day in `rebuild_source_set` has no source; a source store violates
+    its contract; a day falls inside the protected spatial window; or the disk precheck fails.
     """
     journal = _Journal(artifacts_dir)
     try:
@@ -235,7 +344,8 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
             confirmed_missing=list(confirmed_missing),
             spatial_window_days=spatial_window_days, window_latest_day=window_latest_day,
             lock=lock, journal=journal, artifacts_dir=artifacts_dir, tile=tile,
-            resume=resume, hard_reserve_bytes=hard_reserve_bytes, sealed=sealed)
+            resume=resume, hard_reserve_bytes=hard_reserve_bytes, sealed=sealed,
+            unsafe_skip_isolation=unsafe_skip_isolation)
     except BuildRefused as exc:
         journal.event(event="refused", reason=str(exc))
         raise
@@ -248,7 +358,21 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
 def _build_block(out_path, *, start_day, end_day, classification_target, predecessor_present,
                  delta_path, predecessor_path, daily_root, hold_root, confirmed_missing,
                  spatial_window_days, window_latest_day, lock, journal, artifacts_dir,
-                 tile, resume, hard_reserve_bytes, sealed) -> dict:
+                 tile, resume, hard_reserve_bytes, sealed, unsafe_skip_isolation) -> dict:
+    # ---- isolation is MANDATORY unless explicitly, loudly waived
+    if not unsafe_skip_isolation:
+        if lock is None or not getattr(lock, "held", False):
+            raise BuildRefused(
+                "a held CompactionLock is required: without it a delta prune or swap can "
+                "retarget the delta path mid-build and freeze wrong bytes into an immutable "
+                "block (§7.1b). Pass a held lock, or unsafe_skip_isolation=True in a test "
+                "that is not exercising isolation.")
+        lock.assert_still_held()                       # before the FIRST write, not only at publish
+        if int(hard_reserve_bytes) <= 0:
+            raise BuildRefused(
+                "hard_reserve_bytes must be > 0: a zero reserve disables the disk gate, and a "
+                "compaction that fills the filesystem takes the API down (§7.1c)")
+
     span = bm.calendar_span(start_day, end_day)
     if not span:
         raise BuildRefused(f"end_day {end_day} precedes start_day {start_day}")
@@ -281,6 +405,22 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
             f"{unresolved[0]}. Refusing before writing anything.")
     for d, s in smap.items():
         s["day"] = d
+
+    # ---- strict SOURCE inspection, once per distinct source, before anything is read.
+    # An output inspection proves the output is structurally valid; it says nothing about
+    # whether the input was sound. A corrupt source would otherwise be copied faithfully into
+    # a block that then inspects clean.
+    reader = _SourceReader()
+    try:
+        for path in {s["source_path"] for s in smap.values()
+                     if s["source_kind"] in ("delta", "block")}:
+            reader.inspect_cube(path)
+        for s in smap.values():
+            if s["source_kind"] in ("daily", "hold"):
+                reader.inspect_daily(s["source_path"], s["day"])
+        reader.assert_uniform_grid()
+    except bm.ManifestError as exc:
+        raise BuildRefused(f"source store violates its contract: {exc}") from exc
     journal.event(event="source_map",
                   rebuild_source_set=len(rebuild_source_set),
                   classification_target=len(classification_target),
@@ -289,7 +429,7 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
 
     # ---- geometry from a source, then the disk precheck
     probe = smap[rebuild_source_set[0]]
-    ny, nx, lon, lat = _probe_grid(probe)
+    ny, nx, lon, lat = _probe_grid(probe, reader)
     T = len(rebuild_source_set)
     est = T * ny * nx * 4 * len(VARS)
     disk = disk_precheck(out_path, block_bytes_estimate=est,
@@ -314,7 +454,7 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
     present_flags = {v: [] for v in VARS}
     for d in rebuild_source_set:
         for v in VARS:
-            present_flags[v].append(_source_has_var(smap[d], v))
+            present_flags[v].append(reader.has_var(smap[d], v))
     keep_vars = [v for v in VARS if any(present_flags[v])]
 
     if not done:
@@ -334,7 +474,7 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
             for i0 in range(0, ny, tile):
                 for j0 in range(0, nx, tile):
                     i1, j1 = min(i0 + tile, ny), min(j0 + tile, nx)
-                    block = _read_tile(smap[day], v, i0, i1, j0, j1)
+                    block = reader.read_tile(smap[day], v, i0, i1, j0, j1)
                     if block is not None:
                         g[v][t, i0:i1, j0:j1] = block
             _mark(ck_path, key)
@@ -348,7 +488,8 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
     g.attrs["region"] = [0, ny, 0, nx]
     g.attrs["layout"] = "time_lat_lon"
     build_s = round(time.perf_counter() - t0, 2)
-    journal.event(event="build_finalized", days=T, build_s=build_s)
+    journal.event(event="build_finalized", days=T, build_s=build_s,
+                  source_group_opens=reader.opens)
 
     # ---- THE WRITE-SIDE GUARD: inspect what we ACTUALLY wrote, then derive from that
     if lock is not None:
@@ -392,6 +533,7 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
             "rebuild_source_set": rebuild_source_set,
             "classification_target": sorted(classification_target),
             "disk": disk, "build_s": build_s, "performed_publish": False,
+            "source_group_opens": reader.opens,
             "note": ("A plan, not a publication. The segment entry was derived from an "
                      "inspection of the block ACTUALLY written -- never from build intent.")}
     if artifacts_dir:                                  # success only
@@ -404,13 +546,13 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
 
 
 # --------------------------------------------------------------------------- helpers
-def _probe_grid(source: dict):
+def _probe_grid(source: dict, reader: "_SourceReader"):
     kind, path = source["source_kind"], source["source_path"]
     if kind in ("daily", "hold"):
         y, m, d = source["day"].split("-")
-        g = zarr.open_group(os.path.join(path, y, m, d), mode="r")
+        g = reader._group(os.path.join(path, y, m, d))
     else:
-        g = zarr.open_group(path, mode="r")
+        g = reader._group(path)
     lon = np.asarray(g["lon"][:], dtype="float32")
     lat = np.asarray(g["lat"][:], dtype="float32")
     return int(lat.size), int(lon.size), lon, lat

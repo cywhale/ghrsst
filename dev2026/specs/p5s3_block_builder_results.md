@@ -10,8 +10,12 @@ Implements P5-S3 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Compaction lock: [`../store/compaction_lock.py`](../store/compaction_lock.py)
 - Gate wired into [`../ingest/prune_delta.py`](../ingest/prune_delta.py) and
   [`../ingest/swap_delta.py`](../ingest/swap_delta.py)
-- Tests: [`../tests/test_phase2_p5s3.py`](../tests/test_phase2_p5s3.py) — **28/28 green**
-- Full local suite: **426 tests OK** (17 skipped), up from 398.
+- Tests: [`../tests/test_phase2_p5s3.py`](../tests/test_phase2_p5s3.py) — **45/45 green**
+- Full local suite: **443 tests OK** (17 skipped), up from 398.
+
+**Review round 2** raised four findings; §11 records what each one changed. Two of them were
+defects I had introduced without noticing — the per-tile group open, and two safety gates that
+were technically present but opt-in.
 
 ## 1. The write-side guard — the thing this step exists to get right
 
@@ -95,6 +99,11 @@ a terabyte of `pinned_existing` changes neither `additional_bytes` nor
 
 Naming these rather than letting the step look complete:
 
+0. **The NetCDF source fallback (§7.1a, deep recovery).** It was listed in `SOURCE_ORDER` with
+   no resolver and no reader behind it, so a day only NetCDF could have supplied looked like a
+   missing *day* rather than a missing *feature*. It is now **removed from `SOURCE_ORDER`**;
+   such a day refuses loudly, naming the date. Recovery scope, not S3.
+
 1. **The repair WAL (§7.5a-1) and the identity-based prune gate (E1/E2/E3).** The builder emits
    `build_provenance.materialized_repairs` as an **empty map** — the structure is present, the
    WAL that would populate it is not. Until it exists, the §7.5a prune authorization cannot be
@@ -123,7 +132,7 @@ dev2026/.venv/bin/python -m unittest discover -s dev2026/tests -p "test_*.py"
 
 ## 10. Mutation verification
 
-Every new guard was disabled in turn and the suite re-run; all eleven fail.
+Every new guard was disabled in turn and the suite re-run; all nineteen fail. A twentieth mutation survived by design and is discussed below the table.
 
 | guard disabled | result |
 |---|---|
@@ -138,3 +147,83 @@ Every new guard was disabled in turn and the suite re-run; all eleven fail.
 | publish requires the lock held | FAILED |
 | `prune_delta` compaction gate | FAILED |
 | `execute_swap_plan` compaction gate | FAILED |
+| handle cache disabled (opens per tile) | FAILED |
+| isolation requirement removed | FAILED |
+| positive-reserve check removed | FAILED |
+| pre-write lock assertion removed | FAILED |
+| source contract inspection skipped | FAILED |
+| daily-day inspection skipped | FAILED |
+| grid-uniformity check removed | FAILED |
+| `netcdf` re-advertised in `SOURCE_ORDER` | FAILED |
+
+**One mutation SURVIVED, and it should have.** Relaxing `has_var` from `flag is True` to
+`bool(flag)` leaves the suite green. That is not a coverage hole: `inspect_store_contract`
+(`block_manifest.py:549`) rejects any `var_valid` entry that is not an exact `bool`, so nothing
+non-bool can reach `has_var` in the first place, and the two expressions are provably equivalent
+there. The strict form stays as defence-in-depth against a future path that skips the
+inspection — but it is **not** a gated guard, and is recorded here as such rather than listed
+above as if a test were holding it.
+
+## 11. Review round 2 — what the four findings changed
+
+### 1. [High] The source group was re-opened on every tile
+
+`_read_tile` and `_source_has_var` each called `zarr.open_group()`. At production geometry
+(17999x36000, 256-tiles, 90 days, 3 vars) that is **~2.7M opens for one fold** — enough to put
+compaction back into the hours it exists to avoid. This was mine and the tests did not see it,
+because a 32x32 fixture with one tile per var opens exactly as often either way.
+
+`_SourceReader` now opens each distinct source **once** and holds the handle; `opens` is
+exposed on the plan and in the progress journal, so it is a gated quantity rather than an
+assumption. Gates: opens are `1` for a single delta source regardless of tile size, `4` for
+delta + three daily days, and **do not change when the tile shrinks** — the exact scaling that
+regressed.
+
+**A wall-clock gate was tried here and removed, deliberately.** At fixture scale tile=4 is
+~33x slower than tile=64 *with the cache in place*, because per-slice overhead dominates when
+the grid is 32x32. A time-ratio gate would therefore have failed on correct code while proving
+nothing about opens. The open count is exact, causal, and is the quantity that becomes hours;
+the test states this rather than leaving a silently weaker gate in place.
+
+### 2. [High] The lock and the disk reserve were opt-in
+
+`lock=None` and `hard_reserve_bytes=0` were defaults. Both guards existed and both were tested
+— but a caller who simply *forgot* them got a build with no isolation and a disabled disk gate,
+and nothing said so. A guard you can omit by accident is not a guard.
+
+Both are now **required keyword arguments with no default**. `lock` must be a *currently held*
+`CompactionLock` and `hard_reserve_bytes` must be `> 0`; either failure refuses before a byte is
+written. The lock is additionally asserted held **before the first write**, not only before
+publish — losing it after three hours of building is worth catching, but catching it at minute
+zero is better.
+
+`unsafe_skip_isolation=True` is the single, greppable, deliberately ugly waiver, used by the
+tests that are not about isolation (via one named shim at the top of the test module, so no test
+silently passes `lock=None`). `TestIsolationIsMandatory` calls the strict entry point directly,
+including a test that the fully guarded path still *builds* — a mandatory gate that refuses
+everything would also pass every negative test.
+
+### 3. [High] Source stores were never strictly inspected
+
+The write-side guard inspects the block it wrote. As the reviewer put it, that proves the
+**output** is structurally legal; it proves nothing about whether the **input** was semantically
+sound. A source with a corrupt axis or a wrong dtype gets copied faithfully into a block that
+then inspects perfectly clean — the S1 laundering pattern, relocated.
+
+`resolve_source_map` results are now inspected before anything is read: `inspect_store_contract`
+for delta and predecessor-block sources, and a new `inspect_daily_day` for daily/hold groups
+(shape `(1,ny,nx)`, `float32`, axes 1-D, finite and strictly increasing). `has_var` reads
+`var_valid` **from the inspection** and requires `flag is True` rather than truthiness — the
+same strictness the read side arrived at, though see §10 for why that last part is redundant
+rather than load-bearing.
+
+One thing the finding did not name, which fell out of doing it: nothing checked that the sources
+**agree on a grid**. A block has one `lon`/`lat` pair, so a mixed-grid source set would write
+each source's tiles into the same axes and interleave two geographies day by day — and the
+output guard, which sees only one axis pair, would pass it. `assert_uniform_grid()` now refuses.
+
+### 4. [Medium] NetCDF was advertised but not implemented
+
+Removed from `SOURCE_ORDER` and declared undelivered in §7.0. Implementing it was the other
+option; declaring it is the honest one for this step, and the refusal now names the missing day
+instead of implying the source was consulted.
