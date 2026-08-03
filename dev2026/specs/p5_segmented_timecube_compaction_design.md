@@ -1849,6 +1849,7 @@ implementation follows. Local suite today: **256 green** — P5 must keep it gre
 | **F16 compaction lock (round-4)** | a delta prune / swap / repair attempted while the builder holds `flock(p5_compaction.lock)` is **refused** with `compaction_lock_held` (non-blocking `LOCK_NB`) and touches nothing; daily delta **append** proceeds normally (it does not take this lock); the holder **exiting** releases the lock and a prune then proceeds. |
 | **F16b split-brain / fencing (round-4)** | (a) the holder is **paused** (`SIGSTOP`) past any plausible TTL → the lock is **still held** → a prune is **still refused** → the holder resumes and publishes correctly (this is the case a TTL lease gets wrong); (b) the lock file is **deleted and recreated** underneath the holder, a second process locks the new inode and performs a delta swap → the original holder's publish-time **inode check fails → it refuses to publish**; (c) *if the TTL-lease variant is ever chosen instead*: an expired holder that resumes **after** a new holder took over and swapped must **fail to renew and fail to publish** (fence-token check). |
 | **F16c lock-fd ownership (round-5)** | with the recommended single-process/threaded build: killing the builder releases the lock and a prune then proceeds, while any staging tree left behind **cannot be published**. With a child-process build: (a) fd is **not inherited** (`O_CLOEXEC`) → parent death frees the lock and a surviving worker cannot publish; (b) **the hazard case** — if a child *did* inherit the fd, parent death leaves the lock held by the child, so a prune is still refused and the runbook's process-group kill + **fresh non-blocking test acquisition** is required before proceeding; (c) a resume over an orphaned staging tree re-acquires the lock and revalidates rather than trusting the frontier. |
+| **F18 two-week outage + bulk backfill (R4)** | a 14-day upstream gap, then a batch backfill, exercising four invariants together: backfilled days land at the **delta array tail** so `attrs["days"]` is append-order (never `days[-1]` for latest); a prune attempted while the recent window still has the hole is **refused** until repaired (§4.1); the swollen delta measurably degrades a crossing range (**H5**); and folding must still refuse any day inside the protected window, while a backfilled day landing in an already-sealed window requires a **§7.8 corrective refold** rather than an in-place edit. |
 | **F17 multi-generation superseded lifecycle (round-4)** | v1 is superseded at generation `N` and moved to hold, while manifests advance to `N+2` / `N+3`. Asserts: **v1's entry is still present in generation `N+3`'s `superseded[]`** with `superseded_at_generation == N` and `status: held` and `current_path` = its hold path; the `pinned_existing` forecast counts it; **rollback from `N+3` to `N` restores it** via §9.3a; a v1 entry disappears **only** when ops hard-deletes it, and that removal is itself a new generation; a `superseded[]` entry whose `current_path` is missing **alarms and marks the affected rollback unavailable without failing the served snapshot** (§5.6). |
 
 ### 13.2 Required performance tests
@@ -1926,13 +1927,20 @@ condition. Steps S0–S7 are **local-only**; S8–S10 are the VM24 boundary (§1
 
 ### P5-S2 — grouped multi-segment read path + parity  **[MUT-STG]**
 - **Out:** production `SegmentedCubeStore.point_series` with per-segment grouping; `TieredCube` generalized
-  to accept a segmented base; fixtures F4–F9.
+  to accept a segmented base **and to capture ONE composite snapshot per request** —
+  `TieredSnapshot(base_snapshot, delta_snapshot, day_source_map)`, resolved once at entry, so a base
+  manifest refresh or a delta refresh landing mid-request cannot mix generations across tiers (**R1**;
+  P5-S1 proved only *static* composition); fixtures F4–F9, **F18**. **`assert_disjoint_from(delta_path)`
+  must be called by the assembly itself** — `TieredCube`/`TieredSnapshot` construction fails closed if any
+  base segment resolves to the delta path. P5-S1 shipped it as an optional helper, which relies on an
+  operator remembering; an invariant that depends on memory is not an invariant.
 - **Tests:** G1 semantic equality on every fixture; append-order (F4); overlap (F5); gap (F6); absent var
   across a boundary (F7); NaN (F8); `mixed` (F9); **assert one array call per (segment,var)** — a test that
   counts calls and fails on per-day access.
 - **Bench:** segment-count sensitivity; cached vs per-request open.
-- **Gate:** G1, G2, G3, G12. **Rollback:** unmerged branch. **Stop if:** G1 fails anywhere — parity is not
-  negotiable, and a parity failure means the read model is wrong, not the test.
+- **Gate:** G1, G2, G3, G12, plus **G6/G16 groundwork for R3** (no per-request store opens; fd and RSS
+  recorded). **Rollback:** unmerged branch. **Stop if:** G1 fails anywhere — parity is not negotiable, and a
+  parity failure means the read model is wrong, not the test.
 
 ### P5-S3 — tail-block bulk builder + checkpoint/resume  **[MUT-STG]**
 - **Out:** `ingest/build_block.py` — **§7.1a/§5.5 two-set resolution: `classification_target` (newly aged)
@@ -1989,6 +1997,9 @@ condition. Steps S0–S7 are **local-only**; S8–S10 are the VM24 boundary (§1
   (c) a superseded block deleted too early → snapshot build **fails closed**, never fabricates `None`;
   (d) every §9 crash point, injected;
   (e) concurrent refresh + reads under load, asserting no torn snapshot;
+  (e2) **composite base+delta (R1):** pause a request mid-flight, refresh the base manifest and/or the
+  delta, resume — the result must be a **complete-old** or **complete-new** view and never a mix across
+  tiers. This is the case `TieredCube`'s tier-by-tier lookup does not close on its own;
   (f) **build isolation + fencing (round-4, F16/F16b/G17):** with a block build in flight holding
   `flock(p5_compaction.lock)`, an attempted `prune_delta` / `execute_swap_plan` / repair-overwrite is
   **refused non-blocking** and touches nothing; a concurrent daily append proceeds and does not perturb the
@@ -2059,6 +2070,9 @@ condition. Steps S0–S7 are **local-only**; S8–S10 are the VM24 boundary (§1
 
 ## 16. Unresolved decisions requiring Codex / human sign-off
 
+*(§17 below carries the **cross-phase risk register** — risks that span steps, each bound to
+the step that implements it and the gate that proves it.)*
+
 | # | question | why it matters | default if unanswered |
 |---|---|---|---|
 | **Q1** | **Confirm `S = 90` / `C = 30`** (§10.8), or mandate the S6 benchmark decide unconditionally? | Sets peak temp disk (141 vs 71 GB), fold frequency (12 vs 8 /yr) and delta span (64 vs 79 d). | Proceed to S6 with S=90/C=30 as the hypothesis to beat. |
@@ -2081,9 +2095,30 @@ condition. Steps S0–S7 are **local-only**; S8–S10 are the VM24 boundary (§1
 
 ---
 
+## 17. Cross-phase risk register
+
+Risks that span more than one step, each bound to the step that must **implement** it and the
+gate that must **prove** it. They live here rather than in a step's prose so they cannot be
+lost between phases — an unowned risk is one that gets rediscovered in production.
+
+| # | risk | why it is not settled by any single step | implement | gate / prove | status |
+|---|---|---|---|---|---|
+| **R1a** | **Base/delta disjointness is not enforced at assembly.** `SegmentedCubeStore.assert_disjoint_from(delta_path)` exists (P5-S1) but is an *optional* call. A base segment that resolves to the delta path would serve delta bytes as immutable base, and nothing forces the check. | The store cannot see the delta by design (§4.0), so only the composing layer can enforce it. | **S2** — `TieredCube`/`TieredSnapshot` construction calls it unconditionally and fails closed. | **G1/G12** plus a construction-time negative test. | **OPEN** |
+| **R1** | **Composite base+delta snapshot.** `TieredCube.point_series` consults delta membership and then calls base and delta separately; it never captures **one composite snapshot** for a request. Each tier is individually immutable, but a base manifest refresh *or* a delta refresh landing mid-request could mix generations across tiers. P5-S1 proved only *static* composition (fixed base snapshot + fixed delta snapshot ⇒ correct precedence and order). | Needs a read-path change (S2) **and** an adversarial proof (S5); neither alone closes it. | **S2** — a request-level `TieredSnapshot(base_snapshot, delta_snapshot, day_source_map)` captured once per request. | **S5 / G10** — pause a request, refresh base and/or delta, resume: the result must be a **complete-old** or **complete-new** view, never a mix. | **OPEN** — S1 explicitly does *not* claim this. |
+| **R2** | **Superseded / hold cleanup, and the alarm for forgetting it.** `superseded[]` is cumulative (§5.6) and hard delete is ops-only after `hold_until`. Nothing yet *notices* when entries accumulate past their `release_after_utc` / `hold_until_utc`, so disk silently fills and §7.1c's `pinned_existing` forecast drifts from reality. | The data model is S1/S4; the operational detection is an ops audit; the disk consequence is S6/S7. | **S4** — lifecycle transitions (`referenced → releasable → held`) written on publish. | **G19**, plus an **S8 ops audit** line reporting overdue entries alongside `delta_span` / `free_disk` (§16-Q6, Q11). | **OPEN** |
+| **R3** | **Multi-store RSS / file descriptors / snapshot-open cost.** A segmented base holds N `TimeCubeStore` handles instead of one, and the block tree reaches ~6.6 M files at +10 y (§10.6). Per-request fd churn, snapshot build time on process start, and metadata-scan cost all scale with segment count. | S1 builds the snapshot but measures nothing; the cost only appears at realistic segment counts and concurrency. | **S2** (grouped reads, no per-request opens) | **H7 / G6 / G16** at **S6** (5/13/41/82/122 segments) and **S7** (C=1/4/8/16 under sustained load). | **OPEN** |
+| **R4** | **Two-week outage then bulk backfill.** A multi-day upstream gap followed by a batch backfill exercises four invariants at once: **append-order** delta days (backfilled days land at the array tail, P4-S4 §2), **recent-window repair** before any prune may run (§4.1 `recent_window_contiguous`), **delta-span latency** (H5 — a delta swollen by backfill degrades every crossing range), and **compaction ordering** (days inside the protected window must not be folded; days already sealed need §7.8 corrective refolds). | No existing fixture produces this shape; each invariant is currently tested in isolation, and the interaction is where they break. | **New fixture F18** (see §13.1) driven through S2/S3 | **G1/G2** (semantics), **G13** (source authority for backfilled days), **G14** (`confirmed_missing` → `present` promotion), **H5** (delta-span latency), and the §7.1 fold-cutoff precondition | **OPEN** |
+
+**Rules for this register.** An entry leaves `OPEN` only when its named gate has passed with a
+committed artifact — not when the code merely exists. A step's results document must state the
+register entries it closes, and any it discovers.
+
+---
+
 ### Acceptance self-check
 
-- ✅ 16 sections as specified, in order.
+- ✅ 16 sections as specified, in order, plus **§17 cross-phase risk register** (R1–R4) added
+  after review so multi-step risks are owned by a step and a gate rather than by memory.
 - ✅ Candidates A–E each evaluated with **measured** structural evidence, not assertion; E researched against
   the **Zarr v3 specification and zarr-python 3.2.1 source**, not prior API assumptions; **D's verdict is
   scoped to what the evidence actually shows** (not selected / deferred, not disproven).
