@@ -30,8 +30,6 @@ every read goes through `point_series_from(meta, …)` against exactly those. To
 possible, `TimeCubeStore` and `SegmentedCubeStore` gained a **meta-explicit** read
 (`point_series_from`); their public `point_series` is unchanged and simply passes `self._meta`.
 
-Proven by four tests:
-
 **Round 2 corrected four ways this was still not true.** The first implementation captured the
 snapshot in one place and then leaked live reads at three others — the same "capture once"
 idea applied at one level but not carried up or down:
@@ -56,16 +54,17 @@ idea applied at one level but not carried up or down:
 | **request-level** | a delta refresh after `query_snapshot()` changes neither availability, nor routing, nor the read; a *new* snapshot sees it |
 | **R1a for a `TimeCubeStore` base** | same path as base and delta is rejected; a symlinked delta is rejected; distinct paths compose |
 
-That last one is the decisive check: if any read path still reached for `self._meta`, it would
-raise instead of returning rows.
+The sentinel tests are the decisive ones: if any read path still reached for a live `_meta`, it
+would raise instead of returning rows.
 
-## 2. R1a — disjointness enforced by the assembly
+## 2. R1a — disjointness enforced by the assembly, for every base shape
 
-`SegmentedCubeStore` cannot check this: by §4.0 it never sees the delta. So `TieredCube.__init__`
-now calls `base.assert_disjoint_from(delta.path)` **unconditionally** and fails closed. A base
-segment resolving to the delta path would serve delta bytes as immutable base. It was previously
-an optional helper an operator had to remember; an invariant that depends on memory is not an
-invariant.
+`SegmentedCubeStore` cannot check this itself: by §4.0 it never sees the delta. `TieredCube`
+now compares **realpaths** between base and delta at construction and fails closed —
+independent of whether the base happens to expose a helper. That distinction mattered: the
+first version only ran when `assert_disjoint_from` existed, which is true of
+`SegmentedCubeStore` and **false of `TimeCubeStore`** — so it did nothing for the assembly
+running on VM24 today. Symlinked deltas are caught because the comparison is on realpaths.
 
 ## 3. G1/G2 — parity with the P1 oracle
 
