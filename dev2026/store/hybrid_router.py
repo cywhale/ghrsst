@@ -26,12 +26,113 @@ from .store_access import StoreAccess, primary_contiguous_bounds
 from .time_cube import TimeCubeStore
 
 
+class QuerySnapshot:
+    """ONE consistent view for ONE request (P5-S2, risk R1).
+
+    A request used to re-derive its view three times: availability, then routing, then the
+    read. A refresh landing between them could answer "available", route on a second view and
+    read from a third. This captures the cube's composite snapshot and the daily day-set
+    **once**, and every decision in the request is answered from it."""
+
+    __slots__ = ("_cube_snap", "_daily", "_daily_days", "_dayset")
+
+    def __init__(self, daily: StoreAccess, cube_snapshot):
+        self._cube_snap = cube_snapshot
+        self._daily = daily
+        self._daily_days = frozenset(daily.existing_days())
+        self._dayset = set(self._daily_days)
+        if cube_snapshot is not None:
+            self._dayset |= set(cube_snapshot.days)
+
+    # ---- availability (point scope = cube ∪ daily) ----------------------
+    def point_days(self) -> List[str]:
+        return sorted(self._dayset)
+
+    def point_bounds(self) -> tuple:
+        return (min(self._dayset), max(self._dayset)) if self._dayset else (None, None)
+
+    def point_primary_bounds(self) -> tuple:
+        return primary_contiguous_bounds(self.point_days())
+
+    def point_day_present(self, day: str) -> bool:
+        return day in self._dayset
+
+    @property
+    def cube_days(self) -> frozenset:
+        return frozenset(self._cube_snap.days) if self._cube_snap is not None else frozenset()
+
+    @property
+    def daily_days(self) -> frozenset:
+        return self._daily_days
+
+    # ---- routing + read, both answered from THIS view -------------------
+    def route(self, days: Sequence[str]) -> str:
+        if not days:
+            return "daily"
+        if self._cube_snap is not None and self._cube_snap.covers_days(days):
+            return "cube"
+        if all(d in self._daily_days for d in days):
+            return "daily"
+        return "mixed"
+
+    def point_series(self, lon: float, lat: float, days: Sequence[str],
+                     fields: Sequence[str]) -> List[dict]:
+        route = self.route(days)
+        if route == "cube":
+            return self._cube_snap.point_series(lon, lat, days, fields)
+        if route == "daily":
+            return self._daily.point_series(lon, lat, days, fields)
+        cube_set = self.cube_days
+        cube_days = [d for d in days if d in cube_set]
+        rest = [d for d in days if d not in cube_set]
+        by_day = {}
+        if cube_days:
+            for r in self._cube_snap.point_series(lon, lat, cube_days, fields):
+                by_day[r["date"]] = r
+        if rest:
+            for r in self._daily.point_series(lon, lat, rest, fields):
+                by_day[r["date"]] = r
+        return [by_day[d] for d in days if d in by_day]
+
+
+class _WholeCube:
+    """Adapter for a cube with no `snapshot()` (a bare `TimeCubeStore` in transition configs).
+
+    It captures that store's own immutable `_Meta` once, so the request still gets a single
+    view rather than repeated live reads."""
+
+    __slots__ = ("_store", "_meta", "days")
+
+    def __init__(self, store):
+        self._store = store
+        self._meta = store._meta
+        self.days = tuple(self._meta.days)
+
+    def covers_days(self, days):
+        di = self._meta.day_index
+        return all(d in di for d in days)
+
+    def point_series(self, lon, lat, days, fields):
+        return self._store.point_series_from(self._meta, lon, lat, days, fields)
+
+
 class HybridRouter:
     def __init__(self, daily: StoreAccess, cube: Optional[TimeCubeStore] = None):
         self.daily = daily
         self.cube = cube
         self.route_counts = {"cube": 0, "daily": 0, "mixed": 0}   # observability (healthz)
         self._rc_lock = threading.Lock()
+
+    def query_snapshot(self) -> QuerySnapshot:
+        """Take ONE view for a whole request. Callers that answer availability, routing and
+        the read separately must use this rather than calling the router three times."""
+        if self.cube is None:                    # no cube configured: pure P1 behaviour
+            cube_snap = None
+        elif hasattr(self.cube, "snapshot"):     # TieredCube -> composite cross-tier capture
+            cube_snap = self.cube.snapshot()
+        else:                                    # bare TimeCubeStore (transition configs)
+            cube_snap = _WholeCube(self.cube)
+        return QuerySnapshot(self.daily, cube_snap)
 
     # ---- POINT AVAILABILITY (P4 post-prune fix) --------------------------
     # After the P4 daily-staging prune the daily store holds only a recent window, so it is NO LONGER
@@ -83,6 +184,11 @@ class HybridRouter:
         if all(d in daily_days for d in days):
             return "daily"
         return "mixed"
+
+    def count_route(self, route: str) -> None:
+        """Record a route decision made by a `QuerySnapshot` (observability only)."""
+        with self._rc_lock:
+            self.route_counts[route] = self.route_counts.get(route, 0) + 1
 
     # ---- point/range time-series (routed; counts ONCE per actual query) --
     def point_series(self, lon: float, lat: float, days: Sequence[str],

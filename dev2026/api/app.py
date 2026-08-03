@@ -276,10 +276,11 @@ def _available_range_text(store: StoreAccess) -> str:
     return _range_text(*store.primary_bounds(), *store.bounds())
 
 
-def _point_range_text(router) -> str:
+def _point_range_text(router, qs=None) -> str:
     """POINT availability: the base+delta+daily union. After the P4 prune the daily store is a recent
     staging window only, so a point error must advertise the FULL history — not the 38-day window."""
-    return _range_text(*router.point_primary_bounds(), *router.point_bounds())
+    src = qs if qs is not None else router
+    return _range_text(*src.point_primary_bounds(), *src.point_bounds())
 
 
 def _spatial_window_gate(app, day: str):
@@ -330,12 +331,15 @@ async def read_ghrsst(
     # TWO availability scopes (P4): point/range = base+delta+daily union (full history); spatial
     # (bbox / POST points) = the daily store, further gated to the delta window. Conflating them is
     # what produced the post-prune 400s on historical point queries.
-    point_earliest, point_latest = router.point_bounds()
     earliest, latest = store.bounds()                 # DAILY bounds — spatial paths only
-    if not point_latest:
-        raise HTTPException(503, "No available dates.")
-
     bbox_mode = (lon1 is not None) and (lat1 is not None) and not (lon1 == lon0 and lat1 == lat0)
+    # The point/range QuerySnapshot is built INSIDE the point branch, deliberately. Building it
+    # before the split coupled bbox — which reads the daily store only — to cube health: a
+    # manifest that would not settle could fail a bbox that daily could serve perfectly well.
+    qs = router.query_snapshot() if not bbox_mode else None
+    point_earliest, point_latest = qs.point_bounds() if qs else (None, None)
+    if not bbox_mode and not point_latest:
+        raise HTTPException(503, "No available dates.")
     if not bbox_mode and sample != 1:
         raise HTTPException(400, "Parameter 'sample' is only supported in BBox mode.")
     if not bbox_mode and fmt != "json":
@@ -376,12 +380,13 @@ async def read_ghrsst(
             # cacheable only if the upper bound can never be affected by new ingest
             cacheable = e_req < point_latest
 
-        existing = [d for d in wanted if router.point_day_present(d)]
+        existing = [d for d in wanted if qs.point_day_present(d)]
         if not existing:
             raise HTTPException(400, f"Data not exist for requested period; "
-                                     f"{_point_range_text(router)}.")
-        route = router.route_point(existing)             # 'cube' | 'daily' | 'mixed'
-        rows = await bex.run(router.point_series, lon0, lat0, existing, fields)
+                                     f"{_point_range_text(router, qs)}.")
+        route = qs.route(existing)                       # 'cube' | 'daily' | 'mixed'
+        router.count_route(route)                        # observability only
+        rows = await bex.run(qs.point_series, lon0, lat0, existing, fields)
         rows = _apply_modes(rows, modes, fields)
         headers = _fixed_cache() if cacheable else _no_store()
         headers["X-Store-Route"] = route                 # observability (canary/tests)

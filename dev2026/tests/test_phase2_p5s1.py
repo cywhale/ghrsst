@@ -429,12 +429,12 @@ class TestPrecedenceAndReads(_Base):
         calls = {"n": 0}
         for sid in ("legacy", "b0_v2"):
             st = self.store.segment_store(sid)
-            orig = st.point_series
+            orig = st.point_series_from        # P5-S2: the grouped path reads meta-explicitly
 
             def counting(*a, _orig=orig, **k):
                 calls["n"] += 1
                 return _orig(*a, **k)
-            st.point_series = counting
+            st.point_series_from = counting
         rows = self.store.point_series(105.0, 5.0, self.span0, ["sst"])
         self.assertEqual(len(rows), 90)
         self.assertEqual(calls["n"], 2, "one call per segment touched, not per day")
