@@ -154,6 +154,34 @@ def resolve_source_map(days: Sequence[str], *, delta_path: Optional[str] = None,
     return out
 
 
+def source_map_record(day: str, source: dict) -> dict:
+    """The per-day provenance record: WHICH bytes were read, not merely from which tier.
+
+    `source_kind` alone cannot answer the audit question. Two blocks can both say `"block"`
+    for day D and have read different predecessor versions; two can both say `"delta"` and have
+    read different physical indices, which matters precisely because delta `attrs['days']` is
+    APPEND order after a backfill (P4-S4 §2) — the same date can sit at a different index in
+    two otherwise identical deltas. A late correction is exactly the case where "we read D from
+    delta" is true of both the stale and the corrected read.
+
+    `source_path` is stored **resolved** (`realpath`). The delta path is a stable alias that
+    gets retargeted at swap; the alias records what we were *pointed at*, the resolved path
+    records what we actually *read*. For provenance the latter is the answer worth keeping."""
+    return {"source_kind": source["source_kind"],
+            "source_path": os.path.realpath(source["source_path"]),
+            "source_day_index": int(source["source_day_index"])}
+
+
+def source_map_digest(sources: Dict[str, dict]) -> str:
+    """sha256 over the canonicalized WHOLE map (§5 `build_provenance.source_map_digest`).
+
+    Digesting `day:source_kind` made two builds that read different bytes hash identically,
+    which defeats the only purpose the digest has."""
+    return hashlib.sha256(bm.canonical_json(
+        {d: dict(sorted(rec.items())) for d, rec in sorted(sources.items())}).encode()
+    ).hexdigest()
+
+
 # --------------------------------------------------------------------------- disk precheck
 def disk_precheck(out_path: str, *, block_bytes_estimate: int, hard_reserve_bytes: int,
                   growth_bytes: int = 0, temp_bytes: int = 0,
@@ -548,6 +576,7 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
     if is_sealed and unknown:
         raise BuildRefused(f"cannot seal: {len(unknown)} day(s) still unknown")
 
+    source_records = {d: source_map_record(d, smap[d]) for d in rebuild_source_set}
     segment = {
         "segment_id": os.path.basename(out_path.rstrip("/")),
         "kind": "block", "path": os.path.basename(out_path.rstrip("/")), "immutable": True,
@@ -563,13 +592,13 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
                         "day_digest": bm.day_digest(insp.days)},
         "precedence": 0, "sealed": is_sealed, "supersedes": None,
         "build_provenance": {
-            "source_map_digest": bm.day_digest(
-                [f"{d}:{smap[d]['source_kind']}" for d in rebuild_source_set]),
+            "source_map_digest": source_map_digest(source_records),
             "materialized_repairs": {},
-            "sources": {d: smap[d]["source_kind"] for d in rebuild_source_set},
+            "sources": source_records,
         },
     }
     plan = {"status": "ok", "out_path": out_path, "segment": segment,
+            "source_map": source_records,
             "rebuild_source_set": rebuild_source_set,
             "classification_target": sorted(classification_target),
             "disk": disk, "build_s": build_s, "performed_publish": False,

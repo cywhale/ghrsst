@@ -200,8 +200,12 @@ class TestTailRebuildChain(_Base):
                          predecessor_present=self.span[:30],
                          predecessor_path=v1["out_path"], delta_path=pruned)
         srcs = v2["segment"]["build_provenance"]["sources"]
-        self.assertEqual(srcs[self.span[0]], "block", "A must come from the predecessor")
-        self.assertEqual(srcs[self.span[30]], "delta", "B must come from delta")
+        self.assertEqual(srcs[self.span[0]]["source_kind"], "block",
+                         "A must come from the predecessor")
+        self.assertEqual(srcs[self.span[30]]["source_kind"], "delta",
+                         "B must come from delta")
+        self.assertEqual(srcs[self.span[0]]["source_path"],
+                         os.path.realpath(v1["out_path"]))
 
         pruned2 = self._delta(self.span[60:90], name="delta_pruned2.zarr")
         v3 = build_block(self._out("v3"), start_day=self.s0, end_day=self.e0,
@@ -768,3 +772,107 @@ class TestNetcdfIsNotAdvertised(_Base):
                         classification_target=self.span[:4], delta_path=delta,
                         artifacts_dir=self.tmp)
         self.assertIn(self.span[3], str(cm.exception))
+
+
+# ============================================================ provenance completeness
+class TestProvenanceSourceMap(_Base):
+    """`source_kind` alone cannot answer "which bytes did we read". Two builds can both say
+    `block` for day D and have read different predecessor versions; both can say `delta` and
+    have read different physical indices — which is the live case, because delta `attrs['days']`
+    is append order after a backfill, so the same date sits at different indices in two
+    otherwise identical deltas. A late correction is precisely where the weaker record is true
+    of both the stale and the corrected read."""
+
+    def _plan(self, **kw):
+        base = dict(start_day=self.s0, end_day=self.e0,
+                    classification_target=self.span[:6], artifacts_dir=self.tmp)
+        base.update(kw)
+        return build_block(self._out(kw.pop("_name", "b0")), **base)
+
+    def test_every_day_records_kind_path_and_physical_index(self):
+        delta = self._delta(self.span[3:6])
+        daily = self._daily(self.span[:3])
+        plan = build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                           classification_target=self.span[:6], delta_path=delta,
+                           daily_root=daily, artifacts_dir=self.tmp)
+        srcs = plan["segment"]["build_provenance"]["sources"]
+        self.assertEqual(set(srcs), set(self.span[:6]))
+        for day, rec in srcs.items():
+            self.assertEqual(set(rec), {"source_kind", "source_path", "source_day_index"})
+            self.assertTrue(os.path.isabs(rec["source_path"]))
+            self.assertIsInstance(rec["source_day_index"], int)
+        self.assertEqual(plan["source_map"], srcs, "the plan must carry the same map")
+
+    def test_the_map_equals_what_the_resolver_actually_returned(self):
+        """The record must be the resolver's answer, not a plausible reconstruction of it."""
+        from ingest.build_block import source_map_record
+        delta = self._delta(self.span[3:6])
+        daily = self._daily(self.span[:3])
+        plan = build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                           classification_target=self.span[:6], delta_path=delta,
+                           daily_root=daily, artifacts_dir=self.tmp)
+        smap = resolve_source_map(self.span[:6], delta_path=delta, daily_root=daily)
+        expected = {d: source_map_record(d, s) for d, s in smap.items()}
+        self.assertEqual(plan["segment"]["build_provenance"]["sources"], expected)
+
+    def test_digest_changes_when_only_the_source_PATH_changes(self):
+        """Two deltas holding identical days at identical indices, at different paths."""
+        d1 = self._delta(self.span[:6], name="d1.zarr")
+        d2 = self._delta(self.span[:6], name="d2.zarr")
+        p1 = build_block(self._out("b1"), start_day=self.s0, end_day=self.e0,
+                         classification_target=self.span[:6], delta_path=d1)
+        p2 = build_block(self._out("b2"), start_day=self.s0, end_day=self.e0,
+                         classification_target=self.span[:6], delta_path=d2)
+        g1 = p1["segment"]["build_provenance"]
+        g2 = p2["segment"]["build_provenance"]
+        self.assertEqual([r["source_kind"] for r in g1["sources"].values()],
+                         [r["source_kind"] for r in g2["sources"].values()],
+                         "precondition: the kinds are identical, so kind alone cannot tell "
+                         "these builds apart")
+        self.assertNotEqual(g1["source_map_digest"], g2["source_map_digest"])
+
+    def test_digest_changes_when_only_the_PHYSICAL_INDEX_changes(self):
+        """The append-order case: same days, same path shape, different index for the same
+        date. A digest over `day:source_kind` cannot see this at all."""
+        days = self.span[:6]
+        a = self._delta(days, name="a.zarr")
+        b = self._delta(list(reversed(days)), name="b.zarr")     # append order reversed
+        pa = build_block(self._out("ba"), start_day=self.s0, end_day=self.e0,
+                         classification_target=days, delta_path=a)
+        pb = build_block(self._out("bb"), start_day=self.s0, end_day=self.e0,
+                         classification_target=days, delta_path=b)
+        sa = pa["segment"]["build_provenance"]["sources"]
+        sb = pb["segment"]["build_provenance"]["sources"]
+        self.assertNotEqual(sa[days[0]]["source_day_index"], sb[days[0]]["source_day_index"],
+                            "precondition: the same date really is at a different index")
+        self.assertNotEqual(pa["segment"]["build_provenance"]["source_map_digest"],
+                            pb["segment"]["build_provenance"]["source_map_digest"])
+
+    def test_the_digest_covers_the_whole_map_not_just_one_field(self):
+        from ingest.build_block import source_map_digest
+        base = {"2026-06-27": {"source_kind": "delta", "source_path": "/x", "source_day_index": 0}}
+        d0 = source_map_digest(base)
+        for field, other in (("source_kind", "block"), ("source_path", "/y"),
+                             ("source_day_index", 1)):
+            mutated = {"2026-06-27": dict(base["2026-06-27"], **{field: other})}
+            self.assertNotEqual(d0, source_map_digest(mutated),
+                                f"digest ignores {field}")
+
+    def test_the_digest_is_stable_for_an_identical_map(self):
+        from ingest.build_block import source_map_digest
+        m = {"2026-06-28": {"source_kind": "block", "source_path": "/b", "source_day_index": 3},
+             "2026-06-27": {"source_kind": "delta", "source_path": "/a", "source_day_index": 0}}
+        shuffled = {k: dict(reversed(list(v.items()))) for k, v in reversed(list(m.items()))}
+        self.assertEqual(source_map_digest(m), source_map_digest(shuffled))
+
+    def test_source_path_is_resolved_not_the_alias(self):
+        """The delta path is a stable alias that swap retargets. Provenance must record the
+        store actually read, or an audit cannot distinguish two swaps of the same alias."""
+        real = self._delta(self.span[:6], name="delta_v7.zarr")
+        alias = os.path.join(self.tmp, "delta.zarr")
+        os.symlink(real, alias)
+        plan = build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                           classification_target=self.span[:6], delta_path=alias)
+        rec = plan["segment"]["build_provenance"]["sources"][self.span[0]]
+        self.assertEqual(rec["source_path"], os.path.realpath(real))
+        self.assertNotEqual(rec["source_path"], alias)

@@ -10,10 +10,10 @@ Implements P5-S3 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Compaction lock: [`../store/compaction_lock.py`](../store/compaction_lock.py)
 - Gate wired into [`../ingest/prune_delta.py`](../ingest/prune_delta.py) and
   [`../ingest/swap_delta.py`](../ingest/swap_delta.py)
-- Tests: [`../tests/test_phase2_p5s3.py`](../tests/test_phase2_p5s3.py) — **51/51 green**
-- Full local suite: **449 tests OK** (17 skipped), up from 398.
+- Tests: [`../tests/test_phase2_p5s3.py`](../tests/test_phase2_p5s3.py) — **58/58 green**
+- Full local suite: **456 tests OK** (17 skipped), up from 398.
 
-**Review rounds 2 and 3** raised four and three findings; §11 and §12 record what each changed. Two of them were
+**Review rounds 2, 3 and 4** raised four, three and one finding; §11–§13 record what each changed. Two of them were
 defects I had introduced without noticing — the per-tile group open, and two safety gates that
 were technically present but opt-in.
 
@@ -137,7 +137,7 @@ dev2026/.venv/bin/python -m unittest discover -s dev2026/tests -p "test_*.py"
 
 ## 10. Mutation verification
 
-Every new guard was disabled in turn and the suite re-run; all twenty-five fail. A twentieth mutation survived by design and is discussed below the table.
+Every new guard was disabled in turn and the suite re-run; all thirty fail. A twentieth mutation survived by design and is discussed below the table.
 
 | guard disabled | result |
 |---|---|
@@ -166,6 +166,11 @@ Every new guard was disabled in turn and the suite re-run; all twenty-five fail.
 | inspection open not counted | FAILED (5) |
 | day-index opens its own handle again | FAILED |
 | daily inspection opens a second handle | FAILED |
+| digest over `source_kind` only (the old behaviour) | FAILED (3) |
+| digest drops `source_day_index` | FAILED |
+| record drops `source_path` and index | FAILED (2 + 2) |
+| `source_path` stored as the alias, not resolved | FAILED |
+| plan omits the `source_map` | FAILED |
 
 **One mutation SURVIVED, and it should have.** Relaxing `has_var` from `flag is True` to
 `bool(flag)` leaves the suite green. That is not a coverage hole: `inspect_store_contract`
@@ -293,3 +298,35 @@ holds **because the builder is single-process and forks nothing**, with `O_CLOEX
 `exec` case — not because of the flag alone. The requirement a future worker pool would inherit
 (close the fd in the child, or move the lock to a supervisor-only fd) is recorded next to the
 flag rather than in this document, where it would not be read.
+
+## 13. Review round 4 — provenance completeness
+
+**[High] `build_provenance` recorded only `source_kind`, and the digest hashed
+`day:source_kind`.** The spec (§5) asks for `source_kind` / `source_path` /
+`source_day_index`; I shipped the first third and digested the first third.
+
+Why the weak form is not merely incomplete but actively misleading: two builds that read
+genuinely different bytes hash **identically** under it. Both say `"block"` for day D having
+read different predecessor versions. Both say `"delta"` having read different physical indices
+— which is the live case, not a hypothetical, because delta `attrs['days']` is **append order**
+after a backfill (P4-S4 §2), so the same date sits at a different index in two otherwise
+identical deltas. And a late correction is exactly the situation where "we read D from delta"
+is true of both the stale read and the corrected one. A digest whose whole job is answering
+"which bytes did this block materialize" was unable to distinguish the cases it exists for —
+which is what the sealed-block corrective refold (§7.8) will have to rely on.
+
+Now: `source_map_record()` per day carries all three fields; `source_map_digest()` hashes the
+**canonicalized whole map**; the map appears both in `build_provenance.sources` and on the plan
+as `source_map`.
+
+`source_path` is stored **resolved** (`realpath`). The delta path is a stable alias that swap
+retargets, so the alias records what we were *pointed at* while the resolved path records what
+we actually *read* — and an audit that cannot tell two swaps of the same alias apart is not an
+audit. A symlink test pins this.
+
+Seven tests, of the kind the previous ones were not: two assert the digest changes when **only**
+the path changes and when **only** the physical index changes, each with an explicit precondition
+assert that the `source_kind`s really are identical, so the test cannot pass for the wrong
+reason. One asserts the recorded map **equals what the resolver actually returned**, rather than
+a plausible reconstruction of it. The reviewer's diagnosis of why 51/51 passed over this gap was
+exactly right: every existing assertion read `source_kind`.
