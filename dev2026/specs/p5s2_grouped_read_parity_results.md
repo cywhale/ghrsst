@@ -10,10 +10,10 @@ Implements P5-S2 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Meta-explicit reads: [`../store/time_cube.py`](../store/time_cube.py),
   [`../store/segmented_cube.py`](../store/segmented_cube.py) (`point_series_from`)
 - Fixtures F4–F9, F18: [`../tests/p5_fixtures.py`](../tests/p5_fixtures.py)
-- Tests: [`../tests/test_phase2_p5s2.py`](../tests/test_phase2_p5s2.py) — **34/34 green**
+- Tests: [`../tests/test_phase2_p5s2.py`](../tests/test_phase2_p5s2.py) — **36/36 green**
 - Bench: [`../bench/bench_p5_segmented_read.py`](../bench/bench_p5_segmented_read.py) →
   [`../bench/results/p5s2_segmented_read.json`](../bench/results/p5s2_segmented_read.json)
-- Full local suite: **396 tests OK** (17 skipped), up from 362.
+- Full local suite: **398 tests OK** (17 skipped), up from 362.
 - Request-level snapshot: [`../store/hybrid_router.py`](../store/hybrid_router.py)
   (`QuerySnapshot`), consumed by [`../api/app.py`](../api/app.py)
 

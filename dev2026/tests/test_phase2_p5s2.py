@@ -18,6 +18,7 @@ Local/synthetic only: no VM24 path, no `GHRSST_*` store, nothing outside a temp 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -754,13 +755,45 @@ class TestResultsDocMatchesArtifact(unittest.TestCase):
             with self.subTest(value=what):
                 self.assertIn(needle, self.doc, f"{what}: {needle!r} not in the results doc")
 
-    def test_g3_is_not_claimed_as_passed_anywhere(self):
-        """A standing guard: G3 must stay deferred until S6/S7 measures it on production
-        geometry. The synthetic ratio must never be promoted to a pass by a later edit."""
+    #: The doc's three canonical G3 statements. Each is checked EXACTLY, because the document
+    #: contains the word "DEFERRED" in several places and a bare `assertIn("DEFERRED", doc)`
+    #: is satisfied by any of them — so flipping the actual verdict line to PASS would slip
+    #: through while the guard still looked green.
+    G3_DOC_STATEMENTS = (
+        "G3 is DEFERRED to S6/S7",                          # status line
+        "## 6. G3 — DEFERRED to S6/S7",                     # section heading
+        "**G3 verdict: `DEFERRED to S6/S7`**",              # the verdict itself
+    )
+
+    def test_g3_artifact_never_claims_a_pass(self):
         self.assertFalse(self.art["g3_adjudicable_here"])
         self.assertIn("DEFERRED", self.art["g3_verdict"])
+        self.assertNotIn("PASS", self.art["g3_verdict"].upper().replace("DEFERRED", ""))
         self.assertNotIn("g3_pass", self.art)
-        self.assertIn("DEFERRED", self.doc)
+
+    def test_g3_doc_verdict_is_exact_not_merely_present(self):
+        """A standing guard on DIRECTION, not drift: the synthetic ratio must never become a
+        'pass' through a later well-meaning edit. Each canonical statement is asserted in its
+        own right, so changing any one of them fails."""
+        for statement in self.G3_DOC_STATEMENTS:
+            with self.subTest(statement=statement):
+                self.assertIn(statement, self.doc,
+                              f"the G3 statement {statement!r} is missing or was reworded")
+
+    def test_the_g3_verdict_line_itself_says_deferred(self):
+        """Targets the verdict LINE, not the word 'DEFERRED' anywhere in the document.
+
+        A blanket 'no line mentioning G3 may say passed' is wrong here: the doc legitimately
+        contains 'I would rather hand you a deferred gate ... than a passed one', which
+        reinforces the deferral. So the check is scoped to the line that actually states the
+        verdict."""
+        verdict_lines = [ln.strip() for ln in self.doc.splitlines() if "G3 verdict" in ln]
+        self.assertEqual(len(verdict_lines), 1,
+                         f"expected exactly one G3 verdict line, found {verdict_lines}")
+        line = verdict_lines[0]
+        self.assertIn("DEFERRED to S6/S7", line)
+        self.assertNotRegex(line, r"\b(PASS|passed|passes)\b",
+                            "the G3 verdict line claims a pass")
 
 
 if __name__ == "__main__":
