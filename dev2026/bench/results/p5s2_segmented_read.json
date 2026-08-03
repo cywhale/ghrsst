@@ -1,5 +1,5 @@
 {
-  "added_ms_per_extra_array_call": 0.5449,
+  "added_ms_per_extra_array_call": 0.7507,
   "delta_days": 31,
   "env": {
     "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
@@ -8,7 +8,7 @@
   },
   "g3_adjudicable_here": false,
   "g3_bar_x": 1.25,
-  "g3_ratio_on_this_fixture": 4.437,
+  "g3_ratio_on_this_fixture": 3.606,
   "g3_reason": "A RATIO is not portable between fixtures: it is the added per-call cost divided by the baseline's absolute magnitude. On this synthetic fixture a 366-day 3-variable read costs ~6 ms, so ~2 ms/call of Python+zarr call overhead IS essentially the whole measurement and the ratio approaches the call-count ratio. Grid size does not change this -- a point read touches one chunk per time block regardless of ny/nx -- which was measured: the ratio stayed ~1.7-1.8x at 64, 256 and 512. The same ABSOLUTE overhead against the [VM24] 366-day baseline of 76-100 ms projects to roughly +5-15%. G3 must therefore be adjudicated against the real baseline, which is S6/S7's job, not asserted here.",
   "g3_verdict": "DEFERRED to S6/S7 (production geometry)",
   "grid": [
@@ -23,38 +23,38 @@
   "rows": [
     {
       "crossing": {
-        "max_ms": 42.229,
-        "min_ms": 32.966,
-        "p50_ms": 37.26,
-        "p95_ms": 42.229,
+        "max_ms": 38.864,
+        "min_ms": 34.184,
+        "p50_ms": 37.917,
+        "p95_ms": 38.864,
         "repeats": 15
       },
-      "days_per_segment": 360,
+      "days_per_segment": 400,
       "open_fds_after": 6,
       "open_fds_before": 6,
       "range_366d": {
-        "max_ms": 6.911,
-        "min_ms": 5.609,
-        "p50_ms": 6.167,
-        "p95_ms": 6.911,
+        "max_ms": 7.329,
+        "min_ms": 6.701,
+        "p50_ms": 6.99,
+        "p95_ms": 7.329,
         "repeats": 15
       },
-      "rss_mb_after": 109.6,
-      "rss_mb_before": 109.5,
+      "rss_mb_after": 114.0,
+      "rss_mb_before": 114.0,
       "segments": 1,
       "segments_touched_366d": 1,
       "single_day": {
-        "max_ms": 3.387,
-        "min_ms": 2.32,
-        "p50_ms": 2.439,
-        "p95_ms": 3.387,
+        "max_ms": 2.613,
+        "min_ms": 2.339,
+        "p50_ms": 2.405,
+        "p95_ms": 2.613,
         "repeats": 15
       },
       "snapshot_open_ms": {
-        "max_ms": 7.508,
-        "min_ms": 7.045,
-        "p50_ms": 7.305,
-        "p95_ms": 7.508,
+        "max_ms": 7.371,
+        "min_ms": 6.844,
+        "p50_ms": 7.065,
+        "p95_ms": 7.371,
         "repeats": 3
       },
       "stores_opened_during_read": 0,
@@ -66,93 +66,93 @@
     },
     {
       "crossing": {
-        "max_ms": 42.632,
-        "min_ms": 36.938,
-        "p50_ms": 41.092,
-        "p95_ms": 42.632,
+        "max_ms": 50.104,
+        "min_ms": 39.348,
+        "p50_ms": 43.776,
+        "p95_ms": 50.104,
         "repeats": 15
       },
-      "days_per_segment": 90,
+      "days_per_segment": 100,
       "open_fds_after": 6,
       "open_fds_before": 6,
       "range_366d": {
-        "max_ms": 10.241,
-        "min_ms": 9.732,
-        "p50_ms": 10.076,
-        "p95_ms": 10.241,
+        "max_ms": 15.112,
+        "min_ms": 12.845,
+        "p50_ms": 13.013,
+        "p95_ms": 15.112,
         "repeats": 15
       },
-      "rss_mb_after": 116.4,
-      "rss_mb_before": 116.3,
+      "rss_mb_after": 121.6,
+      "rss_mb_before": 121.5,
       "segments": 4,
       "segments_touched_366d": 4,
       "single_day": {
-        "max_ms": 2.534,
-        "min_ms": 2.287,
-        "p50_ms": 2.327,
-        "p95_ms": 2.534,
+        "max_ms": 2.837,
+        "min_ms": 2.364,
+        "p50_ms": 2.622,
+        "p95_ms": 2.837,
         "repeats": 15
       },
       "snapshot_open_ms": {
-        "max_ms": 26.548,
-        "min_ms": 25.842,
-        "p50_ms": 26.315,
-        "p95_ms": 26.548,
+        "max_ms": 26.761,
+        "min_ms": 26.308,
+        "p50_ms": 26.706,
+        "p95_ms": 26.761,
         "repeats": 3
       },
       "stores_opened_during_read": 0,
       "vs_monolith_p95_x": {
-        "crossing": 1.01,
-        "range_366d": 1.482,
-        "single_day": 0.748
+        "crossing": 1.289,
+        "range_366d": 2.062,
+        "single_day": 1.086
       }
     },
     {
       "crossing": {
-        "max_ms": 60.988,
-        "min_ms": 57.793,
-        "p50_ms": 58.896,
-        "p95_ms": 60.988,
+        "max_ms": 58.084,
+        "min_ms": 53.243,
+        "p50_ms": 56.875,
+        "p95_ms": 58.084,
         "repeats": 15
       },
-      "days_per_segment": 30,
+      "days_per_segment": 33,
       "open_fds_after": 6,
       "open_fds_before": 6,
       "range_366d": {
-        "max_ms": 30.666,
-        "min_ms": 28.202,
-        "p50_ms": 28.619,
-        "p95_ms": 30.666,
+        "max_ms": 26.427,
+        "min_ms": 25.723,
+        "p50_ms": 26.138,
+        "p95_ms": 26.427,
         "repeats": 15
       },
-      "rss_mb_after": 117.6,
-      "rss_mb_before": 117.5,
+      "rss_mb_after": 122.7,
+      "rss_mb_before": 122.7,
       "segments": 12,
-      "segments_touched_366d": 12,
+      "segments_touched_366d": 11,
       "single_day": {
-        "max_ms": 2.467,
-        "min_ms": 2.251,
-        "p50_ms": 2.349,
-        "p95_ms": 2.467,
+        "max_ms": 2.585,
+        "min_ms": 2.281,
+        "p50_ms": 2.318,
+        "p95_ms": 2.585,
         "repeats": 15
       },
       "snapshot_open_ms": {
-        "max_ms": 84.137,
-        "min_ms": 78.041,
-        "p50_ms": 78.634,
-        "p95_ms": 84.137,
+        "max_ms": 83.388,
+        "min_ms": 78.023,
+        "p50_ms": 80.38,
+        "p95_ms": 83.388,
         "repeats": 3
       },
       "stores_opened_during_read": 0,
       "vs_monolith_p95_x": {
-        "crossing": 1.444,
-        "range_366d": 4.437,
-        "single_day": 0.728
+        "crossing": 1.495,
+        "range_366d": 3.606,
+        "single_day": 0.989
       }
     }
   ],
   "s2_gate_pass": true,
   "step": "P5-S2",
-  "total_days": 360,
-  "worst_range_366d_regression_x": 4.437
+  "total_days": 400,
+  "worst_range_366d_regression_x": 3.606
 }

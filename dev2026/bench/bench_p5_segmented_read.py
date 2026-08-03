@@ -113,6 +113,9 @@ def _build(workdir: str, total_days: int, n_segments: int, ny: int, nx: int):
 
 def measure(workdir: str, *, total_days: int, segment_counts, ny: int, nx: int,
             delta_days: int, repeats: int) -> dict:
+    if total_days < 366:
+        raise SystemExit(f"--total-days must be >= 366 (got {total_days}); otherwise the "
+                         f"\"366-day\" case silently measures fewer days")
     rows = []
     delta_path = os.path.join(workdir, "delta.zarr")
     fx.build_delta(delta_path, fx.days_from(bm.add_days(ANCHOR, total_days), delta_days),
@@ -128,7 +131,8 @@ def measure(workdir: str, *, total_days: int, segment_counts, ny: int, nx: int,
         fds1, rss1 = _open_fds(), _rss_mb()
 
         one = [days[total_days // 2]]
-        span = days[-min(366, total_days):]
+        span = days[-366:]
+        assert len(span) == 366, f"the 366-day case has {len(span)} days"
         crossing = days[-(366 - delta_days):] + fx.read_days(delta_path)[:delta_days]
 
         cube.point_series(LON, LAT, span, FIELDS)          # warm
@@ -220,7 +224,8 @@ def main():
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--ny", type=int, default=64)
     ap.add_argument("--nx", type=int, default=64)
-    ap.add_argument("--total-days", type=int, default=360, dest="total_days")
+    ap.add_argument("--total-days", type=int, default=400, dest="total_days",
+                    help="must be >= 366 so the 366-day case is really 366 days")
     ap.add_argument("--segments", default="1,4,12")
     ap.add_argument("--delta-days", type=int, default=31, dest="delta_days")
     ap.add_argument("--repeats", type=int, default=15)

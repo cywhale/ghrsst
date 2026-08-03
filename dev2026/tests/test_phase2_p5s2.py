@@ -179,6 +179,182 @@ class TestCompositeSnapshot(_Base):
             self.delta._meta = real_delta_meta
 
 
+# ============================================================ adversarial: atomic capture
+class TestSnapshotCaptureIsAtomic(_Base):
+    """R1 round 2: capturing `base._meta` and then `delta._meta` is two reads. A refresh
+    landing BETWEEN them yields base-old + delta-new — a mixed snapshot the earlier tests
+    could not see, because they refreshed before or after a capture, never during one."""
+
+    def setUp(self):
+        super().setUp()
+        self.base, self.base_days = self._two_blocks()
+        self.delta, self.delta_path = self._delta(fx.days_from("2026-12-24", 10))
+
+    def _interleaving_base(self, on_access):
+        base = self.base
+
+        class Interleaving:
+            """Delegates to the real base but runs a callback whenever `_meta` is read."""
+            def __init__(self):
+                self._n = 0
+
+            def __getattr__(self, name):
+                return getattr(base, name)
+
+            @property
+            def _meta(self):
+                self._n += 1
+                on_access(self._n)
+                return base._meta
+
+        return Interleaving()
+
+    def test_refresh_between_the_two_captures_is_detected(self):
+        fired = {"n": 0}
+
+        def refresh_delta_once(n):
+            if n == 1 and fired["n"] == 0:      # exactly between base and delta capture
+                fired["n"] = 1
+                fx.append_delta_day(self.delta_path, "2027-02-02")
+                self.delta.refresh()
+
+        cube = TieredCube(self._interleaving_base(refresh_delta_once), self.delta)
+        snap = cube.snapshot()
+        self.assertEqual(fired["n"], 1, "the interleaved refresh must actually have happened")
+        # whatever it returns must be SELF-CONSISTENT: the captured delta meta is the one
+        # whose days the snapshot reports
+        self.assertEqual(set(snap.delta_days), set(snap.delta_meta.days))
+        self.assertEqual(set(snap.base_days), set(snap.base_meta.days))
+
+    def test_a_never_settling_store_fails_closed_rather_than_mixing(self):
+        """If metadata keeps moving under us, refuse. A mixed snapshot is worse than an
+        error, which is the whole lesson of P4-S8a."""
+        def always_refresh(n):
+            self.delta.refresh()
+
+        cube = TieredCube(self._interleaving_base(always_refresh), self.delta)
+        # force delta._meta to be a NEW object on every refresh so the capture never settles
+        real_build = self.delta._build_meta
+        self.delta._build_meta = lambda: real_build()
+        with self.assertRaises(SnapshotError) as cm:
+            cube.snapshot()
+        self.assertIn("stable", str(cm.exception).lower())
+
+    def test_refresh_updates_both_tiers_under_one_lock(self):
+        cube = TieredCube(self.base, self.delta)
+        seen = []
+        real = self.base.refresh
+
+        def base_refresh():
+            seen.append(cube._lock.locked())
+            return real()
+        self.base.refresh = base_refresh
+        cube.refresh()
+        self.assertEqual(seen, [True], "tier refreshes must happen under the composite lock")
+
+
+# ============================================================ adversarial: segment metas
+class TestSegmentMetadataIsCaptured(_Base):
+    def test_snapshot_read_survives_inner_segment_meta_replacement(self):
+        """R1 round 2: the outer sentinel test replaced `base._meta` but the grouped read
+        still reached into each SEGMENT's live `_meta`. Replacing those must not matter."""
+        base, base_days = self._two_blocks()
+        cube = TieredCube(base, None)
+        snap = cube.snapshot()
+
+        sentinel = object()
+        originals = {}
+        for sid in ("b0", "b1"):
+            st = base.segment_store(sid)
+            originals[sid] = st._meta
+            st._meta = sentinel
+        try:
+            rows = snap.point_series(LON, LAT, base_days[:5] + base_days[-5:], ["sst"])
+            self.assertEqual(len(rows), 10)
+        finally:
+            for sid, m in originals.items():
+                base.segment_store(sid)._meta = m
+
+
+# ============================================================ R1a for a monolithic base
+class TestDisjointnessForAnyBase(_Base):
+    def test_timecubestore_base_equal_to_delta_is_rejected(self):
+        """R1a was only enforced when the base happened to expose `assert_disjoint_from`.
+        The CURRENT VM24 assembly uses a `TimeCubeStore` base, which does not — so the check
+        silently did nothing exactly where it is deployed today."""
+        days = fx.days_from("2026-12-24", 10)
+        p = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(p, days)
+        with self.assertRaises(SnapshotError) as cm:
+            TieredCube(TimeCubeStore(p), TimeCubeStore(p))
+        self.assertIn("disjoint", str(cm.exception).lower())
+
+    def test_distinct_timecubestore_paths_are_fine(self):
+        a = os.path.join(self.tmp, "a.zarr")
+        b = os.path.join(self.tmp, "b.zarr")
+        fx.build_delta(a, fx.days_from("2026-12-24", 5))
+        fx.build_delta(b, fx.days_from("2027-01-01", 5))
+        TieredCube(TimeCubeStore(a), TimeCubeStore(b))          # no raise
+
+    def test_symlinked_delta_is_still_caught(self):
+        real = os.path.join(self.tmp, "real.zarr")
+        fx.build_delta(real, fx.days_from("2026-12-24", 5))
+        link = os.path.join(self.tmp, "link.zarr")
+        os.symlink(real, link)
+        with self.assertRaises(SnapshotError):
+            TieredCube(TimeCubeStore(real), TimeCubeStore(link))
+
+
+# ============================================================ request-level query snapshot
+class TestRequestLevelSnapshot(_Base):
+    def test_availability_routing_and_read_share_one_snapshot(self):
+        """A request used to re-snapshot for availability, again for routing, and again for
+        the read. A refresh between them could answer 'available' and then read a view that
+        no longer matches."""
+        from store.hybrid_router import HybridRouter
+        from store.store_access import StoreAccess
+
+        base, base_days = self._two_blocks()
+        delta_days = fx.days_from("2026-12-24", 10)
+        delta, delta_path = self._delta(delta_days)
+        daily_root = os.path.join(self.tmp, "mur.zarr")
+        fx.build_daily(daily_root, delta_days[-2:], seed=700)
+        router = HybridRouter(StoreAccess(daily_root), TieredCube(base, delta))
+
+        qs = router.query_snapshot()
+        days_before = list(qs.point_days())
+        bounds_before = qs.point_bounds()
+
+        fx.append_delta_day(delta_path, "2027-03-03")          # lands mid-"request"
+        delta.refresh()
+
+        self.assertEqual(list(qs.point_days()), days_before,
+                         "a captured query snapshot must not see a later refresh")
+        self.assertEqual(qs.point_bounds(), bounds_before)
+        self.assertFalse(qs.point_day_present("2027-03-03"))
+        rows = qs.point_series(LON, LAT, ["2027-03-03"], ["sst"])
+        self.assertEqual(rows, [], "the day is not in this snapshot, so it is not served")
+
+        fresh = router.query_snapshot()                        # a NEW request does see it
+        self.assertTrue(fresh.point_day_present("2027-03-03"))
+
+    def test_route_and_read_agree_within_one_snapshot(self):
+        from store.hybrid_router import HybridRouter
+        from store.store_access import StoreAccess
+
+        base, base_days = self._two_blocks()
+        delta, _ = self._delta(fx.days_from("2026-12-24", 10))
+        daily_root = os.path.join(self.tmp, "mur.zarr")
+        fx.build_daily(daily_root, ["2027-05-05"], seed=700)
+        router = HybridRouter(StoreAccess(daily_root), TieredCube(base, delta))
+
+        qs = router.query_snapshot()
+        req = [base_days[0], "2027-05-05"]                     # cube day + daily-only day
+        self.assertEqual(qs.route(req), "mixed")
+        rows = qs.point_series(LON, LAT, req, ["sst"])
+        self.assertEqual([r["date"] for r in rows], req, "mixed must not truncate")
+
+
 # ============================================================ G1/G2: parity with the P1 oracle
 class TestParityWithDailyOracle(_Base):
     """G1: every route must return what the P1 daily store returns, value for value."""

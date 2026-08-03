@@ -42,6 +42,10 @@ class _Meta(NamedTuple):
     checksum: str
     segment_ids: List[str]
     stores: List[TimeCubeStore]
+    # each segment's OWN captured metadata. Reading through `store._meta` at read time was a
+    # live read hiding inside a snapshot: the outer sentinel test replaced the segmented
+    # store's `_meta` but every segment was still consulted live.
+    segment_metas: List[object]
     day_map: Dict[str, Tuple[int, int]]     # day -> (segment index, local time index)
     days: List[str]                         # chronological; AVAILABILITY view only
     latest: Optional[str]
@@ -92,6 +96,12 @@ class SegmentedCubeStore:
         else:                                    # unreachable: schema restricts `kind`
             raise SnapshotError(f"segment {seg['segment_id']!r}: unsupported kind")
         return resolved
+
+    @property
+    def segment_paths(self) -> List[str]:
+        """Every on-disk store this base resolves to — what `TieredCube` compares against the
+        delta path."""
+        return [s.path for s in self._meta.stores]
 
     def assert_disjoint_from(self, other_path: str) -> None:
         """Assert no base segment resolves to `other_path` (used for the delta at composition
@@ -245,7 +255,9 @@ class SegmentedCubeStore:
         return _Meta(generation=int(manifest["generation"]),
                      generation_id=manifest["generation_id"],
                      checksum=manifest["manifest_checksum"],
-                     segment_ids=segment_ids, stores=stores, day_map=day_map,
+                     segment_ids=segment_ids, stores=stores,
+                     segment_metas=[s._meta for s in stores],
+                     day_map=day_map,
                      days=days, latest=(max(days) if days else None), vars=vars_)
 
     def refresh(self):
@@ -345,7 +357,7 @@ class SegmentedCubeStore:
         for seg_idx, seg_days in by_segment.items():
             # ONE call per segment, not per day
             store = m.stores[seg_idx]
-            for row in store.point_series_from(store._meta, lon, lat,
+            for row in store.point_series_from(m.segment_metas[seg_idx], lon, lat,
                                                seg_days, fields):
                 rows[row["date"]] = row
         return [rows[d] for d in days if d in rows]   # requested order preserved

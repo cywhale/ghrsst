@@ -10,10 +10,12 @@ Implements P5-S2 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Meta-explicit reads: [`../store/time_cube.py`](../store/time_cube.py),
   [`../store/segmented_cube.py`](../store/segmented_cube.py) (`point_series_from`)
 - Fixtures F4–F9, F18: [`../tests/p5_fixtures.py`](../tests/p5_fixtures.py)
-- Tests: [`../tests/test_phase2_p5s2.py`](../tests/test_phase2_p5s2.py) — **16/16 green**
+- Tests: [`../tests/test_phase2_p5s2.py`](../tests/test_phase2_p5s2.py) — **25/25 green**
 - Bench: [`../bench/bench_p5_segmented_read.py`](../bench/bench_p5_segmented_read.py) →
   [`../bench/results/p5s2_segmented_read.json`](../bench/results/p5s2_segmented_read.json)
-- Full local suite: **378 tests OK** (17 skipped), up from 362.
+- Full local suite: **387 tests OK** (17 skipped), up from 362.
+- Request-level snapshot: [`../store/hybrid_router.py`](../store/hybrid_router.py)
+  (`QuerySnapshot`), consumed by [`../api/app.py`](../api/app.py)
 
 ## 1. R1 — one composite snapshot per request
 
@@ -30,12 +32,29 @@ possible, `TimeCubeStore` and `SegmentedCubeStore` gained a **meta-explicit** re
 
 Proven by four tests:
 
+**Round 2 corrected four ways this was still not true.** The first implementation captured the
+snapshot in one place and then leaked live reads at three others — the same "capture once"
+idea applied at one level but not carried up or down:
+
+| gap | what still read live | now |
+|---|---|---|
+| **cross-tier capture was two reads** | `base._meta` then `delta._meta`: a refresh landing *between* them yields base-old + delta-new | a composite lock serializes refreshes made through `TieredCube`, **plus** a double-read verification (take both, take both again, accept only if neither moved) so a tier refreshed *directly* — the TTL loop, the delta cron — is detected. If metadata will not settle, **refuse**: `TierCompositionError`, a subclass of `SnapshotError` |
+| **the segmented base read live segment metadata** | the grouped read used each segment's `store._meta`, so the outer sentinel test never covered it | `SegmentedCubeStore._Meta` now carries **`segment_metas`**, and the read passes the captured one per segment |
+| **the API re-derived its view three times** | availability, then routing, then the read, then the route header | `HybridRouter.query_snapshot()` → **`QuerySnapshot`**, captured once per request in `api/app.py` and used for all four |
+| **R1a was not unconditional** | it only ran when the base exposed `assert_disjoint_from` — which `SegmentedCubeStore` does and **`TimeCubeStore` does not**, so it did nothing for the assembly deployed on VM24 today | `TieredCube` compares **realpaths** for any base shape (symlinked delta caught), with the segmented helper kept as a richer secondary message |
+
 | test | asserts |
 |---|---|
 | snapshot identity + immutability | `snap.base_meta is base._meta`; the `NamedTuple` cannot be mutated |
 | **delta refresh mid-flight** | appending a day and refreshing delta leaves a captured snapshot's values **and** day set unchanged; a *new* snapshot sees the day |
 | **base generation change mid-flight** | publishing generation 2 and refreshing the base does not grow a captured snapshot |
 | **reads never re-consult the live store** | both `store._meta` are replaced with a sentinel object and the snapshot still reads correctly |
+| **a refresh interleaved between the two captures** | a callback fires a delta refresh *during* the capture; the returned snapshot is still self-consistent (`delta_days == delta_meta.days`) |
+| **metadata that never settles** | refuses with `TierCompositionError` rather than returning a mixed view |
+| **refresh holds the composite lock** | tier refreshes observed to run with the lock held |
+| **inner segment metas** | replacing every segment's `_meta` with a sentinel does not affect a captured snapshot's read |
+| **request-level** | a delta refresh after `query_snapshot()` changes neither availability, nor routing, nor the read; a *new* snapshot sees it |
+| **R1a for a `TimeCubeStore` base** | same path as base and delta is rejected; a symlinked delta is rejected; distinct paths compose |
 
 That last one is the decisive check: if any read path still reached for `self._meta`, it would
 raise instead of returning rows.
@@ -84,20 +103,20 @@ for the whole call). Confirmed again in the benchmark at 1, 4 and 12 segments:
 
 ## 6. G3 — DEFERRED to S6/S7, and why
 
-Measured, monolith vs segmented on **identical days** (360 days, 3 variables, delta 31 days):
+Measured, monolith vs segmented on **identical days** (**400 stored days, a genuine 366-day request**, 3 variables, delta 31 days):
 
 | segments | segments touched | 1-day p95 | 366-day p95 | vs monolith | crossing p95 | snapshot open p95 |
 |---|---|---|---|---|---|---|
-| 1 | 1 | 3.39 ms | **6.91 ms** | 1.00× | 42.2 ms | 7.5 ms |
-| 4 | 4 | 2.53 ms | **10.24 ms** | **1.48×** | 42.6 ms | 26.5 ms |
-| 12 | 12 | 2.47 ms | **30.67 ms** | **4.44×** | 61.0 ms | 84.1 ms |
+| 1 | 1 | 2.61 ms | **7.33 ms** | 1.00× | 38.9 ms | 7.4 ms |
+| 4 | 4 | 2.84 ms | **15.11 ms** | **2.06×** | 50.1 ms | 26.8 ms |
+| 12 | 11 | 2.59 ms | **26.43 ms** | **3.61×** | 58.1 ms | 83.4 ms |
 
-**Added cost per extra array call: 0.545 ms** — consistent with P5-S0's independently measured
+**Added cost per extra array call: 0.751 ms** — consistent with P5-S0's independently measured
 0.65 ms per extra segment.
 
 On its face that is a G3 failure. It is not reported as one, because **a ratio is not portable
 between fixtures**: it is the added per-call cost divided by the baseline's absolute magnitude.
-On this synthetic fixture a 366-day 3-variable read costs ~6.9 ms, so ~2 ms/call of Python+zarr
+On this synthetic fixture a 366-day 3-variable read costs ~7.3 ms, so ~2 ms/call of Python+zarr
 call overhead *is essentially the whole measurement*, and the ratio approaches the call-count
 ratio.
 
@@ -109,7 +128,7 @@ and `nx`, so enlarging the grid does not enlarge the work either.
 
 What does change the ratio is the **baseline's absolute magnitude**, which on VM24 is **76–100
 ms** for a 366-day range (v0.5.0). The same absolute overhead — ~12 extra calls × 0.545 ms ≈
-**+6.5 ms** at S = 90 — projects to roughly **+7–9 %** there. That is a projection, not a
+**+9 ms** at S = 90 — projects to roughly **+9–12 %** there. That is a projection, not a
 measurement, and it is exactly the adjudication **S6/S7** own on production geometry.
 
 So this step records:
@@ -129,8 +148,8 @@ at S = 90) this projects to ~0.3 s — comfortable, but S6 must measure it rathe
 
 | risk | status after S2 |
 |---|---|
-| **R1** composite base+delta snapshot | **implemented** here; the adversarial pause/refresh/resume proof is **S5/G10**, so it stays `OPEN` until then |
-| **R1a** disjointness at assembly | **CLOSED** — enforced in `TieredCube.__init__`, negative test included |
+| **R1** composite base+delta snapshot | **implemented** at all three levels (cross-tier capture, segment metas, request-level `QuerySnapshot`); the adversarial pause/refresh/resume proof is **S5/G10**, so it stays `OPEN` until then |
+| **R1a** disjointness at assembly | **CLOSED** — realpath comparison in `TieredCube` for **any** base shape, `TimeCubeStore` and symlink cases tested |
 | **R3** multi-store RSS/FD/snapshot-open | groundwork recorded (fd growth 0, snapshot-open curve); the gates are **S6/S7** |
 | **R4** outage + bulk backfill | fixture **F18** exists and passes; the compaction-ordering half needs **S3** |
 

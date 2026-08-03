@@ -28,9 +28,30 @@ to remember — an invariant that depends on memory is not an invariant.
 """
 from __future__ import annotations
 
+import os
+import threading
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
+from .segmented_cube import SnapshotError
 from .time_cube import TimeCubeStore
+
+
+class TierCompositionError(SnapshotError):
+    """Base and delta are not composable, or a consistent cross-tier view is unobtainable.
+
+    A subclass of `SnapshotError` because it means the same thing to a caller: no consistent
+    view could be established, so nothing is served."""
+
+
+def _store_paths(store) -> List[str]:
+    """Every on-disk store a tier resolves to, as realpaths.
+
+    A `SegmentedCubeStore` is many stores; a `TimeCubeStore` is one. Both must be comparable,
+    because the disjointness check has to work for the base shape actually deployed today
+    (`TimeCubeStore`) and not only for the one that happens to expose a helper."""
+    if hasattr(store, "segment_paths"):
+        return [os.path.realpath(p) for p in store.segment_paths]
+    return [os.path.realpath(store.path)]
 
 
 class TieredSnapshot(NamedTuple):
@@ -84,39 +105,82 @@ class TieredSnapshot(NamedTuple):
 
 
 class TieredCube:
+    #: how many times `snapshot()` retries before refusing to return a cross-tier view
+    SNAPSHOT_ATTEMPTS = 8
+
     def __init__(self, base, delta: Optional[TimeCubeStore] = None):
         self.base = base
         self.delta = delta
-        # R1a: the assembly enforces disjointness -- not an operator remembering to call it.
-        if delta is not None and hasattr(base, "assert_disjoint_from"):
+        self._lock = threading.Lock()
+        if delta is not None:
+            self._assert_disjoint(base, delta)
+
+    @staticmethod
+    def _assert_disjoint(base, delta):
+        """R1a: enforced HERE, for every base shape.
+
+        The previous version only checked when the base exposed `assert_disjoint_from`, which
+        a `SegmentedCubeStore` does and a `TimeCubeStore` does not — so it did nothing for the
+        assembly actually deployed on VM24 today. Comparison is by realpath, so a symlinked
+        delta is caught too."""
+        delta_paths = set(_store_paths(delta))
+        clash = sorted(set(_store_paths(base)) & delta_paths)
+        if clash:
+            raise TierCompositionError(
+                f"base and delta must be disjoint stores (§4.0): {clash[0]} is both. A base "
+                f"segment that IS the delta would serve delta bytes as immutable base.")
+        if hasattr(base, "assert_disjoint_from"):     # belt and braces, richer message
             base.assert_disjoint_from(delta.path)
 
     # ---- the composite snapshot (R1) -------------------------------------
     def snapshot(self) -> TieredSnapshot:
-        """Capture BOTH tiers' metadata together. Callers that need request-level atomicity
-        should take one of these and use it for every decision and read in that request."""
-        bm_ = self.base._meta
-        dm_ = self.delta._meta if self.delta is not None else None
-        base_days = frozenset(bm_.days)
-        delta_days = frozenset(dm_.days) if dm_ is not None else frozenset()
+        """Capture BOTH tiers' metadata as ONE consistent pair.
+
+        Reading `base._meta` and then `delta._meta` is two reads: a refresh landing between
+        them yields base-old + delta-new. The composite lock serializes refreshes made through
+        this object, but a tier can also be refreshed directly (the TTL loop, the delta cron),
+        so the capture is additionally verified by a double read: take both, take both again,
+        and accept only when neither moved. If metadata keeps moving we **refuse** — a mixed
+        cross-tier view is worse than an error, which is the P4-S8a lesson.
+        """
+        with self._lock:
+            for _ in range(self.SNAPSHOT_ATTEMPTS):
+                b1 = self.base._meta
+                d1 = self.delta._meta if self.delta is not None else None
+                b2 = self.base._meta
+                d2 = self.delta._meta if self.delta is not None else None
+                if b1 is b2 and d1 is d2:
+                    return self._compose(b1, d1)
+        raise TierCompositionError(
+            f"could not capture a stable base+delta view in {self.SNAPSHOT_ATTEMPTS} "
+            f"attempts; refusing to return a snapshot that may mix generations across tiers")
+
+    def _compose(self, base_meta, delta_meta) -> TieredSnapshot:
+        base_days = frozenset(base_meta.days)
+        delta_days = frozenset(delta_meta.days) if delta_meta is not None else frozenset()
         union = sorted(base_days | delta_days)
         return TieredSnapshot(
-            base=self.base, base_meta=bm_, delta=self.delta, delta_meta=dm_,
+            base=self.base, base_meta=base_meta, delta=self.delta, delta_meta=delta_meta,
             base_days=base_days, delta_days=delta_days,
             days=tuple(union), latest=(max(union) if union else None))
 
     # ---- refresh ---------------------------------------------------------
     def refresh(self):
-        """P4-S3: refresh base + delta metadata (new delta days visible without a restart)."""
-        self.base.refresh()
-        if self.delta is not None:
-            self.delta.refresh()
+        """P4-S3: refresh base + delta metadata (new delta days visible without a restart).
+
+        Held under the composite lock so a `snapshot()` cannot observe the tiers half-updated
+        when the refresh goes through this object."""
+        with self._lock:
+            self.base.refresh()
+            if self.delta is not None:
+                self.delta.refresh()
 
     def maybe_refresh(self, ttl_seconds: float) -> bool:
-        refreshed = self.base.maybe_refresh(ttl_seconds)
-        if self.delta is not None:
-            refreshed = self.delta.maybe_refresh(ttl_seconds) or refreshed
-        return refreshed
+        with self._lock:
+            refreshed = self.base.maybe_refresh(ttl_seconds)
+            if self.delta is not None:
+                refreshed = self.delta.maybe_refresh(ttl_seconds) or refreshed
+            return refreshed
 
     # ---- surface consumed by HybridRouter (unchanged) --------------------
     @property
