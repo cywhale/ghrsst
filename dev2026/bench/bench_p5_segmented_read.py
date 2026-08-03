@@ -20,6 +20,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
@@ -245,9 +246,36 @@ def measure(workdir: str, *, total_days: int, segment_counts, ny: int, nx: int,
         # What S2 CAN decide on its own fixtures:
         "s2_gate_pass": bool(all(r["stores_opened_during_read"] == 0 for r in rows)
                              and (fd_growth is None or fd_growth <= 8)),
+        "markdown_table": None,          # filled in below, from these very rows
+        "run_digest": None,
         "note": ("G3 compares like with like: the same days, one block vs k. The absolute "
                  "numbers are laptop/synthetic and are NOT the VM24 gate -- S6/S7 own that."),
     }
+
+
+def _markdown_table(rows) -> str:
+    """Render the results table FROM the rows.
+
+    Hand-transcribing this into the results document drifted on four separate rounds. A
+    generated string can be copied verbatim and checked against `run_digest`, so a doc quoting
+    one run's numbers under another run's heading is detectable instead of plausible."""
+    out = ["| segments | segments touched | 1-day p95 | 366-day p95 | vs monolith | "
+           "crossing p95 | snapshot open p95 |",
+           "|---|---|---|---|---|---|---|"]
+    for r in rows:
+        out.append(
+            f"| {r['segments']} | {r['segments_touched_366d']} | "
+            f"{r['single_day']['p95_ms']:.2f} ms | **{r['range_366d']['p95_ms']:.2f} ms** | "
+            f"{r['vs_monolith_p95_x']['range_366d']:.2f}× | "
+            f"{r['crossing']['p95_ms']:.1f} ms | {r['snapshot_open_ms']['p95_ms']:.1f} ms |")
+    return "\n".join(out)
+
+
+def _finalize(res: dict) -> dict:
+    res["markdown_table"] = _markdown_table(res["rows"])
+    res["run_digest"] = hashlib.sha256(
+        json.dumps(res["rows"], sort_keys=True).encode()).hexdigest()[:16]
+    return res
 
 
 def main():
@@ -265,9 +293,10 @@ def main():
     args = ap.parse_args()
 
     workdir = args.workdir or tempfile.mkdtemp(prefix="p5s2_")
-    res = measure(workdir, total_days=args.total_days,
+    res = _finalize(measure(workdir, total_days=args.total_days,
                   segment_counts=[int(x) for x in args.segments.split(",")],
-                  ny=args.ny, nx=args.nx, delta_days=args.delta_days, repeats=args.repeats)
+                  ny=args.ny, nx=args.nx, delta_days=args.delta_days,
+                  repeats=args.repeats))
     if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w") as fh:
@@ -285,6 +314,8 @@ def main():
           f"(median; samples {res['added_ms_per_extra_array_call_samples']})")
     print(f"G3: {res['g3_verdict']} -- ratio here {res['g3_ratio_on_this_fixture']}x "
           f"(bar {res['g3_bar_x']}x), NOT adjudicable on a synthetic fixture")
+    print(f"run_digest: {res['run_digest']}")
+    print(res["markdown_table"])
     print(f"S2 gate: {res['s2_gate_pass']} | no opens in read path: "
           f"{res['no_store_opens_in_read_path']} | max fd growth: "
           f"{res['max_fd_growth_on_open']}")
