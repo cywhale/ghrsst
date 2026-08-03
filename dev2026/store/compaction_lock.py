@@ -9,7 +9,8 @@ published as history.
 Holding the ingest lock for the whole build is not an option; it would block the twice-daily
 delta append for hours. So compaction takes a **separate, dedicated `flock`**:
 
-* the builder holds `LOCK_EX` on `p5_compaction.lock` for the entire build;
+* the builder holds `LOCK_EX` on `p5_compaction.lock` for the entire build, in a single
+  process that forks no workers (see `acquire` on why that restriction is load-bearing);
 * delta prune / swap / repair try `LOCK_EX | LOCK_NB` on the same file and **refuse** on
   contention — non-blocking, never a blocking wait;
 * the daily delta append does **not** take this lock and continues normally;
@@ -64,9 +65,14 @@ class CompactionLock:
     # ---- acquire / release ----------------------------------------------
     def acquire(self) -> "CompactionLock":
         os.makedirs(os.path.dirname(os.path.abspath(self.path)) or ".", exist_ok=True)
-        # O_CLOEXEC: a child process must NOT inherit this fd. If it did, killing the parent
-        # would leave the lock held by the child, contradicting "process death releases it"
-        # (§7.1b-1). Only the supervisor owns the lock.
+        # O_CLOEXEC closes this fd across `exec`, so a spawned program cannot end up holding
+        # the lock after the supervisor dies. It does NOT protect against a plain `fork`: a
+        # forked child keeps the descriptor and the flock reference until it execs or exits.
+        # The builder is single-process/single-thread and forks nothing, so nothing today can
+        # reach that state -- but if a fork-based worker pool is ever added here, O_CLOEXEC
+        # alone will not keep "process death releases the lock" (§7.1b-1) true. Such a pool
+        # must close the fd in the child, or the lock must move to a supervisor-only fd that
+        # workers never see.
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

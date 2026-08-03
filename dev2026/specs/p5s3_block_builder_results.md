@@ -10,10 +10,10 @@ Implements P5-S3 of [`p5_segmented_timecube_compaction_design.md`](p5_segmented_
 - Compaction lock: [`../store/compaction_lock.py`](../store/compaction_lock.py)
 - Gate wired into [`../ingest/prune_delta.py`](../ingest/prune_delta.py) and
   [`../ingest/swap_delta.py`](../ingest/swap_delta.py)
-- Tests: [`../tests/test_phase2_p5s3.py`](../tests/test_phase2_p5s3.py) — **45/45 green**
-- Full local suite: **443 tests OK** (17 skipped), up from 398.
+- Tests: [`../tests/test_phase2_p5s3.py`](../tests/test_phase2_p5s3.py) — **51/51 green**
+- Full local suite: **449 tests OK** (17 skipped), up from 398.
 
-**Review round 2** raised four findings; §11 records what each one changed. Two of them were
+**Review rounds 2 and 3** raised four and three findings; §11 and §12 record what each changed. Two of them were
 defects I had introduced without noticing — the per-tile group open, and two safety gates that
 were technically present but opt-in.
 
@@ -68,8 +68,13 @@ than wait — a prune blocked for hours reads as a hang, and the operator needs 
 
 Two details that matter more than the lock itself:
 
-- **`O_CLOEXEC`**: the fd is not inherited by children, so "process death releases the lock"
-  stays true (§7.1b-1). If a child inherited it, killing the supervisor would leave it held.
+- **`O_CLOEXEC`**: the fd is closed across `exec`, so a spawned program cannot outlive the
+  supervisor still holding the lock. Stated precisely, because the flag is narrower than it
+  looks: it does **not** stop a plain `fork` from inheriting the descriptor. "Process death
+  releases the lock" (§7.1b-1) therefore holds **because the builder is single-process and
+  forks nothing**, with `O_CLOEXEC` covering the `exec` case — not because of the flag alone.
+  A future fork-based worker pool must close the fd in the child or move the lock to a
+  supervisor-only fd; this is recorded in the module docstring next to the flag.
 - **the publish-time assertion checks the fd *and the inode***. `rm` + recreate gives a new
   inode another process can lock freely while we hold the orphaned one — the only two-writer
   state reachable here. Both the deleted and the replaced cases are tested.
@@ -132,7 +137,7 @@ dev2026/.venv/bin/python -m unittest discover -s dev2026/tests -p "test_*.py"
 
 ## 10. Mutation verification
 
-Every new guard was disabled in turn and the suite re-run; all nineteen fail. A twentieth mutation survived by design and is discussed below the table.
+Every new guard was disabled in turn and the suite re-run; all twenty-five fail. A twentieth mutation survived by design and is discussed below the table.
 
 | guard disabled | result |
 |---|---|
@@ -155,6 +160,12 @@ Every new guard was disabled in turn and the suite re-run; all nineteen fail. A 
 | daily-day inspection skipped | FAILED |
 | grid-uniformity check removed | FAILED |
 | `netcdf` re-advertised in `SOURCE_ORDER` | FAILED |
+| grid identity reduced to `(ny, nx)` | FAILED (3) |
+| grid identity ignores dtype | FAILED |
+| uniform-grid comparison removed | FAILED (2 + 1) |
+| inspection open not counted | FAILED (5) |
+| day-index opens its own handle again | FAILED |
+| daily inspection opens a second handle | FAILED |
 
 **One mutation SURVIVED, and it should have.** Relaxing `has_var` from `flag is True` to
 `bool(flag)` leaves the suite green. That is not a coverage hole: `inspect_store_contract`
@@ -227,3 +238,58 @@ output guard, which sees only one axis pair, would pass it. `assert_uniform_grid
 Removed from `SOURCE_ORDER` and declared undelivered in §7.0. Implementing it was the other
 option; declaring it is the honest one for this step, and the refusal now names the missing day
 instead of implying the source was consulted.
+
+
+## 12. Review round 3 — what the three findings changed
+
+### 1. [High] `assert_uniform_grid` compared size, not identity
+
+I wrote the grid check as `(ny, nx)`, which is the version of the check that catches the case
+I happened to have a fixture for. Two sources can both be 18000x36000 and be shifted half a
+cell apart, or use 0..360 where the other uses -180..180 — same shape, same dtype, same cell
+count, different Earth. Those are precisely the cases that produce plausible-looking wrong data
+instead of an error, so a size comparison guards the easy half and leaves the dangerous half
+open.
+
+The comparison is now over the **S1 grid identity** — `lon`/`lat` value digest, shape and dtype
+— reached through one shared `grid_identity()` helper. This matters beyond tidiness: the daily
+path and the cube path are inspected by different code, so if they did not compute the digest
+the same way, every legitimate mixed-source fold would look like a grid mismatch. `inspect_daily_day`
+therefore routes its axes through `block_manifest._axis`, the same validator the cube inspection
+uses, rather than reimplementing the rules and the digest convention beside it.
+
+Four tests: same-size-shifted-axes, same-size-different-longitude-convention, the existing
+different-size case, and — the one that keeps the guard honest — a **matching** delta+daily fold
+that must still succeed. The refusal names the differing fields (`lon_digest`, …) and prints both
+grids, because "sources disagree on the grid" without saying how is not actionable at 3am.
+
+### 2. [Medium] `source_group_opens` under-counted real opens
+
+The reviewer was right, and the real number was worse than the finding said. Both
+`inspect_store_contract` and `inspect_daily_day` opened the group themselves, *and*
+`resolve_source_map`'s day-index read opened the delta a third time — none of them counted.
+A performance gate reading that number was under-stating the cost it exists to bound.
+
+Two changes. The day-index read and the daily inspection now **reuse the reader's handle**
+instead of opening their own. `inspect_store_contract` keeps S1's path-only signature, so its
+open is real and is now **counted explicitly** rather than hidden.
+
+The important part is the test, which does not trust the instrumentation at all: it patches
+`zarr.open_group` on the zarr module — the one both `build_block` and `block_manifest` resolve
+through — records every open of a source path, and asserts the reported count **equals** the
+observed count. That test is what found the third delta open; the finding as written would have
+left it there. Reported counts are now 2 for a lone delta (inspection + handle) and 5 for
+delta + three daily days, and disabling any of the three sharing/counting fixes fails it.
+
+### 3. [Low] The `O_CLOEXEC` comment claimed more than the flag delivers
+
+`O_CLOEXEC` closes the fd across `exec`. It does **not** stop a plain `fork` from inheriting
+the descriptor and the flock reference. Nothing here forks, so no current path is affected, but
+the comment said "a child process must NOT inherit this fd", which is the kind of statement
+someone later builds a fork-based worker pool on top of.
+
+Reworded in `compaction_lock.py` and in §4 above: "process death releases the lock" (§7.1b-1)
+holds **because the builder is single-process and forks nothing**, with `O_CLOEXEC` covering the
+`exec` case — not because of the flag alone. The requirement a future worker pool would inherit
+(close the fd in the child, or move the lock to a supervisor-only fd) is recorded next to the
+flag rather than in this document, where it would not be read.

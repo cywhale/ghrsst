@@ -536,7 +536,9 @@ class TestSourceHandlesAreCached(_Base):
                            classification_target=self.span[:6], delta_path=delta,
                            artifacts_dir=self.tmp, tile=4)
         opens = plan["source_group_opens"]
-        self.assertEqual(opens, 1, f"one delta source must be opened once, got {opens}")
+        # 2, not 1: the strict inspection opens the group and that open is real. The point of
+        # the gate is that this is O(sources), not O(tiles).
+        self.assertEqual(opens, 2, f"one delta source, got {opens} opens")
 
     def test_open_count_does_not_grow_when_the_tile_shrinks(self):
         """The regression this closes: opens scaled with the tile count."""
@@ -571,7 +573,52 @@ class TestSourceHandlesAreCached(_Base):
         # production geometry, one 90-day fold from a single delta source
         prod_tiles = ((17999 + 255) // 256) * ((36000 + 255) // 256)
         self.assertGreater(90 * 3 * prod_tiles, 2_000_000)   # what it WAS
-        self.assertEqual(plan["source_group_opens"], 1)      # what it is: O(sources)
+        self.assertEqual(plan["source_group_opens"], 2)      # what it is: O(sources)
+
+    def test_the_reported_count_equals_the_REAL_number_of_opens(self):
+        """`source_group_opens` was a count of cache entries, not of `zarr.open_group` calls.
+
+        The inspection opened the group too — inside `block_manifest` for cube sources and
+        inside `inspect_daily_day` for daily ones — so a gate reading the reported number was
+        under-counting the real cost it exists to bound. This test does not trust the
+        instrumentation: it patches `zarr.open_group` at BOTH call sites and compares."""
+        import ingest.build_block as bbmod
+        import store.block_manifest as bmmod
+
+        delta = self._delta(self.span[3:6])
+        daily = self._daily(self.span[:3])
+        source_prefixes = (os.path.realpath(delta), os.path.realpath(daily))
+        real_opens = []
+
+        real = zarr.open_group
+
+        def counting(path, *a, **kw):
+            rp = os.path.realpath(str(path))
+            if any(rp.startswith(pref) for pref in source_prefixes):
+                real_opens.append(rp)
+            return real(path, *a, **kw)
+
+        zarr.open_group = counting
+        try:
+            plan = build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                               classification_target=self.span[:6], delta_path=delta,
+                               daily_root=daily, artifacts_dir=self.tmp, tile=4)
+        finally:
+            zarr.open_group = real
+
+        self.assertEqual(plan["source_group_opens"], len(real_opens),
+                         f"reported {plan['source_group_opens']} but {len(real_opens)} real "
+                         f"opens occurred: {real_opens}")
+
+    def test_the_daily_inspection_reuses_the_cached_handle(self):
+        """A strict daily check must not cost a second open per day."""
+        delta = self._delta(self.span[3:6])
+        daily = self._daily(self.span[:3])
+        plan = build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                           classification_target=self.span[:6], delta_path=delta,
+                           daily_root=daily, artifacts_dir=self.tmp, tile=4)
+        # 3 daily days x 1 open each, + delta: 1 inspection open + 1 cached handle = 2
+        self.assertEqual(plan["source_group_opens"], 5)
 
     def test_mixed_sources_open_once_each(self):
         delta = self._delta(self.span[3:6])
@@ -579,8 +626,8 @@ class TestSourceHandlesAreCached(_Base):
         plan = build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
                            classification_target=self.span[:6], delta_path=delta,
                            daily_root=daily, artifacts_dir=self.tmp, tile=4)
-        # one delta group + one group per daily day
-        self.assertEqual(plan["source_group_opens"], 4)
+        # delta: inspection + handle = 2; each daily day: one shared handle = 3
+        self.assertEqual(plan["source_group_opens"], 5)
 
 
 # ============================================================ finding 3: source inspection
@@ -633,7 +680,7 @@ class TestSourceContractIsInspected(_Base):
                         artifacts_dir=self.tmp)
         self.assertIn("non-finite", str(cm.exception))
 
-    def test_sources_on_different_grids_refuse(self):
+    def test_sources_of_different_size_refuse(self):
         """A block has ONE axis pair. Two grids would interleave geographies day by day and
         the output guard, which sees only one axis, would pass it."""
         delta = self._delta(self.span[3:6])
@@ -643,6 +690,60 @@ class TestSourceContractIsInspected(_Base):
                         classification_target=self.span[:6], delta_path=delta,
                         daily_root=daily, artifacts_dir=self.tmp)
         self.assertIn("disagree on the grid", str(cm.exception))
+
+    def test_same_size_but_shifted_coordinates_refuse(self):
+        """The case a size comparison cannot see, and the one that produces plausible wrong
+        data rather than an error: identical `(ny, nx)`, axes half a cell apart."""
+        delta = self._delta(self.span[3:6])
+        daily = self._daily(self.span[:3])                       # same 32x32
+        for day in self.span[:3]:
+            y, m, d = day.split("-")
+            g = zarr.open_group(os.path.join(daily, y, m, d), mode="a")
+            g["lon"][:] = np.asarray(g["lon"][:]) + 0.5          # shifted, still ascending
+        out = self._out("b0")
+        with self.assertRaises(BuildRefused) as cm:
+            build_block(out, start_day=self.s0, end_day=self.e0,
+                        classification_target=self.span[:6], delta_path=delta,
+                        daily_root=daily, artifacts_dir=self.tmp)
+        msg = str(cm.exception)
+        self.assertIn("disagree on the grid", msg)
+        self.assertIn("lon_digest", msg)
+        self.assertFalse(os.path.exists(out))
+
+    def test_same_size_but_a_different_longitude_convention_refuses(self):
+        """0..360 against -180..180: same shape, same dtype, same cell count, different Earth."""
+        delta = self._delta(self.span[3:6])
+        daily = self._daily(self.span[:3])
+        for day in self.span[:3]:
+            y, m, d = day.split("-")
+            g = zarr.open_group(os.path.join(daily, y, m, d), mode="a")
+            nx = g["lon"].shape[0]
+            g["lon"][:] = np.linspace(-180.0, -180.0 + nx - 1, nx, dtype=np.float32)
+        with self.assertRaises(BuildRefused) as cm:
+            build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                        classification_target=self.span[:6], delta_path=delta,
+                        daily_root=daily, artifacts_dir=self.tmp)
+        self.assertIn("disagree on the grid", str(cm.exception))
+
+    def test_matching_grids_across_source_kinds_are_accepted(self):
+        """The identity check must not reject a legitimate mixed-source fold. delta and daily
+        are inspected by different code paths, so their digests have to agree by construction,
+        not by luck."""
+        delta = self._delta(self.span[3:6])
+        daily = self._daily(self.span[:3])
+        plan = build_block(self._out("b0"), start_day=self.s0, end_day=self.e0,
+                           classification_target=self.span[:6], delta_path=delta,
+                           daily_root=daily, artifacts_dir=self.tmp)
+        self.assertEqual(plan["segment"]["day_count"], 6)
+
+    def test_grid_identity_compares_more_than_size(self):
+        """Guards the comparison itself: dropping any identity field must be detectable."""
+        from ingest.build_block import grid_identity
+        a = grid_identity("d1", "d2", (32,), (32,), "float32", "float32")
+        self.assertEqual(set(a), {"lon_digest", "lat_digest", "lon_shape", "lat_shape",
+                                  "lon_dtype", "lat_dtype"})
+        self.assertNotEqual(a, grid_identity("dX", "d2", (32,), (32,), "float32", "float32"))
+        self.assertNotEqual(a, grid_identity("d1", "d2", (32,), (32,), "float64", "float32"))
 
     def test_inspect_daily_day_accepts_a_sound_day(self):
         daily = self._daily(self.span[:2])

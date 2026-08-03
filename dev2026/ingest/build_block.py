@@ -41,6 +41,7 @@ gate asserts peak RSS does not scale with grid area.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -106,11 +107,11 @@ class _Journal:
 
 
 # --------------------------------------------------------------------------- source map
-def _store_day_index(path: str) -> Dict[str, int]:
+def _store_day_index(path: str, *, group=None) -> Dict[str, int]:
     """`day -> physical index` from a cube-like store, BY DATE.
 
     Never by position: delta `attrs['days']` is append order after a backfill (P4-S4 §2)."""
-    g = zarr.open_group(path, mode="r")
+    g = zarr.open_group(path, mode="r") if group is None else group
     return {d: i for i, d in enumerate(g.attrs["days"])}
 
 
@@ -122,7 +123,7 @@ def _daily_has(daily_root: str, day: str) -> bool:
 def resolve_source_map(days: Sequence[str], *, delta_path: Optional[str] = None,
                        predecessor_path: Optional[str] = None,
                        daily_root: Optional[str] = None,
-                       hold_root: Optional[str] = None) -> Dict[str, dict]:
+                       hold_root: Optional[str] = None, reader=None) -> Dict[str, dict]:
     """`day -> {source_kind, source_path, source_day_index}` for EVERY requested day.
 
     Resolution order is the serving authority (§7.1a). A day present in delta resolves to
@@ -131,7 +132,8 @@ def resolve_source_map(days: Sequence[str], *, delta_path: Optional[str] = None,
     indexes: Dict[str, Dict[str, int]] = {}
     for kind, path in (("delta", delta_path), ("block", predecessor_path)):
         if path and os.path.isdir(path):
-            indexes[kind] = _store_day_index(path)
+            indexes[kind] = _store_day_index(
+                path, group=None if reader is None else reader._group(path))
 
     out: Dict[str, dict] = {}
     for day in days:
@@ -176,34 +178,47 @@ def disk_precheck(out_path: str, *, block_bytes_estimate: int, hard_reserve_byte
 
 
 # --------------------------------------------------------------------------- sources
-def inspect_daily_day(root: str, day: str) -> dict:
+def grid_identity(lon_digest, lat_digest, lon_shape, lat_shape, lon_dtype, lat_dtype) -> dict:
+    """The S1 grid identity, in one place so every source is compared the same way.
+
+    Shape alone is not identity. Two sources can both be 18000x36000 and still be different
+    grids -- shifted by half a cell, or on a different longitude convention -- and folding them
+    together writes two geographies into one axis pair. S1 already settled what identity means
+    (value digest + shape + dtype, digest over float64 bytes); this reuses it rather than
+    inventing a second, subtly different notion of "same grid"."""
+    return {"lon_digest": lon_digest, "lat_digest": lat_digest,
+            "lon_shape": tuple(int(x) for x in lon_shape),
+            "lat_shape": tuple(int(x) for x in lat_shape),
+            "lon_dtype": str(lon_dtype), "lat_dtype": str(lat_dtype)}
+
+
+def inspect_daily_day(root: str, day: str, *, group=None) -> dict:
     """Strict contract check for ONE daily-group day.
 
     `inspect_store_contract` does not fit a daily group (no `days` attr, shape `(1,ny,nx)`),
     but the same principle applies: an OUTPUT inspection proves the output is structurally
     valid, never that the INPUT was semantically sound. A source with a corrupt dtype, shape
-    or axis would otherwise be copied faithfully into a block that then inspects clean."""
+    or axis would otherwise be copied faithfully into a block that then inspects clean.
+
+    The axes go through `block_manifest._axis` -- the same validator the cube inspection uses.
+    Reimplementing it here would drift, and worse, would have to reproduce its digest
+    convention exactly or every daily source would look like a different grid from every delta
+    source. `group` lets the caller pass a handle it already holds, so the strict check costs
+    no extra `zarr.open_group`."""
     y, m, d = day.split("-")
     path = os.path.join(root, y, m, d)
-    if not os.path.isdir(path):
-        raise bm.ManifestError(f"{path}: daily group missing")
-    g = zarr.open_group(path, mode="r")
-    for axis in ("lon", "lat"):
-        if axis not in g:
-            raise bm.ManifestError(f"{path}: coordinate {axis!r} missing")
-        a = np.asarray(g[axis][:], dtype="float64")
-        if g[axis].ndim != 1 or a.size == 0:
-            raise bm.ManifestError(f"{path}: {axis!r} must be a non-empty 1-D axis")
-        if not np.all(np.isfinite(a)):
-            raise bm.ManifestError(f"{path}: {axis!r} contains non-finite values")
-        if a.size > 1 and not np.all(np.diff(a) > 0):
-            raise bm.ManifestError(f"{path}: {axis!r} is not strictly increasing")
-    ny, nx = int(np.asarray(g["lat"][:]).size), int(np.asarray(g["lon"][:]).size)
+    if group is None:
+        if not os.path.isdir(path):
+            raise bm.ManifestError(f"{path}: daily group missing")
+        group = zarr.open_group(path, mode="r")
+    lon, lon_shape, lon_dtype = bm._axis(group, "lon", path)
+    lat, lat_shape, lat_dtype = bm._axis(group, "lat", path)
+    ny, nx = int(lat.size), int(lon.size)
     present = []
     for v in VARS:
-        if v not in g:
+        if v not in group:
             continue
-        arr = g[v]
+        arr = group[v]
         if arr.ndim != 3 or arr.shape[0] != 1:
             raise bm.ManifestError(f"{path}: {v!r} must be (1, ny, nx), got {arr.shape}")
         if (arr.shape[1], arr.shape[2]) != (ny, nx):
@@ -214,7 +229,10 @@ def inspect_daily_day(root: str, day: str) -> dict:
         present.append(v)
     if not present:
         raise bm.ManifestError(f"{path}: no data variables")
-    return {"ny": ny, "nx": nx, "vars": present}
+    identity = grid_identity(hashlib.sha256(lon.tobytes()).hexdigest(),
+                             hashlib.sha256(lat.tobytes()).hexdigest(),
+                             lon_shape, lat_shape, lon_dtype, lat_dtype)
+    return {"ny": ny, "nx": nx, "vars": present, "grid": identity}
 
 
 class _SourceReader:
@@ -231,7 +249,7 @@ class _SourceReader:
         self._groups: Dict[str, object] = {}
         self._cube_valid: Dict[str, Dict[str, list]] = {}
         self._daily_meta: Dict[str, dict] = {}
-        self._grids: Dict[str, tuple] = {}   # source label -> (ny, nx)
+        self._grids: Dict[str, dict] = {}    # source label -> grid IDENTITY, not just size
         self.opens = 0                      # observable, so a gate can assert it stays small
 
     def _group(self, path: str):
@@ -248,32 +266,52 @@ class _SourceReader:
             return
         insp = bm.inspect_store_contract(path)          # raises on any contract violation
         self._cube_valid[path] = {v: list(flags) for v, flags in insp.var_valid}
-        self._grids[path] = (insp.lat_shape[0], insp.lon_shape[0])
+        self._grids[path] = grid_identity(insp.lon_digest, insp.lat_digest,
+                                          insp.lon_shape, insp.lat_shape,
+                                          insp.lon_dtype, insp.lat_dtype)
+        # `inspect_store_contract` opens the group itself, and its signature is S1's. That
+        # open is real, so it is counted here rather than hidden -- see `opens`.
+        self.opens += 1
         self._group(path)
 
     def inspect_daily(self, root: str, day: str) -> None:
         key = f"{root}|{day}"
         if key not in self._daily_meta:
-            meta = inspect_daily_day(root, day)
-            self._daily_meta[key] = meta
-            self._grids[key] = (meta["ny"], meta["nx"])
             y, m, d = day.split("-")
-            self._group(os.path.join(root, y, m, d))
+            path = os.path.join(root, y, m, d)
+            if not os.path.isdir(path):
+                raise bm.ManifestError(f"{path}: daily group missing")
+            meta = inspect_daily_day(root, day, group=self._group(path))   # reuse the handle
+            self._daily_meta[key] = meta
+            self._grids[key] = meta["grid"]
 
     def assert_uniform_grid(self) -> None:
-        """Every source must be on the SAME grid.
+        """Every source must be on the SAME grid -- by IDENTITY, not by size.
 
-        A block has one `lon`/`lat` axis pair. Sources on different grids would each write
-        their own tiles into it, and the result inspects perfectly clean while interleaving
-        two geographies day by day — invisible to the output guard, which only sees one axis."""
-        seen = sorted(set(self._grids.values()))
-        if len(seen) > 1:
-            detail = ", ".join(f"{k} -> {v[0]}x{v[1]}" for k, v in sorted(self._grids.items()))
+        A block has one `lon`/`lat` axis pair. Sources on different grids each write their
+        tiles into it and the result inspects perfectly clean while interleaving two
+        geographies day by day, invisible to the output guard, which sees only one axis.
+
+        Comparing `(ny, nx)` is not enough: two sources can both be 18000x36000 and be shifted
+        by half a cell, or use 0..360 against -180..180. Those are exactly the cases that
+        produce plausible-looking wrong data rather than an error, so the comparison is over
+        the full S1 identity -- axis value digest, shape and dtype."""
+        keys = sorted(self._grids)
+        if not keys:
+            return
+        ref = self._grids[keys[0]]
+        for k in keys[1:]:
+            other = self._grids[k]
+            if other == ref:
+                continue
+            diff = sorted(f for f in ref if ref[f] != other[f])
             raise bm.ManifestError(
-                f"sources disagree on the grid ({seen}); a block has ONE axis pair, so folding "
-                f"these together would interleave geographies day by day: {detail}")
+                f"sources disagree on the grid: {keys[0]!r} and {k!r} differ in {diff}. "
+                f"A block has ONE axis pair, so folding these together would interleave "
+                f"geographies day by day. "
+                f"{keys[0]}={_grid_str(ref)} vs {k}={_grid_str(other)}")
 
-    def grid(self) -> tuple:
+    def grid(self) -> dict:
         return next(iter(self._grids.values()))
 
     def has_var(self, source: dict, var: str) -> bool:
@@ -394,10 +432,13 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
                 f"spatial window (>= {cutoff}), first {inside[0]}; folding them would remove "
                 f"bbox/POST availability with no bbox-friendly tier to replace it")
 
-    # ---- §7.1a source map for EVERY rebuild day, resolved BEFORE any write
+    # ---- §7.1a source map for EVERY rebuild day, resolved BEFORE any write.
+    # The reader is created here, before resolution, so the day-index read shares the same
+    # handle the tiles will use instead of costing a third open of the delta.
+    reader = _SourceReader()
     smap = resolve_source_map(rebuild_source_set, delta_path=delta_path,
                               predecessor_path=predecessor_path, daily_root=daily_root,
-                              hold_root=hold_root)
+                              hold_root=hold_root, reader=reader)
     unresolved = [d for d in rebuild_source_set if d not in smap]
     if unresolved:
         raise BuildRefused(
@@ -410,7 +451,6 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
     # An output inspection proves the output is structurally valid; it says nothing about
     # whether the input was sound. A corrupt source would otherwise be copied faithfully into
     # a block that then inspects clean.
-    reader = _SourceReader()
     try:
         for path in {s["source_path"] for s in smap.values()
                      if s["source_kind"] in ("delta", "block")}:
@@ -546,6 +586,11 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
 
 
 # --------------------------------------------------------------------------- helpers
+def _grid_str(g: dict) -> str:
+    return (f"{g['lat_shape']}x{g['lon_shape']} {g['lat_dtype']}/{g['lon_dtype']} "
+            f"lon:{g['lon_digest'][:8]} lat:{g['lat_digest'][:8]}")
+
+
 def _probe_grid(source: dict, reader: "_SourceReader"):
     kind, path = source["source_kind"], source["source_path"]
     if kind in ("daily", "hold"):
