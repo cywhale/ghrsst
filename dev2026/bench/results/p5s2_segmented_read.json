@@ -1,12 +1,12 @@
 {
-  "added_ms_per_extra_array_call": 0.636,
+  "added_ms_per_extra_array_call": 0.608,
   "added_ms_per_extra_array_call_band": [
-    0.631,
-    0.636
+    0.602,
+    0.614
   ],
   "added_ms_per_extra_array_call_samples": [
-    0.631,
-    0.636
+    0.602,
+    0.614
   ],
   "delta_days": 31,
   "env": {
@@ -16,8 +16,8 @@
   },
   "g3_adjudicable_here": false,
   "g3_bar_x": 1.25,
-  "g3_ratio_on_this_fixture": 3.507,
-  "g3_reason": "A RATIO is not portable between fixtures: it is the added per-call cost divided by the baseline's absolute magnitude. On this synthetic fixture a 3-variable 366-day read costs 7.5 ms p95, so the per-call overhead IS essentially the whole measurement and the ratio approaches the call-count ratio. Grid size does not change this -- a point read touches one chunk per time block regardless of ny/nx. Against the [VM24] 366-day baseline of 76.0-100.0 ms, the same absolute overhead (12 extra calls x 0.636 ms median = 7.6 ms at S=90; per-call samples this run [0.631, 0.636], and repeated runs of this harness span roughly 0.45-0.80 ms) projects to roughly +8-10%. G3 must therefore be adjudicated against the real baseline, which is S6/S7's job, not asserted here.",
+  "g3_ratio_on_this_fixture": 3.422,
+  "g3_reason": "A RATIO is not portable between fixtures: it is the added per-call cost divided by the baseline's absolute magnitude. On this synthetic fixture a 3-variable 366-day read costs 7.6 ms p95, so the per-call overhead IS essentially the whole measurement and the ratio approaches the call-count ratio. Grid size does not change this -- a point read touches one chunk per time block regardless of ny/nx. Against the [VM24] 366-day baseline of 76.0-100.0 ms, the same absolute overhead (12 extra calls x 0.608 ms median = 7.3 ms at S=90; per-call samples this run [0.602, 0.614]) projects to roughly +7-10%. G3 must therefore be adjudicated against the real baseline, which is S6/S7's job, not asserted here.",
   "g3_verdict": "DEFERRED to S6/S7 (production geometry)",
   "grid": [
     64,
@@ -27,47 +27,47 @@
   "max_fd_growth_on_open": 0,
   "no_store_opens_in_read_path": true,
   "note": "G3 compares like with like: the same days, one block vs k. The absolute numbers are laptop/synthetic and are NOT the VM24 gate -- S6/S7 own that.",
-  "projected_added_ms_at_s90": 7.63,
+  "projected_added_ms_at_s90": 7.3,
   "projected_regression_pct_at_s90": [
-    7.6,
-    10.0
+    7.3,
+    9.6
   ],
   "provenance": "COMMITTED harness, synthetic fixtures, local, warm. Monolith vs segmented on IDENTICAL days. Not VM24 performance.",
   "rows": [
     {
       "crossing": {
-        "max_ms": 43.341,
-        "min_ms": 33.419,
-        "p50_ms": 37.81,
-        "p95_ms": 41.708,
+        "max_ms": 37.936,
+        "min_ms": 33.158,
+        "p50_ms": 37.029,
+        "p95_ms": 37.905,
         "repeats": 31
       },
       "days_per_segment": 400,
       "open_fds_after": 6,
       "open_fds_before": 6,
       "range_366d": {
-        "max_ms": 7.619,
-        "min_ms": 6.778,
-        "p50_ms": 7.123,
-        "p95_ms": 7.547,
+        "max_ms": 7.67,
+        "min_ms": 6.645,
+        "p50_ms": 7.193,
+        "p95_ms": 7.601,
         "repeats": 31
       },
-      "rss_mb_after": 112.9,
-      "rss_mb_before": 112.8,
+      "rss_mb_after": 116.0,
+      "rss_mb_before": 115.9,
       "segments": 1,
       "segments_touched_366d": 1,
       "single_day": {
-        "max_ms": 2.611,
-        "min_ms": 2.333,
-        "p50_ms": 2.398,
-        "p95_ms": 2.592,
+        "max_ms": 2.692,
+        "min_ms": 2.322,
+        "p50_ms": 2.357,
+        "p95_ms": 2.67,
         "repeats": 31
       },
       "snapshot_open_ms": {
-        "max_ms": 7.423,
-        "min_ms": 6.774,
-        "p50_ms": 7.298,
-        "p95_ms": 7.423,
+        "max_ms": 7.249,
+        "min_ms": 6.862,
+        "p50_ms": 7.083,
+        "p95_ms": 7.249,
         "repeats": 3
       },
       "stores_opened_during_read": 0,
@@ -79,88 +79,88 @@
     },
     {
       "crossing": {
-        "max_ms": 45.138,
-        "min_ms": 39.397,
-        "p50_ms": 43.716,
-        "p95_ms": 44.531,
+        "max_ms": 45.103,
+        "min_ms": 39.071,
+        "p50_ms": 43.066,
+        "p95_ms": 44.127,
         "repeats": 31
       },
       "days_per_segment": 100,
       "open_fds_after": 6,
       "open_fds_before": 6,
       "range_366d": {
-        "max_ms": 13.334,
-        "min_ms": 12.397,
-        "p50_ms": 12.979,
-        "p95_ms": 13.271,
+        "max_ms": 13.248,
+        "min_ms": 12.461,
+        "p50_ms": 12.824,
+        "p95_ms": 13.022,
         "repeats": 31
       },
-      "rss_mb_after": 127.8,
-      "rss_mb_before": 127.8,
+      "rss_mb_after": 123.9,
+      "rss_mb_before": 123.8,
       "segments": 4,
       "segments_touched_366d": 4,
       "single_day": {
-        "max_ms": 2.679,
-        "min_ms": 2.31,
+        "max_ms": 2.627,
+        "min_ms": 2.297,
         "p50_ms": 2.355,
-        "p95_ms": 2.592,
+        "p95_ms": 2.624,
         "repeats": 31
       },
       "snapshot_open_ms": {
-        "max_ms": 26.869,
-        "min_ms": 26.506,
-        "p50_ms": 26.71,
-        "p95_ms": 26.869,
+        "max_ms": 26.234,
+        "min_ms": 25.827,
+        "p50_ms": 25.917,
+        "p95_ms": 26.234,
         "repeats": 3
       },
       "stores_opened_during_read": 0,
       "vs_monolith_p95_x": {
-        "crossing": 1.068,
-        "range_366d": 1.758,
-        "single_day": 1.0
+        "crossing": 1.164,
+        "range_366d": 1.713,
+        "single_day": 0.983
       }
     },
     {
       "crossing": {
-        "max_ms": 63.691,
-        "min_ms": 52.723,
-        "p50_ms": 56.527,
-        "p95_ms": 58.089,
+        "max_ms": 63.408,
+        "min_ms": 52.174,
+        "p50_ms": 55.975,
+        "p95_ms": 57.081,
         "repeats": 31
       },
       "days_per_segment": 33,
       "open_fds_after": 6,
       "open_fds_before": 6,
       "range_366d": {
-        "max_ms": 26.535,
-        "min_ms": 25.553,
-        "p50_ms": 26.07,
-        "p95_ms": 26.468,
+        "max_ms": 26.011,
+        "min_ms": 25.43,
+        "p50_ms": 25.745,
+        "p95_ms": 26.007,
         "repeats": 31
       },
       "rss_mb_after": 129.3,
-      "rss_mb_before": 129.0,
+      "rss_mb_before": 128.9,
       "segments": 12,
       "segments_touched_366d": 11,
       "single_day": {
-        "max_ms": 2.592,
-        "min_ms": 2.258,
-        "p50_ms": 2.316,
-        "p95_ms": 2.567,
+        "max_ms": 2.544,
+        "min_ms": 2.263,
+        "p50_ms": 2.3,
+        "p95_ms": 2.53,
         "repeats": 31
       },
       "snapshot_open_ms": {
-        "max_ms": 77.06,
-        "min_ms": 76.441,
-        "p50_ms": 76.985,
-        "p95_ms": 77.06,
+        "max_ms": 83.049,
+        "min_ms": 76.749,
+        "p50_ms": 76.784,
+        "p95_ms": 83.049,
         "repeats": 3
       },
       "stores_opened_during_read": 0,
       "vs_monolith_p95_x": {
-        "crossing": 1.393,
-        "range_366d": 3.507,
-        "single_day": 0.99
+        "crossing": 1.506,
+        "range_366d": 3.422,
+        "single_day": 0.948
       }
     }
   ],
@@ -171,5 +171,5 @@
     76.0,
     100.0
   ],
-  "worst_range_366d_regression_x": 3.507
+  "worst_range_366d_regression_x": 3.422
 }

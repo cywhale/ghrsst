@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import statistics
 import os
 import platform
 import shutil
@@ -188,7 +189,9 @@ def measure(workdir: str, *, total_days: int, segment_counts, ny: int, nx: int,
     # 0.47-0.75 ms for the same quantity; quoting one value to four decimals would be false
     # precision, and any document citing it would be stale on the next run.
     per_call = sorted(round(x, 3) for x in per_call)
-    added_ms_per_call = per_call[len(per_call) // 2] if per_call else None
+    # statistics.median, not per_call[len//2]: with an even number of samples the latter is
+    # the upper-middle value, not the median (for [0.631, 0.636] it returns 0.636, not 0.6335).
+    added_ms_per_call = round(statistics.median(per_call), 4) if per_call else None
     per_call_band = [per_call[0], per_call[-1]] if per_call else None
     # Projection to production: at S=90 a 366-day request touches ceil(366/90)=5 segments,
     # i.e. 4 extra vs a monolith, across every variable.
@@ -228,8 +231,8 @@ def measure(workdir: str, *, total_days: int, segment_counts, ny: int, nx: int,
             f"{VM24_BASELINE_MS[0]}-{VM24_BASELINE_MS[1]} ms, the same absolute overhead "
             f"({recommended_extra_calls} extra calls x {added_ms_per_call} ms median = "
             f"{projected_added_ms:.1f} ms at S=90; per-call samples this run "
-            f"{per_call_band}, and repeated runs of this harness span roughly 0.45-0.80 ms) "
-            f"projects to roughly +{projected_pct[1]:.0f}-{projected_pct[0]:.0f}%. "
+            f"{per_call_band}) projects to roughly "
+            f"+{projected_pct[1]:.0f}-{projected_pct[0]:.0f}%. "
             f"G3 must therefore be "
             f"adjudicated against the real baseline, which is S6/S7's job, not asserted "
             f"here."),

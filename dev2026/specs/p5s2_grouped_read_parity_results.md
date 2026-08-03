@@ -129,11 +129,11 @@ Measured, monolith vs segmented on **identical days** (**400 stored days, a genu
 
 | segments | segments touched | 1-day p95 | 366-day p95 | vs monolith | crossing p95 | snapshot open p95 |
 |---|---|---|---|---|---|---|
-| 1 | 1 | 2.59 ms | **7.55 ms** | 1.00× | 41.7 ms | 7.4 ms |
-| 4 | 4 | 2.59 ms | **13.27 ms** | **1.76×** | 44.5 ms | 26.9 ms |
-| 12 | 11 | 2.57 ms | **26.47 ms** | **3.51×** | 58.1 ms | 77.1 ms |
+| 1 | 1 | 2.57 ms | **7.60 ms** | 1.00× | 41.0 ms | 7.2 ms |
+| 4 | 4 | 2.55 ms | **13.02 ms** | **1.71×** | 44.0 ms | 26.2 ms |
+| 12 | 11 | 2.55 ms | **26.01 ms** | **3.42×** | 57.7 ms | 83.0 ms |
 
-**Added cost per extra array call: ≈ 0.63–0.71 ms** (median 0.636 in the committed run) — the same order as P5-S0's independently measured 0.65 ms.
+**Added cost per extra array call: ≈ 0.60–0.71 ms** (median 0.608 in the committed run) — the same order as P5-S0's independently measured 0.65 ms.
 
 On its face that is a G3 failure. It is not reported as one, because **a ratio is not portable
 between fixtures**: it is the added per-call cost divided by the baseline's absolute magnitude.
@@ -148,8 +148,8 @@ per-call cost. It does not — measured at 64², 256² and 512² the ratio staye
 and `nx`, so enlarging the grid does not enlarge the work either.
 
 What does change the ratio is the **baseline's absolute magnitude**, which on VM24 is **76–100
-ms** for a 366-day range (v0.5.0). The same absolute overhead — 12 extra calls × ≈0.64 ms ≈
-**≈ 7.6 ms** at S = 90 — projects to roughly **+7.6–10 %** there. That is a projection, not a
+ms** for a 366-day range (v0.5.0). The same absolute overhead — 12 extra calls × ≈0.61 ms ≈
+**≈ 7.3 ms** at S = 90 — projects to roughly **+7.3–9.6 %** there. That is a projection, not a
 measurement, and it is exactly the adjudication **S6/S7** own on production geometry.
 
 So this step records:
@@ -160,7 +160,7 @@ So this step records:
 - The S2 gate the fixture *can* decide — zero store opens in the read path, bounded fd growth —
   which is what the harness exits non-zero on.
 
-**Snapshot-open cost** (7.4 → 26.9 → 77.1 ms for 1 → 4 → 12 segments) is roughly linear in
+**Snapshot-open cost** (7.2 → 26.2 → 83.0 ms for 1 → 4 → 12 segments) is roughly linear in
 segment count and is R3/G16 groundwork: it runs on process start and on each generation change,
 not per request, and must stay well inside the refresh TTL. At the +10-year horizon (41 segments
 at S = 90) this projects to ~0.3 s — comfortable, but S6 must measure it rather than extrapolate.

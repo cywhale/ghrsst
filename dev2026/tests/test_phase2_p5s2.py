@@ -405,10 +405,15 @@ class TestRequestLevelSnapshot(_Base):
         day = "2027-05-05"
         fx.build_daily(daily_root, [day], seed=700)
 
-        prev = os.environ.get("GHRSST_ZARR_PATH")
+        # Restore EVERY global this test touches: three env vars and the app's router.
+        # Restoring only GHRSST_ZARR_PATH leaves the others cleared and the router pointing at
+        # a cube rigged to raise, which would leak into whatever runs next.
+        env_keys = ("GHRSST_ZARR_PATH", "GHRSST_TIMECUBE_PATH", "GHRSST_DELTACUBE_PATH")
+        prev_env = {k: os.environ.get(k) for k in env_keys}
         os.environ["GHRSST_ZARR_PATH"] = daily_root
-        os.environ.pop("GHRSST_TIMECUBE_PATH", None)
-        os.environ.pop("GHRSST_DELTACUBE_PATH", None)
+        for k in env_keys[1:]:
+            os.environ.pop(k, None)
+        prev_router = getattr(app.state, "router", None)
         try:
             with TestClient(app) as client:
                 base, _ = self._two_blocks()
@@ -433,10 +438,13 @@ class TestRequestLevelSnapshot(_Base):
                         "lon0": 100.0, "lat0": 0.0, "start": day, "end": day,
                         "append": "sst"})
         finally:
-            if prev is None:
-                os.environ.pop("GHRSST_ZARR_PATH", None)
-            else:
-                os.environ["GHRSST_ZARR_PATH"] = prev
+            for k, v in prev_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            if prev_router is not None:
+                app.state.router = prev_router
 
     def test_query_snapshot_freezes_daily_MEMBERSHIP_not_daily_DATA(self):
         """Documented limitation: the daily day-set is captured, the daily VALUES are read
