@@ -152,8 +152,16 @@ class TimeCubeStore:
         return list(fields)
 
     def point_series(self, lon, lat, days: Sequence[str], fields: Sequence[str]) -> List[dict]:
+        return self.point_series_from(self._meta, lon, lat, days, fields)
+
+    def point_series_from(self, m: _Meta, lon, lat, days: Sequence[str],
+                          fields: Sequence[str]) -> List[dict]:
+        """Read against a CALLER-SUPPLIED snapshot.
+
+        P5-S2 needs this: `TieredSnapshot` captures base and delta metadata together and must
+        then read from exactly those, never re-consulting `self._meta`. Re-reading per tier is
+        what let a refresh landing mid-request mix generations across tiers (R1)."""
         fields = self._check_fields(fields)
-        m = self._meta                         # ONE consistent snapshot for the whole call
         ii, jj, glon, glat = self._nearest(m, lon, lat)
         # requested days that exist in the cube, in requested order
         idx = [(d, m.day_index[d]) for d in days if d in m.day_index]

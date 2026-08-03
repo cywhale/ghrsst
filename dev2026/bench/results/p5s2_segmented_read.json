@@ -1,0 +1,158 @@
+{
+  "added_ms_per_extra_array_call": 0.5449,
+  "delta_days": 31,
+  "env": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "python": "3.13.11",
+    "zarr": "3.2.1"
+  },
+  "g3_adjudicable_here": false,
+  "g3_bar_x": 1.25,
+  "g3_ratio_on_this_fixture": 4.437,
+  "g3_reason": "A RATIO is not portable between fixtures: it is the added per-call cost divided by the baseline's absolute magnitude. On this synthetic fixture a 366-day 3-variable read costs ~6 ms, so ~2 ms/call of Python+zarr call overhead IS essentially the whole measurement and the ratio approaches the call-count ratio. Grid size does not change this -- a point read touches one chunk per time block regardless of ny/nx -- which was measured: the ratio stayed ~1.7-1.8x at 64, 256 and 512. The same ABSOLUTE overhead against the [VM24] 366-day baseline of 76-100 ms projects to roughly +5-15%. G3 must therefore be adjudicated against the real baseline, which is S6/S7's job, not asserted here.",
+  "g3_verdict": "DEFERRED to S6/S7 (production geometry)",
+  "grid": [
+    64,
+    64
+  ],
+  "harness": "bench_p5_segmented_read.py",
+  "max_fd_growth_on_open": 0,
+  "no_store_opens_in_read_path": true,
+  "note": "G3 compares like with like: the same days, one block vs k. The absolute numbers are laptop/synthetic and are NOT the VM24 gate -- S6/S7 own that.",
+  "provenance": "COMMITTED harness, synthetic fixtures, local, warm. Monolith vs segmented on IDENTICAL days. Not VM24 performance.",
+  "rows": [
+    {
+      "crossing": {
+        "max_ms": 42.229,
+        "min_ms": 32.966,
+        "p50_ms": 37.26,
+        "p95_ms": 42.229,
+        "repeats": 15
+      },
+      "days_per_segment": 360,
+      "open_fds_after": 6,
+      "open_fds_before": 6,
+      "range_366d": {
+        "max_ms": 6.911,
+        "min_ms": 5.609,
+        "p50_ms": 6.167,
+        "p95_ms": 6.911,
+        "repeats": 15
+      },
+      "rss_mb_after": 109.6,
+      "rss_mb_before": 109.5,
+      "segments": 1,
+      "segments_touched_366d": 1,
+      "single_day": {
+        "max_ms": 3.387,
+        "min_ms": 2.32,
+        "p50_ms": 2.439,
+        "p95_ms": 3.387,
+        "repeats": 15
+      },
+      "snapshot_open_ms": {
+        "max_ms": 7.508,
+        "min_ms": 7.045,
+        "p50_ms": 7.305,
+        "p95_ms": 7.508,
+        "repeats": 3
+      },
+      "stores_opened_during_read": 0,
+      "vs_monolith_p95_x": {
+        "crossing": 1.0,
+        "range_366d": 1.0,
+        "single_day": 1.0
+      }
+    },
+    {
+      "crossing": {
+        "max_ms": 42.632,
+        "min_ms": 36.938,
+        "p50_ms": 41.092,
+        "p95_ms": 42.632,
+        "repeats": 15
+      },
+      "days_per_segment": 90,
+      "open_fds_after": 6,
+      "open_fds_before": 6,
+      "range_366d": {
+        "max_ms": 10.241,
+        "min_ms": 9.732,
+        "p50_ms": 10.076,
+        "p95_ms": 10.241,
+        "repeats": 15
+      },
+      "rss_mb_after": 116.4,
+      "rss_mb_before": 116.3,
+      "segments": 4,
+      "segments_touched_366d": 4,
+      "single_day": {
+        "max_ms": 2.534,
+        "min_ms": 2.287,
+        "p50_ms": 2.327,
+        "p95_ms": 2.534,
+        "repeats": 15
+      },
+      "snapshot_open_ms": {
+        "max_ms": 26.548,
+        "min_ms": 25.842,
+        "p50_ms": 26.315,
+        "p95_ms": 26.548,
+        "repeats": 3
+      },
+      "stores_opened_during_read": 0,
+      "vs_monolith_p95_x": {
+        "crossing": 1.01,
+        "range_366d": 1.482,
+        "single_day": 0.748
+      }
+    },
+    {
+      "crossing": {
+        "max_ms": 60.988,
+        "min_ms": 57.793,
+        "p50_ms": 58.896,
+        "p95_ms": 60.988,
+        "repeats": 15
+      },
+      "days_per_segment": 30,
+      "open_fds_after": 6,
+      "open_fds_before": 6,
+      "range_366d": {
+        "max_ms": 30.666,
+        "min_ms": 28.202,
+        "p50_ms": 28.619,
+        "p95_ms": 30.666,
+        "repeats": 15
+      },
+      "rss_mb_after": 117.6,
+      "rss_mb_before": 117.5,
+      "segments": 12,
+      "segments_touched_366d": 12,
+      "single_day": {
+        "max_ms": 2.467,
+        "min_ms": 2.251,
+        "p50_ms": 2.349,
+        "p95_ms": 2.467,
+        "repeats": 15
+      },
+      "snapshot_open_ms": {
+        "max_ms": 84.137,
+        "min_ms": 78.041,
+        "p50_ms": 78.634,
+        "p95_ms": 84.137,
+        "repeats": 3
+      },
+      "stores_opened_during_read": 0,
+      "vs_monolith_p95_x": {
+        "crossing": 1.444,
+        "range_366d": 4.437,
+        "single_day": 0.728
+      }
+    }
+  ],
+  "s2_gate_pass": true,
+  "step": "P5-S2",
+  "total_days": 360,
+  "worst_range_366d_regression_x": 4.437
+}

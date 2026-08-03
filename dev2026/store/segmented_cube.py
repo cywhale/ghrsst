@@ -327,7 +327,11 @@ class SegmentedCubeStore:
     # ---- the read path (§6.2: grouped by segment, never by day) --------------
     def point_series(self, lon: float, lat: float, days: Sequence[str],
                      fields: Sequence[str]) -> List[dict]:
-        m = self._meta                              # ONE snapshot for the whole call
+        return self.point_series_from(self._meta, lon, lat, days, fields)
+
+    def point_series_from(self, m: _Meta, lon: float, lat: float, days: Sequence[str],
+                          fields: Sequence[str]) -> List[dict]:
+        """Read against a CALLER-SUPPLIED snapshot — see `TimeCubeStore.point_series_from`."""
         by_segment: Dict[int, List[str]] = {}
         for d in days:
             hit = m.day_map.get(d)
@@ -340,6 +344,8 @@ class SegmentedCubeStore:
         rows: Dict[str, dict] = {}
         for seg_idx, seg_days in by_segment.items():
             # ONE call per segment, not per day
-            for row in m.stores[seg_idx].point_series(lon, lat, seg_days, fields):
+            store = m.stores[seg_idx]
+            for row in store.point_series_from(store._meta, lon, lat,
+                                               seg_days, fields):
                 rows[row["date"]] = row
         return [rows[d] for d in days if d in rows]   # requested order preserved
