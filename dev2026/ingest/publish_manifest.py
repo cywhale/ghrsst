@@ -39,6 +39,7 @@ from typing import Dict, List, Optional, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from ingest.build_block import SOURCE_ORDER   # noqa: E402  -- one list, not a second copy
 from store import block_manifest as bm         # noqa: E402
 from store import repair_wal as rw            # noqa: E402
 from store.compaction_lock import refuse_if_compaction_running   # noqa: E402
@@ -63,8 +64,130 @@ class PublishRefused(Exception):
 _ABSENT = object()
 
 
+#: The record shape `build_block.source_map_record()` emits. Exactly these keys.
+_SRC_FIELDS = ("source_kind", "source_path", "source_day_index")
+
+
+def validate_source_map(sources, segment: dict, *, where: str) -> dict:
+    """Strict validation of `build_provenance.sources` against the segment that carries it.
+
+    Comparing two copies of a map only proves they agree; it says nothing about whether either
+    is *well-formed*, and a self-consistent map is still trusted input. Anyone able to edit a
+    plan can edit both copies and recompute `manifest_checksum`, so the map must be validated
+    on its own terms:
+
+    * exactly the three fields `build_block` writes, no more;
+    * `source_kind` from the resolver's own `SOURCE_ORDER` -- otherwise an unknown kind falls
+      through `staleness_guard`'s `else` branch and is silently treated as a non-delta source,
+      skipping the realpath and index checks entirely;
+    * `source_day_index` a **raw** non-negative `int`. Not `int(x)`: the coercion accepts
+      `"3"`, `3.9` and `True`, so a string index would compare unequal to the live index and
+      the refusal would look like drift rather than like malformed input;
+    * `source_path` a non-empty absolute path, since it is compared against a `realpath`;
+    * keys **exactly** the segment's declared present days -- a map missing a day leaves that
+      day unguarded, and an extra day guards something the block does not contain.
+    """
+    if not isinstance(sources, dict):
+        raise PublishRefused(f"{where}: build_provenance.sources must be an object, got "
+                             f"{type(sources).__name__}")
+    if not sources:
+        raise PublishRefused(
+            f"{where}: the segment carries no build_provenance.sources, so there is nothing "
+            f"for the staleness guard to re-verify. A block published without provenance "
+            f"cannot be shown to have read what it claims (§5, P5-S3 round 4).")
+
+    for day, rec in sorted(sources.items()):
+        if not isinstance(day, str):
+            raise PublishRefused(f"{where}: source map key {day!r} is not a string")
+        if not isinstance(rec, dict):
+            raise PublishRefused(f"{where}: source map entry for {day} is not an object")
+        missing = [k for k in _SRC_FIELDS if k not in rec]
+        extra = [k for k in rec if k not in _SRC_FIELDS]
+        if missing or extra:
+            raise PublishRefused(
+                f"{where}: source map entry for {day} has the wrong field set "
+                f"(missing={missing}, unexpected={extra})")
+        if rec["source_kind"] not in SOURCE_ORDER:
+            raise PublishRefused(
+                f"{where}: source map entry for {day} has source_kind "
+                f"{rec['source_kind']!r}, not one of {list(SOURCE_ORDER)}. An unrecognised "
+                f"kind would be guarded as a non-delta source, skipping the realpath and "
+                f"index checks a delta day requires.")
+        idx = rec["source_day_index"]
+        if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
+            raise PublishRefused(
+                f"{where}: source map entry for {day} has source_day_index {idx!r} "
+                f"({type(idx).__name__}); it must be a non-negative int, not something that "
+                f"merely converts to one")
+        path = rec["source_path"]
+        if not isinstance(path, str) or not path or not os.path.isabs(path):
+            raise PublishRefused(
+                f"{where}: source map entry for {day} has source_path {path!r}; it must be a "
+                f"non-empty absolute path, because it is compared against a realpath")
+
+    declared = set(bm.declared_present_days(segment))
+    if set(sources) != declared:
+        only_map = sorted(set(sources) - declared)
+        only_seg = sorted(declared - set(sources))
+        raise PublishRefused(
+            f"{where}: the source map does not cover the segment's present days exactly "
+            f"(in map only: {only_map[:3]}, in segment only: {only_seg[:3]}). A day missing "
+            f"from the map is a day the staleness guard never checks.")
+    return dict(sources)
+
+
+def bind_provenance_to_block(sources: dict, block_path: str, *, where: str) -> None:
+    """Tie the map to the **block on disk**, not to another copy of itself.
+
+    Everything up to here is plan-internal: two maps agreeing, and a map that is well-formed.
+    Neither reaches outside the document. This opens the block that is about to be published
+    and requires the map to cover exactly the days it actually contains.
+
+    **What this does and does not establish.** It establishes that the map describes *this*
+    block rather than some other one, which is what makes a forged map fail unless the forger
+    also rebuilds the block. It does **not** establish that each day was read from the
+    `source_path` and `source_day_index` the map claims -- nothing on disk records that except
+    the map itself. Full binding needs the builder to emit a checksummed artifact alongside the
+    block; `verify_build_artifact()` checks one when it is available, and §9 records the
+    residual gap plainly rather than letting this read as more than it is.
+    """
+    insp = bm.inspect_store_contract(block_path)
+    actual = set(insp.days)
+    if set(sources) != actual:
+        only_map = sorted(set(sources) - actual)
+        only_block = sorted(actual - set(sources))
+        raise PublishRefused(
+            f"{where}: the source map does not match the days actually present in "
+            f"{block_path} (in map only: {only_map[:3]}, in block only: {only_block[:3]}). "
+            f"The map describes a different block than the one being published.")
+
+
+def verify_build_artifact(sources: dict, artifact_path: str, *, segment_id: str,
+                          where: str) -> None:
+    """Cross-check the map against the builder's own `p5_block_plan.json`, when it exists.
+
+    This is the only evidence outside the manifest of what the build actually read, so when it
+    is available it is authoritative and a disagreement refuses."""
+    with open(artifact_path) as fh:
+        artifact = json.load(fh)
+    built = artifact.get("segment", {}).get("segment_id")
+    if built != segment_id:
+        raise PublishRefused(
+            f"{where}: build artifact {artifact_path} describes segment {built!r}, not "
+            f"{segment_id!r}")
+    recorded = ((artifact.get("segment", {}).get("build_provenance") or {}).get("sources")
+                or artifact.get("source_map") or {})
+    if recorded != sources:
+        differing = sorted(d for d in set(recorded) & set(sources) if recorded[d] != sources[d])
+        raise PublishRefused(
+            f"{where}: the manifest's source map disagrees with the builder's own record in "
+            f"{artifact_path} (differing: {differing[:3]}, only in manifest: "
+            f"{sorted(set(sources) - set(recorded))[:3]}). The builder's record is the only "
+            f"evidence outside the manifest of what was actually read.")
+
+
 def _segment_provenance(segment: dict) -> dict:
-    return dict((segment.get("build_provenance") or {}).get("sources") or {})
+    return (segment.get("build_provenance") or {}).get("sources")
 
 
 def _validate_plan_source_map(segment: dict, supplied, *, where: str) -> dict:
@@ -77,12 +200,7 @@ def _validate_plan_source_map(segment: dict, supplied, *, where: str) -> dict:
     would sail through a guard that had already been satisfied. **Both entry points call
     this**, and execution re-derives the authority from the manifest it is about to publish.
     """
-    provenance = _segment_provenance(segment)
-    if not provenance:
-        raise PublishRefused(
-            f"{where}: the segment carries no build_provenance.sources, so there is nothing "
-            f"for the staleness guard to re-verify. A block published without provenance "
-            f"cannot be shown to have read what it claims (§5, P5-S3 round 4).")
+    provenance = validate_source_map(_segment_provenance(segment) or {}, segment, where=where)
     if supplied is _ABSENT:
         return provenance                       # nothing to contradict; the segment is used
     if not isinstance(supplied, dict):
@@ -306,6 +424,7 @@ def _read_delta_days(delta_path: Optional[str]) -> List[str]:
 # --------------------------------------------------------------------------- execute
 def execute_publication(plan: dict, *, ingest_lock_path: str, delta_path: Optional[str] = None,
                         compaction_lock_path: Optional[str] = None,
+                        build_artifact_path: Optional[str] = None,
                         operator: str = "", now: Optional[datetime] = None) -> dict:
     """§7.4 steps 1-4. The commit point is `os.replace`, inside `bm.publish`.
 
@@ -329,6 +448,9 @@ def execute_publication(plan: dict, *, ingest_lock_path: str, delta_path: Option
             f"the block it claims")
     source_map = _validate_plan_source_map(published[0], plan.get("source_map", _ABSENT),
                                            where="at publication")
+    if build_artifact_path:
+        verify_build_artifact(source_map, build_artifact_path,
+                              segment_id=plan["new_segment_id"], where="at publication")
 
     if compaction_lock_path:
         # A build holding the lock may still be writing the very block we are about to
@@ -362,6 +484,10 @@ def execute_publication(plan: dict, *, ingest_lock_path: str, delta_path: Option
                     "reason": (f"generation {plan['generation']} references block(s) that are "
                                f"not present: {missing[:3]}. Publishing would produce a "
                                f"manifest whose snapshot build fails closed.")}
+
+        # ...and the map must describe THAT block, not merely be internally consistent.
+        bind_provenance_to_block(source_map, _seg_path(root, published[0]),
+                                 where="at publication")
 
         archive = bm.publish(root, plan["manifest"])
         _append_log(root, MANIFEST_LOG, {

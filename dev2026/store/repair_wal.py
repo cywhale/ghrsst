@@ -336,14 +336,19 @@ def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc
         fcntl.flock(fd, fcntl.LOCK_EX)           # blocking: held only for the append itself
         state = parse_wal(path)                  # <- refuses the append if anything is wrong
         seq = state.last_seq + 1
+        # NOT `payload or {}`: a dict subclass whose __bool__ is False would be silently
+        # replaced by an empty payload, which is the same laundering the type check above
+        # exists to prevent -- and worse, because the record would then be written with
+        # content the caller never asked for. Only `None` means "no payload".
+        payload_obj = {} if payload is None else dict(payload)
         if repair_id is None:
             if record != INTENT:
                 raise WalError("only an intent may allocate its own repair_id")
             repair_id = f"{uuid.uuid4()}-{seq}"
         _check_transition(state, record=record, repair_id=repair_id, day=day,
-                          payload=payload or {}, next_seq=seq)
+                          payload=payload_obj, next_seq=seq)
         rec = {"seq": seq, "repair_id": repair_id, "day": day, "record": record,
-               "at_utc": at_utc, "operator": operator, "payload": dict(payload or {}),
+               "at_utc": at_utc, "operator": operator, "payload": payload_obj,
                "prev_checksum": state.last_checksum if seq > 1 else None,
                "record_checksum": ""}
         rec["record_checksum"] = record_checksum(rec)

@@ -12,10 +12,12 @@ was folded.
 
 - Repair WAL: [`../store/repair_wal.py`](../store/repair_wal.py)
 - Publish / lifecycle / rollback: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py)
-- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **88/88 green**
-- Full local suite: **544 tests OK** (17 skipped), up from 456.
+- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **103/103 green**
+- Full local suite: **559 tests OK** (17 skipped), up from 456.
 
-**Review rounds 2 and 3** raised five findings and one; §8–§9 record what each changed.
+**Review rounds 2, 3 and 4** raised five, one and three findings; §8–§10 record what each changed.
+
+**This step does not claim crash safety.** It claims that each individual operation either commits or leaves the live manifest byte-unchanged. Two states are known-ambiguous and are P5-S5's job, not this step's (§10.3).
 
 ## 1. The repair WAL (§7.5a-1) — identity, never time
 
@@ -155,7 +157,7 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_phase2_p5s4
 
 ## 7. Mutation verification
 
-Every guard was disabled in turn and the suite re-run; **all 50 fail**. One further mutation survives by construction and is discussed below the table.
+Every guard was disabled in turn and the suite re-run; **all 61 fail**. One further mutation survives by construction and is discussed below the table.
 
 | guard disabled | result |
 |---|---|
@@ -209,6 +211,17 @@ Every guard was disabled in turn and the suite re-run; **all 50 fail**. One furt
 | authority taken from a planning-time copy | FAILED (3 + 4) |
 | plan/manifest segment identity unchecked | FAILED |
 | writer coerces `payload` with `dict()` | FAILED |
+| `source_kind` not restricted to `SOURCE_ORDER` | FAILED (2) |
+| index accepted via `int()` coercion | FAILED (4) |
+| `source_path` not required absolute | FAILED (3) |
+| record field set not checked | FAILED |
+| map need not cover the segment's present days | FAILED |
+| provenance not bound to the block on disk | FAILED |
+| block binding compares nothing | FAILED |
+| build artifact not cross-checked | FAILED |
+| build artifact segment identity unchecked | FAILED |
+| validator not run at publication | FAILED (5) |
+| `payload` falsey-subclass emptied | FAILED |
 
 **Two mutations initially survived, and both were my tests passing for the wrong reason** — the
 same failure mode the last three review rounds found, caught here by the mutation run rather
@@ -364,3 +377,60 @@ Making `staleness_guard` read `plan.get("source_map") or source_map` instead of 
 ingest lock is taken**, so by the time the guard runs the two are equal by construction and
 nothing between them mutates the plan. That mutation is redundant code, not an untested guard,
 and it is recorded here rather than listed above as if a test were holding it.
+
+## 10. Review round 4 — three findings
+
+### 1. [High] The provenance map was compared, never validated
+
+Rounds 2–3 made the two copies agree and bound the authority to the manifest being published.
+Both are about *agreement*. Neither asks whether the map is **well-formed**, and neither reaches
+outside the document — so anyone able to edit a plan could edit both copies, recompute
+`manifest_checksum`, and hand the guard a self-consistent map that need not describe the actual
+build.
+
+`validate_source_map()` now checks each record on its own terms. The one that mattered most:
+`source_kind` must be one of the resolver's own `SOURCE_ORDER` — an unrecognised kind fell
+through `staleness_guard`'s `else` branch and was silently treated as a **non-delta** source,
+skipping the realpath and index checks that a delta day requires. That is a bypass of the round-2
+fix, reachable by writing `"netcdf"` into one entry.
+
+Also: exactly the three fields `build_block` emits; `source_day_index` a **raw** non-negative
+`int` (not `int(x)` — the coercion accepts `"3"`, `3.9` and `True`, so a string index would
+compare unequal to the live index and the refusal would read as *drift* rather than as malformed
+input); `source_path` a non-empty absolute path, since it is compared against a `realpath`; and
+keys **exactly** the segment's declared present days, because a day missing from the map is a day
+the guard never looks at. `SOURCE_ORDER` is imported from `build_block` rather than copied.
+
+**Binding to the artifact, and the part that is still not bound.** `bind_provenance_to_block()`
+opens the block about to be published and requires the map to cover exactly the days it actually
+contains — so a forged map fails unless the forger also rebuilds the block. `verify_build_artifact()`
+cross-checks the builder's own `p5_block_plan.json` when a path is supplied, and that record wins
+on disagreement.
+
+What is **still** self-asserted: that each day was read from the `source_path` and
+`source_day_index` the map claims. Nothing on disk records that except the map itself, so the
+binding is to *which block* and *which days*, not to *which bytes were read*. Closing it properly
+needs the builder to emit a checksummed provenance artifact alongside the block, which is a P5-S5
+item. Stating it rather than letting "bound to the artifact" read as more than it is.
+
+### 2. [Medium] `payload or {}` emptied a falsey dict subclass
+
+A `dict` subclass with a `__bool__` returning `False` but real contents was silently replaced by
+`{}` — the same laundering the round-3 type check was added to prevent, and worse, because the
+record would then be written with content the caller never asked for. Now
+`{} if payload is None else dict(payload)`: only `None` means "no payload". Tested with a
+subclass that is falsey and non-empty at once, both for the written record and for the replay
+comparison.
+
+### 3. [Medium] Audit-log failure after the manifest commits — NOT fixed here
+
+Confirmed and deliberately deferred. If `_append_log` fails after `bm.publish` succeeds, the
+manifest is committed, the caller sees an exception, and a naive retry hits "generation archive
+already exists". The ordering is intentional — logging *before* the commit yields the worse
+ambiguity of a trail claiming a move that was rolled back — but this step does **not** resolve
+it, and the summary above no longer implies it does.
+
+P5-S5 must define and test: the manifest is authoritative; the hold/manifest logs are
+reconstructible from the generation archives; and a retry after a committed-but-unlogged publish
+must be able to recognise "already committed" and complete idempotently rather than refuse on the
+archive.

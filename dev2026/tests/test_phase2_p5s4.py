@@ -1253,7 +1253,203 @@ class TestWalWriterDoesNotLaunderPayload(_Base):
                   at_utc="t", operator="o", payload=D(expected_vars=["sst"]))
         self.assertEqual(rw.read_wal(self.tmp).last_seq, 1)
 
+    def test_a_FALSEY_dict_subclass_keeps_its_contents(self):
+        """`payload or {}` would replace this with an empty payload -- writing a record with
+        content the caller never asked for, which is worse than rejecting it."""
+        class Falsey(dict):
+            def __bool__(self):
+                return False
+
+        payload = Falsey(fingerprint="fp1", expected_vars=["sst"])
+        self.assertFalse(payload, "precondition: it really is falsey")
+        self.assertTrue(len(payload), "precondition: and really is non-empty")
+        rw.append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
+                  at_utc="t", operator="o", payload=payload)
+        self.assertEqual(rw.read_wal(self.tmp).records[0]["payload"],
+                         {"fingerprint": "fp1", "expected_vars": ["sst"]})
+
+    def test_a_falsey_subclass_replay_is_compared_on_CONTENT(self):
+        """The replay comparison must see the real payload too, not an emptied one."""
+        class Falsey(dict):
+            def __bool__(self):
+                return False
+
+        rid = self._open_repair(self.span[0])
+        self._commit(rid, self.span[0], "fp1", vars=["sst"])
+        with self.assertRaises(rw.WalError):
+            rw.append(self.tmp, record=rw.COMMITTED, repair_id=rid, day=self.span[0],
+                      at_utc="t", operator="o",
+                      payload=Falsey(fingerprint="fp1", vars=["sst", "sea_ice"]))
+
     def test_an_absent_payload_is_still_allowed(self):
         rw.append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
                   at_utc="t", operator="o")
         self.assertEqual(rw.read_wal(self.tmp).records[0]["payload"], {})
+
+
+# ============================================ review round 4: the map is VALIDATED and BOUND
+class TestSourceMapIsStrictlyValidated(_Base):
+    """Two copies agreeing proves they agree. It says nothing about whether either is
+    well-formed -- and anyone who can edit a plan can edit both copies and recompute
+    `manifest_checksum`, so a self-consistent map is still untrusted input."""
+
+    def setUp(self):
+        super().setUp()
+        self._live_gen1()
+        self.delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(self.delta, self.span[:60])
+
+    def _plan_src(self, mutate=None):
+        src = self._plan_for_v2(self.delta, self.span[:60])
+        if mutate:
+            mutate(src["segment"]["build_provenance"]["sources"])
+        src["source_map"] = src["segment"]["build_provenance"]["sources"]
+        return src
+
+    def _refused(self, mutate):
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.plan_publication(self.root, self._plan_src(mutate), now=T0)
+        return str(cm.exception)
+
+    def test_an_unknown_source_kind_is_refused(self):
+        """The one that matters most: an unrecognised kind falls through the guard's `else`
+        branch and is treated as a non-delta source, skipping realpath and index entirely."""
+        def m(s):
+            s[self.span[0]] = dict(s[self.span[0]], source_kind="netcdf")
+        msg = self._refused(m)
+        self.assertIn("source_kind", msg)
+        self.assertIn("skipping the realpath and index checks", msg)
+
+    def test_a_string_index_is_refused_not_coerced(self):
+        def m(s):
+            s[self.span[0]] = dict(s[self.span[0]], source_day_index="0")
+        self.assertIn("not something that merely converts", self._refused(m))
+
+    def test_a_float_or_bool_index_is_refused(self):
+        for bad in (0.0, True, -1):
+            with self.subTest(bad=bad):
+                def m(s, bad=bad):
+                    s[self.span[0]] = dict(s[self.span[0]], source_day_index=bad)
+                self.assertIn("source_day_index", self._refused(m))
+
+    def test_a_relative_or_empty_source_path_is_refused(self):
+        for bad in ("", "delta.zarr", None):
+            with self.subTest(bad=bad):
+                def m(s, bad=bad):
+                    s[self.span[0]] = dict(s[self.span[0]], source_path=bad)
+                self.assertIn("absolute path", self._refused(m))
+
+    def test_an_extra_or_missing_record_field_is_refused(self):
+        def extra(s):
+            s[self.span[0]] = dict(s[self.span[0]], note="hand-edited")
+        self.assertIn("unexpected", self._refused(extra))
+
+        def missing(s):
+            s[self.span[0]] = {"source_kind": "delta"}
+        self.assertIn("missing", self._refused(missing))
+
+    def test_a_map_that_does_not_cover_the_segments_present_days_is_refused(self):
+        """A day missing from the map is a day the staleness guard never checks."""
+        def drop(s):
+            del s[self.span[0]]
+        self.assertIn("never checks", self._refused(drop))
+
+        def add(s):
+            s["2099-01-01"] = {"source_kind": "delta",
+                               "source_path": os.path.realpath(self.delta),
+                               "source_day_index": 0}
+        self.assertIn("does not cover", self._refused(add))
+
+    def test_a_non_object_entry_is_refused(self):
+        def m(s):
+            s[self.span[0]] = ["delta", "/x", 0]
+        self.assertIn("not an object", self._refused(m))
+
+    def test_validation_also_runs_at_publication_not_only_at_planning(self):
+        """A plan edited after planning must be re-validated, not merely re-compared."""
+        plan = pub.plan_publication(self.root, self._plan_src(), now=T0)
+        seg = next(s for s in plan["manifest"]["segments"] if s["segment_id"] == "b_v2")
+        seg["build_provenance"]["sources"][self.span[0]]["source_kind"] = "netcdf"
+        plan["manifest"]["manifest_checksum"] = ""
+        plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
+        del plan["source_map"]
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                    now=T0)
+        self.assertIn("source_kind", str(cm.exception))
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+
+class TestProvenanceIsBoundToTheBlock(_Base):
+    def setUp(self):
+        super().setUp()
+        self._live_gen1()
+        self.delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(self.delta, self.span[:60])
+
+    def test_a_map_describing_a_DIFFERENT_block_is_refused(self):
+        """Everything before this is plan-internal. This opens the block being published and
+        requires the map to cover exactly the days it actually contains -- so a forged map
+        fails unless the forger also rebuilds the block."""
+        src = self._plan_for_v2(self.delta, self.span[:60])
+        # a segment that DECLARES 30 days, with a matching map, but whose block holds 60
+        src["segment"]["day_count"] = 30
+        src["segment"]["unknown"] = self.span[30:]
+        src["segment"]["materialized_through"] = self.span[29]
+        smap = self._smap(self.delta, self.span[:30])
+        src["segment"]["build_provenance"]["sources"] = smap
+        src["source_map"] = smap
+        plan = pub.plan_publication(self.root, src, now=T0)      # internally consistent
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                    now=T0)
+        self.assertIn("different block", str(cm.exception))
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+    def test_a_matching_map_publishes(self):
+        plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                      now=T0)
+        self.assertEqual(out["status"], "published")
+
+    def test_a_build_artifact_that_disagrees_is_refused(self):
+        """The builder's own p5_block_plan.json is the only record outside the manifest of
+        what was actually read, so when it exists it wins."""
+        src = self._plan_for_v2(self.delta, self.span[:60])
+        artifact = os.path.join(self.tmp, "p5_block_plan.json")
+        other = self._smap(self.delta, self.span[:60])
+        other[self.span[0]] = dict(other[self.span[0]], source_day_index=41)
+        with open(artifact, "w") as fh:
+            json.dump({"segment": {"segment_id": "b_v2",
+                                   "build_provenance": {"sources": other}}}, fh)
+        plan = pub.plan_publication(self.root, src, now=T0)
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                    build_artifact_path=artifact, now=T0)
+        self.assertIn("builder's own record", str(cm.exception))
+
+    def test_a_build_artifact_for_another_segment_is_refused(self):
+        src = self._plan_for_v2(self.delta, self.span[:60])
+        artifact = os.path.join(self.tmp, "p5_block_plan.json")
+        with open(artifact, "w") as fh:
+            json.dump({"segment": {"segment_id": "someone_else",
+                                   "build_provenance": {"sources": src["source_map"]}}}, fh)
+        plan = pub.plan_publication(self.root, src, now=T0)
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                    build_artifact_path=artifact, now=T0)
+        self.assertIn("describes segment", str(cm.exception))
+
+    def test_an_agreeing_build_artifact_publishes(self):
+        src = self._plan_for_v2(self.delta, self.span[:60])
+        artifact = os.path.join(self.tmp, "p5_block_plan.json")
+        with open(artifact, "w") as fh:
+            json.dump({"segment": {"segment_id": "b_v2",
+                                   "build_provenance": {"sources": src["source_map"]}}}, fh)
+        plan = pub.plan_publication(self.root, src, now=T0)
+        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                      build_artifact_path=artifact, now=T0)
+        self.assertEqual(out["status"], "published")
