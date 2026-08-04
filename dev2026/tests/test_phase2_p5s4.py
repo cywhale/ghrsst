@@ -35,17 +35,30 @@ T0 = datetime(2027, 1, 1, tzinfo=timezone.utc)
 
 
 def _seg(sid, path, start, end, day_count, *, gaps=(), unknown=(), precedence=0,
-         day_digest="d", sealed=True, supersedes=None, provenance=None):
+         day_digest="d", sealed=True, supersedes=None, provenance=None, block_path=None):
+    """A segment entry.
+
+    When `block_path` is given, every store-dependent field is derived from an inspection of
+    that block -- the same way `build_block` derives them, and the same way publication now
+    re-derives them. Hand-written placeholders would make the binding test pass or fail for
+    reasons unrelated to what it is testing."""
     known = [d for d in fx.calendar_span(start, end) if d not in set(unknown)]
+    layout = {"time_chunk": day_count, "spatial_chunk": 8, "shard": [day_count, 32, 32]}
+    variables, metadata = list(fx.VARS), "m"
+    if block_path:
+        insp = bm.inspect_store_contract(block_path)
+        layout = bm.segment_layout_from_inspection(insp)
+        variables = sorted(insp.vars)
+        metadata = bm.metadata_fingerprint_from_inspection(insp)
+        day_digest = bm.day_digest(insp.days)
+        day_count = len(insp.days)
     return {
         "segment_id": sid, "kind": "block", "path": path, "immutable": True,
         "boundary_kind": "calendar", "start_day": start, "end_day": end,
         "materialized_through": max(known) if known else start, "day_count": day_count,
         "gaps": list(gaps), "unknown": list(unknown), "day_list": None,
-        "layout": {"time_chunk": day_count, "spatial_chunk": 8,
-                   "shard": [day_count, 32, 32]},
-        "variables": list(fx.VARS),
-        "fingerprint": {"algo": "sha256", "metadata": "m", "day_digest": day_digest},
+        "layout": layout, "variables": variables,
+        "fingerprint": {"algo": "sha256", "metadata": metadata, "day_digest": day_digest},
         "precedence": precedence, "sealed": sealed, "supersedes": supersedes,
         **({"build_provenance": provenance} if provenance else {}),
     }
@@ -116,10 +129,9 @@ class _Base(unittest.TestCase):
 
     def _live_gen1(self, *, with_block=True):
         days = self.span[:30]
-        if with_block:
-            self._block("b_v1", days)
+        path = self._block("b_v1", days) if with_block else None
         seg = _seg("b_v1", "b_v1.zarr", self.s0, self.e0, 30, unknown=self.span[30:],
-                   sealed=False, day_digest=bm.day_digest(days))
+                   sealed=False, day_digest=bm.day_digest(days), block_path=path)
         bm.publish(self.root, self._manifest([seg]))
         return seg, days
 
@@ -139,7 +151,7 @@ class _Base(unittest.TestCase):
         smap = self._smap(delta_path, days_v2) if smap is None else smap
         seg = _seg("b_v2", "b_v2.zarr", self.s0, self.e0, len(days_v2),
                    unknown=self.span[len(days_v2):], sealed=False, supersedes="b_v1",
-                   day_digest=bm.day_digest(days_v2),
+                   day_digest=bm.day_digest(days_v2), block_path=path,
                    provenance={"sources": smap, "materialized_repairs": {},
                                "source_map_digest": "sha256:test"})
         return {"segment": seg, "out_path": path, "source_map": smap,
@@ -1453,3 +1465,197 @@ class TestProvenanceIsBoundToTheBlock(_Base):
         out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       build_artifact_path=artifact, now=T0)
         self.assertEqual(out["status"], "published")
+
+
+# ============================ review round 5: full block binding + kind-specific source checks
+class TestSegmentEntryIsBoundToTheBlock(_Base):
+    """A manifest that passes its own checksum but disagrees with the block is not caught until
+    a snapshot build fails closed -- which is an outage (stale in-memory snapshot, unusable
+    manifest on disk) rather than a refusal."""
+
+    def setUp(self):
+        super().setUp()
+        self._live_gen1()
+        self.delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(self.delta, self.span[:60])
+
+    def _edited(self, mutate):
+        plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+        seg = next(s for s in plan["manifest"]["segments"] if s["segment_id"] == "b_v2")
+        mutate(seg, plan["manifest"])
+        plan["manifest"]["manifest_checksum"] = ""
+        plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
+        bm.validate_manifest(plan["manifest"])     # precondition: still schema-legal
+        del plan["source_map"]
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                    now=T0)
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before,
+                         "the live manifest must be byte-identical after a refusal")
+        return str(cm.exception)
+
+    def test_an_edited_layout_is_refused(self):
+        def m(seg, manifest):
+            seg["layout"] = dict(seg["layout"], spatial_chunk=16)
+        self.assertIn("layout", self._edited(m))
+
+    def test_an_edited_variable_list_is_refused(self):
+        """The segment list and the top-level list must both be edited to stay schema-legal,
+        which is exactly what an editor forging a manifest would do."""
+        def m(seg, manifest):
+            seg["variables"] = ["sst"]
+            manifest["variables"] = ["sst"]
+        self.assertIn("variables", self._edited(m))
+
+    def test_an_edited_metadata_fingerprint_is_refused(self):
+        def m(seg, manifest):
+            seg["fingerprint"] = dict(seg["fingerprint"], metadata="0" * 64)
+        self.assertIn("fingerprint.metadata", self._edited(m))
+
+    def test_an_edited_day_digest_is_refused(self):
+        def m(seg, manifest):
+            seg["fingerprint"] = dict(seg["fingerprint"], day_digest="0" * 64)
+        self.assertIn("fingerprint.day_digest", self._edited(m))
+
+    def test_day_count_is_bound_too_although_an_earlier_guard_usually_wins(self):
+        """`day_count` cannot be edited in isolation and stay schema-legal -- changing it means
+        changing `gaps`/`unknown`, which changes the declared present days, which the source-map
+        coverage check catches first. So the publication path refuses either way; the binding
+        arm itself is defence in depth and is tested where it can actually be reached."""
+        block = self._block("probe", self.span[:10])
+        seg = _seg("probe", "probe.zarr", self.s0, self.e0, 10, unknown=self.span[10:],
+                   sealed=False, block_path=block)
+        seg["day_count"] = 9
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.bind_segment_to_block(seg, {d: {} for d in self.span[:10]}, block,
+                                      {"ny": 32, "nx": 32, "region": [0, 32, 0, 32]},
+                                      where="probe")
+        self.assertIn("day_count", str(cm.exception))
+
+        def m(seg, manifest):
+            seg["day_count"] = 59
+            seg["gaps"] = [self.span[0]]
+        self.assertIn("never checks", self._edited(m))       # the earlier guard, still a refusal
+
+    def test_a_grid_that_does_not_match_the_block_is_refused(self):
+        plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+        plan["manifest"]["grid"] = {"ny": 64, "nx": 64, "region": [0, 64, 0, 64]}
+        plan["manifest"]["manifest_checksum"] = ""
+        plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                    now=T0)
+        self.assertIn("manifest grid declares", str(cm.exception))
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+    def test_a_carried_forward_entry_that_was_edited_is_refused(self):
+        """Published blocks are immutable, so their entries must be too -- and re-inspecting
+        every segment on every publish would be disk work for no new information."""
+        src = self._plan_for_v2(self.delta, self.span[:60])
+        src["segment"]["supersedes"] = None                    # keep b_v1 in `segments`
+        src["segment"]["start_day"], src["segment"]["end_day"] = bm.block_bounds(ANCHOR, S, 1)
+        s1, e1 = src["segment"]["start_day"], src["segment"]["end_day"]
+        days = fx.calendar_span(s1, e1)[:60]
+        shutil.rmtree(src["out_path"])
+        fx.build_block(src["out_path"], days)
+        src["segment"] = _seg("b_v2", "b_v2.zarr", s1, e1, 60, unknown=fx.calendar_span(s1, e1)[60:],
+                              sealed=False, precedence=1, block_path=src["out_path"],
+                              provenance={"sources": self._smap(self.delta, days),
+                                          "materialized_repairs": {},
+                                          "source_map_digest": "sha256:test"})
+        src["source_map"] = src["segment"]["build_provenance"]["sources"]
+        fx.build_delta(self.delta, days)
+        plan = pub.plan_publication(self.root, src, now=T0)
+        old = next(s for s in plan["manifest"]["segments"] if s["segment_id"] == "b_v1")
+        old["variables"] = ["sst"]                             # edit the CARRIED entry
+        plan["manifest"]["manifest_checksum"] = ""
+        plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                      now=T0)
+        self.assertEqual(out["status"], "refused")
+        self.assertIn("b_v1", out["reason"])
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+
+class TestSourceKindIsCheckedOnItsOwnTerms(_Base):
+    """One branch for every non-delta kind made `source_kind` almost decorative."""
+
+    def setUp(self):
+        super().setUp()
+        self._live_gen1()
+        self.delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(self.delta, self.span[:60])
+        self.daily = os.path.join(self.tmp, "mur.zarr")
+        fx.build_daily(self.daily, self.span[:60])
+
+    def _run(self, smap):
+        plan = pub.plan_publication(
+            self.root, self._plan_for_v2(self.delta, self.span[:60], smap=smap), now=T0)
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                      now=T0)
+        if out.get("published"):
+            return out
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+        return out
+
+    def test_a_block_source_pointing_at_a_daily_root_is_refused(self):
+        smap = self._smap(self.delta, self.span[:60], kind="block", root=self.daily)
+        out = self._run(smap)
+        self.assertEqual(out["status"], "aborted_stale")
+        self.assertIn("not a block published in the live manifest", out["reason"])
+
+    def test_a_block_source_naming_an_UNPUBLISHED_block_is_refused(self):
+        stray = os.path.join(self.tmp, "stray.zarr")
+        fx.build_block(stray, self.span[:60])
+        out = self._run(self._smap(self.delta, self.span[:60], kind="block", root=stray))
+        self.assertEqual(out["status"], "aborted_stale")
+        self.assertIn("not a block published", out["reason"])
+
+    def test_a_block_source_with_the_WRONG_index_is_refused(self):
+        published = os.path.join(self.root, "b_v1.zarr")
+        smap = {d: {"source_kind": "block", "source_path": os.path.realpath(published),
+                    "source_day_index": i + 7} for i, d in enumerate(self.span[:30])}
+        plan = pub.plan_publication(
+            self.root, self._plan_for_v2(self.delta, self.span[:30], smap=smap), now=T0)
+        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                      now=T0)
+        self.assertEqual(out["status"], "aborted_stale")
+        self.assertIn("holds this day at index", out["reason"])
+
+    def test_a_block_source_that_IS_published_at_the_right_index_passes(self):
+        published = os.path.join(self.root, "b_v1.zarr")
+        smap = {d: {"source_kind": "block", "source_path": os.path.realpath(published),
+                    "source_day_index": i} for i, d in enumerate(self.span[:30])}
+        plan = pub.plan_publication(
+            self.root, self._plan_for_v2(self.delta, self.span[:30], smap=smap), now=T0)
+        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                      now=T0)
+        self.assertEqual(out["status"], "published")
+
+    def test_a_daily_source_with_a_nonzero_index_is_refused(self):
+        smap = {d: {"source_kind": "daily", "source_path": os.path.realpath(self.daily),
+                    "source_day_index": i} for i, d in enumerate(self.span[:60])}
+        out = self._run(smap)
+        self.assertEqual(out["status"], "aborted_stale")
+        self.assertIn("index 0 is the only meaningful value", out["reason"])
+
+    def test_a_hold_source_with_index_zero_passes(self):
+        hold = os.path.join(self.tmp, "hold_daily")
+        fx.build_daily(hold, self.span[:60])
+        smap = {d: {"source_kind": "hold", "source_path": os.path.realpath(hold),
+                    "source_day_index": 0} for d in self.span[:60]}
+        self.assertEqual(self._run(smap)["status"], "published")
+
+    def test_a_block_source_refuses_when_no_resolver_is_supplied(self):
+        """An unverifiable claim is not a weaker claim; it is no claim."""
+        smap = {self.span[0]: {"source_kind": "block", "source_path": "/somewhere/b.zarr",
+                               "source_day_index": 0}}
+        out = pub.staleness_guard(smap, delta_path=None, live_days=[])
+        self.assertEqual(out["status"], "aborted_stale")
+        self.assertIn("cannot be checked", out["reason"])

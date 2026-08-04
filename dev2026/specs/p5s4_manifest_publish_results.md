@@ -12,10 +12,10 @@ was folded.
 
 - Repair WAL: [`../store/repair_wal.py`](../store/repair_wal.py)
 - Publish / lifecycle / rollback: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py)
-- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **103/103 green**
-- Full local suite: **559 tests OK** (17 skipped), up from 456.
+- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **117/117 green**
+- Full local suite: **573 tests OK** (17 skipped), up from 456.
 
-**Review rounds 2, 3 and 4** raised five, one and three findings; §8–§10 record what each changed.
+**Review rounds 2–5** raised five, one, three and two findings; §8–§11 record what each changed.
 
 **This step does not claim crash safety.** It claims that each individual operation either commits or leaves the live manifest byte-unchanged. Two states are known-ambiguous and are P5-S5's job, not this step's (§10.3).
 
@@ -157,7 +157,7 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_phase2_p5s4
 
 ## 7. Mutation verification
 
-Every guard was disabled in turn and the suite re-run; **all 61 fail**. One further mutation survives by construction and is discussed below the table.
+Every guard was disabled in turn and the suite re-run; **all 70 fail**. One further mutation survives by construction and is discussed below the table.
 
 | guard disabled | result |
 |---|---|
@@ -222,6 +222,15 @@ Every guard was disabled in turn and the suite re-run; **all 61 fail**. One furt
 | build artifact segment identity unchecked | FAILED |
 | validator not run at publication | FAILED (5) |
 | `payload` falsey-subclass emptied | FAILED |
+| segment fields not re-derived from the block | FAILED (5) |
+| grid not compared to the block | FAILED |
+| grid shape ignored | FAILED |
+| carried-forward entries not compared | FAILED |
+| block sources not resolved against published blocks | FAILED (3) |
+| block source index not compared | FAILED |
+| block source without a resolver allowed | FAILED |
+| daily/hold index not pinned to 0 | FAILED |
+| unpublished path accepted as a block source | FAILED |
 
 **Two mutations initially survived, and both were my tests passing for the wrong reason** — the
 same failure mode the last three review rounds found, caught here by the mutation run rather
@@ -434,3 +443,69 @@ P5-S5 must define and test: the manifest is authoritative; the hold/manifest log
 reconstructible from the generation archives; and a retry after a committed-but-unlogged publish
 must be able to recognise "already committed" and complete idempotently rather than refuse on the
 archive.
+
+## 11. Review round 5 — two findings
+
+### 1. [High] Only the day set was bound; the rest of the entry was not
+
+`layout`, `variables`, `fingerprint.metadata` and `day_digest` could each be edited,
+`manifest_checksum` recomputed, and the manifest **published successfully** — with the mismatch
+surfacing later, when `SegmentedCubeStore` fails closed building a snapshot. That converts an
+editable-document error into an outage: the service holds a stale in-memory snapshot and the
+on-disk manifest is unusable. Refusing at publication keeps it a refusal.
+
+`bind_segment_to_block()` now re-derives every store-dependent field from the block on disk
+using **the same functions the reader uses** — `inspect_store_contract` →
+`segment_layout_from_inspection` / `metadata_fingerprint_from_inspection` — and compares. This
+is P5-S3's `build → inspect → fingerprint` discipline applied at the commit point instead of
+only at build time.
+
+**Grid:** shape is always compared; the sub-region only when the block declares one. An absent
+`attrs["region"]` means the block *is* the full grid, and treating that as a mismatch would
+refuse every block the builder writes without a region.
+
+**Carried-forward segments** are compared against the live generation's entries rather than
+re-inspected. Published blocks are immutable, so their entries must be too; an edit to an
+existing entry is the same hazard as an edit to the new one, and this catches it without
+O(segments) disk work on every publish.
+
+*One arm is defence in depth and is tested as such:* `day_count` cannot be edited in isolation
+and stay schema-legal — changing it means changing `gaps`/`unknown`, which changes the declared
+present days, which the source-map coverage check catches first. The publication path refuses
+either way; the binding arm is tested directly against `bind_segment_to_block()`, where it can
+actually be reached, rather than through a test that would pass for the other guard's reason.
+
+*This also required fixing the test fixtures:* segment entries now derive `layout`,
+`variables`, `metadata` and `day_digest` from an inspection of the block, the way production
+does. Hand-written placeholders would have made the binding tests pass or fail for reasons
+unrelated to what they test.
+
+### 2. [Medium] Every non-delta kind went through one branch
+
+That made `source_kind` almost decorative. A `block` entry pointing at a daily root, or a
+`daily` entry carrying an arbitrary index, passed a check that only asked whether *some* path
+existed. Each kind now means something specific and is checked accordingly:
+
+| kind | what must hold |
+|---|---|
+| `delta` | the live delta's realpath, and the day at the recorded index |
+| `block` | a block **published in the live manifest**, holding that day at the recorded index |
+| `daily` / `hold` | the exact `YYYY/MM/DD` group, index `0` |
+
+`daily`/`hold` index is pinned to `0` because a daily group has shape `(1, ny, nx)` — any other
+value indicates a map built by something that did not understand the source.
+
+`_published_block_index()` resolves `{day: index}` lazily and only for paths the **live
+generation** publishes: a `block` source is a claim to have read *published history*, and a
+path that is a legal Zarr store but is not in the manifest is not that. **With no resolver
+supplied, a `block` source refuses** — an unverifiable claim is not a weaker claim, it is no
+claim.
+
+### 3. [Medium, still deferred] Source bytes are still not proven
+
+Unchanged and restated: without `build_artifact_path`, the source map remains a declaration
+inside the manifest. If a source is modified in place after the build, nothing here detects it.
+The round-2/4 checks bind the map to *which block*, *what is in it*, and *whether each recorded
+source still means what its kind says* — none of that is a checksum over the bytes that were
+read. P5-S5 owns the checksummed provenance artifact; **no claim of complete provenance safety
+is made here.**

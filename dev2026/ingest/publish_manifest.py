@@ -136,20 +136,28 @@ def validate_source_map(sources, segment: dict, *, where: str) -> dict:
     return dict(sources)
 
 
-def bind_provenance_to_block(sources: dict, block_path: str, *, where: str) -> None:
-    """Tie the map to the **block on disk**, not to another copy of itself.
+def bind_segment_to_block(segment: dict, sources: dict, block_path: str, grid: dict, *,
+                          where: str) -> None:
+    """Re-derive the segment's every store-dependent field from the block ON DISK and compare.
 
-    Everything up to here is plan-internal: two maps agreeing, and a map that is well-formed.
-    Neither reaches outside the document. This opens the block that is about to be published
-    and requires the map to cover exactly the days it actually contains.
+    Everything before this is plan-internal: two maps agreeing, and a map that is well-formed.
+    Neither reaches outside the document. This opens the block about to be published and
+    rebuilds what the manifest claims about it, using the **same functions the reader uses** --
+    `inspect_store_contract` → `segment_layout_from_inspection` /
+    `metadata_fingerprint_from_inspection`, which is P5-S3's `build → inspect → fingerprint`
+    discipline applied at the commit point rather than only at build time.
 
-    **What this does and does not establish.** It establishes that the map describes *this*
-    block rather than some other one, which is what makes a forged map fail unless the forger
-    also rebuilds the block. It does **not** establish that each day was read from the
-    `source_path` and `source_day_index` the map claims -- nothing on disk records that except
-    the map itself. Full binding needs the builder to emit a checksummed artifact alongside the
-    block; `verify_build_artifact()` checks one when it is available, and §9 records the
-    residual gap plainly rather than letting this read as more than it is.
+    Checking the day set alone was not enough. `layout`, `variables`, `fingerprint.metadata`
+    and `day_digest` could each be edited, `manifest_checksum` recomputed, and the manifest
+    published successfully -- with the mismatch surfacing only later, when `SegmentedCubeStore`
+    fails closed building a snapshot. That turns an editable-document error into an outage: the
+    service holds a stale in-memory snapshot and the on-disk manifest is unusable. Refusing
+    here keeps it a refusal.
+
+    **What this still does not establish.** That each day was read from the `source_path` and
+    `source_day_index` the map claims. Nothing on disk records that except the map itself, so
+    the binding is to *which block* and *what is in it*, not to *which bytes were read*. See
+    §10.
     """
     insp = bm.inspect_store_contract(block_path)
     actual = set(insp.days)
@@ -160,6 +168,47 @@ def bind_provenance_to_block(sources: dict, block_path: str, *, where: str) -> N
             f"{where}: the source map does not match the days actually present in "
             f"{block_path} (in map only: {only_map[:3]}, in block only: {only_block[:3]}). "
             f"The map describes a different block than the one being published.")
+
+    expected = {
+        "day_count": len(insp.days),
+        "layout": bm.segment_layout_from_inspection(insp),
+        "variables": sorted(insp.vars),
+        "fingerprint.metadata": bm.metadata_fingerprint_from_inspection(insp),
+        "fingerprint.day_digest": bm.day_digest(insp.days),
+    }
+    declared = {
+        "day_count": segment["day_count"],
+        "layout": segment["layout"],
+        "variables": sorted(segment["variables"]),
+        "fingerprint.metadata": segment["fingerprint"].get("metadata"),
+        "fingerprint.day_digest": segment["fingerprint"].get("day_digest"),
+    }
+    wrong = sorted(k for k in expected if declared[k] != expected[k])
+    if wrong:
+        detail = "; ".join(f"{k}: manifest {declared[k]!r} vs block {expected[k]!r}"
+                           for k in wrong[:3])
+        raise PublishRefused(
+            f"{where}: the segment entry does not describe {block_path} ({detail}). A manifest "
+            f"that passes its own checksum but disagrees with the block is not caught until a "
+            f"snapshot build fails closed, which is an outage rather than a refusal.")
+
+    if not _grid_matches(insp, grid):
+        raise PublishRefused(
+            f"{where}: {block_path} is {insp.ny}x{insp.nx} region {list(insp.region)}, but the "
+            f"manifest grid declares {grid.get('ny')}x{grid.get('nx')} region "
+            f"{grid.get('region')}")
+
+
+def _grid_matches(insp, grid: dict) -> bool:
+    """Shape always; sub-region only when the block declares one.
+
+    An absent `attrs["region"]` means the block IS the full grid -- it is not a mismatch, and
+    treating it as one would refuse every block the builder writes without a region."""
+    if int(grid.get("ny", -1)) != int(insp.ny) or int(grid.get("nx", -1)) != int(insp.nx):
+        return False
+    if not insp.region:
+        return True
+    return list(grid.get("region") or []) == list(insp.region)
 
 
 def verify_build_artifact(sources: dict, artifact_path: str, *, segment_id: str,
@@ -327,7 +376,8 @@ def plan_publication(root: str, plan: dict, *, release_after_s: int = DEFAULT_RE
 
 # --------------------------------------------------------------------------- staleness guard
 def staleness_guard(source_map: dict, *, delta_path: Optional[str],
-                    live_days: Sequence[str]) -> Optional[dict]:
+                    live_days: Sequence[str],
+                    block_day_index=None) -> Optional[dict]:
     """§7.4 step 1, run **under the ingest lock**. Returns a refusal dict, or None.
 
     The build ran for hours outside the lock. What it read then is a claim; this is where the
@@ -347,8 +397,22 @@ def staleness_guard(source_map: dict, *, delta_path: Optional[str],
     * the live delta must have **unique** days, or the delta is in a state no downstream gate
       can reason about (the P4-S8a shape).
 
-    Non-delta sources are checked at the **exact group**, not the root: a daily root exists for
-    years, so `os.path.exists(root)` proves nothing about whether `YYYY/MM/DD` is still there.
+    **Each kind is checked on its own terms.** Putting every non-delta kind through one branch
+    made `source_kind` almost decorative: a `block` entry pointed at a daily root, or a
+    `daily` entry carrying an arbitrary index, passed a check that only asked whether *some*
+    path existed. What each kind means is different, so what must be true of it is different:
+
+    * `delta` — the live delta's realpath, and the day at the recorded index;
+    * `block` — a block **published in the live manifest**, holding that day at the recorded
+      index. `block_day_index(path)` resolves `{day: index}` for a published block; if the
+      caller supplies no resolver, a `block` source **refuses**, because an unverifiable claim
+      is not a weaker claim, it is no claim;
+    * `daily` / `hold` — the exact `YYYY/MM/DD` group, with index `0`. A daily group has shape
+      `(1, ny, nx)`, so `0` is the only index that means anything and any other value indicates
+      a map built by something that did not understand the source.
+
+    Checking the exact group rather than the root matters on its own: a daily root exists for
+    years, so `os.path.exists(root)` proves nothing about the day.
     """
     live = list(live_days)
     if len(live) != len(set(live)):
@@ -358,20 +422,37 @@ def staleness_guard(source_map: dict, *, delta_path: Optional[str],
     live_index = {d: i for i, d in enumerate(live)}
     live_real = os.path.realpath(delta_path) if delta_path else None
 
-    absent, retargeted, moved, missing_src = [], [], [], []
+    absent, retargeted, moved, missing_src, bad_kind = [], [], [], [], []
     for day, rec in sorted(source_map.items()):
-        kind = rec.get("source_kind")
+        kind, path = rec["source_kind"], rec["source_path"]
+        idx = rec["source_day_index"]
         if kind == "delta":
             if delta_path is None or day not in live_index:
                 absent.append(day)
-            elif rec.get("source_path") != live_real:
-                retargeted.append((day, rec.get("source_path"), live_real))
-            elif int(rec.get("source_day_index", -1)) != live_index[day]:
-                moved.append((day, rec.get("source_day_index"), live_index[day]))
-        else:
-            path = _source_group_path(kind, rec.get("source_path"), day)
-            if not path or not os.path.isdir(path):
-                missing_src.append((day, path))
+            elif path != live_real:
+                retargeted.append((day, path, live_real))
+            elif idx != live_index[day]:
+                moved.append((day, idx, live_index[day]))
+        elif kind == "block":
+            if block_day_index is None:
+                bad_kind.append((day, f"source_kind 'block' at {path}, but no published-block "
+                                      f"resolver was supplied, so the claim cannot be checked"))
+                continue
+            index = block_day_index(path)
+            if index is None:
+                bad_kind.append((day, f"{path} is not a block published in the live manifest"))
+            elif day not in index:
+                bad_kind.append((day, f"published block {path} does not contain this day"))
+            elif idx != index[day]:
+                bad_kind.append((day, f"published block {path} holds this day at index "
+                                      f"{index[day]}, not the recorded {idx}"))
+        else:                                   # daily | hold -- validated to be one of these
+            group = _source_group_path(kind, path, day)
+            if not group or not os.path.isdir(group):
+                missing_src.append((day, group))
+            elif idx != 0:
+                bad_kind.append((day, f"a {kind} group has shape (1, ny, nx), so index 0 is "
+                                      f"the only meaningful value; the map records {idx}"))
 
     def refuse(reason, days):
         return {"status": "aborted_stale", "published": False, "reason": reason,
@@ -401,7 +482,36 @@ def staleness_guard(source_map: dict, *, delta_path: Optional[str],
             f"{len(missing_src)} recorded non-delta source group(s) no longer exist (first "
             f"{missing_src[0][0]} at {missing_src[0][1]}); the provenance the block records "
             f"cannot be re-verified", [d for d, _ in missing_src])
+    if bad_kind:
+        return refuse(
+            f"{len(bad_kind)} source record(s) do not match what their source_kind means "
+            f"(first {bad_kind[0][0]}: {bad_kind[0][1]})", [d for d, _ in bad_kind])
     return None
+
+
+def _published_block_index(root: str, live: dict):
+    """`realpath -> {day: index}` for blocks the LIVE generation publishes, resolved lazily.
+
+    Lazily because most folds reference one predecessor block and opening every published
+    segment to answer a question about one of them is disk work for nothing. Restricted to the
+    live generation because a `block` source is a claim to have read *published history*; a
+    path that is a legal Zarr store but is not in the manifest is not that."""
+    allowed = {os.path.realpath(_seg_path(root, s)): s for s in live["segments"]}
+    cache: Dict[str, Optional[dict]] = {}
+
+    def resolve(path: Optional[str]) -> Optional[dict]:
+        if not path:
+            return None
+        real = os.path.realpath(path)
+        if real not in cache:
+            if real not in allowed:
+                cache[real] = None
+            else:
+                insp = bm.inspect_store_contract(real)
+                cache[real] = {d: i for i, d in enumerate(insp.days)}
+        return cache[real]
+
+    return resolve
 
 
 def _source_group_path(kind: str, root: Optional[str], day: str) -> Optional[str]:
@@ -472,7 +582,8 @@ def execute_publication(plan: dict, *, ingest_lock_path: str, delta_path: Option
                                f"{live['generation']}. Re-plan against the current generation.")}
 
         drift = staleness_guard(source_map, delta_path=delta_path,
-                                live_days=_read_delta_days(delta_path))
+                                live_days=_read_delta_days(delta_path),
+                                block_day_index=_published_block_index(root, live))
         if drift:
             return drift
 
@@ -485,9 +596,26 @@ def execute_publication(plan: dict, *, ingest_lock_path: str, delta_path: Option
                                f"not present: {missing[:3]}. Publishing would produce a "
                                f"manifest whose snapshot build fails closed.")}
 
-        # ...and the map must describe THAT block, not merely be internally consistent.
-        bind_provenance_to_block(source_map, _seg_path(root, published[0]),
-                                 where="at publication")
+        # ...and the entry must describe THAT block, not merely be internally consistent.
+        bind_segment_to_block(published[0], source_map, _seg_path(root, published[0]),
+                              plan["manifest"]["grid"], where="at publication")
+
+        # Carried-forward segments are immutable and were verified when they were published,
+        # so re-inspecting every one of them on every publish would be O(segments) disk work
+        # for no new information. What must hold is that their entries are UNCHANGED: an edit
+        # to an existing entry is the same hazard as an edit to the new one, and comparing
+        # against the live generation catches it without opening anything.
+        carried = {s["segment_id"]: s for s in plan["manifest"]["segments"]
+                   if s["segment_id"] != plan["new_segment_id"]}
+        was = {s["segment_id"]: s for s in live["segments"]}
+        drifted_entries = sorted(sid for sid, s in carried.items()
+                                 if sid not in was or was[sid] != s)
+        if drifted_entries:
+            return {"status": "refused", "published": False,
+                    "reason": (f"carried-forward segment entr(y/ies) {drifted_entries[:3]} "
+                               f"differ from generation {live['generation']}. Published blocks "
+                               f"are immutable, so their entries must be too; a changed entry "
+                               f"is either an edit or a plan built against another manifest.")}
 
         archive = bm.publish(root, plan["manifest"])
         _append_log(root, MANIFEST_LOG, {
