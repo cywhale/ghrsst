@@ -12,10 +12,10 @@ was folded.
 
 - Repair WAL: [`../store/repair_wal.py`](../store/repair_wal.py)
 - Publish / lifecycle / rollback: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py)
-- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **76/76 green**
-- Full local suite: **532 tests OK** (17 skipped), up from 456.
+- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **88/88 green**
+- Full local suite: **544 tests OK** (17 skipped), up from 456.
 
-**Review round 2** raised five findings; §8 records what each changed.
+**Review rounds 2 and 3** raised five findings and one; §8–§9 record what each changed.
 
 ## 1. The repair WAL (§7.5a-1) — identity, never time
 
@@ -142,7 +142,10 @@ reports itself unavailable rather than half-completing.
 4. **Snapshot refresh on publication (§7.4 step 5) and the §7.6 post-publication probes.** This
    step commits the manifest; it does not yet refresh the serving snapshot or run the probes.
 5. **Crash-injection and concurrency proof.** That is P5-S5 and is where these guarantees get
-   adversarially tested rather than unit-tested.
+   adversarially tested rather than unit-tested. Carried into that scope explicitly: the
+   ambiguous state when the audit log fails to write **after** the manifest has committed
+   (§9), and the recovery rule that the manifest is authoritative while the hold log is
+   reconstructible from the generation archives.
 
 ## 6. Reproduce
 
@@ -152,7 +155,7 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_phase2_p5s4
 
 ## 7. Mutation verification
 
-Every guard was disabled in turn and the suite re-run; **all 44 fail**.
+Every guard was disabled in turn and the suite re-run; **all 50 fail**. One further mutation survives by construction and is discussed below the table.
 
 | guard disabled | result |
 |---|---|
@@ -200,6 +203,12 @@ Every guard was disabled in turn and the suite re-run; **all 44 fail**.
 | replay compares only the fingerprint (parser) | FAILED |
 | replay compares only the fingerprint (append gate) | FAILED |
 | field types not checked | FAILED (4 + 1) |
+| execute trusts the plan's map (no re-bind) | FAILED (3 + 1) |
+| empty map treated as absent (the old `if top`) | FAILED (2) |
+| non-dict `source_map` tolerated | FAILED |
+| authority taken from a planning-time copy | FAILED (3 + 4) |
+| plan/manifest segment identity unchecked | FAILED |
+| writer coerces `payload` with `dict()` | FAILED |
 
 **Two mutations initially survived, and both were my tests passing for the wrong reason** — the
 same failure mode the last three review rounds found, caught here by the mutation run rather
@@ -298,3 +307,60 @@ lock-exclusion mutation had no test (requiring the path was tested; taking the l
 both `repair_id` suffix rules were tested only through the **append gate**, so removing them from
 the **parser** changed nothing — a hand-edited log would have bypassed the whole rule. All three
 now have tests and all three fail.
+
+
+## 9. Review round 3 — one finding, and one deliberate deviation
+
+### [High] The source map was *checked* at planning time, not *bound* at publication
+
+`plan_publication` validated the two maps against each other and `execute_publication` then used
+`plan["source_map"]` directly. A plan exists to be inspected, serialized and read back by a
+human between those two calls — so a top-level `source_map` edited in that window sailed through
+a guard that had already been satisfied, and the block would publish with one provenance while
+having been guarded against another. Validating once is a check; re-deriving the authority at
+the moment of commit is a binding, and only the second survives an edit in between.
+
+`_validate_plan_source_map()` is now called from **both** entry points, and at publication the
+authority is re-derived from the **manifest about to be published** — located by
+`new_segment_id`, with a refusal if the plan's manifest does not contain exactly that segment
+(a plan whose manifest does not describe the block it names is not a plan for that block).
+
+`{}` is no longer waved through. `plan.get("source_map")` collapses "the field is absent" and
+"the caller supplied an empty map" into the same falsy value, but an empty map is a positive
+claim that the block read nothing — for a block with days, a claim to refuse rather than skip.
+A module-level `_ABSENT` sentinel separates them: absent falls back to the segment's own map
+(and is still fully guarded); empty, or any other mismatch, refuses.
+
+Nine tests, including the workflow the binding exists for — plan → JSON file → reload → execute
+— and one that edits the **manifest's own** provenance and asserts the guard verdict changes,
+which is what proves the guard reads the segment being published rather than a planning-time
+copy. Every refusal asserts `manifest.json` is byte-identical.
+
+### [Non-blocking] The WAL writer laundered `payload`
+
+`dict(payload)` accepts a list of pairs and writes a record that looks perfectly well-formed;
+the reader would have no way to know the writer passed something else. The parser was strict
+about types while the writer was not, which means the strictness only applied to files nobody
+wrote through this function. `append()` now rejects a non-mapping payload outright.
+
+**Deviation from the review's wording, flagged deliberately:** the check is `isinstance`, not
+`type(payload) is dict`. An ordinary dict subclass canonicalizes identically, so rejecting it
+would cost callers without closing anything; the hazard is a non-mapping *sequence*, and that is
+what this blocks. Both cases are tested.
+
+### [Non-blocking, carried to P5-S5] `_append_log` runs after the manifest commits
+
+If the audit-log write fails after `bm.publish` succeeds, the manifest is updated and the hold
+log has no record of it. This is deliberate ordering — logging *before* the commit would produce
+the opposite and worse ambiguity, a trail claiming a move that was rolled back (§8.4) — but it
+is a real ambiguous state and it is **not** resolved here. Added to §5 as P5-S5 crash-proof
+scope: the recovery answer is that the manifest is authoritative and the log is reconstructible
+from generation archives, but that has to be demonstrated, not asserted.
+
+### A mutation that survives by construction
+
+Making `staleness_guard` read `plan.get("source_map") or source_map` instead of the re-bound
+`source_map` leaves the suite green — correctly. `_validate_plan_source_map` raises **before the
+ingest lock is taken**, so by the time the guard runs the two are equal by construction and
+nothing between them mutates the plan. That mutation is redundant code, not an untested guard,
+and it is recorded here rather than listed above as if a test were holding it.

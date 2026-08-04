@@ -1119,3 +1119,141 @@ class TestWalStrictnessRoundTwo(_Base):
                     fh.write(rw.canonical(rec) + "\n")
                 with self.assertRaises(rw.WalCorrupt):
                     rw.read_wal(tmp)
+
+
+# ============================================== review round 3: the map is BOUND, not checked
+class TestSourceMapIsReboundAtPublication(_Base):
+    """A plan exists to be inspected, serialized and read back by a human. Validating its
+    `source_map` once at planning time is a check; re-deriving the authority from the manifest
+    about to be published is a binding. Only the second survives an edit in between."""
+
+    def setUp(self):
+        super().setUp()
+        self._live_gen1()
+        self.delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(self.delta, self.span[:60])
+        self.retargeted = os.path.join(self.tmp, "delta_v2.zarr")
+        fx.build_delta(self.retargeted, self.span[:60])
+
+    def _plan(self):
+        return pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+
+    def _publish(self, plan, **kw):
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        try:
+            out = pub.execute_publication(plan, ingest_lock_path=self.lock,
+                                          delta_path=self.delta, now=T0, **kw)
+        except pub.PublishRefused as exc:
+            out = {"status": "refused", "published": False, "reason": str(exc)}
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before,
+                         "a refusal must leave manifest.json byte-identical")
+        return out
+
+    def test_a_source_map_MUTATED_after_planning_is_refused(self):
+        plan = self._plan()
+        plan["source_map"] = dict(plan["source_map"])
+        plan["source_map"][self.span[0]] = dict(plan["source_map"][self.span[0]],
+                                                source_day_index=999)
+        out = self._publish(plan)
+        self.assertFalse(out["published"])
+        self.assertIn("at publication", out["reason"])
+
+    def test_a_source_map_EMPTIED_after_planning_is_refused(self):
+        """`{}` is not a missing field. It is a positive claim that the block read nothing,
+        and `if top:` used to skip straight past it."""
+        plan = self._plan()
+        plan["source_map"] = {}
+        out = self._publish(plan)
+        self.assertFalse(out["published"])
+        self.assertIn("disagree", out["reason"])
+
+    def test_a_source_map_DELETED_after_planning_falls_back_to_the_provenance(self):
+        """An absent field has nothing to contradict, so the segment's own map is used -- and
+        it must still be fully guarded, not waved through."""
+        plan = self._plan()
+        del plan["source_map"]
+        out = pub.execute_publication(plan, ingest_lock_path=self.lock,
+                                      delta_path=self.retargeted, now=T0)
+        self.assertEqual(out["status"], "aborted_stale")
+
+    def test_a_deleted_source_map_still_publishes_when_the_delta_is_intact(self):
+        plan = self._plan()
+        del plan["source_map"]
+        out = pub.execute_publication(plan, ingest_lock_path=self.lock,
+                                      delta_path=self.delta, now=T0)
+        self.assertEqual(out["status"], "published")
+
+    def test_an_empty_map_is_distinguished_from_an_absent_one(self):
+        """The two must not resolve to the same verdict, which is exactly what `plan.get()`
+        without a sentinel would do."""
+        empty, absent = self._plan(), self._plan()
+        empty["source_map"] = {}
+        del absent["source_map"]
+        self.assertFalse(self._publish(empty)["published"])
+        self.assertEqual(pub.execute_publication(absent, ingest_lock_path=self.lock,
+                                                 delta_path=self.delta, now=T0)["status"],
+                         "published")
+
+    def test_a_non_dict_source_map_is_refused(self):
+        plan = self._plan()
+        plan["source_map"] = [[self.span[0], {}]]
+        out = self._publish(plan)
+        self.assertFalse(out["published"])
+        self.assertIn("must be an object", out["reason"])
+
+    def test_the_PUBLISHED_segment_provenance_is_the_authority(self):
+        """Editing the manifest's own provenance must change what the guard checks -- proving
+        the guard reads the segment being published, not a copy made at planning time."""
+        plan = self._plan()
+        seg = next(s for s in plan["manifest"]["segments"] if s["segment_id"] == "b_v2")
+        seg["build_provenance"]["sources"] = {
+            d: {"source_kind": "delta", "source_path": os.path.realpath(self.retargeted),
+                "source_day_index": i} for i, d in enumerate(self.span[:60])}
+        del plan["source_map"]
+        out = self._publish(plan)
+        self.assertEqual(out["status"], "aborted_stale")
+        self.assertIn("not the same bytes", out["reason"])
+
+    def test_a_plan_whose_manifest_lacks_its_own_segment_is_refused(self):
+        plan = self._plan()
+        plan["manifest"]["segments"] = [s for s in plan["manifest"]["segments"]
+                                        if s["segment_id"] != "b_v2"]
+        out = self._publish(plan)
+        self.assertFalse(out["published"])
+        self.assertIn("cannot be the plan for the block it claims", out["reason"])
+
+    def test_a_plan_round_tripped_through_json_still_publishes(self):
+        """The workflow the binding exists for: plan -> file -> human -> execute."""
+        plan = self._plan()
+        path = os.path.join(self.tmp, "plan.json")
+        with open(path, "w") as fh:
+            json.dump(plan, fh, indent=2, sort_keys=True)
+        with open(path) as fh:
+            reloaded = json.load(fh)
+        out = pub.execute_publication(reloaded, ingest_lock_path=self.lock,
+                                      delta_path=self.delta, now=T0)
+        self.assertEqual(out["status"], "published")
+
+
+class TestWalWriterDoesNotLaunderPayload(_Base):
+    def test_a_list_of_pairs_payload_is_refused_not_coerced(self):
+        """`dict(payload)` accepts a list of pairs and writes a record that looks well-formed.
+        The reader could never tell the writer had passed something else."""
+        with self.assertRaises(rw.WalError) as cm:
+            rw.append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
+                      at_utc="t", operator="o", payload=[("fingerprint", "fp1")])
+        self.assertIn("NOT coerced", str(cm.exception))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, rw.WAL_NAME)))
+
+    def test_a_dict_subclass_is_still_accepted(self):
+        class D(dict):
+            pass
+        rw.append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
+                  at_utc="t", operator="o", payload=D(expected_vars=["sst"]))
+        self.assertEqual(rw.read_wal(self.tmp).last_seq, 1)
+
+    def test_an_absent_payload_is_still_allowed(self):
+        rw.append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
+                  at_utc="t", operator="o")
+        self.assertEqual(rw.read_wal(self.tmp).records[0]["payload"], {})

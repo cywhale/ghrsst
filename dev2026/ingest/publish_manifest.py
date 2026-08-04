@@ -56,6 +56,52 @@ class PublishRefused(Exception):
     """Nothing was written. The live manifest is byte-unchanged."""
 
 
+#: Distinguishes "the caller did not supply a source_map" from "the caller supplied an EMPTY
+#: one". `plan.get("source_map")` collapses those two into the same falsy value, and an empty
+#: map is not a missing field -- it is a positive claim that the block read nothing, which for
+#: a block with days is a claim that must be refused rather than skipped over.
+_ABSENT = object()
+
+
+def _segment_provenance(segment: dict) -> dict:
+    return dict((segment.get("build_provenance") or {}).get("sources") or {})
+
+
+def _validate_plan_source_map(segment: dict, supplied, *, where: str) -> dict:
+    """Bind the guard's map to the segment's OWN provenance, and return it.
+
+    The authority is `build_provenance.sources` -- the copy that gets published and that an
+    auditor reads back -- never the plan's convenience copy. Checking this once, at planning
+    time, is not enough: a plan is designed to be inspected, serialized and re-loaded by a
+    human between planning and execution, so a top-level `source_map` edited in that window
+    would sail through a guard that had already been satisfied. **Both entry points call
+    this**, and execution re-derives the authority from the manifest it is about to publish.
+    """
+    provenance = _segment_provenance(segment)
+    if not provenance:
+        raise PublishRefused(
+            f"{where}: the segment carries no build_provenance.sources, so there is nothing "
+            f"for the staleness guard to re-verify. A block published without provenance "
+            f"cannot be shown to have read what it claims (§5, P5-S3 round 4).")
+    if supplied is _ABSENT:
+        return provenance                       # nothing to contradict; the segment is used
+    if not isinstance(supplied, dict):
+        raise PublishRefused(
+            f"{where}: source_map must be an object, got {type(supplied).__name__}")
+    if supplied != provenance:
+        only_top = sorted(set(supplied) - set(provenance))
+        only_prov = sorted(set(provenance) - set(supplied))
+        differing = sorted(d for d in set(supplied) & set(provenance)
+                           if supplied[d] != provenance[d])
+        raise PublishRefused(
+            f"{where}: source_map and the segment's build_provenance.sources disagree "
+            f"({len(supplied)} vs {len(provenance)} day(s); only in source_map: "
+            f"{only_top[:3]}, only in provenance: {only_prov[:3]}, differing: "
+            f"{differing[:3]}). The staleness guard would be checking a map the published "
+            f"manifest does not contain.")
+    return provenance
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -146,26 +192,8 @@ def plan_publication(root: str, plan: dict, *, release_after_s: int = DEFAULT_RE
     candidate["manifest_checksum"] = bm.compute_checksum(candidate)
     bm.validate_manifest(candidate)
 
-    # The guard's map is the segment's OWN provenance -- the copy that gets published and that
-    # an auditor will later read -- not the plan's convenience copy. If the two disagree, the
-    # plan is not describing the block it is about to publish, and a guard run against the
-    # wrong map would pass while the published record says something else.
-    provenance = dict((segment.get("build_provenance") or {}).get("sources") or {})
-    if not provenance:
-        raise PublishRefused(
-            "the segment carries no build_provenance.sources, so there is nothing for the "
-            "staleness guard to re-verify. A block published without provenance cannot be "
-            "shown to have read what it claims (§5, P5-S3 round 4).")
-    top = dict(plan.get("source_map") or {})
-    if top and top != provenance:
-        only_top = sorted(set(top) - set(provenance))
-        only_prov = sorted(set(provenance) - set(top))
-        differing = sorted(d for d in set(top) & set(provenance) if top[d] != provenance[d])
-        raise PublishRefused(
-            f"the plan's source_map and the segment's build_provenance.sources disagree "
-            f"(only in plan: {only_top[:3]}, only in provenance: {only_prov[:3]}, differing: "
-            f"{differing[:3]}). The staleness guard would be checking a map the published "
-            f"manifest does not contain.")
+    provenance = _validate_plan_source_map(segment, plan.get("source_map", _ABSENT),
+                                           where="the build plan")
 
     return {"status": "planned", "root": root, "generation": gen,
             "predecessor_generation": int(live["generation"]),
@@ -289,6 +317,19 @@ def execute_publication(plan: dict, *, ingest_lock_path: str, delta_path: Option
     now = now or _utcnow()
     root = plan["root"]
 
+    # Re-bind the guard's map to the manifest ABOUT TO BE PUBLISHED, not to whatever the plan
+    # carries now. Between planning and here a plan may have been written to disk, reviewed and
+    # read back; re-validating is the difference between a check and a binding.
+    published = [s for s in plan["manifest"]["segments"]
+                 if s["segment_id"] == plan["new_segment_id"]]
+    if len(published) != 1:
+        raise PublishRefused(
+            f"the plan's manifest does not contain exactly one segment "
+            f"{plan['new_segment_id']!r} ({len(published)} found); it cannot be the plan for "
+            f"the block it claims")
+    source_map = _validate_plan_source_map(published[0], plan.get("source_map", _ABSENT),
+                                           where="at publication")
+
     if compaction_lock_path:
         # A build holding the lock may still be writing the very block we are about to
         # reference. Publication is not the operation that should race it.
@@ -308,7 +349,7 @@ def execute_publication(plan: dict, *, ingest_lock_path: str, delta_path: Option
                                f"generation {plan['predecessor_generation']}, live is "
                                f"{live['generation']}. Re-plan against the current generation.")}
 
-        drift = staleness_guard(plan["source_map"], delta_path=delta_path,
+        drift = staleness_guard(source_map, delta_path=delta_path,
                                 live_days=_read_delta_days(delta_path))
         if drift:
             return drift

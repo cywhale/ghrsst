@@ -314,6 +314,18 @@ def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc
     until the log is repaired."""
     if record not in RECORD_TYPES:
         raise WalError(f"unknown record type {record!r}")
+    # `dict(payload)` accepts a list of pairs and would launder a malformed caller argument
+    # into a well-formed record -- the reader would then see a clean dict and have no way to
+    # know the writer had passed something else. The parser is strict about types; the writer
+    # must be too, or the strictness only applies to files nobody wrote through this function.
+    if payload is not None and not isinstance(payload, dict):
+        raise WalError(
+            f"payload must be a dict, got {type(payload).__name__}. It is NOT coerced: "
+            f"dict() would silently accept a list of pairs and write a record that looks "
+            f"well-formed but is not what the caller meant, and the reader would have no way "
+            f"to tell. (`isinstance`, not `type(...) is dict`: an ordinary dict subclass "
+            f"canonicalizes identically, so rejecting it would cost callers without closing "
+            f"anything. The hazard is a non-mapping sequence, and that is what this blocks.)")
     os.makedirs(root, exist_ok=True)
     path = os.path.join(root, WAL_NAME)
     lock = os.path.join(root, LOCK_NAME)
