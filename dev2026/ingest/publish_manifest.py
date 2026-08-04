@@ -146,12 +146,33 @@ def plan_publication(root: str, plan: dict, *, release_after_s: int = DEFAULT_RE
     candidate["manifest_checksum"] = bm.compute_checksum(candidate)
     bm.validate_manifest(candidate)
 
+    # The guard's map is the segment's OWN provenance -- the copy that gets published and that
+    # an auditor will later read -- not the plan's convenience copy. If the two disagree, the
+    # plan is not describing the block it is about to publish, and a guard run against the
+    # wrong map would pass while the published record says something else.
+    provenance = dict((segment.get("build_provenance") or {}).get("sources") or {})
+    if not provenance:
+        raise PublishRefused(
+            "the segment carries no build_provenance.sources, so there is nothing for the "
+            "staleness guard to re-verify. A block published without provenance cannot be "
+            "shown to have read what it claims (§5, P5-S3 round 4).")
+    top = dict(plan.get("source_map") or {})
+    if top and top != provenance:
+        only_top = sorted(set(top) - set(provenance))
+        only_prov = sorted(set(provenance) - set(top))
+        differing = sorted(d for d in set(top) & set(provenance) if top[d] != provenance[d])
+        raise PublishRefused(
+            f"the plan's source_map and the segment's build_provenance.sources disagree "
+            f"(only in plan: {only_top[:3]}, only in provenance: {only_prov[:3]}, differing: "
+            f"{differing[:3]}). The staleness guard would be checking a map the published "
+            f"manifest does not contain.")
+
     return {"status": "planned", "root": root, "generation": gen,
             "predecessor_generation": int(live["generation"]),
             "manifest": candidate,
             "new_segment_id": segment["segment_id"],
             "superseded_now": None if replaced is None else replaced["segment_id"],
-            "source_map": dict(plan.get("source_map") or {}),
+            "source_map": provenance,
             "block_path": plan.get("out_path"),
             "note": ("A plan. Nothing is committed until execute_publication re-checks it "
                      "under the ingest lock."),
@@ -166,45 +187,85 @@ def staleness_guard(source_map: dict, *, delta_path: Optional[str],
     The build ran for hours outside the lock. What it read then is a claim; this is where the
     claim is re-checked against the world as it is at the commit point.
 
-    Two conditions. The live delta must have **unique** days -- a duplicated day means the delta
-    itself is in a state no gate downstream can reason about (the P4-S8a shape). And every day
-    the block folded **from delta** must still be in the live delta: if it left, the delta was
-    swapped underneath the build and what the block froze may be a value that is no longer the
-    serving authority. Days folded from a block/daily/hold source are checked against their
-    recorded path instead, because those sources are immutable or append-only, and the recorded
-    path is exactly what round-4's provenance map exists to make checkable.
+    **Date membership is not identity.** A day being present in "the delta" says nothing about
+    *which* delta, or *where in it*. The provenance map records `source_path` (resolved) and
+    `source_day_index` precisely so both can be re-checked, and all three must still agree:
+
+    * the live delta must **resolve to the same store** the build read. The delta path is a
+      stable alias that swap retargets, so a swap that replaces the store behind the same alias
+      leaves every date present while every byte may differ;
+    * the day must still sit at the **same physical index**. Delta `attrs['days']` is append
+      order after a backfill (P4-S4 §2), so a rebuild can preserve the date set and move the
+      dates -- and an index that moved means the build read a different slot than the one the
+      manifest will claim it read;
+    * the live delta must have **unique** days, or the delta is in a state no downstream gate
+      can reason about (the P4-S8a shape).
+
+    Non-delta sources are checked at the **exact group**, not the root: a daily root exists for
+    years, so `os.path.exists(root)` proves nothing about whether `YYYY/MM/DD` is still there.
     """
     live = list(live_days)
     if len(live) != len(set(live)):
         dups = sorted({d for d in live if live.count(d) > 1})
         return {"status": "aborted_stale", "reason": f"live delta has duplicate days: {dups}",
                 "published": False}
-    live_set = set(live)
+    live_index = {d: i for i, d in enumerate(live)}
+    live_real = os.path.realpath(delta_path) if delta_path else None
 
-    drifted, missing_src = [], []
+    absent, retargeted, moved, missing_src = [], [], [], []
     for day, rec in sorted(source_map.items()):
         kind = rec.get("source_kind")
         if kind == "delta":
-            if delta_path is None or day not in live_set:
-                drifted.append(day)
+            if delta_path is None or day not in live_index:
+                absent.append(day)
+            elif rec.get("source_path") != live_real:
+                retargeted.append((day, rec.get("source_path"), live_real))
+            elif int(rec.get("source_day_index", -1)) != live_index[day]:
+                moved.append((day, rec.get("source_day_index"), live_index[day]))
         else:
-            path = rec.get("source_path")
-            if not path or not os.path.exists(path):
+            path = _source_group_path(kind, rec.get("source_path"), day)
+            if not path or not os.path.isdir(path):
                 missing_src.append((day, path))
-    if drifted:
-        return {"status": "aborted_stale", "published": False,
-                "reason": (f"{len(drifted)} day(s) folded from delta are no longer in the live "
-                           f"delta (first {drifted[0]}); the delta was swapped underneath the "
-                           f"build, so the block may hold a value that is no longer the "
-                           f"serving authority"),
-                "days": drifted[:10]}
+
+    def refuse(reason, days):
+        return {"status": "aborted_stale", "published": False, "reason": reason,
+                "days": days[:10]}
+
+    if absent:
+        return refuse(
+            f"{len(absent)} day(s) folded from delta are no longer in the live delta (first "
+            f"{absent[0]}); the delta was swapped underneath the build, so the block may hold "
+            f"a value that is no longer the serving authority", absent)
+    if retargeted:
+        d, was, now = retargeted[0]
+        return refuse(
+            f"the live delta resolves to {now} but the block read {was} ({len(retargeted)} "
+            f"day(s), first {d}). Every date is still present, but they are not the same "
+            f"bytes: the alias was retargeted by a swap while the build ran",
+            [x[0] for x in retargeted])
+    if moved:
+        d, was, now = moved[0]
+        return refuse(
+            f"{len(moved)} day(s) moved physical index in the live delta (first {d}: index "
+            f"{was} -> {now}). `attrs['days']` is append order after a backfill, so the delta "
+            f"was rebuilt and the block read a different slot than it records",
+            [x[0] for x in moved])
     if missing_src:
-        return {"status": "aborted_stale", "published": False,
-                "reason": (f"{len(missing_src)} recorded non-delta source(s) no longer exist "
-                           f"(first {missing_src[0][0]} at {missing_src[0][1]}); the "
-                           f"provenance the block records cannot be re-verified"),
-                "days": [d for d, _ in missing_src[:10]]}
+        return refuse(
+            f"{len(missing_src)} recorded non-delta source group(s) no longer exist (first "
+            f"{missing_src[0][0]} at {missing_src[0][1]}); the provenance the block records "
+            f"cannot be re-verified", [d for d, _ in missing_src])
     return None
+
+
+def _source_group_path(kind: str, root: Optional[str], day: str) -> Optional[str]:
+    """The path that must still exist for `day` -- the GROUP, never merely the root."""
+    if not root:
+        return None
+    if kind in ("daily", "hold"):
+        y, m, d = day.split("-")
+        return os.path.join(root, y, m, d)
+    return root
 
 
 def _read_delta_days(delta_path: Optional[str]) -> List[str]:
@@ -283,7 +344,8 @@ def _seg_path(root: str, seg: dict) -> str:
 
 # --------------------------------------------------------------------------- lifecycle §8.5
 def advance_lifecycle(root: str, *, hold_root: str, now: Optional[datetime] = None,
-                      operator: str = "", apply: bool = False) -> dict:
+                      operator: str = "", apply: bool = False,
+                      ingest_lock_path: Optional[str] = None) -> dict:
     """`referenced` → `releasable` → `held`. Never deletes.
 
     A superseded block has three live uses after it leaves `segments`: an in-flight snapshot
@@ -293,7 +355,41 @@ def advance_lifecycle(root: str, *, hold_root: str, now: Optional[datetime] = No
 
     `apply=False` (the default) reports the transitions without performing them. Moving a block
     is the one action here that touches bytes on disk, so it does not happen by accident.
+
+    **`apply=True` requires the ingest lock**, and holds it across both the renames and the
+    manifest publish. Without it two hazards are open at once: this reads the live manifest,
+    mutates `superseded[]` and publishes a new generation, so a concurrent publication would
+    make one of the two writers' changes vanish; and the rename would race a publication that
+    is checking whether a referenced block exists.
+
+    **The rename and the publish are made atomic-or-undone.** A rename that succeeds followed
+    by a publish that fails would leave the manifest naming a `current_path` that no longer
+    holds the block -- and `current_path` is exactly what §9.3a restore-before-rollback looks
+    up, so the block would still be on disk and still be unreachable. Every rename is therefore
+    undone if the publish raises, and a divergence found on entry is **refused**, not silently
+    repaired: a `current_path` that does not exist may equally mean someone deleted the block,
+    and guessing between the two is how a rollback target quietly disappears.
     """
+    if apply and not ingest_lock_path:
+        raise PublishRefused(
+            "advance_lifecycle(apply=True) requires ingest_lock_path: it publishes a manifest "
+            "generation and moves blocks, and both must be exclusive with the daily append "
+            "and with compaction's publication (§8.6)")
+    if not apply:
+        return _advance_lifecycle(root, hold_root=hold_root, now=now, operator=operator,
+                                  apply=False)
+    lk = open(ingest_lock_path, "w")
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        return _advance_lifecycle(root, hold_root=hold_root, now=now, operator=operator,
+                                  apply=True)
+    finally:
+        fcntl.flock(lk, fcntl.LOCK_UN)
+        lk.close()
+
+
+def _advance_lifecycle(root: str, *, hold_root: str, now: Optional[datetime] = None,
+                       operator: str = "", apply: bool = False) -> dict:
     now = now or _utcnow()
     live = bm.load_live(root)
     bm.validate_manifest(live)
@@ -301,6 +397,19 @@ def advance_lifecycle(root: str, *, hold_root: str, now: Optional[datetime] = No
 
     transitions, blocked = [], []
     entries = [dict(e) for e in live["superseded"]]
+
+    # A `current_path` the manifest names but that is not on disk is the split state a crashed
+    # apply would leave. Refuse rather than repair: the same symptom is produced by a deletion,
+    # and a wrong guess retires a rollback target.
+    for e in entries:
+        cp = _seg_path(root, {"path": e["current_path"]})
+        if not os.path.exists(cp):
+            raise PublishRefused(
+                f"superseded block {e['segment_id']!r} is recorded at {cp} but nothing is "
+                f"there. Either an apply crashed between the rename and the publish, or the "
+                f"block was deleted. These need different answers, so this refuses instead of "
+                f"guessing: look for it under {hold_root} and correct the manifest, or accept "
+                f"that rollback past generation {e['superseded_at_generation']} is gone.")
     for e in entries:
         if e["segment_id"] in referenced_ids:
             # Cannot happen through plan_publication, but a hand-edited manifest could do it,
@@ -330,37 +439,53 @@ def advance_lifecycle(root: str, *, hold_root: str, now: Optional[datetime] = No
         return {"status": "planned", "transitions": transitions, "blocked": blocked,
                 "applied": False}
 
-    moved = []
-    for t in transitions:
-        e = next(x for x in entries if x["segment_id"] == t["segment_id"])
-        if t["to"] == "releasable":
-            e["status"] = "releasable"
-            continue
-        src = _seg_path(root, {"path": e["current_path"]})
-        os.makedirs(hold_root, exist_ok=True)
-        dst = os.path.join(hold_root, os.path.basename(src.rstrip("/")))
-        if os.path.exists(dst):
-            raise PublishRefused(f"hold path already occupied: {dst}")
-        os.rename(src, dst)                     # same filesystem: content is never altered
-        e["status"] = "held"
-        e["current_path"] = dst
-        moved.append({"segment_id": e["segment_id"], "from": src, "to": dst})
-        _append_log(root, HOLD_LOG, {"op": "hold_move", "at_utc": _iso(now),
-                                     "operator": operator, "segment_id": e["segment_id"],
-                                     "original_path": e["path"], "from": src, "to": dst})
+    moved, done = [], []
+    try:
+        for tr in transitions:
+            e = next(x for x in entries if x["segment_id"] == tr["segment_id"])
+            if tr["to"] == "releasable":
+                e["status"] = "releasable"
+                continue
+            src = _seg_path(root, {"path": e["current_path"]})
+            os.makedirs(hold_root, exist_ok=True)
+            dst = os.path.join(hold_root, os.path.basename(src.rstrip("/")))
+            if os.path.exists(dst):
+                raise PublishRefused(f"hold path already occupied: {dst}")
+            os.rename(src, dst)                 # same filesystem: content is never altered
+            done.append((src, dst))
+            e["status"] = "held"
+            e["current_path"] = dst
+            moved.append({"segment_id": e["segment_id"], "from": src, "to": dst})
 
-    gen = int(live["generation"]) + 1
-    candidate = dict(live)
-    candidate["generation"] = gen
-    candidate["generation_id"] = str(uuid.uuid4())
-    candidate["created_utc"] = _iso(now)
-    candidate["predecessor_generation"] = int(live["generation"])
-    candidate["predecessor_manifest"] = bm.archive_name(int(live["generation"]))
-    candidate["superseded"] = entries
-    candidate["manifest_checksum"] = ""
-    candidate["manifest_checksum"] = bm.compute_checksum(candidate)
-    bm.validate_manifest(candidate)
-    bm.publish(root, candidate)
+        gen = int(live["generation"]) + 1
+        candidate = dict(live)
+        candidate["generation"] = gen
+        candidate["generation_id"] = str(uuid.uuid4())
+        candidate["created_utc"] = _iso(now)
+        candidate["predecessor_generation"] = int(live["generation"])
+        candidate["predecessor_manifest"] = bm.archive_name(int(live["generation"]))
+        candidate["superseded"] = entries
+        candidate["manifest_checksum"] = ""
+        candidate["manifest_checksum"] = bm.compute_checksum(candidate)
+        bm.validate_manifest(candidate)
+        bm.publish(root, candidate)             # <- the commit point for the whole transition
+    except BaseException:
+        # Undo the renames. The manifest was not updated, so leaving the blocks in hold would
+        # make every one of them unreachable through the path the manifest still names.
+        for src, dst in reversed(done):
+            if os.path.exists(dst) and not os.path.exists(src):
+                os.rename(dst, src)
+        raise
+
+    # Logged only after the manifest commits, so the audit trail never claims a move that was
+    # rolled back.
+    for m in moved:
+        _append_log(root, HOLD_LOG, {"op": "hold_move", "at_utc": _iso(now),
+                                     "operator": operator, "segment_id": m["segment_id"],
+                                     "original_path": next(
+                                         e["path"] for e in entries
+                                         if e["segment_id"] == m["segment_id"]),
+                                     "from": m["from"], "to": m["to"]})
     return {"status": "applied", "transitions": transitions, "blocked": blocked,
             "moved": moved, "applied": True, "generation": gen}
 

@@ -12,8 +12,10 @@ was folded.
 
 - Repair WAL: [`../store/repair_wal.py`](../store/repair_wal.py)
 - Publish / lifecycle / rollback: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py)
-- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **55/55 green**
-- Full local suite: **511 tests OK** (17 skipped), up from 456.
+- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **76/76 green**
+- Full local suite: **532 tests OK** (17 skipped), up from 456.
+
+**Review round 2** raised five findings; §8 records what each changed.
 
 ## 1. The repair WAL (§7.5a-1) — identity, never time
 
@@ -73,11 +75,14 @@ commits. Splitting them is what makes "validated-plan-only" mean something: a pl
 inspected, diffed and refused by a human before anything touches disk.
 
 **The staleness guard is the point of the lock.** A build runs for hours *outside* it; what it
-read at minute zero is a *claim*. Under the lock the claim is re-checked: the live delta must
-have unique days, and every day the block folded **from delta** must still be in the live delta.
-Days folded from block/daily/hold are checked against their recorded `source_path` instead —
-which is exactly what P5-S3 round-4's provenance map was added for, now load-bearing rather than
-merely auditable.
+read at minute zero is a *claim*. Under the lock the claim is re-checked against **identity, not
+date membership** (§8.2): the live delta must have unique days, must **resolve to the same store**
+the build read, and must still hold each folded day at the **same physical index**. Non-delta
+sources are checked at their exact `YYYY/MM/DD` group, never at the root.
+
+The map being re-verified is the segment's own `build_provenance.sources` — the copy that gets
+published — which is exactly what P5-S3 round-4's provenance fields were added for. They were
+introduced for auditability; they are now what this commit-time guard is built on.
 
 Every refusal path leaves `manifest.json` **byte-identical**, asserted on bytes rather than on
 generation number: stale delta, drifted manifest generation, a missing referenced block, a
@@ -147,7 +152,7 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_phase2_p5s4
 
 ## 7. Mutation verification
 
-Every guard was disabled in turn and the suite re-run; **all 27 fail**.
+Every guard was disabled in turn and the suite re-run; **all 44 fail**.
 
 | guard disabled | result |
 |---|---|
@@ -178,6 +183,23 @@ Every guard was disabled in turn and the suite re-run; **all 27 fail**.
 | supersedes a segment that is not published | FAILED |
 | `apply` defaults to True | FAILED |
 | parser `_fail` becomes a no-op | FAILED (9) |
+| guard falls back to the plan's `source_map` | FAILED |
+| a segment without provenance may publish | FAILED |
+| guard reads the plan's map instead of the provenance | FAILED |
+| delta `realpath` not compared | FAILED (2) |
+| delta physical index not compared | FAILED |
+| daily/hold checked at the root, not the day group | FAILED |
+| lifecycle `apply` without the ingest lock allowed | FAILED |
+| lifecycle `apply` does not take the lock | FAILED |
+| a failed publish does not undo the rename | FAILED |
+| `hold_move` logged before the manifest commits | FAILED |
+| a missing `current_path` silently tolerated | FAILED |
+| `repair_id` suffix not required (parser) | FAILED |
+| intent suffix need not equal its own `seq` (parser) | FAILED |
+| append does not enforce the suffix | FAILED (2) |
+| replay compares only the fingerprint (parser) | FAILED |
+| replay compares only the fingerprint (append gate) | FAILED |
+| field types not checked | FAILED (4 + 1) |
 
 **Two mutations initially survived, and both were my tests passing for the wrong reason** — the
 same failure mode the last three review rounds found, caught here by the mutation run rather
@@ -192,3 +214,87 @@ than by a reviewer:
   one breaks `prev_checksum`. Either way the *chain* check fires first. The test now hand-builds
   a log where `seq` jumps 1 → 3 while every `prev_checksum` still points at the record that
   actually precedes it, and asserts the message names the seq gap and **not** the chain.
+
+
+## 8. Review round 2 — five findings
+
+### 1. [Blocker] The guard read `plan["source_map"]`, not the segment's provenance
+
+Two copies of the same map, and the guard checked the one that is **not** published. A plan
+whose top-level copy disagreed with `build_provenance.sources` would pass a guard run against
+the wrong map while the manifest recorded something else — and the provenance copy is the one an
+auditor reads back.
+
+`plan_publication` now derives the guard's map from `segment.build_provenance.sources`, refuses
+when a supplied top-level copy disagrees (naming the differing days), and refuses a segment that
+carries **no** provenance at all — there is nothing to re-verify, and a block published without
+provenance cannot be shown to have read what it claims. A test passes a plan with `source_map`
+removed entirely and asserts the guard still catches a retargeted delta.
+
+### 2. [Blocker] Delta staleness compared dates, not identity
+
+"Day D is in the live delta" says nothing about *which* delta or *where in it*. Two cases the
+membership check could not see, both of which leave every date present:
+
+- **the alias was retargeted.** The delta path is stable; swap replaces the store behind it. Same
+  dates, different bytes. Now compared by `realpath` against the recorded `source_path`.
+- **the day moved physical index.** `attrs['days']` is append order after a backfill (P4-S4 §2),
+  so a rebuild can preserve the date set and reorder it — meaning the block read a different slot
+  than it records. Now compared against the recorded `source_day_index`.
+
+This is the second time P5-S3 round 4's provenance fields have turned out to be the thing that
+makes a later check possible. They were added for auditability; they are now what the commit-time
+guard is built on.
+
+### 3. [Blocker] daily/hold sources were checked at the root
+
+`os.path.exists(daily_root)` is true for years and says nothing about whether `YYYY/MM/DD` is
+still there. `_source_group_path()` now resolves the exact group. The test deletes one day group
+and asserts the root is still present, so it cannot pass for the old reason.
+
+### 4. [Blocker] `advance_lifecycle(apply=True)` held no lock, and rename/publish could split
+
+Two defects. It reads the live manifest, mutates `superseded[]` and publishes a new generation,
+so a concurrent publication would silently drop one writer's changes; and a rename that succeeded
+before a publish that failed left the manifest naming a `current_path` that no longer holds the
+block — on disk and unreachable at once, since `current_path` is exactly what §9.3a
+restore-before-rollback looks up.
+
+`ingest_lock_path` is now **required** for `apply=True` and held across both the renames and the
+publish. Every rename is **undone** if the publish raises, and `hold_move` is logged only after
+the manifest commits, so the audit trail never claims a move that was rolled back. A
+`current_path` that does not exist on entry is **refused, not repaired** — a crashed apply and a
+deletion produce the same symptom and need different answers, and guessing between them is how a
+rollback target quietly disappears.
+
+Requiring the lock path is not the same as taking it, so that is tested separately: `flock`
+conflicts across distinct open file descriptions even inside one process, so the test holds the
+real lock and observes that the lifecycle waits and that the generation does not move.
+
+### 5. [Blocker] WAL replay compared only the fingerprint; types and id monotonicity unchecked
+
+- **Replay** now compares the **whole canonical payload**. Two commits agreeing on the
+  fingerprint but disagreeing on the variables or the operator are two different claims about
+  what happened; picking one silently is the ambiguity this log exists to remove. Enforced in
+  both the append gate and the parser, because a hand-edited log never passes the gate.
+- **Field types** are validated before any field is used. A checksum proves a record is
+  unmodified, not that it was well-formed when written — `seq` as a float or `payload` as a list
+  passes the checksum and then compares unequal to everything downstream, and in this file an
+  unequal comparison means *authorized*.
+- **`repair_id` monotonicity.** The spec calls `UUID + seq` "acceptable and recommended"; this
+  implementation makes it **required**, because a recommendation cannot be checked. With
+  `-<seq of the intent record>` mandatory, uniqueness follows from `seq` being gap-free and
+  ordering follows from `seq` being monotonic. An opaque id cannot be ordered at all — UUIDs have
+  no ordering — so "latest repair" would otherwise rest on nothing. `open_repair()` allocates
+  conforming ids **in the same lock hold as the append**; allocating in one hold and appending in
+  another leaves a window where a concurrent writer takes that seq.
+
+  *This is a tightening beyond the spec's wording and is flagged as such.*
+
+### Mutation survivors, again
+
+Three mutations survived the first round-2 run and each was a test gap, not a code gap: the
+lock-exclusion mutation had no test (requiring the path was tested; taking the lock was not), and
+both `repair_id` suffix rules were tested only through the **append gate**, so removing them from
+the **parser** changed nothing — a hand-edited log would have bypassed the whole rule. All three
+now have tests and all three fail.

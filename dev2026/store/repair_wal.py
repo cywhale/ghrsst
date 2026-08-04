@@ -29,6 +29,8 @@ import fcntl
 import hashlib
 import json
 import os
+import re
+import uuid
 from typing import Dict, List, NamedTuple, Optional, Sequence
 
 WAL_NAME = "p5_repairs.jsonl"
@@ -87,6 +89,8 @@ class RepairState(NamedTuple):
     day: str
     state: str                                  # "open" | COMMITTED | ABORTED
     fingerprint: Optional[str]                  # committed fingerprint, else None
+    intent_seq: int                             # seq of the intent -- the monotonic authority
+    terminal_payload: Optional[str]             # canonical payload of the terminal record
 
 
 class WalState(NamedTuple):
@@ -107,6 +111,54 @@ class WalState(NamedTuple):
                 if rec["seq"] > best_seq:
                     best_seq, best = rec["seq"], self.repairs.get(rec["repair_id"])
         return best
+
+
+#: `<opaque>-<seq of the intent record>`. The spec calls "UUID + seq" acceptable and
+#: RECOMMENDED; this implementation makes it REQUIRED, because a recommendation cannot be
+#: checked. With the suffix mandatory, "repair_id is unique and monotonic" stops being a
+#: convention the caller is trusted to honour and becomes a property the parser verifies:
+#: uniqueness follows from seq being gap-free, and ordering follows from seq being monotonic.
+#: An opaque id could not be ordered at all -- UUIDs have no ordering, so a log of them can
+#: only be sequenced by something else, and pretending otherwise would leave "latest repair"
+#: resting on nothing. `open_repair()` allocates conforming ids so callers never construct one.
+_REPAIR_ID_RE = re.compile(r"^[A-Za-z0-9_.:+-]+-(\d+)$")
+
+
+def repair_id_seq(repair_id: str) -> Optional[int]:
+    m = _REPAIR_ID_RE.match(repair_id or "")
+    return int(m.group(1)) if m else None
+
+
+def _check_types(rec: dict, n: int, path: str) -> None:
+    """Every field's TYPE, before any of them is used.
+
+    A checksum proves a record is unmodified; it does not prove it was well-formed when it was
+    written. `seq` as a float, `payload` as a list or `day` as a number would each pass the
+    checksum happily and then be compared against values of another type downstream, where the
+    comparison silently yields False -- and a False in this file's comparisons means
+    "authorized"."""
+    for key, typ in (("repair_id", str), ("day", str), ("record", str),
+                     ("at_utc", str), ("operator", str), ("payload", dict)):
+        if not isinstance(rec[key], typ):
+            _fail(f"{path}: line {n} `{key}` must be {typ.__name__}, got "
+                  f"{type(rec[key]).__name__} {rec[key]!r}. All prune is refused.")
+    if isinstance(rec["seq"], bool) or not isinstance(rec["seq"], int):
+        _fail(f"{path}: line {n} `seq` must be an integer, got "
+              f"{type(rec['seq']).__name__} {rec['seq']!r}.")
+    if rec["seq"] < 1:
+        _fail(f"{path}: line {n} `seq` must be >= 1, got {rec['seq']}.")
+    if rec["prev_checksum"] is not None and not isinstance(rec["prev_checksum"], str):
+        _fail(f"{path}: line {n} `prev_checksum` must be a string or null.")
+    if not isinstance(rec["record_checksum"], str):
+        _fail(f"{path}: line {n} `record_checksum` must be a string.")
+    if rec["record"] not in RECORD_TYPES:
+        _fail(f"{path}: line {n} has unknown record type {rec['record']!r}.")
+    if not rec["repair_id"]:
+        _fail(f"{path}: line {n} has an empty repair_id.")
+    if rec["record"] != LOG_TAIL_REPAIRED and repair_id_seq(rec["repair_id"]) is None:
+        _fail(f"{path}: line {n} repair_id {rec['repair_id']!r} does not end in "
+              f"'-<seq>'. The suffix is what makes repair ids verifiably unique and "
+              f"monotonic; an opaque id cannot be ordered at all. All prune is refused.")
 
 
 def _fail(msg, **kw):
@@ -152,10 +204,7 @@ def parse_text(raw: str, *, path: str = "<wal>") -> WalState:
         if missing or extra:
             _fail(f"{path}: line {n} has the wrong field set (missing={missing}, "
                   f"unexpected={extra}). All prune is refused.")
-        if rec["record"] not in RECORD_TYPES:
-            _fail(f"{path}: line {n} has unknown record type {rec['record']!r}.")
-        if not isinstance(rec["seq"], int) or isinstance(rec["seq"], bool):
-            _fail(f"{path}: line {n} `seq` must be an integer, got {rec['seq']!r}.")
+        _check_types(rec, n, path)
 
         # ---- checksum BEFORE anything is believed, including this record's own `day`
         want = record_checksum(rec)
@@ -203,7 +252,11 @@ def _replay(records: Sequence[dict], path: str):
         if kind == INTENT:
             if rid in repairs:
                 _fail(f"{path}: duplicate repair_intent for {rid!r}. All prune is refused.")
-            repairs[rid] = RepairState(rid, day, "open", None)
+            if repair_id_seq(rid) != rec["seq"]:
+                _fail(f"{path}: repair_intent {rid!r} at seq {rec['seq']} carries suffix "
+                      f"{repair_id_seq(rid)}. The suffix must be the intent's own seq -- that "
+                      f"is what makes ids unique and monotonic. All prune is refused.")
+            repairs[rid] = RepairState(rid, day, "open", None, rec["seq"], None)
             continue
 
         # terminal
@@ -215,11 +268,16 @@ def _replay(records: Sequence[dict], path: str):
             poisoned.add(day)
             continue
         fp = rec["payload"].get("fingerprint") if kind == COMMITTED else None
+        body = canonical(rec["payload"])
         if cur.state == "open":
-            repairs[rid] = RepairState(rid, day, kind, fp)
+            repairs[rid] = RepairState(rid, day, kind, fp, cur.intent_seq, body)
             continue
-        # already terminal -- only a byte-identical replay of the SAME terminal is a no-op
-        if cur.state != kind or (kind == COMMITTED and cur.fingerprint != fp):
+        # Already terminal. Only a byte-identical replay of the SAME terminal is a no-op --
+        # compared over the WHOLE canonical payload, not just the fingerprint. Two commits
+        # agreeing on the fingerprint while disagreeing on the variables or the operator are
+        # two different claims about what happened, and picking one silently is exactly the
+        # ambiguity this log exists to remove.
+        if cur.state != kind or cur.terminal_payload != body:
             poisoned.add(day)
     return repairs, poisoned
 
@@ -243,7 +301,7 @@ def read_wal(root: str) -> WalState:
 
 
 # --------------------------------------------------------------------------- append
-def append(root: str, *, record: str, repair_id: str, day: str, at_utc: str,
+def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc: str,
            operator: str, payload: Optional[dict] = None) -> dict:
     """Validate the ENTIRE existing log, then append exactly one fsync'd record.
 
@@ -265,9 +323,13 @@ def append(root: str, *, record: str, repair_id: str, day: str, at_utc: str,
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)           # blocking: held only for the append itself
         state = parse_wal(path)                  # <- refuses the append if anything is wrong
-        _check_transition(state, record=record, repair_id=repair_id, day=day,
-                          payload=payload or {})
         seq = state.last_seq + 1
+        if repair_id is None:
+            if record != INTENT:
+                raise WalError("only an intent may allocate its own repair_id")
+            repair_id = f"{uuid.uuid4()}-{seq}"
+        _check_transition(state, record=record, repair_id=repair_id, day=day,
+                          payload=payload or {}, next_seq=seq)
         rec = {"seq": seq, "repair_id": repair_id, "day": day, "record": record,
                "at_utc": at_utc, "operator": operator, "payload": dict(payload or {}),
                "prev_checksum": state.last_checksum if seq > 1 else None,
@@ -290,9 +352,29 @@ def append(root: str, *, record: str, repair_id: str, day: str, at_utc: str,
         os.close(fd)
 
 
-def _check_transition(state: WalState, *, record: str, repair_id: str, day: str, payload: dict):
+def open_repair(root: str, *, day: str, at_utc: str, operator: str,
+                payload: Optional[dict] = None) -> dict:
+    """Open a repair, allocating a conforming `repair_id` **in the same lock hold** as the
+    append.
+
+    The id cannot be chosen before the lock is held, because its `-<seq>` suffix must be the
+    seq this intent will occupy. Allocating in one hold and appending in another would leave a
+    window in which a concurrent writer takes that seq -- fail-closed, since the suffix check
+    would then reject the append, but a spurious failure all the same. Callers do not construct
+    repair ids; they ask for one. `record["repair_id"]` is what the terminal records and the
+    block's `materialized_repairs` must carry."""
+    return append(root, record=INTENT, repair_id=None, day=day, at_utc=at_utc,
+                  operator=operator, payload=payload)
+
+
+def _check_transition(state: WalState, *, record: str, repair_id: str, day: str, payload: dict,
+                      next_seq: int):
     if record == LOG_TAIL_REPAIRED:
         return
+    if record == INTENT and repair_id_seq(repair_id) != next_seq:
+        raise WalError(
+            f"repair_id {repair_id!r} must end in '-{next_seq}' (the seq this intent will "
+            f"occupy). Use open_repair() rather than constructing ids by hand.")
     cur = state.repairs.get(repair_id)
     for rec in state.records:
         if rec["repair_id"] == repair_id and rec["day"] != day:
@@ -308,9 +390,9 @@ def _check_transition(state: WalState, *, record: str, repair_id: str, day: str,
                        f"record without an intent cannot authorize anything.")
     if cur.state == "open":
         return
-    # Idempotent replay: the expected retry after an uncertain fsync.
-    if cur.state == record and (record != COMMITTED
-                                or cur.fingerprint == payload.get("fingerprint")):
+    # Idempotent replay: the expected retry after an uncertain fsync. Byte-identical over the
+    # whole canonical payload -- not merely agreeing on the fingerprint.
+    if cur.state == record and cur.terminal_payload == canonical(dict(payload)):
         return
     raise WalError(
         f"repair {repair_id!r} is already {cur.state!r}; a conflicting terminal record is "
