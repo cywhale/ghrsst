@@ -57,6 +57,13 @@ class PublishRefused(Exception):
     """Nothing was written. The live manifest is byte-unchanged."""
 
 
+#: Fields of a re-composed generation that legitimately differ from the plan's: they are
+#: freshly generated or clock-derived, so a whole-object comparison must take the plan's values
+#: for exactly these and for nothing else.
+_FREE_TOP = ("generation_id", "created_utc", "created_by")
+_FREE_SUPERSEDED = ("release_after_utc", "hold_until_utc", "bytes")
+
+
 #: Distinguishes "the caller did not supply a source_map" from "the caller supplied an EMPTY
 #: one". `plan.get("source_map")` collapses those two into the same falsy value, and an empty
 #: map is not a missing field -- it is a positive claim that the block read nothing, which for
@@ -312,7 +319,40 @@ def plan_publication(root: str, plan: dict, *, release_after_s: int = DEFAULT_RE
     live = bm.load_live(root)
     bm.validate_manifest(live)
     segment = dict(plan["segment"])
+    candidate, replaced = compose_generation(
+        live, segment, now=now, release_after_s=release_after_s, hold_days=hold_days,
+        predecessor_bytes=int(plan.get("predecessor_bytes", 0)), created_by=created_by)
+    gen = candidate["generation"]
 
+    provenance = _validate_plan_source_map(segment, plan.get("source_map", _ABSENT),
+                                           where="the build plan")
+
+    return {"status": "planned", "root": root, "generation": gen,
+            "predecessor_generation": int(live["generation"]),
+            "manifest": candidate,
+            "new_segment_id": segment["segment_id"],
+            "superseded_now": None if replaced is None else replaced["segment_id"],
+            "source_map": provenance,
+            "block_path": plan.get("out_path"),
+            "note": ("A plan. Nothing is committed until execute_publication re-checks it "
+                     "under the ingest lock."),
+    }
+
+
+def compose_generation(live: dict, segment: dict, *, now: datetime,
+                       release_after_s: int = DEFAULT_RELEASE_AFTER_S,
+                       hold_days: int = DEFAULT_HOLD_DAYS, predecessor_bytes: int = 0,
+                       created_by: str = "p5-compaction"):
+    """Generation `N+1` = live, minus exactly the superseded segment, plus exactly the new one.
+
+    Written once and called from **both** planning and publication. At publication it is
+    re-run against the live manifest under the lock and the result is compared, whole-object,
+    against the plan's manifest -- so the question is never "which fields did someone change",
+    which requires enumerating the ways a document can be wrong, but "is this the manifest this
+    live generation and this segment produce". Enumerating is how the round-5 fix still left
+    a hole: it compared the entries that *remained*, and said nothing about an entry that was
+    removed or one that was injected.
+    """
     gen = int(live["generation"]) + 1
     segments = [dict(s) for s in live["segments"]]
     superseded = [dict(s) for s in live["superseded"]]      # CUMULATIVE (§5.6), never reset
@@ -342,7 +382,7 @@ def plan_publication(root: str, plan: dict, *, release_after_s: int = DEFAULT_RE
             "hold_until_utc": _iso(now + timedelta(days=hold_days)),
             "status": "referenced",
             "current_path": replaced["path"],
-            "bytes": int(plan.get("predecessor_bytes", 0)),
+            "bytes": int(predecessor_bytes),
             "fingerprint": {"algo": "sha256",
                             "day_digest": replaced["fingerprint"]["day_digest"]},
         })
@@ -358,20 +398,9 @@ def plan_publication(root: str, plan: dict, *, release_after_s: int = DEFAULT_RE
     }
     candidate["manifest_checksum"] = bm.compute_checksum(candidate)
     bm.validate_manifest(candidate)
+    return candidate, replaced
 
-    provenance = _validate_plan_source_map(segment, plan.get("source_map", _ABSENT),
-                                           where="the build plan")
 
-    return {"status": "planned", "root": root, "generation": gen,
-            "predecessor_generation": int(live["generation"]),
-            "manifest": candidate,
-            "new_segment_id": segment["segment_id"],
-            "superseded_now": None if replaced is None else replaced["segment_id"],
-            "source_map": provenance,
-            "block_path": plan.get("out_path"),
-            "note": ("A plan. Nothing is committed until execute_publication re-checks it "
-                     "under the ingest lock."),
-    }
 
 
 # --------------------------------------------------------------------------- staleness guard
@@ -532,10 +561,73 @@ def _read_delta_days(delta_path: Optional[str]) -> List[str]:
 
 
 # --------------------------------------------------------------------------- execute
-def execute_publication(plan: dict, *, ingest_lock_path: str, delta_path: Optional[str] = None,
-                        compaction_lock_path: Optional[str] = None,
+def recompose_and_compare(live: dict, plan: dict, *, now: datetime) -> Optional[str]:
+    """Re-derive generation `N+1` from the LIVE manifest and compare it, whole-object, to the
+    plan's.
+
+    Round 5 compared the carried-forward entries that were still *present*, which says nothing
+    about an entry that was **removed** or one that was **injected**. Enumerating what may
+    change requires enumerating every way a document can be wrong; re-composing asks the only
+    question that has a definite answer — *is this the manifest this live generation and this
+    segment produce?* Anything else, including a segment quietly dropped from history, differs.
+
+    Returns a description of the difference, or `None` when they match. Only freshly generated
+    and clock-derived fields are taken from the plan (`_FREE_TOP`, `_FREE_SUPERSEDED`); every
+    other byte must be reproducible from the live manifest.
+    """
+    segment = next((s for s in plan["manifest"]["segments"]
+                    if s["segment_id"] == plan["new_segment_id"]), None)
+    if segment is None:
+        return f"the plan's manifest does not contain segment {plan['new_segment_id']!r}"
+    try:
+        expected, replaced = compose_generation(live, segment, now=now)
+    except (PublishRefused, bm.ManifestError) as exc:
+        # The live manifest plus this segment does not compose into a valid generation at all,
+        # which is a stronger statement than "differs" and is reported as the difference.
+        return (f"generation {int(live['generation']) + 1} cannot be composed from the live "
+                f"manifest and segment {plan['new_segment_id']!r}: {exc}")
+
+    for key in _FREE_TOP:
+        expected[key] = plan["manifest"].get(key)
+    if replaced is not None:
+        mine = next((e for e in expected["superseded"]
+                     if e["segment_id"] == replaced["segment_id"]
+                     and e["superseded_at_generation"] == expected["generation"]), None)
+        theirs = next((e for e in plan["manifest"]["superseded"]
+                       if e["segment_id"] == replaced["segment_id"]
+                       and e.get("superseded_at_generation") == expected["generation"]), None)
+        if mine is not None and theirs is not None:
+            for key in _FREE_SUPERSEDED:
+                mine[key] = theirs.get(key)
+    expected["manifest_checksum"] = ""
+    expected["manifest_checksum"] = bm.compute_checksum(expected)
+
+    if expected == plan["manifest"]:
+        return None
+
+    got, want = plan["manifest"], expected
+    got_ids = [s["segment_id"] for s in got["segments"]]
+    want_ids = [s["segment_id"] for s in want["segments"]]
+    if got_ids != want_ids:
+        return (f"the plan publishes segments {got_ids} but this live generation plus "
+                f"{plan['new_segment_id']!r} yields {want_ids} (removed: "
+                f"{sorted(set(want_ids) - set(got_ids))}, injected: "
+                f"{sorted(set(got_ids) - set(want_ids))})")
+    got_sup = [(e["segment_id"], e["superseded_at_generation"]) for e in got["superseded"]]
+    want_sup = [(e["segment_id"], e["superseded_at_generation"]) for e in want["superseded"]]
+    if got_sup != want_sup:
+        return f"the plan's superseded list is {got_sup}, expected {want_sup}"
+    differing = sorted(k for k in set(got) | set(want) if got.get(k) != want.get(k))
+    return (f"the plan's manifest differs from the one this live generation produces "
+            f"(fields: {differing})")
+
+
+def execute_publication(plan: dict, *, ingest_lock_path: str,
+                        compaction_lock_path: Optional[str],
+                        delta_path: Optional[str] = None,
                         build_artifact_path: Optional[str] = None,
-                        operator: str = "", now: Optional[datetime] = None) -> dict:
+                        operator: str = "", now: Optional[datetime] = None,
+                        unsafe_skip_compaction_lock: bool = False) -> dict:
     """§7.4 steps 1-4. The commit point is `os.replace`, inside `bm.publish`.
 
     Refuses without writing anything on: a running compaction, a missing referenced block, a
@@ -562,9 +654,17 @@ def execute_publication(plan: dict, *, ingest_lock_path: str, delta_path: Option
         verify_build_artifact(source_map, build_artifact_path,
                               segment_id=plan["new_segment_id"], where="at publication")
 
-    if compaction_lock_path:
-        # A build holding the lock may still be writing the very block we are about to
-        # reference. Publication is not the operation that should race it.
+    # `compaction_lock_path` is a REQUIRED keyword with no default. It used to be optional, so
+    # a caller who simply forgot it published without ever asking whether a build was running
+    # -- and a build holding the lock may still be writing the very block we are about to
+    # reference. The waiver is named so it cannot be typed by accident, and is greppable.
+    if not compaction_lock_path:
+        if not unsafe_skip_compaction_lock:
+            raise PublishRefused(
+                "compaction_lock_path is required: publication must not race a build that is "
+                "still writing the block it references (§7.1b). Pass the lock path, or "
+                "unsafe_skip_compaction_lock=True in a test that is not exercising it.")
+    else:
         busy = refuse_if_compaction_running(compaction_lock_path, operation="manifest_publish")
         if busy:
             return {**busy, "published": False}
@@ -580,6 +680,14 @@ def execute_publication(plan: dict, *, ingest_lock_path: str, delta_path: Option
                     "reason": (f"the manifest moved while this plan was held: planned against "
                                f"generation {plan['predecessor_generation']}, live is "
                                f"{live['generation']}. Re-plan against the current generation.")}
+
+        # The manifest must be the one THIS live generation produces -- not merely one whose
+        # remaining entries agree with it.
+        diff = recompose_and_compare(live, plan, now=now)
+        if diff:
+            return {"status": "refused", "published": False,
+                    "reason": (f"{diff}. Generation N+1 is exactly: live, minus the one "
+                               f"superseded segment, plus the one new segment.")}
 
         drift = staleness_guard(source_map, delta_path=delta_path,
                                 live_days=_read_delta_days(delta_path),
@@ -600,22 +708,6 @@ def execute_publication(plan: dict, *, ingest_lock_path: str, delta_path: Option
         bind_segment_to_block(published[0], source_map, _seg_path(root, published[0]),
                               plan["manifest"]["grid"], where="at publication")
 
-        # Carried-forward segments are immutable and were verified when they were published,
-        # so re-inspecting every one of them on every publish would be O(segments) disk work
-        # for no new information. What must hold is that their entries are UNCHANGED: an edit
-        # to an existing entry is the same hazard as an edit to the new one, and comparing
-        # against the live generation catches it without opening anything.
-        carried = {s["segment_id"]: s for s in plan["manifest"]["segments"]
-                   if s["segment_id"] != plan["new_segment_id"]}
-        was = {s["segment_id"]: s for s in live["segments"]}
-        drifted_entries = sorted(sid for sid, s in carried.items()
-                                 if sid not in was or was[sid] != s)
-        if drifted_entries:
-            return {"status": "refused", "published": False,
-                    "reason": (f"carried-forward segment entr(y/ies) {drifted_entries[:3]} "
-                               f"differ from generation {live['generation']}. Published blocks "
-                               f"are immutable, so their entries must be too; a changed entry "
-                               f"is either an edit or a plan built against another manifest.")}
 
         archive = bm.publish(root, plan["manifest"])
         _append_log(root, MANIFEST_LOG, {

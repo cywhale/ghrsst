@@ -12,10 +12,10 @@ was folded.
 
 - Repair WAL: [`../store/repair_wal.py`](../store/repair_wal.py)
 - Publish / lifecycle / rollback: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py)
-- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **117/117 green**
-- Full local suite: **573 tests OK** (17 skipped), up from 456.
+- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **127/127 green**
+- Full local suite: **583 tests OK** (17 skipped), up from 456.
 
-**Review rounds 2–5** raised five, one, three and two findings; §8–§11 record what each changed.
+**Review rounds 2–6** raised five, one, three, two and two findings; §8–§12 record what each changed.
 
 **This step does not claim crash safety.** It claims that each individual operation either commits or leaves the live manifest byte-unchanged. Two states are known-ambiguous and are P5-S5's job, not this step's (§10.3).
 
@@ -157,7 +157,7 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_phase2_p5s4
 
 ## 7. Mutation verification
 
-Every guard was disabled in turn and the suite re-run; **all 70 fail**. One further mutation survives by construction and is discussed below the table.
+Every guard was disabled in turn and the suite re-run; **all 76 fail**. One further mutation survives by construction and is discussed below the table.
 
 | guard disabled | result |
 |---|---|
@@ -231,6 +231,12 @@ Every guard was disabled in turn and the suite re-run; **all 70 fail**. One furt
 | block source without a resolver allowed | FAILED |
 | daily/hold index not pinned to 0 | FAILED |
 | unpublished path accepted as a block source | FAILED |
+| no re-composition at publication | FAILED (8 + 1) |
+| re-composition compares only the segment ids | FAILED (5 + 1) |
+| too many fields treated as free | FAILED (6) |
+| uncomposable generation not reported | FAILED |
+| compaction lock optional again | FAILED |
+| compaction lock never consulted | FAILED |
 
 **Two mutations initially survived, and both were my tests passing for the wrong reason** — the
 same failure mode the last three review rounds found, caught here by the mutation run rather
@@ -464,10 +470,9 @@ only at build time.
 `attrs["region"]` means the block *is* the full grid, and treating that as a mismatch would
 refuse every block the builder writes without a region.
 
-**Carried-forward segments** are compared against the live generation's entries rather than
-re-inspected. Published blocks are immutable, so their entries must be too; an edit to an
-existing entry is the same hazard as an edit to the new one, and this catches it without
-O(segments) disk work on every publish.
+**Carried-forward segments** are not re-inspected. Round 5 compared their *entries* against the
+live generation; round 6 replaced that with re-composition (§12.1), which subsumes it and also
+covers the cases entry-comparison could not see.
 
 *One arm is defence in depth and is tested as such:* `day_count` cannot be edited in isolation
 and stay schema-legal — changing it means changing `gaps`/`unknown`, which changes the declared
@@ -509,3 +514,63 @@ The round-2/4 checks bind the map to *which block*, *what is in it*, and *whethe
 source still means what its kind says* — none of that is a checksum over the bytes that were
 read. P5-S5 owns the checksummed provenance artifact; **no claim of complete provenance safety
 is made here.**
+
+## 12. Review round 6 — two findings
+
+### 1. [High] The segment **set** was accepted, not derived
+
+Round 5 compared the carried-forward entries that were still **present**. That says nothing
+about an entry that was **removed** or one that was **injected**: drop an unrelated segment from
+the plan, recompute `manifest_checksum`, and `validate_manifest` still passes — publishing a
+manifest that silently loses history. Injecting a legal extra segment is the mirror image.
+
+The fix is not another comparison. Enumerating what may change requires enumerating every way a
+document can be wrong, and this is the second round where that approach left a hole.
+`compose_generation()` — the function `plan_publication` already used — is now called **again
+under the ingest lock**, against the live manifest, and the result is compared to the plan's
+manifest **whole-object**. The question stops being "which fields differ" and becomes *is this
+the manifest this live generation and this segment produce?*
+
+> Generation `N+1` is exactly: live, minus the one superseded segment, plus the one new segment.
+
+Only freshly generated and clock-derived fields are taken from the plan — `generation_id`,
+`created_utc`, `created_by`, and the new superseded entry's `release_after_utc` /
+`hold_until_utc` / `bytes`. Everything else must be reproducible from the live manifest.
+A mutation widening that free list fails, and so does one narrowing the comparison to segment
+ids.
+
+A plan that cannot be composed at all — an edited segment `variables` list makes the top-level
+union inconsistent — is reported as such rather than escaping as a raw `ManifestError`.
+
+Ten tests, including the one the review asked for (live has two segments; the plan drops the
+one that is *not* superseded → refused, naming it), plus injection, an emptied `superseded`
+list, an edited generation number, an edited predecessor pointer, and — the test that keeps the
+guard honest — an unedited plan that must still publish with both segments intact, and one that
+edits **every** free field at once and must still publish.
+
+**This subsumes round 5's carried-entry check**, which has been removed rather than left beside
+it. Two overlapping guards where one is strictly stronger is how the weaker one ends up being
+the only one someone maintains.
+
+*Check ordering shifted as a result, and the tests say so.* Edits to `grid`, `variables` and
+`day_count` are now caught by re-composition before the block binding sees them, because those
+fields are derived from the live manifest. Their block-binding arms are defence in depth and are
+tested directly against `bind_segment_to_block()`, where they can actually be reached — rather
+than through publication tests that would pass for a different guard's reason.
+
+### 2. [Medium] The compaction lock was optional
+
+`compaction_lock_path` had a default of `None`, so a caller who forgot it published without ever
+asking whether a build was running — and a build holding the lock may still be writing the very
+block being referenced. It is now a **required keyword with no default**, with
+`unsafe_skip_compaction_lock=True` as the single greppable waiver, applied through one named
+shim in the test module so no test silently passes `None`. Same pattern as `build_block`'s
+`unsafe_skip_isolation`.
+
+### 3. [Known residual, unchanged] Source bytes are still not proven
+
+Restated once more without softening: the map is bound to *which block*, *what is in it*, and
+*whether each recorded source still means what its kind says*. None of that is a checksum over
+the bytes that were read, and an in-place modification of a source after the build is
+undetectable here. P5-S5 owns the checksummed provenance artifact. **No claim of complete
+provenance safety is made in S4.**

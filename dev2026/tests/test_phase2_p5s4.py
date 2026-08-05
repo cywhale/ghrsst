@@ -28,6 +28,19 @@ import p5_fixtures as fx  # noqa: E402
 from ingest import publish_manifest as pub  # noqa: E402
 from store import block_manifest as bm  # noqa: E402
 from store import repair_wal as rw  # noqa: E402
+from store.compaction_lock import CompactionLock  # noqa: E402
+
+def _execute(plan, **kw):
+    """Test shim: waive the compaction-lock requirement for the cases that are not about it.
+
+    `execute_publication` requires `compaction_lock_path`. Tests below that exercise staleness,
+    binding, lifecycle etc. are not about compaction isolation, so they waive it explicitly
+    here -- in ONE named place, rather than each silently passing `None`.
+    `TestCompactionLockIsMandatory` calls `pub.execute_publication` directly."""
+    kw.setdefault("compaction_lock_path", None)
+    kw.setdefault("unsafe_skip_compaction_lock", True)
+    return pub.execute_publication(plan, **kw)
+
 
 ANCHOR = "2026-06-27"
 S = 90
@@ -488,7 +501,7 @@ class TestPublication(_Base):
     def test_publication_commits_generation_n_plus_1_and_archives_it(self):
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
                                     now=T0)
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock,
+        out = _execute(plan, ingest_lock_path=self.lock,
                                       delta_path=self.delta, now=T0)
         self.assertEqual(out["status"], "published")
         live = bm.load_live(self.root)
@@ -501,7 +514,7 @@ class TestPublication(_Base):
     def test_the_superseded_block_moves_to_the_superseded_list_as_referenced(self):
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
                                     now=T0)
-        pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
         sup = bm.load_live(self.root)["superseded"]
         self.assertEqual([e["segment_id"] for e in sup], ["b_v1"])
         self.assertEqual(sup[0]["status"], "referenced")
@@ -515,7 +528,7 @@ class TestPublication(_Base):
         pruned = os.path.join(self.tmp, "delta2.zarr")
         fx.build_delta(pruned, self.span[30:60])               # the first 30 days are gone
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=pruned,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=pruned,
                                       now=T0)
         self.assertEqual(out["status"], "aborted_stale")
         self.assertFalse(out["published"])
@@ -526,7 +539,7 @@ class TestPublication(_Base):
                                     now=T0)
         g = zarr.open_group(self.delta, mode="a")
         g.attrs["days"] = list(g.attrs["days"]) + [self.span[0]]
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       now=T0)
         self.assertEqual(out["status"], "aborted_stale")
         self.assertIn("duplicate", out["reason"])
@@ -536,7 +549,7 @@ class TestPublication(_Base):
                                     now=T0)
         other = self._manifest([self.v1_seg], generation=2)
         bm.publish(self.root, other)                           # someone else published first
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       now=T0)
         self.assertEqual(out["status"], "aborted_stale")
         self.assertIn("moved while this plan was held", out["reason"])
@@ -546,7 +559,7 @@ class TestPublication(_Base):
                                     now=T0)
         shutil.rmtree(os.path.join(self.root, "b_v2.zarr"))
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       now=T0)
         self.assertEqual(out["status"], "refused")
         self.assertIn("fails closed", out["reason"])
@@ -560,7 +573,6 @@ class TestPublication(_Base):
         self.assertIn("no such segment", str(cm.exception))
 
     def test_a_running_compaction_blocks_publication(self):
-        from store.compaction_lock import CompactionLock
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
                                     now=T0)
         clock = os.path.join(self.tmp, "p5_compaction.lock")
@@ -571,10 +583,35 @@ class TestPublication(_Base):
         self.assertEqual(out["reason"], "compaction_lock_held")
         self.assertFalse(out["published"])
 
+    def test_the_compaction_lock_path_is_REQUIRED(self):
+        """It used to be optional, so a caller who forgot it published without ever asking
+        whether a build was running."""
+        plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+        with self.assertRaises(TypeError):
+            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                    now=T0)
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                    compaction_lock_path=None, now=T0)
+        self.assertIn("compaction_lock_path is required", str(cm.exception))
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+    def test_an_idle_compaction_lock_does_not_block_publication(self):
+        plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+        clock = os.path.join(self.tmp, "p5_compaction.lock")
+        with CompactionLock(clock):
+            pass                                            # created, then released
+        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                      compaction_lock_path=clock, now=T0)
+        self.assertEqual(out["status"], "published")
+
     def test_the_generation_archive_is_never_rewritten(self):
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
                                     now=T0)
-        pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
         with self.assertRaises(bm.ManifestError) as cm:
             bm.publish(self.root, plan["manifest"])
         self.assertIn("immutable", str(cm.exception))
@@ -582,7 +619,7 @@ class TestPublication(_Base):
     def test_publication_appends_an_audit_line(self):
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
                                     now=T0)
-        pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+        _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                 operator="tester", now=T0)
         with open(os.path.join(self.root, pub.MANIFEST_LOG)) as fh:
             entry = json.loads(fh.read().splitlines()[-1])
@@ -598,7 +635,7 @@ class TestSupersededLifecycle(_Base):
         fx.build_delta(self.delta, self.span[:60])
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
                                     now=T0)
-        pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
 
     def test_referenced_does_not_advance_before_release_after_utc(self):
         """The block is still an in-flight snapshot's target, the next fold's build input, and
@@ -688,7 +725,7 @@ class TestRollback(_Base):
         fx.build_delta(self.delta, self.span[:60])
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
                                     now=T0)
-        pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
 
     def _to_hold(self):
         later = T0 + timedelta(seconds=pub.DEFAULT_RELEASE_AFTER_S + 1)
@@ -804,7 +841,7 @@ class TestPruneOutlookReporting(_Base):
         fx.build_delta(delta, self.span[:60])
         self._open_repair(self.span[0])
         plan = pub.plan_publication(self.root, self._plan_for_v2(delta, self.span[:60]), now=T0)
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=delta,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=delta,
                                       now=T0)
         self.assertEqual(out["status"], "published")
         self.assertIn("UNCHANGED", out["note"])
@@ -849,7 +886,7 @@ class TestGuardUsesThePublishedProvenance(_Base):
                          src["segment"]["build_provenance"]["sources"])
         retargeted = os.path.join(self.tmp, "delta_v2.zarr")
         fx.build_delta(retargeted, self.span[:60])
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock,
+        out = _execute(plan, ingest_lock_path=self.lock,
                                       delta_path=retargeted, now=T0)
         self.assertEqual(out["status"], "aborted_stale")
 
@@ -880,7 +917,7 @@ class TestStalenessChecksIdentityNotMembership(_Base):
         os.symlink(real2, alias)                               # the swap
         live = fx.read_days(alias)
         self.assertEqual(set(live), set(self.span[:60]), "precondition: same date set")
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=alias,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=alias,
                                       now=T0)
         self.assertEqual(out["status"], "aborted_stale")
         self.assertIn("not the same bytes", out["reason"])
@@ -892,7 +929,7 @@ class TestStalenessChecksIdentityNotMembership(_Base):
         g = zarr.open_group(self.delta, mode="a")
         days = list(g.attrs["days"])
         g.attrs["days"] = days[30:] + days[:30]                # same set, rotated
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       now=T0)
         self.assertEqual(out["status"], "aborted_stale")
         self.assertIn("physical index", out["reason"])
@@ -908,7 +945,7 @@ class TestStalenessChecksIdentityNotMembership(_Base):
         y, m, d = self.span[0].split("-")
         shutil.rmtree(os.path.join(daily, y, m, d))
         self.assertTrue(os.path.isdir(daily), "precondition: the ROOT is still there")
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       now=T0)
         self.assertEqual(out["status"], "aborted_stale")
         self.assertIn("source group", out["reason"])
@@ -920,7 +957,7 @@ class TestStalenessChecksIdentityNotMembership(_Base):
                     "source_day_index": 0} for d in self.span[:60]}
         plan = pub.plan_publication(
             self.root, self._plan_for_v2(self.delta, self.span[:60], smap=smap), now=T0)
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       now=T0)
         self.assertEqual(out["status"], "published")
 
@@ -932,7 +969,7 @@ class TestLifecycleIsolationAndAtomicity(_Base):
         fx.build_delta(self.delta, self.span[:60])
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
                                     now=T0)
-        pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
         self.later = T0 + timedelta(seconds=pub.DEFAULT_RELEASE_AFTER_S + 1)
 
     def test_apply_without_the_ingest_lock_is_refused(self):
@@ -1154,7 +1191,7 @@ class TestSourceMapIsReboundAtPublication(_Base):
     def _publish(self, plan, **kw):
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
         try:
-            out = pub.execute_publication(plan, ingest_lock_path=self.lock,
+            out = _execute(plan, ingest_lock_path=self.lock,
                                           delta_path=self.delta, now=T0, **kw)
         except pub.PublishRefused as exc:
             out = {"status": "refused", "published": False, "reason": str(exc)}
@@ -1185,14 +1222,14 @@ class TestSourceMapIsReboundAtPublication(_Base):
         it must still be fully guarded, not waved through."""
         plan = self._plan()
         del plan["source_map"]
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock,
+        out = _execute(plan, ingest_lock_path=self.lock,
                                       delta_path=self.retargeted, now=T0)
         self.assertEqual(out["status"], "aborted_stale")
 
     def test_a_deleted_source_map_still_publishes_when_the_delta_is_intact(self):
         plan = self._plan()
         del plan["source_map"]
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock,
+        out = _execute(plan, ingest_lock_path=self.lock,
                                       delta_path=self.delta, now=T0)
         self.assertEqual(out["status"], "published")
 
@@ -1203,7 +1240,7 @@ class TestSourceMapIsReboundAtPublication(_Base):
         empty["source_map"] = {}
         del absent["source_map"]
         self.assertFalse(self._publish(empty)["published"])
-        self.assertEqual(pub.execute_publication(absent, ingest_lock_path=self.lock,
+        self.assertEqual(_execute(absent, ingest_lock_path=self.lock,
                                                  delta_path=self.delta, now=T0)["status"],
                          "published")
 
@@ -1222,6 +1259,8 @@ class TestSourceMapIsReboundAtPublication(_Base):
         seg["build_provenance"]["sources"] = {
             d: {"source_kind": "delta", "source_path": os.path.realpath(self.retargeted),
                 "source_day_index": i} for i, d in enumerate(self.span[:60])}
+        plan["manifest"]["manifest_checksum"] = ""      # a forger would recompute this
+        plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
         del plan["source_map"]
         out = self._publish(plan)
         self.assertEqual(out["status"], "aborted_stale")
@@ -1243,7 +1282,7 @@ class TestSourceMapIsReboundAtPublication(_Base):
             json.dump(plan, fh, indent=2, sort_keys=True)
         with open(path) as fh:
             reloaded = json.load(fh)
-        out = pub.execute_publication(reloaded, ingest_lock_path=self.lock,
+        out = _execute(reloaded, ingest_lock_path=self.lock,
                                       delta_path=self.delta, now=T0)
         self.assertEqual(out["status"], "published")
 
@@ -1387,7 +1426,7 @@ class TestSourceMapIsStrictlyValidated(_Base):
         del plan["source_map"]
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
         with self.assertRaises(pub.PublishRefused) as cm:
-            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+            _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                     now=T0)
         self.assertIn("source_kind", str(cm.exception))
         self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
@@ -1415,7 +1454,7 @@ class TestProvenanceIsBoundToTheBlock(_Base):
         plan = pub.plan_publication(self.root, src, now=T0)      # internally consistent
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
         with self.assertRaises(pub.PublishRefused) as cm:
-            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+            _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                     now=T0)
         self.assertIn("different block", str(cm.exception))
         self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
@@ -1423,7 +1462,7 @@ class TestProvenanceIsBoundToTheBlock(_Base):
     def test_a_matching_map_publishes(self):
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
                                     now=T0)
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       now=T0)
         self.assertEqual(out["status"], "published")
 
@@ -1439,7 +1478,7 @@ class TestProvenanceIsBoundToTheBlock(_Base):
                                    "build_provenance": {"sources": other}}}, fh)
         plan = pub.plan_publication(self.root, src, now=T0)
         with self.assertRaises(pub.PublishRefused) as cm:
-            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+            _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                     build_artifact_path=artifact, now=T0)
         self.assertIn("builder's own record", str(cm.exception))
 
@@ -1451,7 +1490,7 @@ class TestProvenanceIsBoundToTheBlock(_Base):
                                    "build_provenance": {"sources": src["source_map"]}}}, fh)
         plan = pub.plan_publication(self.root, src, now=T0)
         with self.assertRaises(pub.PublishRefused) as cm:
-            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+            _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                     build_artifact_path=artifact, now=T0)
         self.assertIn("describes segment", str(cm.exception))
 
@@ -1462,7 +1501,7 @@ class TestProvenanceIsBoundToTheBlock(_Base):
             json.dump({"segment": {"segment_id": "b_v2",
                                    "build_provenance": {"sources": src["source_map"]}}}, fh)
         plan = pub.plan_publication(self.root, src, now=T0)
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       build_artifact_path=artifact, now=T0)
         self.assertEqual(out["status"], "published")
 
@@ -1489,12 +1528,15 @@ class TestSegmentEntryIsBoundToTheBlock(_Base):
         bm.validate_manifest(plan["manifest"])     # precondition: still schema-legal
         del plan["source_map"]
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
-        with self.assertRaises(pub.PublishRefused) as cm:
-            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                                    now=T0)
+        try:
+            out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+            reason = out["reason"]
+            self.assertFalse(out["published"])
+        except pub.PublishRefused as exc:
+            reason = str(exc)
         self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before,
                          "the live manifest must be byte-identical after a refusal")
-        return str(cm.exception)
+        return reason
 
     def test_an_edited_layout_is_refused(self):
         def m(seg, manifest):
@@ -1502,12 +1544,26 @@ class TestSegmentEntryIsBoundToTheBlock(_Base):
         self.assertIn("layout", self._edited(m))
 
     def test_an_edited_variable_list_is_refused(self):
-        """The segment list and the top-level list must both be edited to stay schema-legal,
-        which is exactly what an editor forging a manifest would do."""
+        """Two layers again. The segment list and the top-level list must BOTH be edited to
+        stay schema-legal, and the top-level one is copied from the live manifest, so the
+        re-composition catches it. The block-level `variables` check is defence in depth and
+        is tested where it can be reached."""
         def m(seg, manifest):
             seg["variables"] = ["sst"]
             manifest["variables"] = ["sst"]
-        self.assertIn("variables", self._edited(m))
+        # The composition itself rejects it: the top-level list is rebuilt from the live
+        # manifest's segments, so an edited segment list makes generation N+1 uncomposable.
+        self.assertIn("cannot be composed", self._edited(m))
+
+        block = self._block("probe", self.span[:10])
+        seg = _seg("probe", "probe.zarr", self.s0, self.e0, 10, unknown=self.span[10:],
+                   sealed=False, block_path=block)
+        seg["variables"] = ["sst"]
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.bind_segment_to_block(seg, {d: {} for d in self.span[:10]}, block,
+                                      {"ny": 32, "nx": 32, "region": [0, 32, 0, 32]},
+                                      where="probe")
+        self.assertIn("variables", str(cm.exception))
 
     def test_an_edited_metadata_fingerprint_is_refused(self):
         def m(seg, manifest):
@@ -1540,17 +1596,30 @@ class TestSegmentEntryIsBoundToTheBlock(_Base):
         self.assertIn("never checks", self._edited(m))       # the earlier guard, still a refusal
 
     def test_a_grid_that_does_not_match_the_block_is_refused(self):
+        """Two layers, and it is worth being explicit about which one fires.
+
+        A grid edited in the plan is caught by the re-composition, because `grid` is copied
+        from the live manifest and cannot legitimately change. The block-level grid check is
+        for the case re-composition cannot see -- a live manifest whose grid genuinely does not
+        match the block -- so it is tested directly."""
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
                                     now=T0)
         plan["manifest"]["grid"] = {"ny": 64, "nx": 64, "region": [0, 64, 0, 64]}
         plan["manifest"]["manifest_checksum"] = ""
         plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
-        with self.assertRaises(pub.PublishRefused) as cm:
-            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                                    now=T0)
-        self.assertIn("manifest grid declares", str(cm.exception))
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        self.assertEqual(out["status"], "refused")
         self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+        block = self._block("probe", self.span[:10])
+        seg = _seg("probe", "probe.zarr", self.s0, self.e0, 10, unknown=self.span[10:],
+                   sealed=False, block_path=block)
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.bind_segment_to_block(seg, {d: {} for d in self.span[:10]}, block,
+                                      {"ny": 64, "nx": 64, "region": [0, 64, 0, 64]},
+                                      where="probe")
+        self.assertIn("manifest grid declares", str(cm.exception))
 
     def test_a_carried_forward_entry_that_was_edited_is_refused(self):
         """Published blocks are immutable, so their entries must be too -- and re-inspecting
@@ -1575,10 +1644,9 @@ class TestSegmentEntryIsBoundToTheBlock(_Base):
         plan["manifest"]["manifest_checksum"] = ""
         plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                                      now=T0)
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
         self.assertEqual(out["status"], "refused")
-        self.assertIn("b_v1", out["reason"])
+        self.assertIn("live generation produces", out["reason"])
         self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
 
 
@@ -1597,7 +1665,7 @@ class TestSourceKindIsCheckedOnItsOwnTerms(_Base):
         plan = pub.plan_publication(
             self.root, self._plan_for_v2(self.delta, self.span[:60], smap=smap), now=T0)
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       now=T0)
         if out.get("published"):
             return out
@@ -1623,7 +1691,7 @@ class TestSourceKindIsCheckedOnItsOwnTerms(_Base):
                     "source_day_index": i + 7} for i, d in enumerate(self.span[:30])}
         plan = pub.plan_publication(
             self.root, self._plan_for_v2(self.delta, self.span[:30], smap=smap), now=T0)
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       now=T0)
         self.assertEqual(out["status"], "aborted_stale")
         self.assertIn("holds this day at index", out["reason"])
@@ -1634,7 +1702,7 @@ class TestSourceKindIsCheckedOnItsOwnTerms(_Base):
                     "source_day_index": i} for i, d in enumerate(self.span[:30])}
         plan = pub.plan_publication(
             self.root, self._plan_for_v2(self.delta, self.span[:30], smap=smap), now=T0)
-        out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       now=T0)
         self.assertEqual(out["status"], "published")
 
@@ -1659,3 +1727,122 @@ class TestSourceKindIsCheckedOnItsOwnTerms(_Base):
         out = pub.staleness_guard(smap, delta_path=None, live_days=[])
         self.assertEqual(out["status"], "aborted_stale")
         self.assertIn("cannot be checked", out["reason"])
+
+
+# ============ review round 6: the manifest must be the one THIS live generation produces
+class TestSegmentSetIsDerivedNotAccepted(_Base):
+    """Round 5 compared the carried-forward entries that were still *present*, which says
+    nothing about an entry that was REMOVED or one that was INJECTED. Enumerating what may
+    change requires enumerating every way a document can be wrong; re-composing asks the one
+    question with a definite answer."""
+
+    def setUp(self):
+        super().setUp()
+        # a live generation with TWO segments, so "drop one" is expressible
+        self.b0 = self._block("b_v1", self.span[:30])
+        s1, e1 = bm.block_bounds(ANCHOR, S, 1)
+        self.span1 = fx.calendar_span(s1, e1)
+        self.other = self._block("b_other", self.span1[:20])
+        seg0 = _seg("b_v1", "b_v1.zarr", self.s0, self.e0, 30, unknown=self.span[30:],
+                    sealed=False, block_path=self.b0)
+        seg1 = _seg("b_other", "b_other.zarr", s1, e1, 20, unknown=self.span1[20:],
+                    sealed=False, precedence=1, block_path=self.other)
+        bm.publish(self.root, self._manifest([seg0, seg1]))
+        self.delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(self.delta, self.span[:60])
+
+    def _plan(self):
+        return pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+
+    def _refuse(self, plan):
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        self.assertFalse(out["published"])
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before,
+                         "the live manifest must be byte-identical after a refusal")
+        return out["reason"]
+
+    def _reseal(self, plan):
+        plan["manifest"]["manifest_checksum"] = ""
+        plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
+        bm.validate_manifest(plan["manifest"])       # precondition: still schema-legal
+        return plan
+
+    def test_removing_a_segment_that_is_NOT_the_superseded_one_is_refused(self):
+        """The case the review named: history quietly dropped, checksum recomputed, schema
+        still valid."""
+        plan = self._plan()
+        plan["manifest"]["segments"] = [s for s in plan["manifest"]["segments"]
+                                        if s["segment_id"] != "b_other"]
+        plan["manifest"]["variables"] = sorted(
+            {v for s in plan["manifest"]["segments"] for v in s["variables"]})
+        reason = self._refuse(self._reseal(plan))
+        self.assertIn("removed: ['b_other']", reason)
+
+    def test_injecting_an_extra_segment_is_refused(self):
+        s2, e2 = bm.block_bounds(ANCHOR, S, 2)
+        span2 = fx.calendar_span(s2, e2)
+        extra_path = self._block("b_extra", span2[:10])
+        plan = self._plan()
+        plan["manifest"]["segments"].append(
+            _seg("b_extra", "b_extra.zarr", s2, e2, 10, unknown=span2[10:], sealed=False,
+                 precedence=2, block_path=extra_path))
+        reason = self._refuse(self._reseal(plan))
+        self.assertIn("injected: ['b_extra']", reason)
+
+    def test_an_edited_superseded_list_is_refused(self):
+        plan = self._plan()
+        plan["manifest"]["superseded"] = []
+        reason = self._refuse(self._reseal(plan))
+        self.assertIn("superseded list", reason)
+
+    def test_an_edited_generation_number_is_refused(self):
+        plan = self._plan()
+        plan["manifest"]["generation"] = 7
+        plan["predecessor_generation"] = 1
+        reason = self._refuse(self._reseal(plan))
+        self.assertIn("differs from the one this live generation produces", reason)
+
+    def test_an_edited_predecessor_pointer_is_refused(self):
+        plan = self._plan()
+        plan["manifest"]["predecessor_manifest"] = bm.archive_name(99)
+        reason = self._refuse(self._reseal(plan))
+        self.assertIn("predecessor_manifest", reason)
+
+    def test_a_superseded_entry_pointed_at_a_different_block_is_refused(self):
+        plan = self._plan()
+        entry = next(e for e in plan["manifest"]["superseded"]
+                     if e["segment_id"] == "b_v1")
+        entry["current_path"] = "b_other.zarr"
+        reason = self._refuse(self._reseal(plan))
+        self.assertIn("differs", reason)
+
+    def test_the_UNEDITED_plan_still_publishes_with_both_segments_intact(self):
+        """The re-composition must not reject the legitimate case."""
+        out = _execute(self._plan(), ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        self.assertEqual(out["status"], "published")
+        live = bm.load_live(self.root)
+        self.assertEqual(sorted(s["segment_id"] for s in live["segments"]),
+                         ["b_other", "b_v2"])
+        self.assertEqual([e["segment_id"] for e in live["superseded"]], ["b_v1"])
+
+    def test_the_free_fields_may_differ_and_everything_else_may_not(self):
+        """`generation_id`, `created_utc`, `created_by` and the new superseded entry's clock
+        fields are freshly generated, so the comparison takes them from the plan. If it took
+        more than that, an edit would slip through; if it took less, every publish would
+        refuse."""
+        plan = self._plan()
+        plan["manifest"]["generation_id"] = "some-other-uuid"
+        plan["manifest"]["created_utc"] = "2099-01-01T00:00:00Z"
+        plan["manifest"]["created_by"] = "someone-else"
+        entry = next(e for e in plan["manifest"]["superseded"] if e["segment_id"] == "b_v1")
+        entry["release_after_utc"] = "2099-01-02T00:00:00Z"
+        entry["hold_until_utc"] = "2099-01-20T00:00:00Z"
+        entry["bytes"] = 999
+        out = _execute(self._reseal(plan), ingest_lock_path=self.lock, delta_path=self.delta,
+                       now=T0)
+        self.assertEqual(out["status"], "published")
+        live = bm.load_live(self.root)
+        self.assertEqual(live["created_by"], "someone-else")
+        self.assertEqual(live["superseded"][0]["bytes"], 999)
