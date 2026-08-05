@@ -28,7 +28,9 @@ import p5_fixtures as fx  # noqa: E402
 from ingest import publish_manifest as pub  # noqa: E402
 from store import block_manifest as bm  # noqa: E402
 from store import repair_wal as rw  # noqa: E402
-from store.compaction_lock import CompactionLock  # noqa: E402
+from store.compaction_lock import (  # noqa: E402
+    CompactionLock, CompactionLockBusy, CompactionLockError,
+)
 
 def _execute(plan, **kw):
     """Test shim: waive the compaction-lock requirement for the cases that are not about it.
@@ -607,6 +609,152 @@ class TestPublication(_Base):
         out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                       compaction_lock_path=clock, now=T0)
         self.assertEqual(out["status"], "published")
+
+    def test_the_compaction_lock_is_held_through_publication_not_merely_probed(self):
+        """§7.1b: a probe-and-release leaves a window between the check and `bm.publish` in which
+        a build can take the lock and begin rewriting the referenced block. The reservation is
+        HELD across the critical section instead, so a build that tries to start mid-publish is
+        refused.
+
+        Proven by pinning publication inside the critical section -- holding the ingest lock it
+        blocks on -- and showing the compaction lock is unavailable to a would-be build while it
+        waits. A regression to probe-and-release makes the acquire below SUCCEED.
+
+        No fixed sleep: the worker is given a bounded window to reach the reservation, and the
+        lock must then still be busy a moment later. A sleep long enough to be safe on an idle
+        machine is not long enough on a loaded one, and a test that fails on correct code is
+        worse than no test."""
+        import threading
+        import time
+        plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+        clock = os.path.join(self.tmp, "p5_compaction.lock")
+        result = {}
+        started, done = threading.Event(), threading.Event()
+
+        def busy() -> bool:
+            try:
+                CompactionLock(clock).acquire().release()
+                return False
+            except CompactionLockBusy:
+                return True
+
+        holder = open(self.lock, "w")
+        fcntl.flock(holder, fcntl.LOCK_EX)          # pin the worker inside the critical section
+        try:
+            def worker():
+                started.set()
+                try:
+                    result["out"] = pub.execute_publication(
+                        plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                        compaction_lock_path=clock, now=T0)
+                except BaseException as exc:        # noqa: BLE001 -- surfaced to the test
+                    result["exc"] = exc
+                finally:
+                    done.set()
+
+            threading.Thread(target=worker, daemon=True).start()
+            self.assertTrue(started.wait(5))
+
+            deadline = time.monotonic() + 10.0
+            while not busy() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(busy(), "the compaction lock was never taken as a reservation")
+            # ...and it is HELD, not momentarily probed: still busy while the worker waits.
+            time.sleep(0.2)
+            self.assertTrue(busy(), "the reservation was released before the commit")
+            self.assertFalse(done.is_set(), "precondition: the worker is still blocked")
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+
+        self.assertTrue(done.wait(10), "worker did not finish after the ingest lock released")
+        self.assertNotIn("exc", result, f"worker raised: {result.get('exc')!r}")
+        self.assertEqual(result["out"]["status"], "published")
+
+    def test_the_fence_is_re_asserted_immediately_before_the_commit(self):
+        """§7.1b: `rm` + recreate gives a new inode another process can lock freely while we
+        hold the orphaned one -- the only two-writer state reachable here. Holding the
+        reservation is not enough; it must still be OURS at the commit point."""
+        import threading
+        import time
+        plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+        clock = os.path.join(self.tmp, "p5_compaction.lock")
+        result = {}
+        started, done = threading.Event(), threading.Event()
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+
+        def busy() -> bool:
+            try:
+                CompactionLock(clock).acquire().release()
+                return False
+            except CompactionLockBusy:
+                return True
+
+        holder = open(self.lock, "w")
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        try:
+            def worker():
+                started.set()
+                try:
+                    result["out"] = pub.execute_publication(
+                        plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                        compaction_lock_path=clock, now=T0)
+                except BaseException as exc:        # noqa: BLE001
+                    result["exc"] = exc
+                finally:
+                    done.set()
+
+            threading.Thread(target=worker, daemon=True).start()
+            self.assertTrue(started.wait(5))
+            deadline = time.monotonic() + 10.0
+            while not busy() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(busy(), "the reservation was never taken")
+            os.remove(clock)                        # the worker now holds an orphaned inode
+            open(clock, "w").close()
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+
+        self.assertTrue(done.wait(10))
+        self.assertIsInstance(result.get("exc"), CompactionLockError)
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before,
+                         "nothing may be committed once the fence fails")
+
+    def test_the_reservation_is_still_held_DURING_the_commit_itself(self):
+        """The fence proves the lock was ours immediately before `bm.publish`; this proves it
+        is still ours *inside* it. Releasing between the two reopens the very window the
+        reservation closes -- narrow, but `bm.publish` writes an archive, fsyncs and renames, so
+        it is not instantaneous.
+
+        Probed from inside the commit rather than from another thread, so there is no timing to
+        get wrong."""
+        plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+        clock = os.path.join(self.tmp, "p5_compaction.lock")
+        observed = {}
+        real_publish = bm.publish
+
+        def probing_publish(*a, **kw):
+            try:
+                CompactionLock(clock).acquire().release()
+                observed["busy_during_commit"] = False
+            except CompactionLockBusy:
+                observed["busy_during_commit"] = True
+            return real_publish(*a, **kw)
+
+        bm.publish = probing_publish
+        try:
+            out = pub.execute_publication(plan, ingest_lock_path=self.lock,
+                                          delta_path=self.delta,
+                                          compaction_lock_path=clock, now=T0)
+        finally:
+            bm.publish = real_publish
+        self.assertEqual(out["status"], "published")
+        self.assertTrue(observed.get("busy_during_commit"),
+                        "a build could have taken the compaction lock during the commit")
 
     def test_the_generation_archive_is_never_rewritten(self):
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
@@ -2087,31 +2235,52 @@ class TestPredecessorBytesAreMeasured(_Base):
             pub.compose_generation(live, seg, now=T0, predecessor_bytes=-5)
         self.assertIn("non-negative int", str(cm.exception))
 
-    def test_the_plan_fallback_is_used_only_when_the_block_is_gone_and_is_sanitised(self):
-        """The predecessor can legitimately be absent -- already moved to hold. Then the plan's
-        claim is all there is, and a negative claim must become 0 rather than propagate."""
+    def test_publish_refuses_when_a_still_referenced_predecessor_block_is_gone(self):
+        """The predecessor is still an active segment of live -- THIS publication is what moves
+        it to hold -- so its block must be on disk here. If it is gone we refuse and leave the
+        manifest byte-unchanged, rather than sizing a hold entry off the plan's unverified claim
+        (round 9). An absent-but-still-referenced block is data loss, not a legitimate release."""
         src = self._plan_for_v2(self.delta, self.span[:60])
         plan = pub.plan_publication(self.root, src, now=T0)
-        entry = next(e for e in plan["manifest"]["superseded"] if e["segment_id"] == "b_v1")
-        entry["bytes"] = -1
-        plan["manifest"]["manifest_checksum"] = ""
-        plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
         shutil.rmtree(os.path.join(self.root, "b_v1.zarr"))    # nothing left to measure
-        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
-        self.assertEqual(out["status"], "published")
-        self.assertEqual(bm.load_live(self.root)["superseded"][0]["bytes"], 0)
+        with self.assertRaises(pub.PublishRefused) as cm:
+            _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        self.assertIn("not present", str(cm.exception))
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
 
-    def test_a_positive_plan_claim_survives_when_the_block_is_gone(self):
+    def test_publish_refuses_when_the_predecessor_cannot_be_measured_in_full(self):
+        """Distinct from "gone": the block is there but part of it cannot be read. A short
+        count would size the hold entry and the §7.1c forecast below the real block, so the
+        measurement error is translated into a refusal rather than a smaller number."""
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses directory permissions")
+        src = self._plan_for_v2(self.delta, self.span[:60])
+        plan = pub.plan_publication(self.root, src, now=T0)
+        inner = os.path.join(self.root, "b_v1.zarr", "sst")
+        mode = os.stat(inner).st_mode
+        os.chmod(inner, 0o000)
+        self.addCleanup(os.chmod, inner, mode)
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        self.assertIn("could not be measured in full", str(cm.exception))
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+    def test_a_positive_plan_claim_cannot_mask_a_missing_predecessor_block(self):
+        """Even a plausible positive byte claim does not license publishing a hold entry for a
+        predecessor whose block is gone: the claim is not evidence (round 9)."""
         src = self._plan_for_v2(self.delta, self.span[:60])
         plan = pub.plan_publication(self.root, src, now=T0)
         entry = next(e for e in plan["manifest"]["superseded"] if e["segment_id"] == "b_v1")
         entry["bytes"] = 4242
         plan["manifest"]["manifest_checksum"] = ""
         plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
         shutil.rmtree(os.path.join(self.root, "b_v1.zarr"))
-        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
-        self.assertEqual(out["status"], "published")
-        self.assertEqual(bm.load_live(self.root)["superseded"][0]["bytes"], 4242)
+        with self.assertRaises(pub.PublishRefused):
+            _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
 
     def test_measure_bytes_returns_None_for_a_missing_path(self):
         self.assertIsNone(pub.measure_bytes(os.path.join(self.tmp, "nope.zarr")))
@@ -2123,3 +2292,46 @@ class TestPredecessorBytesAreMeasured(_Base):
                       for d, _dirs, files in os.walk(path) for f in files)
         self.assertEqual(total, by_hand)
         self.assertGreater(total, 0)
+
+    def test_measure_bytes_fails_closed_on_an_untraversable_SUBDIRECTORY(self):
+        """`os.walk` swallows traversal errors unless given an `onerror` hook, so a permission
+        error on a sub-group is skipped before `lstat` is ever reached -- a different path from
+        the unreadable-member case below, and one that under-counts far more."""
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses directory permissions")
+        path = self._block("probe", self.span[:5])
+        inner = os.path.join(path, "sst")
+        self.assertTrue(os.path.isdir(inner), "precondition: the block has sub-groups")
+        mode = os.stat(inner).st_mode
+        os.chmod(inner, 0o000)
+        self.addCleanup(os.chmod, inner, mode)
+        with self.assertRaises(OSError):
+            pub.measure_bytes(path)
+
+    def test_recompose_refuses_a_predecessor_with_no_measured_size(self):
+        """Reached only by calling `recompose` directly -- publication always measures first.
+        It exists so a future caller that forgets gets a refusal rather than a plausible zero,
+        and it is tested here rather than left as an untestable claim."""
+        src = self._plan_for_v2(self.delta, self.span[:60])
+        plan = pub.plan_publication(self.root, src, now=T0)
+        live = bm.load_live(self.root)
+        manifest, replaced, diff = pub.recompose(live, plan, now=T0, measured_bytes=None)
+        self.assertIsNone(manifest)
+        self.assertIn("no measured size was supplied", diff)
+        manifest, replaced, diff = pub.recompose(live, plan, now=T0, measured_bytes=123)
+        self.assertIsNone(diff)
+        self.assertEqual(replaced["segment_id"], "b_v1")
+
+    def test_measure_bytes_fails_closed_on_an_unreadable_member(self):
+        """An I/O or permission error on a member must PROPAGATE, not be swallowed into a short
+        count (round 9). A partial sum feeds the §7.1c forecast and the hold accounting a number
+        smaller than the block, reporting free space that does not exist."""
+        from unittest import mock
+        path = self._block("probe", self.span[:5])
+
+        def boom(_p, *_a, **_k):
+            raise OSError(5, "Input/output error")            # EIO on a real member
+
+        with mock.patch.object(pub.os, "lstat", side_effect=boom):
+            with self.assertRaises(OSError):
+                pub.measure_bytes(path)

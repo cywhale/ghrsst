@@ -12,10 +12,10 @@ was folded.
 
 - Repair WAL: [`../store/repair_wal.py`](../store/repair_wal.py)
 - Publish / lifecycle / rollback: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py)
-- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **148/148 green**
-- Full local suite: **604 tests OK** (17 skipped), up from 456.
+- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **155/155 green**
+- Full local suite: **611 tests OK** (17 skipped), up from 456.
 
-**Review rounds 2–8** raised five, one, three, two, two, two and two findings; §8–§14 record what each changed.
+**Review rounds 2–9** raised five, one, three, two, two, two, two and three findings; §8–§15 record what each changed.
 
 **This step does not claim crash safety.** It claims that each individual operation either commits or leaves the live manifest byte-unchanged. Two states are known-ambiguous and are P5-S5's job, not this step's (§10.3).
 
@@ -157,7 +157,7 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_phase2_p5s4
 
 ## 7. Mutation verification
 
-Every guard was disabled in turn and the suite re-run; **all 93 fail**. One further mutation survives by construction and is discussed below the table.
+Every guard was disabled in turn and the suite re-run; **all 101 fail**. One further mutation survives by construction and is discussed below the table.
 
 | guard disabled | result |
 |---|---|
@@ -254,6 +254,14 @@ Every guard was disabled in turn and the suite re-run; **all 93 fail**. One furt
 | measurement ignored when the block exists | FAILED (3) |
 | negative `predecessor_bytes` accepted by the composer | FAILED |
 | plan fallback does not sanitise a negative claim | FAILED |
+| missing predecessor falls back instead of refusing | FAILED (2) |
+| unreadable predecessor swallowed | FAILED |
+| `measure_bytes` swallows `lstat` errors | FAILED |
+| `os.walk` traversal errors swallowed | FAILED |
+| compaction lock probed and released | FAILED |
+| fence not re-asserted before the commit | FAILED |
+| reservation released just before the commit | FAILED |
+| `recompose` accepts a missing measurement | FAILED |
 
 **Two mutations initially survived, and both were my tests passing for the wrong reason** — the
 same failure mode the last three review rounds found, caught here by the mutation run rather
@@ -695,5 +703,80 @@ anyway. The path comes from the *live* manifest's segment entry, not from the pl
 cannot aim the measurement at a different block.
 
 ### 3. [Known residual, unchanged] Source bytes, and post-commit audit-log failure
+
+Still S5, still unclaimed.
+
+## 15. Review round 9 — three findings
+
+*(These were fixed in a parallel session and handed back; I re-reviewed the changes, corrected
+two things, and completed the mutation verification below.)*
+
+### 1. [High] A missing predecessor was masked by the plan's fallback
+
+Round 8 measured the predecessor and fell back to the plan's claimed size when the block was
+not there. I had written that fallback deliberately and pinned it with two tests, reasoning that
+the predecessor may legitimately already be in hold. **That reasoning was wrong**, and the
+review was right: a predecessor that is still an *active segment of the live manifest* is one
+**this publication is what moves to hold**. It cannot already be released. Its absence is data
+loss, and accepting the plan's number would record a hold entry — with real release and hold
+deadlines — for a block that does not exist, size the §7.1c forecast off nothing, and present
+the loss as an orderly release.
+
+Publication now refuses, before the ingest lock, manifest byte-unchanged. My two round-8 tests
+asserted the old behaviour and have been rewritten to assert the refusal.
+
+**The fallback is now gone entirely**, not merely bypassed. With the refusal upstream,
+`_plan_superseded_bytes` was unreachable, and an unreachable branch that substitutes an
+unverified number reads as a guard while being none — the same reason round 8 deleted the
+unreachable `hold_until <= release_at` check. In its place `recompose()` refuses outright when a
+segment supersedes something and no measured size was supplied, so a future caller that forgets
+to measure gets a refusal rather than a plausible zero. That refusal **is** tested by calling
+`recompose` directly; adding an untested guard while deleting dead code would have been the same
+mistake in a new place.
+
+### 2. [High] `measure_bytes` swallowed every `OSError`
+
+It caught `OSError` per member and continued, returning a short count. A partial sum feeds the
+§7.1c `pinned_existing` forecast and the hold accounting a number smaller than the block —
+reporting free space that does not exist. `os.walk` **also** swallows traversal errors unless
+given an `onerror` hook, so a permission error on a sub-group was skipped before `lstat` was
+ever reached, under-counting far more.
+
+Both are fixed: `onerror` re-raises, and `lstat` errors propagate. Only "the path is not a
+directory" still returns `None`. A block that cannot be measured in full is not measured, and
+the caller turns that into a refusal.
+
+Three tests, because these are three distinct paths: an unreadable *member*, an untraversable
+*sub-directory* (which the member test does not reach), and the *publication-level* translation
+of a measurement error into a refusal.
+
+### 3. [Medium] The compaction lock was probed, not reserved
+
+`refuse_if_compaction_running` acquires, releases and reports. Between that report and
+`bm.publish` a build could take the lock and begin rewriting the referenced block. Publication
+now takes the lock as a **reservation** — non-blocking, so a running build makes us refuse
+rather than wait — holds it across the whole critical section, re-asserts the fd/inode fence
+immediately before the commit, and releases only after the ingest lock is dropped.
+
+**Lock ordering, checked rather than assumed:** compaction is acquired *before* ingest here, and
+`swap_delta` / `prune_delta` also probe compaction *before* their ingest lock, non-blocking.
+Nothing acquires ingest and then blocks on compaction, so there is no cycle. `advance_lifecycle`
+takes ingest and never wants compaction.
+
+Three tests, and the first two needed correcting from what was handed to me:
+
+- the reservation is **held** while publication waits on the ingest lock. The handed-over
+  version used a fixed `sleep(0.3)` to let the worker reach the reservation; a sleep long enough
+  on an idle machine is not long enough on a loaded one, and a test that fails on correct code
+  is worse than none. It now polls for the lock to become busy within a bounded window, then
+  requires it to be **still** busy — which also rules out catching a momentary probe;
+- the **fence** is re-asserted before the commit: `rm` + recreate the lock file while the worker
+  waits, and the publication must fail with `CompactionLockError` and commit nothing;
+- the reservation is still held **during** `bm.publish` itself. Releasing between the fence and
+  the commit survived every other test — the window is one call wide, but `bm.publish` writes an
+  archive, fsyncs and renames, so it is not instantaneous. Probed from **inside** the commit by
+  wrapping `bm.publish`, so there is no timing to get wrong.
+
+### 4. [Known residual, unchanged] Source bytes, and post-commit audit-log failure
 
 Still S5, still unclaimed.

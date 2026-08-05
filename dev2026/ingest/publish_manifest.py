@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ingest.build_block import SOURCE_ORDER   # noqa: E402  -- one list, not a second copy
 from store import block_manifest as bm         # noqa: E402
 from store import repair_wal as rw            # noqa: E402
-from store.compaction_lock import refuse_if_compaction_running   # noqa: E402
+from store.compaction_lock import CompactionLock, CompactionLockBusy   # noqa: E402
 
 #: §8.5 -- must exceed refresh TTL + max request duration + margin, AND the realistic
 #: discover-a-defect window, because a superseded block is also the rollback target.
@@ -58,9 +58,9 @@ class PublishRefused(Exception):
 
 
 #: `created_by` (who asked for the publication) is now the ONLY value that crosses from the
-#: plan. The superseded entry's `bytes` used to as well; it is now measured from the block on
-#: disk, and the plan's claim is a fallback used only when the block cannot be found -- and
-#: then only as a non-negative int, never as written.
+#: plan. The superseded entry's `bytes` used to as well; it is measured from the block on disk,
+#: and there is no longer any fallback to the plan's claim -- a predecessor that cannot be
+#: measured is a refusal, not a number to guess at.
 #:
 #: Fields ignored when comparing, because publication REGENERATES them: a fresh
 #: `generation_id`, `created_utc` at the moment of commit, and the lifecycle deadlines, which
@@ -384,21 +384,33 @@ def validate_retention_policy(release_after_s, hold_days) -> tuple:
 
 
 def measure_bytes(path: str) -> Optional[int]:
-    """On-disk size of a block, by walking it. `None` when it is not there.
+    """On-disk size of a block, by walking it. `None` when it is not there; **raises `OSError`
+    on a member it cannot read** rather than returning a short count.
 
     Called **before the ingest lock is taken**, deliberately. A production block is ~94 GB
     across a large number of files (§10.6), so the walk costs seconds; doing it under the lock
     would stall the twice-daily delta append for exactly as long, which is a worse outcome than
-    a slightly stale measurement of a store that is immutable anyway."""
+    a slightly stale measurement of a store that is immutable anyway.
+
+    It fails closed. An earlier version swallowed every `OSError` -- a vanished file, a
+    permission error, an I/O fault -- and returned the partial sum, which silently under-counts
+    the block. That number feeds the §7.1c `pinned_existing` capacity forecast and the
+    superseded-block hold accounting, so an under-count reports free space that does not exist
+    and records a hold entry sized smaller than the block it is protecting. `os.walk` also
+    swallows traversal errors unless given an `onerror` hook, so a permission error on a
+    sub-group would otherwise be skipped before `lstat` is ever reached. A block that cannot be
+    measured in full is not measured: the error propagates and the caller refuses rather than
+    publish against a guess."""
     if not os.path.isdir(path):
         return None
+
+    def _fail(err: OSError) -> None:            # os.walk ignores traversal errors by default
+        raise err
+
     total = 0
-    for dirpath, _dirnames, filenames in os.walk(path):
+    for dirpath, _dirnames, filenames in os.walk(path, onerror=_fail):
         for name in filenames:
-            try:
-                total += os.lstat(os.path.join(dirpath, name)).st_size
-            except OSError:                     # raced or unreadable: not worth failing on
-                pass
+            total += os.lstat(os.path.join(dirpath, name)).st_size
     return total
 
 
@@ -667,12 +679,21 @@ def recompose(live: dict, plan: dict, *, now: datetime,
     if segment is None:
         return None, None, (f"the plan's manifest does not contain segment "
                             f"{plan['new_segment_id']!r}")
+    if segment.get("supersedes") and measured_bytes is None:
+        # There used to be a fallback here that took the plan's claimed byte count when the
+        # block could not be measured. It is gone: an unmeasured predecessor is now refused
+        # upstream, so the fallback was unreachable, and an unreachable branch that substitutes
+        # an unverified number reads as a guard while being none. This refusal replaces it, so
+        # a future caller that forgets to measure gets a refusal rather than a plausible zero.
+        return None, None, (
+            f"segment {plan['new_segment_id']!r} supersedes "
+            f"{segment['supersedes']!r} but no measured size was supplied for it; the "
+            f"superseded entry's `bytes` is measured from the block on disk and never taken "
+            f"from the plan")
     try:
         expected, replaced = compose_generation(
             live, segment, now=now, release_after_s=release_after_s, hold_days=hold_days,
-            predecessor_bytes=(measured_bytes if measured_bytes is not None
-                               else _plan_superseded_bytes(
-                                   plan, replaced_id=segment.get("supersedes"))),
+            predecessor_bytes=measured_bytes or 0,
             created_by=plan["manifest"].get("created_by", "p5-compaction"))
     except (PublishRefused, bm.ManifestError) as exc:
         # The live manifest plus this segment does not compose into a valid generation at all,
@@ -701,23 +722,6 @@ def recompose(live: dict, plan: dict, *, now: datetime,
     differing = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
     return None, None, (f"the plan's manifest differs from the one this live generation "
                         f"produces (fields: {differing})")
-
-
-def _plan_superseded_bytes(plan: dict, *, replaced_id: Optional[str]) -> int:
-    """The plan's claimed size, used only when the block cannot be measured.
-
-    A claim, not evidence -- so it is accepted only as a non-negative int, and anything else
-    becomes 0 rather than propagating into the manifest."""
-    if not replaced_id:
-        return 0
-    for e in plan["manifest"].get("superseded", []):
-        if e.get("segment_id") == replaced_id and e.get("superseded_at_generation") == \
-                int(plan["manifest"].get("generation", -1)):
-            value = e.get("bytes", 0)
-            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                return int(value)
-            return 0
-    return 0
 
 
 def _comparable(manifest: dict) -> dict:
@@ -780,13 +784,43 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
             prior_live = {"segments": []}
         prior = next((s for s in prior_live["segments"]
                       if s["segment_id"] == supersedes), None)
-        if prior:
-            measured = measure_bytes(_seg_path(root, prior))
+        # `prior is None` (the predecessor is not an active segment of live at all) is left to
+        # `compose_generation`, which refuses it under the lock. But a predecessor that IS still
+        # in live is one THIS publication moves to `superseded`/hold -- so its block must be on
+        # disk and fully measurable right here. If it is gone or unreadable we refuse; we do NOT
+        # fall back to the plan's claimed byte count. Accepting the claim would record a hold
+        # entry (with real hold/release deadlines) for a block that is not there, size the
+        # §7.1c forecast off a number nothing verified, and mask data loss as a block that was
+        # "already released". `measure_bytes` returns None for an absent block and raises for
+        # one it cannot read in full; both are refusals here, before the lock, manifest
+        # byte-unchanged.
+        if prior is not None:
+            seg_path = _seg_path(root, prior)
+            try:
+                measured = measure_bytes(seg_path)
+            except OSError as exc:
+                raise PublishRefused(
+                    f"the superseded block {supersedes!r} at {seg_path} could not be measured "
+                    f"in full ({exc}); refusing rather than publishing a hold entry sized from "
+                    f"the plan's unverified claim") from exc
+            if measured is None:
+                raise PublishRefused(
+                    f"the superseded block {supersedes!r} is not present at {seg_path}, yet it "
+                    f"is still an active segment of the live manifest that this publication "
+                    f"supersedes; refusing rather than recording a hold entry for a block that "
+                    f"is already gone -- its absence is data loss, not a legitimate release")
 
     # `compaction_lock_path` is a REQUIRED keyword with no default. It used to be optional, so
     # a caller who simply forgot it published without ever asking whether a build was running
     # -- and a build holding the lock may still be writing the very block we are about to
     # reference. The waiver is named so it cannot be typed by accident, and is greppable.
+    #
+    # We do not merely PROBE the lock and release it: a probe leaves a window between the check
+    # and `bm.publish` in which a build could take the lock and begin rewriting the referenced
+    # block (§7.1b). We take the lock as a RESERVATION and hold it across the whole critical
+    # section -- non-blocking, so a build that already holds it makes us refuse rather than wait
+    # -- and re-assert the fd/inode fence immediately before the commit.
+    compaction_guard: Optional[CompactionLock] = None
     if not compaction_lock_path:
         if not unsafe_skip_compaction_lock:
             raise PublishRefused(
@@ -794,74 +828,96 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
                 "still writing the block it references (§7.1b). Pass the lock path, or "
                 "unsafe_skip_compaction_lock=True in a test that is not exercising it.")
     else:
-        busy = refuse_if_compaction_running(compaction_lock_path, operation="manifest_publish")
-        if busy:
-            return {**busy, "published": False}
+        try:
+            compaction_guard = CompactionLock(
+                compaction_lock_path, holder="p5-manifest-publish").acquire()
+        except CompactionLockBusy:
+            return {"status": "refused", "published": False,
+                    "reason": "compaction_lock_held", "operation": "manifest_publish",
+                    "lock_path": compaction_lock_path,
+                    "hint": ("a block build holds the compaction lock and may still be writing "
+                             "the block this manifest would reference; publishing now could "
+                             "freeze a half-written block into history. Reschedule after the "
+                             "build completes.")}
 
-    os.makedirs(root, exist_ok=True)
-    lk = open(ingest_lock_path, "w")
     try:
-        fcntl.flock(lk, fcntl.LOCK_EX)          # publish and the daily append are exclusive
+        os.makedirs(root, exist_ok=True)
+        lk = open(ingest_lock_path, "w")
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX)      # publish and the daily append are exclusive
 
-        live = bm.load_live(root)
-        if int(live["generation"]) != int(plan["predecessor_generation"]):
-            return {"status": "aborted_stale", "published": False,
-                    "reason": (f"the manifest moved while this plan was held: planned against "
-                               f"generation {plan['predecessor_generation']}, live is "
-                               f"{live['generation']}. Re-plan against the current generation.")}
+            live = bm.load_live(root)
+            if int(live["generation"]) != int(plan["predecessor_generation"]):
+                return {"status": "aborted_stale", "published": False,
+                        "reason": (f"the manifest moved while this plan was held: planned "
+                                   f"against generation {plan['predecessor_generation']}, live "
+                                   f"is {live['generation']}. Re-plan against the current "
+                                   f"generation.")}
 
-        # The manifest must be the one THIS live generation produces -- not merely one whose
-        # remaining entries agree with it. What comes back is what gets published.
-        manifest, replaced, diff = recompose(
-            live, plan, now=now, release_after_s=release_after_s, hold_days=hold_days,
-            measured_bytes=measured)
-        if diff:
-            return {"status": "refused", "published": False,
-                    "reason": (f"{diff}. Generation N+1 is exactly: live, minus the one "
-                               f"superseded segment, plus the one new segment.")}
-        new_segment = next(s for s in manifest["segments"]
-                           if s["segment_id"] == plan["new_segment_id"])
+            # The manifest must be the one THIS live generation produces -- not merely one whose
+            # remaining entries agree with it. What comes back is what gets published.
+            manifest, replaced, diff = recompose(
+                live, plan, now=now, release_after_s=release_after_s, hold_days=hold_days,
+                measured_bytes=measured)
+            if diff:
+                return {"status": "refused", "published": False,
+                        "reason": (f"{diff}. Generation N+1 is exactly: live, minus the one "
+                                   f"superseded segment, plus the one new segment.")}
+            new_segment = next(s for s in manifest["segments"]
+                               if s["segment_id"] == plan["new_segment_id"])
 
-        drift = staleness_guard(source_map, delta_path=delta_path,
-                                live_days=_read_delta_days(delta_path),
-                                block_day_index=_published_block_index(root, live))
-        if drift:
-            return drift
+            drift = staleness_guard(source_map, delta_path=delta_path,
+                                    live_days=_read_delta_days(delta_path),
+                                    block_day_index=_published_block_index(root, live))
+            if drift:
+                return drift
 
-        # Every block the NEW generation references must exist before we point at it.
-        missing = [s["path"] for s in manifest["segments"]
-                   if not os.path.exists(_seg_path(root, s))]
-        if missing:
-            return {"status": "refused", "published": False,
-                    "reason": (f"generation {plan['generation']} references block(s) that are "
-                               f"not present: {missing[:3]}. Publishing would produce a "
-                               f"manifest whose snapshot build fails closed.")}
+            # Every block the NEW generation references must exist before we point at it.
+            missing = [s["path"] for s in manifest["segments"]
+                       if not os.path.exists(_seg_path(root, s))]
+            if missing:
+                return {"status": "refused", "published": False,
+                        "reason": (f"generation {plan['generation']} references block(s) that "
+                                   f"are not present: {missing[:3]}. Publishing would produce a "
+                                   f"manifest whose snapshot build fails closed.")}
 
-        # ...and the entry must describe THAT block, not merely be internally consistent.
-        bind_segment_to_block(new_segment, source_map, _seg_path(root, new_segment),
-                              manifest["grid"], where="at publication")
+            # ...and the entry must describe THAT block, not merely be internally consistent.
+            bind_segment_to_block(new_segment, source_map, _seg_path(root, new_segment),
+                                  manifest["grid"], where="at publication")
 
+            # Hold the reservation right up to the commit, and prove it is still ours: a build
+            # that rm+recreated the lock file could otherwise lock a fresh inode while we hold
+            # the orphaned one. `assert_still_held` is a no-op for the waived-lock test path.
+            if compaction_guard is not None:
+                compaction_guard.assert_still_held()
 
-        archive = bm.publish(root, manifest)
-        # Everything logged and returned is read off the manifest that was actually committed
-        # and the recomposition that produced it. Reading `plan["generation"]` or
-        # `plan["superseded_now"]` would let an edited plan describe a publication that did not
-        # happen -- an audit trail claiming generation 999 while the manifest says 2 is worse
-        # than no trail, because it is believed.
-        superseded_now = None if replaced is None else replaced["segment_id"]
-        _append_log(root, MANIFEST_LOG, {
-            "op": "manifest_publish", "at_utc": _iso(now), "operator": operator,
-            "from_generation": int(live["generation"]),
-            "to_generation": int(manifest["generation"]),
-            "new_segment": new_segment["segment_id"], "superseded": superseded_now})
-        return {"status": "published", "published": True,
-                "generation": int(manifest["generation"]),
-                "superseded": superseded_now, "archive": archive, "root": root,
-                "note": ("The served view is UNCHANGED at this instant: the manifest does not "
-                         "describe delta, and delta still wins for the folded days (§4.0).")}
+            archive = bm.publish(root, manifest)
+            # Everything logged and returned is read off the manifest that was actually
+            # committed and the recomposition that produced it. Reading `plan["generation"]` or
+            # `plan["superseded_now"]` would let an edited plan describe a publication that did
+            # not happen -- an audit trail claiming generation 999 while the manifest says 2 is
+            # worse than no trail, because it is believed.
+            superseded_now = None if replaced is None else replaced["segment_id"]
+            _append_log(root, MANIFEST_LOG, {
+                "op": "manifest_publish", "at_utc": _iso(now), "operator": operator,
+                "from_generation": int(live["generation"]),
+                "to_generation": int(manifest["generation"]),
+                "new_segment": new_segment["segment_id"], "superseded": superseded_now})
+            return {"status": "published", "published": True,
+                    "generation": int(manifest["generation"]),
+                    "superseded": superseded_now, "archive": archive, "root": root,
+                    "note": ("The served view is UNCHANGED at this instant: the manifest does "
+                             "not describe delta, and delta still wins for the folded days "
+                             "(§4.0).")}
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+            lk.close()
     finally:
-        fcntl.flock(lk, fcntl.LOCK_UN)
-        lk.close()
+        # Release the compaction reservation only AFTER the ingest lock is dropped and the
+        # commit is done -- the whole point is that no build can start while the block is being
+        # referenced.
+        if compaction_guard is not None:
+            compaction_guard.release()
 
 
 def _seg_path(root: str, seg: dict) -> str:
