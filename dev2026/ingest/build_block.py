@@ -56,6 +56,7 @@ import zarr
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from store import block_manifest as bm  # noqa: E402
+from store import source_provenance as sp  # noqa: E402
 from store.compaction_lock import CompactionLock  # noqa: E402
 
 VARS = ("sst", "sst_anomaly", "sea_ice")
@@ -390,6 +391,7 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
                 artifacts_dir: Optional[str] = None,
                 tile: int = 256, resume: bool = False,
                 sealed: Optional[bool] = None,
+                provenance_seed: int = 20260805,
                 unsafe_skip_isolation: bool = False) -> dict:
     """Build one immutable block into `out_path` and return a publish plan.
 
@@ -421,6 +423,7 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
             spatial_window_days=spatial_window_days, window_latest_day=window_latest_day,
             lock=lock, journal=journal, artifacts_dir=artifacts_dir, tile=tile,
             resume=resume, hard_reserve_bytes=hard_reserve_bytes, sealed=sealed,
+            provenance_seed=provenance_seed,
             unsafe_skip_isolation=unsafe_skip_isolation)
     except BuildRefused as exc:
         journal.event(event="refused", reason=str(exc))
@@ -434,7 +437,8 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
 def _build_block(out_path, *, start_day, end_day, classification_target, predecessor_present,
                  delta_path, predecessor_path, daily_root, hold_root, confirmed_missing,
                  spatial_window_days, window_latest_day, lock, journal, artifacts_dir,
-                 tile, resume, hard_reserve_bytes, sealed, unsafe_skip_isolation) -> dict:
+                 tile, resume, hard_reserve_bytes, sealed, provenance_seed,
+                 unsafe_skip_isolation) -> dict:
     # ---- isolation is MANDATORY unless explicitly, loudly waived
     if not unsafe_skip_isolation:
         if lock is None or not getattr(lock, "held", False):
@@ -559,6 +563,29 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
             journal.event(event="var_done", day=day, var=v,
                           source=smap[day]["source_kind"], target_index=t)
 
+    # ---- §7.5a source-BYTE provenance, read from the SOURCE, not from what we wrote.
+    # The locator map records where each day came from; this records what came out. One
+    # tile-sized window per (day, var), through the same cached handle the fill used -- so it
+    # is bounded I/O and it is the source's own bytes, not a re-read of our output (which would
+    # only prove we can read back what we just wrote).
+    prov_days = {}
+    for t_idx, day in enumerate(rebuild_source_set):
+        i0, i1, j0, j1 = sp.sample_window(ny, nx, seed=provenance_seed, day_index=t_idx)
+        tiles, valid = {}, {}
+        for v in keep_vars:
+            has = present_flags[v][t_idx]
+            valid[v] = bool(has)
+            tiles[v] = reader.read_tile(smap[day], v, i0, i1, j0, j1) if has else None
+        rec = source_map_record(day, smap[day])
+        prov_days[day] = {
+            "source_kind": rec["source_kind"], "source_path": rec["source_path"],
+            "source_day_index": rec["source_day_index"], "day_index": t_idx,
+            "source_fingerprint": sp.window_fingerprint(
+                tiles, seed=provenance_seed, day_index=t_idx, var_valid=valid),
+            "var_valid": valid,
+        }
+    journal.event(event="source_fingerprints", days=len(prov_days), seed=provenance_seed)
+
     # ---- finalize attrs LAST (a partial build is never a valid store)
     g.attrs["days"] = list(rebuild_source_set)
     g.attrs["vars"] = list(keep_vars)
@@ -607,8 +634,18 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
             "sources": source_records,
         },
     }
+    provenance = sp.build_artifact(segment_id=segment["segment_id"], block_path=out_path,
+                                   ny=ny, nx=nx, seed=provenance_seed, days=prov_days)
+    provenance_path = None
+    if artifacts_dir:
+        provenance_path = sp.write_artifact(
+            os.path.join(artifacts_dir, sp.ARTIFACT_NAME), provenance)
+        journal.event(event="provenance_written", path=provenance_path,
+                      days=len(prov_days))
+
     plan = {"status": "ok", "out_path": out_path, "segment": segment,
             "source_map": source_records,
+            "provenance": provenance, "provenance_path": provenance_path,
             "rebuild_source_set": rebuild_source_set,
             "classification_target": sorted(classification_target),
             "disk": disk, "build_s": build_s, "performed_publish": False,

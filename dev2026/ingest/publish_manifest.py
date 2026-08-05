@@ -37,11 +37,15 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence
 
+import numpy as np
+import zarr
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ingest.build_block import SOURCE_ORDER   # noqa: E402  -- one list, not a second copy
 from store import block_manifest as bm         # noqa: E402
 from store import repair_wal as rw            # noqa: E402
+from store import source_provenance as sp     # noqa: E402
 from store.compaction_lock import CompactionLock, CompactionLockBusy   # noqa: E402
 
 #: §8.5 -- must exceed refresh TTL + max request duration + margin, AND the realistic
@@ -224,27 +228,142 @@ def _grid_matches(insp, grid: dict) -> bool:
 
 
 def verify_build_artifact(sources: dict, artifact_path: str, *, segment_id: str,
-                          where: str) -> None:
-    """Cross-check the map against the builder's own `p5_block_plan.json`, when it exists.
+                          block_path: str, where: str,
+                          source_reader=None) -> dict:
+    """Verify the builder's checksummed provenance artifact — locator AND bytes.
 
-    This is the only evidence outside the manifest of what the build actually read, so when it
-    is available it is authoritative and a disagreement refuses."""
-    with open(artifact_path) as fh:
-        artifact = json.load(fh)
-    built = artifact.get("segment", {}).get("segment_id")
-    if built != segment_id:
+    Four things must hold, and they are four because each catches something the others cannot:
+
+    1. **the artifact itself is intact** — `load_artifact` checks format, field completeness and
+       `artifact_checksum`. A truncated or edited artifact is refused, not partly believed;
+    2. **it describes this block** — `segment_id`, and a day set exactly matching the manifest's
+       source map;
+    3. **its locator records agree with the manifest's** — the same `source_kind`, resolved
+       `source_path` and `source_day_index` per day. This is the P5-S4 check, still necessary
+       and still not sufficient;
+    4. **the bytes in the block match the fingerprint the builder recorded from the source.**
+       This is the new one. Everything before it is a document agreeing with another document;
+       this reads the block's own cells and compares them to what the build says came out of
+       the source. A block whose contents were altered after the build, or an artifact minted
+       for a different build, fails here and nowhere else.
+
+    When `source_reader` is supplied, a fifth check runs: re-read the same window from the
+    **source** and require the same fingerprint. That is what detects a source modified in
+    place after the build — the case the locator map is structurally blind to.
+
+    A source that is **gone or unreadable is a refusal, not a skip.** The publication path
+    already requires every recorded source to still resolve (the §7.4 staleness guard), so a
+    vanished source is not the ordinary case it might look like; making it a soft skip would
+    add a branch nothing can reach through publication and turn "we could not check" into "we
+    checked".
+
+    **What this does not establish.** The comparison is a seeded sample (§7.5a E2), so a
+    corruption confined to unsampled cells survives it. E2 is defence in depth; E1's repair
+    identity is the deterministic authorization. Recorded here so the artifact is not read as
+    more than it is.
+    """
+    doc = sp.load_artifact(artifact_path)
+    if doc["segment_id"] != segment_id:
         raise PublishRefused(
-            f"{where}: build artifact {artifact_path} describes segment {built!r}, not "
-            f"{segment_id!r}")
-    recorded = ((artifact.get("segment", {}).get("build_provenance") or {}).get("sources")
-                or artifact.get("source_map") or {})
-    if recorded != sources:
-        differing = sorted(d for d in set(recorded) & set(sources) if recorded[d] != sources[d])
+            f"{where}: provenance artifact {artifact_path} describes segment "
+            f"{doc['segment_id']!r}, not {segment_id!r}")
+
+    recorded = doc["days"]
+    if set(recorded) != set(sources):
+        only_art = sorted(set(recorded) - set(sources))
+        only_map = sorted(set(sources) - set(recorded))
         raise PublishRefused(
-            f"{where}: the manifest's source map disagrees with the builder's own record in "
-            f"{artifact_path} (differing: {differing[:3]}, only in manifest: "
-            f"{sorted(set(sources) - set(recorded))[:3]}). The builder's record is the only "
-            f"evidence outside the manifest of what was actually read.")
+            f"{where}: the provenance artifact covers different days than the manifest's "
+            f"source map (only in artifact: {only_art[:3]}, only in manifest: "
+            f"{only_map[:3]})")
+
+    for day in sorted(sources):
+        want, got = sources[day], recorded[day]
+        for field in ("source_kind", "source_path", "source_day_index"):
+            if got[field] != want[field]:
+                raise PublishRefused(
+                    f"{where}: provenance artifact and manifest disagree for {day} on "
+                    f"{field}: {got[field]!r} vs {want[field]!r}. The builder's own record is "
+                    f"the only evidence outside the manifest of what was read.")
+
+    ny, nx = int(doc["grid"]["ny"]), int(doc["grid"]["nx"])
+    seed = int(doc["sample"]["seed"])
+    g = zarr.open_group(block_path, mode="r")
+    block_valid = {v: list(flags) for v, flags in
+                   bm.inspect_store_contract(block_path).var_valid}
+
+    for day in sorted(recorded):
+        rec = recorded[day]
+        t_idx = int(rec["day_index"])
+        i0, i1, j0, j1 = sp.sample_window(ny, nx, seed=seed, day_index=t_idx)
+        tiles, valid = {}, {}
+        for var, flags in block_valid.items():
+            if t_idx >= len(flags):
+                raise PublishRefused(
+                    f"{where}: provenance records day_index {t_idx} for {day} but the block "
+                    f"holds {len(flags)} day(s)")
+            present = flags[t_idx] is True
+            valid[var] = present
+            tiles[var] = (np.asarray(g[var][t_idx, i0:i1, j0:j1]) if present else None)
+        actual = sp.window_fingerprint(tiles, seed=seed, day_index=t_idx, var_valid=valid)
+        if actual != rec["source_fingerprint"]:
+            raise PublishRefused(
+                f"{where}: the block's bytes for {day} do not match the fingerprint the build "
+                f"recorded from its source (block {actual[:12]}… vs artifact "
+                f"{rec['source_fingerprint'][:12]}…). Either the block was altered after the "
+                f"build or the artifact belongs to a different one; both are refusals.")
+
+    checked_sources = 0
+    if source_reader is not None:
+        for day in sorted(recorded):
+            rec = recorded[day]
+            src = {"source_kind": rec["source_kind"], "source_path": rec["source_path"],
+                   "source_day_index": rec["source_day_index"], "day": day}
+            tiles = _read_source_window(source_reader, src, day, rec, ny, nx, seed)
+            if tiles is None:
+                raise PublishRefused(
+                    f"{where}: the source {rec['source_path']} recorded for {day} is gone or "
+                    f"unreadable, so the bytes the build claims to have read cannot be "
+                    f"re-checked. Not being able to check is not the same as checking.")
+            valid = {v: bool(rec["var_valid"].get(v)) for v in rec["var_valid"]}
+            actual = sp.window_fingerprint(tiles, seed=seed,
+                                           day_index=int(rec["day_index"]), var_valid=valid)
+            checked_sources += 1
+            if actual != rec["source_fingerprint"]:
+                raise PublishRefused(
+                    f"{where}: source {rec['source_path']} for {day} no longer holds the bytes "
+                    f"the build read from it (now {actual[:12]}… vs recorded "
+                    f"{rec['source_fingerprint'][:12]}…). An in-place source modification is "
+                    f"invisible to every locator check; this is the one that sees it.")
+    return {"days": len(recorded), "sources_rechecked": checked_sources}
+
+
+def _read_source_window(reader, src: dict, day: str, rec: dict, ny: int, nx: int, seed: int):
+    """The sample window from the SOURCE, or `None` when it cannot be read. The caller turns
+    `None` into a refusal -- this function only reports, it does not decide."""
+    path = rec["source_path"]
+    kind = rec["source_kind"]
+    probe = _source_group_path(kind, path, day)
+    if not probe or not os.path.isdir(probe):
+        return None
+    try:
+        if kind in ("daily", "hold"):
+            reader.inspect_daily(path, day)
+        else:
+            reader.inspect_cube(path)
+    except Exception:                            # unreadable now: treated as gone, not as proof
+        return None
+    i0, i1, j0, j1 = sp.sample_window(ny, nx, seed=seed, day_index=int(rec["day_index"]))
+    tiles = {}
+    for var in rec["var_valid"]:
+        if not rec["var_valid"][var]:
+            tiles[var] = None
+            continue
+        try:
+            tiles[var] = reader.read_tile(src, var, i0, i1, j0, j1)
+        except Exception:
+            return None
+    return tiles
 
 
 def _segment_provenance(segment: dict) -> dict:
@@ -735,11 +854,13 @@ def _comparable(manifest: dict) -> dict:
 def execute_publication(plan: dict, *, ingest_lock_path: str,
                         compaction_lock_path: Optional[str],
                         delta_path: Optional[str] = None,
-                        build_artifact_path: Optional[str] = None,
+                        build_artifact_path: Optional[str],
                         release_after_s: int = DEFAULT_RELEASE_AFTER_S,
                         hold_days: int = DEFAULT_HOLD_DAYS,
                         operator: str = "", now: Optional[datetime] = None,
-                        unsafe_skip_compaction_lock: bool = False) -> dict:
+                        unsafe_skip_compaction_lock: bool = False,
+                        recheck_sources: bool = True,
+                        unsafe_skip_provenance: bool = False) -> dict:
     """§7.4 steps 1-4. The commit point is `os.replace`, inside `bm.publish`.
 
     Refuses without writing anything on: a running compaction, a missing referenced block, a
@@ -762,9 +883,26 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
             f"the block it claims")
     source_map = _validate_plan_source_map(published[0], plan.get("source_map", _ABSENT),
                                            where="at publication")
-    if build_artifact_path:
-        verify_build_artifact(source_map, build_artifact_path,
-                              segment_id=plan["new_segment_id"], where="at publication")
+    # The provenance artifact is REQUIRED. It used to be optional, which made source-byte
+    # provenance opt-in -- and an opt-in proof is not one. The waiver is named so it cannot be
+    # typed by accident, and is greppable.
+    if not build_artifact_path:
+        if not unsafe_skip_provenance:
+            raise PublishRefused(
+                "build_artifact_path is required: without the builder's checksummed provenance "
+                "artifact the manifest carries only locator provenance, which cannot show that "
+                "the block's bytes are the bytes its sources held (§7.5a). Pass the artifact "
+                "path, or unsafe_skip_provenance=True in a test that is not exercising it.")
+        provenance_report = {"verified": False, "reason": "waived"}
+    else:
+        try:
+            provenance_report = verify_build_artifact(
+                source_map, build_artifact_path, segment_id=plan["new_segment_id"],
+                block_path=_seg_path(root, published[0]), where="at publication",
+                source_reader=_source_reader() if recheck_sources else None)
+        except sp.ProvenanceError as exc:
+            raise PublishRefused(f"at publication: {exc}") from exc
+        provenance_report["verified"] = True
 
     # Fail closed on the policy BEFORE anything else: a bad grace period is a caller error, and
     # finding it after the lock is taken would stall the delta append for no reason.
@@ -906,6 +1044,7 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
             return {"status": "published", "published": True,
                     "generation": int(manifest["generation"]),
                     "superseded": superseded_now, "archive": archive, "root": root,
+                    "provenance": provenance_report,
                     "note": ("The served view is UNCHANGED at this instant: the manifest does "
                              "not describe delta, and delta still wins for the folded days "
                              "(§4.0).")}
@@ -918,6 +1057,12 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
         # referenced.
         if compaction_guard is not None:
             compaction_guard.release()
+
+
+def _source_reader():
+    """A fresh `build_block._SourceReader`, imported lazily to keep the module import cheap."""
+    from ingest.build_block import _SourceReader
+    return _SourceReader()
 
 
 def _seg_path(root: str, seg: dict) -> str:
