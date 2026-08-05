@@ -57,11 +57,15 @@ class PublishRefused(Exception):
     """Nothing was written. The live manifest is byte-unchanged."""
 
 
-#: Fields of a re-composed generation that legitimately differ from the plan's: they are
-#: freshly generated or clock-derived, so a whole-object comparison must take the plan's values
-#: for exactly these and for nothing else.
-_FREE_TOP = ("generation_id", "created_utc", "created_by")
-_FREE_SUPERSEDED = ("release_after_utc", "hold_until_utc", "bytes")
+#: Only two values cross from the plan into the published manifest: `created_by` (who asked
+#: for the publication) and the superseded entry's `bytes` (a measurement the builder made).
+#: Neither is clock-derived and neither protects anything, so neither can be abused by editing.
+#:
+#: Fields ignored when comparing, because publication REGENERATES them: a fresh
+#: `generation_id`, `created_utc` at the moment of commit, and the lifecycle deadlines, which
+#: are computed from the publication clock under policy and never accepted from the document.
+_REGENERATED_TOP = ("generation_id", "created_utc", "manifest_checksum")
+_REGENERATED_SUPERSEDED = ("release_after_utc", "hold_until_utc")
 
 
 #: Distinguishes "the caller did not supply a source_map" from "the caller supplied an EMPTY
@@ -561,71 +565,96 @@ def _read_delta_days(delta_path: Optional[str]) -> List[str]:
 
 
 # --------------------------------------------------------------------------- execute
-def recompose_and_compare(live: dict, plan: dict, *, now: datetime) -> Optional[str]:
-    """Re-derive generation `N+1` from the LIVE manifest and compare it, whole-object, to the
-    plan's.
+def recompose(live: dict, plan: dict, *, now: datetime,
+              release_after_s: int = DEFAULT_RELEASE_AFTER_S,
+              hold_days: int = DEFAULT_HOLD_DAYS):
+    """Re-derive generation `N+1` from the LIVE manifest, and say whether the plan matches.
+
+    Returns `(manifest, replaced, difference)`. **The returned manifest is what gets
+    published** — the plan's is never handed to `bm.publish`. That is the difference between
+    checking a document and producing one: a field this function does not deliberately carry
+    across simply cannot survive from the plan into the published manifest, whatever an editor
+    did to it.
 
     Round 5 compared the carried-forward entries that were still *present*, which says nothing
-    about an entry that was **removed** or one that was **injected**. Enumerating what may
-    change requires enumerating every way a document can be wrong; re-composing asks the only
-    question that has a definite answer — *is this the manifest this live generation and this
-    segment produce?* Anything else, including a segment quietly dropped from history, differs.
+    about an entry **removed** or one **injected**. Enumerating what may change requires
+    enumerating every way a document can be wrong; re-composing asks the only question with a
+    definite answer — *is this the manifest this live generation and this segment produce?*
 
-    Returns a description of the difference, or `None` when they match. Only freshly generated
-    and clock-derived fields are taken from the plan (`_FREE_TOP`, `_FREE_SUPERSEDED`); every
-    other byte must be reproducible from the live manifest.
+    **The lifecycle deadlines are computed here, from the publication clock, and never
+    accepted.** They were previously carried over from the plan as "clock-derived", which let a
+    plan set `release_after_utc` and `hold_until_utc` into the past — shortening or erasing the
+    window that keeps a superseded block available to in-flight snapshots, to the next fold,
+    and to rollback, and letting ops hard-delete it early. Validating a lower bound instead
+    would refuse every plan reviewed for longer than the grace period; computing them at
+    publication is both stricter and correct, because the window protects from the moment of
+    publication, not from the moment of planning.
     """
     segment = next((s for s in plan["manifest"]["segments"]
                     if s["segment_id"] == plan["new_segment_id"]), None)
     if segment is None:
-        return f"the plan's manifest does not contain segment {plan['new_segment_id']!r}"
+        return None, None, (f"the plan's manifest does not contain segment "
+                            f"{plan['new_segment_id']!r}")
     try:
-        expected, replaced = compose_generation(live, segment, now=now)
+        expected, replaced = compose_generation(
+            live, segment, now=now, release_after_s=release_after_s, hold_days=hold_days,
+            predecessor_bytes=_plan_superseded_bytes(plan, replaced_id=segment.get("supersedes")),
+            created_by=plan["manifest"].get("created_by", "p5-compaction"))
     except (PublishRefused, bm.ManifestError) as exc:
         # The live manifest plus this segment does not compose into a valid generation at all,
         # which is a stronger statement than "differs" and is reported as the difference.
-        return (f"generation {int(live['generation']) + 1} cannot be composed from the live "
-                f"manifest and segment {plan['new_segment_id']!r}: {exc}")
+        return None, None, (
+            f"generation {int(live['generation']) + 1} cannot be composed from the live "
+            f"manifest and segment {plan['new_segment_id']!r}: {exc}")
 
-    for key in _FREE_TOP:
-        expected[key] = plan["manifest"].get(key)
-    if replaced is not None:
-        mine = next((e for e in expected["superseded"]
-                     if e["segment_id"] == replaced["segment_id"]
-                     and e["superseded_at_generation"] == expected["generation"]), None)
-        theirs = next((e for e in plan["manifest"]["superseded"]
-                       if e["segment_id"] == replaced["segment_id"]
-                       and e.get("superseded_at_generation") == expected["generation"]), None)
-        if mine is not None and theirs is not None:
-            for key in _FREE_SUPERSEDED:
-                mine[key] = theirs.get(key)
-    expected["manifest_checksum"] = ""
-    expected["manifest_checksum"] = bm.compute_checksum(expected)
-
-    if expected == plan["manifest"]:
-        return None
+    if _comparable(expected) == _comparable(plan["manifest"]):
+        return expected, replaced, None
 
     got, want = plan["manifest"], expected
     got_ids = [s["segment_id"] for s in got["segments"]]
     want_ids = [s["segment_id"] for s in want["segments"]]
     if got_ids != want_ids:
-        return (f"the plan publishes segments {got_ids} but this live generation plus "
-                f"{plan['new_segment_id']!r} yields {want_ids} (removed: "
-                f"{sorted(set(want_ids) - set(got_ids))}, injected: "
-                f"{sorted(set(got_ids) - set(want_ids))})")
+        return None, None, (
+            f"the plan publishes segments {got_ids} but this live generation plus "
+            f"{plan['new_segment_id']!r} yields {want_ids} (removed: "
+            f"{sorted(set(want_ids) - set(got_ids))}, injected: "
+            f"{sorted(set(got_ids) - set(want_ids))})")
     got_sup = [(e["segment_id"], e["superseded_at_generation"]) for e in got["superseded"]]
     want_sup = [(e["segment_id"], e["superseded_at_generation"]) for e in want["superseded"]]
     if got_sup != want_sup:
-        return f"the plan's superseded list is {got_sup}, expected {want_sup}"
-    differing = sorted(k for k in set(got) | set(want) if got.get(k) != want.get(k))
-    return (f"the plan's manifest differs from the one this live generation produces "
-            f"(fields: {differing})")
+        return None, None, (f"the plan's superseded list is {got_sup}, expected {want_sup}")
+    a, b = _comparable(got), _comparable(want)
+    differing = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+    return None, None, (f"the plan's manifest differs from the one this live generation "
+                        f"produces (fields: {differing})")
+
+
+def _plan_superseded_bytes(plan: dict, *, replaced_id: Optional[str]) -> int:
+    """`bytes` is a measurement, not a clock, so it comes from the plan -- but only as an int."""
+    if not replaced_id:
+        return 0
+    for e in plan["manifest"].get("superseded", []):
+        if e.get("segment_id") == replaced_id and e.get("superseded_at_generation") == \
+                int(plan["manifest"].get("generation", -1)):
+            value = e.get("bytes", 0)
+            return int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+    return 0
+
+
+def _comparable(manifest: dict) -> dict:
+    """The manifest with regenerated fields blanked, for comparison only."""
+    out = {k: v for k, v in manifest.items() if k not in _REGENERATED_TOP}
+    out["superseded"] = [{k: v for k, v in e.items() if k not in _REGENERATED_SUPERSEDED}
+                         for e in manifest.get("superseded", [])]
+    return out
 
 
 def execute_publication(plan: dict, *, ingest_lock_path: str,
                         compaction_lock_path: Optional[str],
                         delta_path: Optional[str] = None,
                         build_artifact_path: Optional[str] = None,
+                        release_after_s: int = DEFAULT_RELEASE_AFTER_S,
+                        hold_days: int = DEFAULT_HOLD_DAYS,
                         operator: str = "", now: Optional[datetime] = None,
                         unsafe_skip_compaction_lock: bool = False) -> dict:
     """§7.4 steps 1-4. The commit point is `os.replace`, inside `bm.publish`.
@@ -682,12 +711,15 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
                                f"{live['generation']}. Re-plan against the current generation.")}
 
         # The manifest must be the one THIS live generation produces -- not merely one whose
-        # remaining entries agree with it.
-        diff = recompose_and_compare(live, plan, now=now)
+        # remaining entries agree with it. What comes back is what gets published.
+        manifest, replaced, diff = recompose(
+            live, plan, now=now, release_after_s=release_after_s, hold_days=hold_days)
         if diff:
             return {"status": "refused", "published": False,
                     "reason": (f"{diff}. Generation N+1 is exactly: live, minus the one "
                                f"superseded segment, plus the one new segment.")}
+        new_segment = next(s for s in manifest["segments"]
+                           if s["segment_id"] == plan["new_segment_id"])
 
         drift = staleness_guard(source_map, delta_path=delta_path,
                                 live_days=_read_delta_days(delta_path),
@@ -696,7 +728,7 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
             return drift
 
         # Every block the NEW generation references must exist before we point at it.
-        missing = [s["path"] for s in plan["manifest"]["segments"]
+        missing = [s["path"] for s in manifest["segments"]
                    if not os.path.exists(_seg_path(root, s))]
         if missing:
             return {"status": "refused", "published": False,
@@ -705,18 +737,25 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
                                f"manifest whose snapshot build fails closed.")}
 
         # ...and the entry must describe THAT block, not merely be internally consistent.
-        bind_segment_to_block(published[0], source_map, _seg_path(root, published[0]),
-                              plan["manifest"]["grid"], where="at publication")
+        bind_segment_to_block(new_segment, source_map, _seg_path(root, new_segment),
+                              manifest["grid"], where="at publication")
 
 
-        archive = bm.publish(root, plan["manifest"])
+        archive = bm.publish(root, manifest)
+        # Everything logged and returned is read off the manifest that was actually committed
+        # and the recomposition that produced it. Reading `plan["generation"]` or
+        # `plan["superseded_now"]` would let an edited plan describe a publication that did not
+        # happen -- an audit trail claiming generation 999 while the manifest says 2 is worse
+        # than no trail, because it is believed.
+        superseded_now = None if replaced is None else replaced["segment_id"]
         _append_log(root, MANIFEST_LOG, {
             "op": "manifest_publish", "at_utc": _iso(now), "operator": operator,
-            "from_generation": plan["predecessor_generation"],
-            "to_generation": plan["generation"],
-            "new_segment": plan["new_segment_id"], "superseded": plan["superseded_now"]})
-        return {"status": "published", "published": True, "generation": plan["generation"],
-                "archive": archive, "root": root,
+            "from_generation": int(live["generation"]),
+            "to_generation": int(manifest["generation"]),
+            "new_segment": new_segment["segment_id"], "superseded": superseded_now})
+        return {"status": "published", "published": True,
+                "generation": int(manifest["generation"]),
+                "superseded": superseded_now, "archive": archive, "root": root,
                 "note": ("The served view is UNCHANGED at this instant: the manifest does not "
                          "describe delta, and delta still wins for the folded days (§4.0).")}
     finally:

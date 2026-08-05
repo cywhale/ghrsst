@@ -12,10 +12,10 @@ was folded.
 
 - Repair WAL: [`../store/repair_wal.py`](../store/repair_wal.py)
 - Publish / lifecycle / rollback: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py)
-- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **127/127 green**
-- Full local suite: **583 tests OK** (17 skipped), up from 456.
+- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **133/133 green**
+- Full local suite: **589 tests OK** (17 skipped), up from 456.
 
-**Review rounds 2–6** raised five, one, three, two and two findings; §8–§12 record what each changed.
+**Review rounds 2–7** raised five, one, three, two, two and two findings; §8–§13 record what each changed.
 
 **This step does not claim crash safety.** It claims that each individual operation either commits or leaves the live manifest byte-unchanged. Two states are known-ambiguous and are P5-S5's job, not this step's (§10.3).
 
@@ -157,7 +157,7 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_phase2_p5s4
 
 ## 7. Mutation verification
 
-Every guard was disabled in turn and the suite re-run; **all 76 fail**. One further mutation survives by construction and is discussed below the table.
+Every guard was disabled in turn and the suite re-run; **all 84 fail**. One further mutation survives by construction and is discussed below the table.
 
 | guard disabled | result |
 |---|---|
@@ -237,6 +237,14 @@ Every guard was disabled in turn and the suite re-run; **all 76 fail**. One furt
 | uncomposable generation not reported | FAILED |
 | compaction lock optional again | FAILED |
 | compaction lock never consulted | FAILED |
+| publish the plan's manifest instead of the recomposed one | FAILED (5) |
+| deadlines carried over from the plan | FAILED (3 + 1) |
+| deadlines computed from the planning clock | FAILED (2) |
+| release/hold policy args ignored | FAILED |
+| audit log reads the plan's generation | FAILED |
+| audit log reads the plan's `superseded_now` | FAILED |
+| result reports the plan's generation | FAILED |
+| `generation_id`/`created_utc` taken from the plan | FAILED (40 + 13) |
 
 **Two mutations initially survived, and both were my tests passing for the wrong reason** — the
 same failure mode the last three review rounds found, caught here by the mutation run rather
@@ -574,3 +582,56 @@ Restated once more without softening: the map is bound to *which block*, *what i
 the bytes that were read, and an in-place modification of a source after the build is
 undetectable here. P5-S5 owns the checksummed provenance artifact. **No claim of complete
 provenance safety is made in S4.**
+
+## 13. Review round 7 — two findings
+
+### 1. [High] The lifecycle deadlines could be back-dated by the plan
+
+`release_after_utc` and `hold_until_utc` were on the free list as "clock-derived", so a plan
+could set them **into the past** and publish successfully. Those two fields are the whole of
+what keeps a superseded block available to in-flight snapshots, to the next fold, and to
+rollback — back-dating them shortens or erases that window and lets ops hard-delete the block
+early. The §8.5 machinery was intact and its inputs were forgeable.
+
+The review offered two options. I took the first, and rejected the second **because it would
+have been wrong, not merely weaker**: validating `release_after_utc >= execute_now +
+release_after_s` refuses every plan that sat in review for longer than the grace period, which
+is exactly the workflow the plan/execute split exists to support. The window protects from the
+moment of **publication**, not of planning, so computing it at publication is both stricter and
+correct.
+
+That required a structural change worth stating plainly: **`recompose()` now returns the
+manifest, and that is what `bm.publish` writes.** The plan's manifest is never handed to
+`publish` at all. Previously the code compared, then published the plan's document — so every
+field not explicitly compared was a field that could survive an edit. Now a field this function
+does not deliberately carry across *cannot* reach the manifest, whatever an editor did to it.
+
+Exactly two values cross from the plan: `created_by` (who asked) and the superseded entry's
+`bytes` (a measurement the builder made). Neither is clock-derived and neither protects
+anything. `generation_id` and `created_utc` are regenerated at the commit point, so editing them
+changes nothing — a mutation that accepts them instead fails 40 tests.
+
+Four tests, including the consequence rather than only the field: after publishing a back-dated
+plan, `advance_lifecycle` must still **refuse to release** the block. Plus one that publishes a
+plan three days after it was made and asserts a *full* grace period from the publication clock —
+the case a lower-bound check would have refused.
+
+### 2. [Medium] The audit log and result read the plan's metadata
+
+`plan["generation"]` and `plan["superseded_now"]` are top-level plan fields, outside the
+manifest and outside everything the re-composition verifies. Editing them produced a
+`p5_manifest.jsonl` line claiming generation 999 while the manifest said 2, or naming a segment
+that was never superseded. **An audit trail that is wrong is worse than one that is missing,
+because it is believed.**
+
+Both the log line and the returned dict now read the manifest that was actually committed and
+the `replaced` entry the re-composition produced. The result also gained a `superseded` field
+for the same reason. Tested by editing both plan fields and asserting the log, the result and
+the live manifest all agree on generation 2 and `b_v1`.
+
+### 3. [Known residual, unchanged] Source bytes, and post-commit audit-log failure
+
+Neither is addressed here and neither is claimed. The source map still cannot prove which bytes
+were read; `_append_log` still runs after the manifest commits, so a failed log write leaves a
+committed manifest with no trail and a retry that hits "generation archive already exists". Both
+are P5-S5 scope (§10.3, §12.3).

@@ -1827,18 +1827,14 @@ class TestSegmentSetIsDerivedNotAccepted(_Base):
                          ["b_other", "b_v2"])
         self.assertEqual([e["segment_id"] for e in live["superseded"]], ["b_v1"])
 
-    def test_the_free_fields_may_differ_and_everything_else_may_not(self):
-        """`generation_id`, `created_utc`, `created_by` and the new superseded entry's clock
-        fields are freshly generated, so the comparison takes them from the plan. If it took
-        more than that, an edit would slip through; if it took less, every publish would
-        refuse."""
+    def test_only_created_by_and_bytes_cross_from_the_plan(self):
+        """Everything else is either re-derived from the live manifest or regenerated at
+        publication, so editing it changes nothing about what gets committed."""
         plan = self._plan()
         plan["manifest"]["generation_id"] = "some-other-uuid"
         plan["manifest"]["created_utc"] = "2099-01-01T00:00:00Z"
         plan["manifest"]["created_by"] = "someone-else"
         entry = next(e for e in plan["manifest"]["superseded"] if e["segment_id"] == "b_v1")
-        entry["release_after_utc"] = "2099-01-02T00:00:00Z"
-        entry["hold_until_utc"] = "2099-01-20T00:00:00Z"
         entry["bytes"] = 999
         out = _execute(self._reseal(plan), ingest_lock_path=self.lock, delta_path=self.delta,
                        now=T0)
@@ -1846,3 +1842,114 @@ class TestSegmentSetIsDerivedNotAccepted(_Base):
         live = bm.load_live(self.root)
         self.assertEqual(live["created_by"], "someone-else")
         self.assertEqual(live["superseded"][0]["bytes"], 999)
+        self.assertNotEqual(live["generation_id"], "some-other-uuid")
+        self.assertEqual(live["created_utc"], "2027-01-01T00:00:00Z")
+
+
+# ============ review round 7: lifecycle deadlines are COMPUTED at publication, never accepted
+class TestLifecycleDeadlinesAreNotAcceptedFromThePlan(_Base):
+    """`release_after_utc` and `hold_until_utc` are what keep a superseded block available to
+    in-flight snapshots, to the next fold, and to rollback. A plan that could set them into the
+    past would shorten or erase that window and let ops hard-delete the block early."""
+
+    def setUp(self):
+        super().setUp()
+        self._live_gen1()
+        self.delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(self.delta, self.span[:60])
+
+    def _plan(self, **kw):
+        return pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0, **kw)
+
+    def _entry(self):
+        return next(e for e in bm.load_live(self.root)["superseded"]
+                    if e["segment_id"] == "b_v1")
+
+    def test_back_dated_deadlines_in_the_plan_do_not_reach_the_manifest(self):
+        plan = self._plan()
+        entry = next(e for e in plan["manifest"]["superseded"] if e["segment_id"] == "b_v1")
+        entry["release_after_utc"] = "1999-01-01T00:00:00Z"
+        entry["hold_until_utc"] = "1999-01-02T00:00:00Z"
+        plan["manifest"]["manifest_checksum"] = ""
+        plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        self.assertEqual(out["status"], "published")
+        got = self._entry()
+        self.assertEqual(got["release_after_utc"], "2027-01-02T00:00:00Z")
+        self.assertEqual(got["hold_until_utc"], "2027-01-15T00:00:00Z")
+
+    def test_a_back_dated_plan_does_not_release_the_block_early(self):
+        """The consequence, not just the field: the lifecycle must still refuse to release."""
+        plan = self._plan()
+        entry = next(e for e in plan["manifest"]["superseded"] if e["segment_id"] == "b_v1")
+        entry["release_after_utc"] = "1999-01-01T00:00:00Z"
+        entry["hold_until_utc"] = "1999-01-02T00:00:00Z"
+        plan["manifest"]["manifest_checksum"] = ""
+        plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
+        _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        out = pub.advance_lifecycle(self.root, hold_root=self.hold, now=T0)
+        self.assertEqual(out["transitions"], [], "the block must still be protected")
+        self.assertIn("release_after_utc", out["blocked"][0]["reason"])
+
+    def test_the_deadlines_come_from_the_PUBLICATION_clock_not_the_planning_clock(self):
+        """The window protects from the moment of publication. A plan reviewed for a day and
+        then published must still get a full grace period -- which a lower-bound check on the
+        plan's values would have refused outright."""
+        plan = self._plan()
+        later = T0 + timedelta(days=3)
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=later)
+        self.assertEqual(out["status"], "published")
+        got = self._entry()
+        self.assertEqual(got["release_after_utc"], "2027-01-05T00:00:00Z")
+        self.assertEqual(got["hold_until_utc"], "2027-01-18T00:00:00Z")
+        self.assertGreater(got["hold_until_utc"], got["release_after_utc"])
+
+    def test_the_configured_policy_is_what_is_applied(self):
+        out = _execute(self._plan(), ingest_lock_path=self.lock, delta_path=self.delta,
+                       now=T0, release_after_s=7200, hold_days=30)
+        self.assertEqual(out["status"], "published")
+        got = self._entry()
+        self.assertEqual(got["release_after_utc"], "2027-01-01T02:00:00Z")
+        self.assertEqual(got["hold_until_utc"], "2027-01-31T00:00:00Z")
+
+
+class TestAuditReflectsWhatWasCommitted(_Base):
+    """An audit trail claiming generation 999 while the manifest says 2 is worse than no trail,
+    because it is believed."""
+
+    def setUp(self):
+        super().setUp()
+        self._live_gen1()
+        self.delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(self.delta, self.span[:60])
+
+    def _log(self):
+        with open(os.path.join(self.root, pub.MANIFEST_LOG)) as fh:
+            return json.loads(fh.read().splitlines()[-1])
+
+    def test_edited_plan_metadata_does_not_reach_the_audit_log(self):
+        plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+        plan["generation"] = 999                       # top-level plan metadata, not the manifest
+        plan["superseded_now"] = "b_imaginary"
+        plan["predecessor_generation"] = 1             # still matches live, so we get past the gate
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        self.assertEqual(out["status"], "published")
+        self.assertEqual(out["generation"], 2)
+        self.assertEqual(out["superseded"], "b_v1")
+        entry = self._log()
+        self.assertEqual(entry["to_generation"], 2)
+        self.assertEqual(entry["from_generation"], 1)
+        self.assertEqual(entry["superseded"], "b_v1")
+        self.assertEqual(bm.load_live(self.root)["generation"], 2)
+
+    def test_the_log_matches_the_manifest_on_a_normal_publish(self):
+        plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        live = bm.load_live(self.root)
+        entry = self._log()
+        self.assertEqual(entry["to_generation"], live["generation"])
+        self.assertEqual(entry["new_segment"], live["segments"][0]["segment_id"])
+        self.assertEqual(out["generation"], live["generation"])
