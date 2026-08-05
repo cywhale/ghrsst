@@ -57,15 +57,16 @@ class PublishRefused(Exception):
     """Nothing was written. The live manifest is byte-unchanged."""
 
 
-#: Only two values cross from the plan into the published manifest: `created_by` (who asked
-#: for the publication) and the superseded entry's `bytes` (a measurement the builder made).
-#: Neither is clock-derived and neither protects anything, so neither can be abused by editing.
+#: `created_by` (who asked for the publication) is now the ONLY value that crosses from the
+#: plan. The superseded entry's `bytes` used to as well; it is now measured from the block on
+#: disk, and the plan's claim is a fallback used only when the block cannot be found -- and
+#: then only as a non-negative int, never as written.
 #:
 #: Fields ignored when comparing, because publication REGENERATES them: a fresh
 #: `generation_id`, `created_utc` at the moment of commit, and the lifecycle deadlines, which
 #: are computed from the publication clock under policy and never accepted from the document.
 _REGENERATED_TOP = ("generation_id", "created_utc", "manifest_checksum")
-_REGENERATED_SUPERSEDED = ("release_after_utc", "hold_until_utc")
+_REGENERATED_SUPERSEDED = ("release_after_utc", "hold_until_utc", "bytes")
 
 
 #: Distinguishes "the caller did not supply a source_map" from "the caller supplied an EMPTY
@@ -343,6 +344,64 @@ def plan_publication(root: str, plan: dict, *, release_after_s: int = DEFAULT_RE
     }
 
 
+def validate_retention_policy(release_after_s, hold_days) -> tuple:
+    """The deadlines are only as good as the policy they are computed from.
+
+    Round 7 stopped the plan from back-dating `release_after_utc` / `hold_until_utc` by
+    computing them at publication -- from these two numbers. If the numbers themselves can be
+    negative or zero, the protection is back where it started, just one level down:
+    `release_after_s=-1, hold_days=0` produces deadlines already in the past, and the lifecycle
+    releases and holds the block on its next run.
+
+    `hold_days` must be strictly positive: `held` is the terminal state, and a hold window that
+    has already expired means ops may hard-delete immediately. And the hold window must not be
+    *shorter* than the release window -- `release_after_utc > hold_until_utc` would order the
+    lifecycle backwards, making a block eligible for hard delete before it is even eligible to
+    leave `referenced`.
+    """
+    if isinstance(release_after_s, bool) or not isinstance(release_after_s, int):
+        raise PublishRefused(f"release_after_s must be an int, got {release_after_s!r}")
+    if isinstance(hold_days, bool) or not isinstance(hold_days, int):
+        raise PublishRefused(f"hold_days must be an int, got {hold_days!r}")
+    if release_after_s < 0:
+        raise PublishRefused(
+            f"release_after_s must be >= 0, got {release_after_s}: a negative grace period "
+            f"produces a release_after_utc already in the past, which releases a superseded "
+            f"block that in-flight snapshots, the next fold and rollback all still need "
+            f"(§8.5)")
+    if hold_days <= 0:
+        raise PublishRefused(
+            f"hold_days must be > 0, got {hold_days}: `held` is the terminal state, and a hold "
+            f"window that has already expired means ops may hard-delete the block immediately")
+    if hold_days * 86400 <= release_after_s:
+        raise PublishRefused(
+            f"the hold window ({hold_days}d) is not longer than the release window "
+            f"({release_after_s}s), which collapses the lifecycle: at equality the block "
+            f"becomes releasable and hard-deletable at the same instant, and below it the "
+            f"order reverses -- eligible for hard delete before eligible to leave "
+            f"`referenced`. The two stages exist to be distinct.")
+    return int(release_after_s), int(hold_days)
+
+
+def measure_bytes(path: str) -> Optional[int]:
+    """On-disk size of a block, by walking it. `None` when it is not there.
+
+    Called **before the ingest lock is taken**, deliberately. A production block is ~94 GB
+    across a large number of files (§10.6), so the walk costs seconds; doing it under the lock
+    would stall the twice-daily delta append for exactly as long, which is a worse outcome than
+    a slightly stale measurement of a store that is immutable anyway."""
+    if not os.path.isdir(path):
+        return None
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for name in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:                     # raced or unreadable: not worth failing on
+                pass
+    return total
+
+
 def compose_generation(live: dict, segment: dict, *, now: datetime,
                        release_after_s: int = DEFAULT_RELEASE_AFTER_S,
                        hold_days: int = DEFAULT_HOLD_DAYS, predecessor_bytes: int = 0,
@@ -357,6 +416,13 @@ def compose_generation(live: dict, segment: dict, *, now: datetime,
     a hole: it compared the entries that *remained*, and said nothing about an entry that was
     removed or one that was injected.
     """
+    release_after_s, hold_days = validate_retention_policy(release_after_s, hold_days)
+    if isinstance(predecessor_bytes, bool) or not isinstance(predecessor_bytes, int) \
+            or predecessor_bytes < 0:
+        raise PublishRefused(
+            f"predecessor_bytes must be a non-negative int, got {predecessor_bytes!r}; it "
+            f"feeds the §7.1c pinned_existing forecast and the lifecycle audit, and a negative "
+            f"size makes both report free space that does not exist")
     gen = int(live["generation"]) + 1
     segments = [dict(s) for s in live["segments"]]
     superseded = [dict(s) for s in live["superseded"]]      # CUMULATIVE (§5.6), never reset
@@ -379,11 +445,16 @@ def compose_generation(live: dict, segment: dict, *, now: datetime,
     segments.sort(key=lambda s: (s["start_day"], s["segment_id"]))
 
     if replaced is not None:
+        # `validate_retention_policy` has already established hold > release, so the computed
+        # deadlines cannot invert. An extra check here would be unreachable code that no
+        # mutation can kill -- which reads as a guard while being none.
+        release_at = now + timedelta(seconds=release_after_s)
+        hold_until = now + timedelta(days=hold_days)
         superseded.append({
             "segment_id": replaced["segment_id"], "path": replaced["path"],
             "superseded_at_generation": gen,
-            "release_after_utc": _iso(now + timedelta(seconds=release_after_s)),
-            "hold_until_utc": _iso(now + timedelta(days=hold_days)),
+            "release_after_utc": _iso(release_at),
+            "hold_until_utc": _iso(hold_until),
             "status": "referenced",
             "current_path": replaced["path"],
             "bytes": int(predecessor_bytes),
@@ -567,7 +638,8 @@ def _read_delta_days(delta_path: Optional[str]) -> List[str]:
 # --------------------------------------------------------------------------- execute
 def recompose(live: dict, plan: dict, *, now: datetime,
               release_after_s: int = DEFAULT_RELEASE_AFTER_S,
-              hold_days: int = DEFAULT_HOLD_DAYS):
+              hold_days: int = DEFAULT_HOLD_DAYS,
+              measured_bytes: Optional[int] = None):
     """Re-derive generation `N+1` from the LIVE manifest, and say whether the plan matches.
 
     Returns `(manifest, replaced, difference)`. **The returned manifest is what gets
@@ -598,7 +670,9 @@ def recompose(live: dict, plan: dict, *, now: datetime,
     try:
         expected, replaced = compose_generation(
             live, segment, now=now, release_after_s=release_after_s, hold_days=hold_days,
-            predecessor_bytes=_plan_superseded_bytes(plan, replaced_id=segment.get("supersedes")),
+            predecessor_bytes=(measured_bytes if measured_bytes is not None
+                               else _plan_superseded_bytes(
+                                   plan, replaced_id=segment.get("supersedes"))),
             created_by=plan["manifest"].get("created_by", "p5-compaction"))
     except (PublishRefused, bm.ManifestError) as exc:
         # The live manifest plus this segment does not compose into a valid generation at all,
@@ -630,14 +704,19 @@ def recompose(live: dict, plan: dict, *, now: datetime,
 
 
 def _plan_superseded_bytes(plan: dict, *, replaced_id: Optional[str]) -> int:
-    """`bytes` is a measurement, not a clock, so it comes from the plan -- but only as an int."""
+    """The plan's claimed size, used only when the block cannot be measured.
+
+    A claim, not evidence -- so it is accepted only as a non-negative int, and anything else
+    becomes 0 rather than propagating into the manifest."""
     if not replaced_id:
         return 0
     for e in plan["manifest"].get("superseded", []):
         if e.get("segment_id") == replaced_id and e.get("superseded_at_generation") == \
                 int(plan["manifest"].get("generation", -1)):
             value = e.get("bytes", 0)
-            return int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return int(value)
+            return 0
     return 0
 
 
@@ -683,6 +762,27 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
         verify_build_artifact(source_map, build_artifact_path,
                               segment_id=plan["new_segment_id"], where="at publication")
 
+    # Fail closed on the policy BEFORE anything else: a bad grace period is a caller error, and
+    # finding it after the lock is taken would stall the delta append for no reason.
+    release_after_s, hold_days = validate_retention_policy(release_after_s, hold_days)
+
+    # Measure the predecessor OUTSIDE the lock -- see `measure_bytes`. The path comes from the
+    # live manifest's own segment entry, not from the plan, so a plan cannot point the
+    # measurement at some other block. This read is unlocked and could be stale; that is
+    # harmless, because the re-composition under the lock refuses outright if the generation
+    # moved, and the block itself is immutable.
+    measured = None
+    supersedes = published[0].get("supersedes")
+    if supersedes:
+        try:
+            prior_live = bm.load_live(root)
+        except bm.ManifestError:
+            prior_live = {"segments": []}
+        prior = next((s for s in prior_live["segments"]
+                      if s["segment_id"] == supersedes), None)
+        if prior:
+            measured = measure_bytes(_seg_path(root, prior))
+
     # `compaction_lock_path` is a REQUIRED keyword with no default. It used to be optional, so
     # a caller who simply forgot it published without ever asking whether a build was running
     # -- and a build holding the lock may still be writing the very block we are about to
@@ -713,7 +813,8 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
         # The manifest must be the one THIS live generation produces -- not merely one whose
         # remaining entries agree with it. What comes back is what gets published.
         manifest, replaced, diff = recompose(
-            live, plan, now=now, release_after_s=release_after_s, hold_days=hold_days)
+            live, plan, now=now, release_after_s=release_after_s, hold_days=hold_days,
+            measured_bytes=measured)
         if diff:
             return {"status": "refused", "published": False,
                     "reason": (f"{diff}. Generation N+1 is exactly: live, minus the one "

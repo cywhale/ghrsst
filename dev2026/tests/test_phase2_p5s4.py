@@ -1827,9 +1827,9 @@ class TestSegmentSetIsDerivedNotAccepted(_Base):
                          ["b_other", "b_v2"])
         self.assertEqual([e["segment_id"] for e in live["superseded"]], ["b_v1"])
 
-    def test_only_created_by_and_bytes_cross_from_the_plan(self):
-        """Everything else is either re-derived from the live manifest or regenerated at
-        publication, so editing it changes nothing about what gets committed."""
+    def test_created_by_is_the_only_value_that_crosses_from_the_plan(self):
+        """Everything else is re-derived from the live manifest, regenerated at publication, or
+        measured from disk, so editing it changes nothing about what gets committed."""
         plan = self._plan()
         plan["manifest"]["generation_id"] = "some-other-uuid"
         plan["manifest"]["created_utc"] = "2099-01-01T00:00:00Z"
@@ -1841,9 +1841,11 @@ class TestSegmentSetIsDerivedNotAccepted(_Base):
         self.assertEqual(out["status"], "published")
         live = bm.load_live(self.root)
         self.assertEqual(live["created_by"], "someone-else")
-        self.assertEqual(live["superseded"][0]["bytes"], 999)
         self.assertNotEqual(live["generation_id"], "some-other-uuid")
         self.assertEqual(live["created_utc"], "2027-01-01T00:00:00Z")
+        self.assertNotEqual(live["superseded"][0]["bytes"], 999,
+                            "bytes is measured from the block, not taken from the plan")
+        self.assertGreater(live["superseded"][0]["bytes"], 0)
 
 
 # ============ review round 7: lifecycle deadlines are COMPUTED at publication, never accepted
@@ -1953,3 +1955,171 @@ class TestAuditReflectsWhatWasCommitted(_Base):
         self.assertEqual(entry["to_generation"], live["generation"])
         self.assertEqual(entry["new_segment"], live["segments"][0]["segment_id"])
         self.assertEqual(out["generation"], live["generation"])
+
+
+# ================= review round 8: the retention POLICY itself, and measured predecessor bytes
+class TestRetentionPolicyIsValidated(_Base):
+    """Round 7 stopped the plan back-dating the deadlines by computing them from these two
+    numbers. If the numbers can be negative or zero, the protection is back where it started,
+    one level down."""
+
+    def setUp(self):
+        super().setUp()
+        self._live_gen1()
+        self.delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(self.delta, self.span[:60])
+
+    def _plan(self):
+        return pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
+                                    now=T0)
+
+    def _refused(self, **policy):
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            _execute(self._plan(), ingest_lock_path=self.lock, delta_path=self.delta, now=T0,
+                     **policy)
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+        return str(cm.exception)
+
+    def test_a_negative_release_window_is_refused(self):
+        self.assertIn("release_after_s must be >= 0", self._refused(release_after_s=-1))
+
+    def test_a_zero_or_negative_hold_window_is_refused(self):
+        for bad in (0, -1):
+            with self.subTest(hold_days=bad):
+                self.assertIn("hold_days must be > 0", self._refused(hold_days=bad))
+
+    def test_a_hold_window_shorter_than_the_release_window_is_refused(self):
+        """It reverses the lifecycle: eligible for hard delete before eligible to leave
+        `referenced`."""
+        msg = self._refused(release_after_s=5 * 86400, hold_days=1)
+        self.assertIn("not longer than the release window", msg)
+
+    def test_a_hold_window_EQUAL_to_the_release_window_is_refused(self):
+        """At equality the block becomes releasable and hard-deletable at the same instant,
+        which collapses the two stages into one."""
+        msg = self._refused(release_after_s=86400, hold_days=1)
+        self.assertIn("collapses the lifecycle", msg)
+
+    def test_one_second_under_the_release_window_still_refuses(self):
+        self.assertIn("collapses the lifecycle",
+                      self._refused(release_after_s=86400 + 1, hold_days=1))
+
+    def test_non_integer_policy_values_are_refused(self):
+        for kw in ({"release_after_s": "3600"}, {"hold_days": 14.0},
+                   {"hold_days": True}, {"release_after_s": None}):
+            with self.subTest(**kw):
+                self.assertIn("must be an int", self._refused(**kw))
+
+    def test_a_zero_release_window_is_allowed_but_a_zero_hold_window_is_not(self):
+        """`release_after_s=0` is a deliberate, legal choice (publish and release immediately);
+        `hold_days=0` is not, because `held` is terminal."""
+        out = _execute(self._plan(), ingest_lock_path=self.lock, delta_path=self.delta, now=T0,
+                       release_after_s=0)
+        self.assertEqual(out["status"], "published")
+        entry = bm.load_live(self.root)["superseded"][0]
+        self.assertEqual(entry["release_after_utc"], "2027-01-01T00:00:00Z")
+        self.assertGreater(entry["hold_until_utc"], entry["release_after_utc"])
+
+    def test_the_policy_is_checked_before_the_lock_is_taken(self):
+        """A caller error should not stall the delta append while it is discovered."""
+        import threading
+        holder = open(self.lock, "w")
+        try:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            done = threading.Event()
+
+            def worker():
+                try:
+                    _execute(self._plan(), ingest_lock_path=self.lock, delta_path=self.delta,
+                             now=T0, hold_days=0)
+                except pub.PublishRefused:
+                    pass
+                finally:
+                    done.set()
+
+            threading.Thread(target=worker, daemon=True).start()
+            self.assertTrue(done.wait(10),
+                            "the policy check must refuse without waiting for the lock")
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+
+
+class TestPredecessorBytesAreMeasured(_Base):
+    def setUp(self):
+        super().setUp()
+        self._live_gen1()
+        self.delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(self.delta, self.span[:60])
+
+    def _publish(self, plan_src=None):
+        src = plan_src or self._plan_for_v2(self.delta, self.span[:60])
+        plan = pub.plan_publication(self.root, src, now=T0)
+        return _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+
+    def test_bytes_reflect_the_block_on_disk_not_the_plans_claim(self):
+        src = self._plan_for_v2(self.delta, self.span[:60])
+        src["predecessor_bytes"] = 1                       # a wildly wrong claim
+        self.assertEqual(self._publish(src)["status"], "published")
+        actual = pub.measure_bytes(os.path.join(self.root, "b_v1.zarr"))
+        self.assertEqual(bm.load_live(self.root)["superseded"][0]["bytes"], actual)
+        self.assertGreater(actual, 1)
+
+    def test_a_negative_claimed_size_never_reaches_the_manifest(self):
+        src = self._plan_for_v2(self.delta, self.span[:60])
+        plan = pub.plan_publication(self.root, src, now=T0)
+        entry = next(e for e in plan["manifest"]["superseded"] if e["segment_id"] == "b_v1")
+        entry["bytes"] = -(1 << 40)
+        plan["manifest"]["manifest_checksum"] = ""
+        plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        self.assertEqual(out["status"], "published")
+        self.assertGreater(bm.load_live(self.root)["superseded"][0]["bytes"], 0)
+
+    def test_compose_generation_refuses_a_negative_size_outright(self):
+        """The fallback path sanitises; the composer refuses. A negative size feeds the §7.1c
+        pinned_existing forecast and would report free space that does not exist."""
+        live = bm.load_live(self.root)
+        seg = _seg("b_v9", "b_v9.zarr", self.s0, self.e0, 30, unknown=self.span[30:],
+                   sealed=False, supersedes="b_v1")
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.compose_generation(live, seg, now=T0, predecessor_bytes=-5)
+        self.assertIn("non-negative int", str(cm.exception))
+
+    def test_the_plan_fallback_is_used_only_when_the_block_is_gone_and_is_sanitised(self):
+        """The predecessor can legitimately be absent -- already moved to hold. Then the plan's
+        claim is all there is, and a negative claim must become 0 rather than propagate."""
+        src = self._plan_for_v2(self.delta, self.span[:60])
+        plan = pub.plan_publication(self.root, src, now=T0)
+        entry = next(e for e in plan["manifest"]["superseded"] if e["segment_id"] == "b_v1")
+        entry["bytes"] = -1
+        plan["manifest"]["manifest_checksum"] = ""
+        plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
+        shutil.rmtree(os.path.join(self.root, "b_v1.zarr"))    # nothing left to measure
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        self.assertEqual(out["status"], "published")
+        self.assertEqual(bm.load_live(self.root)["superseded"][0]["bytes"], 0)
+
+    def test_a_positive_plan_claim_survives_when_the_block_is_gone(self):
+        src = self._plan_for_v2(self.delta, self.span[:60])
+        plan = pub.plan_publication(self.root, src, now=T0)
+        entry = next(e for e in plan["manifest"]["superseded"] if e["segment_id"] == "b_v1")
+        entry["bytes"] = 4242
+        plan["manifest"]["manifest_checksum"] = ""
+        plan["manifest"]["manifest_checksum"] = bm.compute_checksum(plan["manifest"])
+        shutil.rmtree(os.path.join(self.root, "b_v1.zarr"))
+        out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta, now=T0)
+        self.assertEqual(out["status"], "published")
+        self.assertEqual(bm.load_live(self.root)["superseded"][0]["bytes"], 4242)
+
+    def test_measure_bytes_returns_None_for_a_missing_path(self):
+        self.assertIsNone(pub.measure_bytes(os.path.join(self.tmp, "nope.zarr")))
+
+    def test_measure_bytes_sums_the_whole_tree(self):
+        path = self._block("probe", self.span[:5])
+        total = pub.measure_bytes(path)
+        by_hand = sum(os.lstat(os.path.join(d, f)).st_size
+                      for d, _dirs, files in os.walk(path) for f in files)
+        self.assertEqual(total, by_hand)
+        self.assertGreater(total, 0)

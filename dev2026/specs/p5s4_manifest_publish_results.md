@@ -12,10 +12,10 @@ was folded.
 
 - Repair WAL: [`../store/repair_wal.py`](../store/repair_wal.py)
 - Publish / lifecycle / rollback: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py)
-- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **133/133 green**
-- Full local suite: **589 tests OK** (17 skipped), up from 456.
+- Tests: [`../tests/test_phase2_p5s4.py`](../tests/test_phase2_p5s4.py) — **148/148 green**
+- Full local suite: **604 tests OK** (17 skipped), up from 456.
 
-**Review rounds 2–7** raised five, one, three, two, two and two findings; §8–§13 record what each changed.
+**Review rounds 2–8** raised five, one, three, two, two, two and two findings; §8–§14 record what each changed.
 
 **This step does not claim crash safety.** It claims that each individual operation either commits or leaves the live manifest byte-unchanged. Two states are known-ambiguous and are P5-S5's job, not this step's (§10.3).
 
@@ -157,7 +157,7 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_phase2_p5s4
 
 ## 7. Mutation verification
 
-Every guard was disabled in turn and the suite re-run; **all 84 fail**. One further mutation survives by construction and is discussed below the table.
+Every guard was disabled in turn and the suite re-run; **all 93 fail**. One further mutation survives by construction and is discussed below the table.
 
 | guard disabled | result |
 |---|---|
@@ -245,6 +245,15 @@ Every guard was disabled in turn and the suite re-run; **all 84 fail**. One furt
 | audit log reads the plan's `superseded_now` | FAILED |
 | result reports the plan's generation | FAILED |
 | `generation_id`/`created_utc` taken from the plan | FAILED (40 + 13) |
+| negative release window allowed | FAILED |
+| zero/negative hold window allowed | FAILED (2) |
+| hold window ≤ release window allowed | FAILED |
+| non-int policy values accepted | FAILED (2) |
+| policy validated only after the lock | FAILED (9) |
+| predecessor bytes not measured | FAILED (3) |
+| measurement ignored when the block exists | FAILED (3) |
+| negative `predecessor_bytes` accepted by the composer | FAILED |
+| plan fallback does not sanitise a negative claim | FAILED |
 
 **Two mutations initially survived, and both were my tests passing for the wrong reason** — the
 same failure mode the last three review rounds found, caught here by the mutation run rather
@@ -635,3 +644,56 @@ Neither is addressed here and neither is claimed. The source map still cannot pr
 were read; `_append_log` still runs after the manifest commits, so a failed log write leaves a
 committed manifest with no trail and a retry that hits "generation archive already exists". Both
 are P5-S5 scope (§10.3, §12.3).
+
+## 14. Review round 8 — two findings
+
+### 1. [High] The retention policy itself was unvalidated
+
+Round 7 stopped the *plan* back-dating the deadlines by computing them at publication — from
+`release_after_s` and `hold_days`. Those two arrived unchecked, so the protection was back where
+it started, one level down: `release_after_s=-1, hold_days=0` produces deadlines already in the
+past, and the lifecycle releases and holds the block on its next run.
+
+`validate_retention_policy()` fails closed on: non-int values, `release_after_s < 0`,
+`hold_days <= 0` (`held` is terminal, so an expired hold window means ops may hard-delete
+immediately), and a hold window **not longer** than the release window.
+
+The last one is stricter than the review asked for, deliberately. `hold_until == release_after`
+is not merely an edge case — it collapses the two-stage lifecycle into one instant, making the
+block releasable and hard-deletable simultaneously. Refusing only `<` would have left equality
+legal.
+
+`release_after_s = 0` **is** allowed: publish-and-release-immediately is a legitimate choice for
+a deployment with no in-flight-snapshot concern, and refusing it would be policy invented here
+rather than derived from §8.5. Tested both ways.
+
+The policy is checked **before the ingest lock is taken** — a caller error should not stall the
+twice-daily delta append while it is discovered. Tested by holding the lock and asserting the
+refusal still returns.
+
+*One guard was removed rather than kept.* I first wrote a second check on the computed
+`hold_until <= release_at`. Once the validator refuses equality that branch is unreachable, and
+a mutation confirmed nothing could kill it. Unreachable code that reads as a guard is worse than
+no guard, so it is gone.
+
+### 2. [Medium] `bytes` was still the plan's claim
+
+Now **measured** from the predecessor block on disk; the plan's number is a fallback used only
+when the block is not there (legitimately — it may already be in hold), and then only as a
+non-negative int. `compose_generation` refuses a negative `predecessor_bytes` outright, because
+that value feeds the §7.1c `pinned_existing` forecast and the lifecycle audit, and a negative
+size reports free space that does not exist.
+
+`bytes` therefore moved out of the "crosses from the plan" set into the regenerated set. After
+eight rounds, **`created_by` is the only value that reaches the published manifest from the
+plan.**
+
+The measurement runs **outside the ingest lock**. A production block is ~94 GB across a large
+number of files (§10.6), so the walk costs seconds — holding the lock for that would stall the
+delta append for exactly as long, which is worse than measuring a store that is immutable
+anyway. The path comes from the *live* manifest's segment entry, not from the plan, so a plan
+cannot aim the measurement at a different block.
+
+### 3. [Known residual, unchanged] Source bytes, and post-commit audit-log failure
+
+Still S5, still unclaimed.
