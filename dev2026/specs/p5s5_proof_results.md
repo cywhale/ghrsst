@@ -9,10 +9,10 @@ Branch `dev2026-p5-s5-proof`, stacked on `9bc1795`.
 - Provenance primitive + artifact: [`../store/source_provenance.py`](../store/source_provenance.py)
 - Builder emits the artifact: [`../ingest/build_block.py`](../ingest/build_block.py)
 - Publication verifies it: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py)
-- Tests: [`../tests/test_phase2_p5s5.py`](../tests/test_phase2_p5s5.py) — **59/59 green**
+- Tests: [`../tests/test_phase2_p5s5.py`](../tests/test_phase2_p5s5.py) — **61/61 green**
 - P5-S4 regression: **155/155 green**
-- Full local suite: **670 tests OK** (17 skipped), up from 611
-- `-W error::ResourceWarning` over S4+S5: **214 OK**
+- Full local suite: **672 tests OK** (17 skipped), up from 611
+- `-W error::ResourceWarning` over S4+S5: **216 OK**
 
 > **This document does not claim the P5-S5 gate.** G10/H4 and G17 require the crash and
 > concurrency proof in Part 3, which is not written. Nothing below is marked PASS on the
@@ -41,6 +41,7 @@ Branch `dev2026-p5-s5-proof`, stacked on `9bc1795`.
 | `block_path` is verified against the published block | **PASS** (round 3) | `test_a_renamed_block_path_is_refused` |
 | verification holds **at the commit point**, under both locks | **PASS** (round 4) | `TestProvenanceIsVerifiedInsideTheCriticalSection` |
 | every bypass is named `unsafe_*` and reports unverified | **PASS** (round 4) | `TestTheSourceRecheckWaiverIsLabelled` |
+| the provenance report has one key set across all outcomes | **PASS** (round 5) | `test_a_full_verification_reports_the_canonical_shape` and the two waiver tests |
 | **2. Repair WAL / corrected-day lifecycle** | | |
 | WAL authorization wired into `prune_delta` | **NOT DELIVERED** | — |
 | E2 wired as a prune gate | **NOT DELIVERED** | primitive exists (`compare_days`); no caller |
@@ -124,8 +125,8 @@ wiring — that is Part 2.
   waivers (the `build_block` `unsafe_skip_isolation` pattern). Either one makes the result
   report `verified: False` with `source_recheck: "waived"` and a reason — a bypass that
   reported success would be worse than no bypass.
-- The publish result carries
-  `provenance: {verified, source_recheck, days, sources_rechecked[, reason]}`.
+- The publish result carries `provenance: {verified, source_recheck, days,
+  sources_rechecked}` on **every** outcome, plus `reason` when a waiver is in force.
   `sources_rechecked` is asserted against the day count, so a source quietly not re-read shows
   up as a number rather than as a pass.
 - **Verification runs inside the critical section**, after both locks and after the staleness
@@ -133,7 +134,7 @@ wiring — that is Part 2.
 
 ## 3. Mutation verification
 
-37 guards disabled in turn; **all 37 fail**.
+39 guards disabled in turn; **all 39 fail**.
 
 | guard disabled | result |
 |---|---|
@@ -170,6 +171,8 @@ wiring — that is Part 2.
 | waived recheck still reports `verified` | FAILED |
 | the waiver does not disable the reader | FAILED |
 | skipping provenance entirely reports `verified` | FAILED |
+| skip-provenance drops `days` / `sources_rechecked` | FAILED |
+| skip-provenance reports `verified: True` | FAILED |
 
 **Two mutations survive by construction and are recorded rather than listed above:**
 
@@ -363,3 +366,26 @@ Tested by making a source change that **must** refuse without the waiver and **m
 unverified with it — so the waiver is what makes the difference, not the fixture. The P5-S4
 locator tests, which legitimately use it, now assert the waived reporting, so their bypass
 cannot be mistaken for a pass.
+
+## 9. Review round 5 — one finding
+
+### [Low] The skip-provenance branch returned a different key set
+
+`unsafe_skip_provenance=True` returned only `verified` / `source_recheck` / `reason`, while the
+source-recheck waiver returned `days` and `sources_rechecked` as well. An audit or ops consumer
+would have had to **branch on which waiver was used in order to know how to read the report** —
+reading the report to find out how to read the report.
+
+It also made a claim in §8 of this document wrong: I wrote "the same is true when provenance is
+skipped entirely", and it was not. The finding is Low in blast radius and the inaccurate claim
+is worth naming separately, because a results doc that overstates uniformity is the same class
+of error as a report that overstates verification.
+
+All outcomes now carry `{verified, days, sources_rechecked, source_recheck}`, with `reason`
+added when a waiver is in force. The counts are `0` rather than absent: nothing was checked, and
+`0` says that, while an absent field says nothing at all.
+
+Three tests, one per outcome, sharing a `_assert_waived` helper and an explicit `SHAPE`
+constant, so a field silently added or dropped in any branch fails. The mutation that reproduces
+the reported defect exactly — deleting `days` and `sources_rechecked` from the skip-provenance
+branch — fails the suite.

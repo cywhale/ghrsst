@@ -1097,8 +1097,16 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
                     provenance_report.update({"verified": True,
                                               "source_recheck": "performed"})
             else:
-                provenance_report = {"verified": False, "source_recheck": "waived",
-                                     "reason": "unsafe_skip_provenance=True"}
+                # The SAME key set as every other outcome. A consumer branching on the waiver
+                # type to know which fields exist would be reading the report to find out how
+                # to read the report; the counts are 0 because nothing was checked, which is
+                # the honest value rather than an absent one.
+                provenance_report = {"verified": False, "days": 0, "sources_rechecked": 0,
+                                     "source_recheck": "waived",
+                                     "reason": "unsafe_skip_provenance=True: no provenance "
+                                               "artifact was verified, so neither `block bytes "
+                                               "match the artifact` nor `source changed -> "
+                                               "refuse` holds for this publication"}
 
             # Hold the reservation right up to the commit, and prove it is still ours: a build
             # that rm+recreated the lock file could otherwise lock a fresh inode while we hold

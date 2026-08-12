@@ -942,9 +942,38 @@ class TestTheSourceRecheckWaiverIsLabelled(_Base):
         with self.assertRaises(pub.PublishRefused):
             self._publish(self._seg_plan())
 
-    def test_skipping_provenance_entirely_also_reports_unverified(self):
-        out = self._publish(self._seg_plan(), build_artifact_path=None,
-                            unsafe_skip_provenance=True)
-        self.assertEqual(out["status"], "published")
-        self.assertFalse(out["provenance"]["verified"])
-        self.assertEqual(out["provenance"]["source_recheck"], "waived")
+    #: every outcome reports exactly these keys; a waived one adds `reason` and drops nothing
+    SHAPE = {"verified", "days", "sources_rechecked", "source_recheck"}
+
+    def _assert_waived(self, report, *, expect_days):
+        """A consumer that has to branch on the waiver type to know which fields exist is
+        reading the report to find out how to read the report. The counts are 0 when nothing
+        was checked -- the honest value, not an absent one."""
+        self.assertEqual(set(report), self.SHAPE | {"reason"})
+        self.assertFalse(report["verified"])
+        self.assertEqual(report["source_recheck"], "waived")
+        self.assertEqual(report["days"], expect_days)
+        self.assertEqual(report["sources_rechecked"], 0)
+        self.assertTrue(report["reason"])
+
+    def test_a_full_verification_reports_the_canonical_shape(self):
+        report = self._publish(self._seg_plan())["provenance"]
+        self.assertEqual(set(report), self.SHAPE, "a verified outcome carries no `reason`")
+        self.assertTrue(report["verified"])
+        self.assertEqual(report["days"], len(self.days))
+        self.assertEqual(report["sources_rechecked"], len(self.days))
+
+    def test_a_waived_source_recheck_keeps_the_shape(self):
+        report = self._publish(self._seg_plan(),
+                               unsafe_skip_source_recheck=True)["provenance"]
+        self._assert_waived(report, expect_days=len(self.days))
+        self.assertIn("source changed", report["reason"])
+
+    def test_skipping_provenance_entirely_keeps_the_shape_too(self):
+        """`days` and `sources_rechecked` were missing here, so an audit consumer had to
+        branch on which waiver was used before it could read the report."""
+        report = self._publish(self._seg_plan(), build_artifact_path=None,
+                               unsafe_skip_provenance=True)["provenance"]
+        self._assert_waived(report, expect_days=0)
+        self.assertIn("no provenance artifact was verified", report["reason"])
+
