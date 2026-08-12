@@ -109,7 +109,8 @@ class _Base(unittest.TestCase):
         with open(path, "w") as fh:
             fh.write(text)
 
-    def _artifact_for(self, block_path, segment_id, smap, *, seed=20260805, out=None):
+    def _artifact_for(self, block_path, segment_id, smap, *, out=None):
+        seed = sp.SAMPLE_SEED
         """A genuine artifact for a fixture block, sampled from the block itself.
 
         These tests build blocks with the fixture rather than through `build_block`, so the
@@ -122,8 +123,9 @@ class _Base(unittest.TestCase):
         for t_idx, day in enumerate(insp.days):
             i0, i1, j0, j1 = sp.sample_window(insp.ny, insp.nx, seed=seed, day_index=t_idx)
             tiles, valid = {}, {}
-            for var, flags in valid_map.items():
-                present = flags[t_idx] is True
+            for var in fx.VARS:                 # the canonical domain, as the builder uses
+                flags = valid_map.get(var, [])
+                present = bool(flags) and t_idx < len(flags) and flags[t_idx] is True
                 valid[var] = present
                 tiles[var] = (np.asarray(g[var][t_idx, i0:i1, j0:j1]) if present else None)
             rec = smap[day]
@@ -135,7 +137,7 @@ class _Base(unittest.TestCase):
                 "var_valid": valid,
             }
         doc = sp.build_artifact(segment_id=segment_id, block_path=block_path,
-                                ny=insp.ny, nx=insp.nx, seed=seed, days=days)
+                                ny=insp.ny, nx=insp.nx, days=days)
         path = out or os.path.join(self.tmp, sp.ARTIFACT_NAME)
         sp.write_artifact(path, doc)
         return path, doc

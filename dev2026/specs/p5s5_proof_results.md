@@ -9,10 +9,10 @@ Branch `dev2026-p5-s5-proof`, stacked on `9bc1795`.
 - Provenance primitive + artifact: [`../store/source_provenance.py`](../store/source_provenance.py)
 - Builder emits the artifact: [`../ingest/build_block.py`](../ingest/build_block.py)
 - Publication verifies it: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py)
-- Tests: [`../tests/test_phase2_p5s5.py`](../tests/test_phase2_p5s5.py) — **41/41 green**
+- Tests: [`../tests/test_phase2_p5s5.py`](../tests/test_phase2_p5s5.py) — **50/50 green**
 - P5-S4 regression: **155/155 green**
-- Full local suite: **652 tests OK** (17 skipped), up from 611
-- `-W error::ResourceWarning` over S4+S5: **196 OK**
+- Full local suite: **661 tests OK** (17 skipped), up from 611
+- `-W error::ResourceWarning` over S4+S5: **205 OK**
 
 > **This document does not claim the P5-S5 gate.** G10/H4 and G17 require the crash and
 > concurrency proof in Part 3, which is not written. Nothing below is marked PASS on the
@@ -36,6 +36,9 @@ Branch `dev2026-p5-s5-proof`, stacked on `9bc1795`.
 | E2 primitive: point-wise, float32, NaN-aware | **PASS** | `TestFingerprintSemantics` |
 | `var_valid` transition (absent↔present) in the source → refuse | **PASS** (round 2) | `TestSourceVarValidTransitionsAreCaught` — delta and daily |
 | the artifact cannot choose its own sample or grid | **PASS** (round 2) | `TestTheArtifactCannotChooseItsOwnSample` |
+| `day_index` is bound to the DATE, not just the range | **PASS** (round 3) | `TestDayIndexIsBoundToTheDate` |
+| `var_valid` covers exactly the canonical variables | **PASS** (round 3) | `test_var_valid_must_cover_exactly_the_canonical_variables` |
+| `block_path` is verified against the published block | **PASS** (round 3) | `test_a_renamed_block_path_is_refused` |
 | **2. Repair WAL / corrected-day lifecycle** | | |
 | WAL authorization wired into `prune_delta` | **NOT DELIVERED** | — |
 | E2 wired as a prune gate | **NOT DELIVERED** | primitive exists (`compare_days`); no caller |
@@ -124,7 +127,7 @@ wiring — that is Part 2.
 
 ## 3. Mutation verification
 
-26 guards disabled in turn; **all 26 fail**.
+33 guards disabled in turn; **all 33 fail**.
 
 | guard disabled | result |
 |---|---|
@@ -150,6 +153,13 @@ wiring — that is Part 2.
 | int coercion allowed in grid/sample | FAILED |
 | `var_valid` flags accepted by truthiness | FAILED |
 | builder narrows the fingerprint domain to `keep_vars` | FAILED (2 + 1) |
+| `day_index` not bound to the date | FAILED (2) |
+| date binding relaxed to a range check only | FAILED |
+| `var_valid` key set not compared to canonical `VARS` | FAILED |
+| `block_path` field unchecked | FAILED |
+| `version` coerced | FAILED (3) |
+| `source_day_index` not strictly validated | FAILED (4) |
+| `build_artifact` mints a foreign seed | FAILED (15 + 10) |
 
 **Two mutations survive by construction and are recorded rather than listed above:**
 
@@ -243,3 +253,52 @@ reads as a guard is worse than no guard — the same call made in P5-S4 round 8.
   provably equal, so the substitution cannot change any output.
 
 Both are recorded here rather than listed as verified guards.
+
+## 7. Review round 3 — five findings
+
+### 1. [High] `day_index` was bound to the array bounds, not to the date
+
+The verifier checked only that the index was in range. An in-range index still **selects a
+slot**, and if that slot's sampled cells happen to agree — an all-NaN region, a repeated value,
+a short block — the fingerprint matches and the artifact has attested day D against another
+day's bytes. Now `insp.days[t_idx]` must equal `day`.
+
+The test does not take the easy route of leaving a stale fingerprint behind: it **re-fingerprints
+against the slot the artifact now points at**, so the byte comparison passes and *only* the date
+binding can refuse. A mutation that relaxes the check back to a range test fails it, which is
+what proves the test is testing the binding and not the bounds.
+
+### 2. [Medium] `var_valid` was not required to cover the canonical variables
+
+Only "non-empty dict" was enforced, so a missing key was silently read as `False` by the
+verifier's `.get(..., False)` and an unknown key was ignored. **A partial map bought a partial
+check** — and `var_valid` is the field that decides whether a variable is read from the source
+at all.
+
+`load_artifact` now takes `expected_vars` as a **required** keyword and demands exact set
+equality. Required rather than optional because the canonical set is not knowable from the
+document, and being forced to state it is what stops the check being skipped. Tested in both
+directions plus a `TypeError` test on omitting the argument.
+
+### 3. [Medium] `block_path` was recorded and never checked
+
+Renaming it in the artifact published successfully. It is part of the audit record, so an
+unchecked field is a *wrong* audit record rather than a harmless label. Now compared against the
+canonical basename of the block being published. (The alternative the review offered — delete
+the field — would have removed information an auditor wants; checking it keeps it.)
+
+### 4. [Low] `version` and `source_day_index` accepted coercion
+
+`int("1")` and `int(True)` both succeed. Both now go through the same strict `_exact_int` the
+grid and sample fields use.
+
+### 5. [Low] `build_artifact()` still accepted a `seed`
+
+It defaulted to policy, so the only thing the parameter could do was mint an artifact that
+`load_artifact` would later always reject. **An API that can produce only-invalid output is a
+trap**: the failure surfaces at publication, far from the call that caused it. The parameter is
+removed and the seed is taken from the constant.
+
+*Knock-on:* the P5-S4 artifact helper minted artifacts with the old signature and a
+`keep_vars`-shaped `var_valid`. Updated — the S4 suite is regression coverage for this contract,
+so it has to build artifacts the way the builder does.

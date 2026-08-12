@@ -214,12 +214,17 @@ def _assert_sample_policy(doc: dict, path: str) -> None:
 
 
 def build_artifact(*, segment_id: str, block_path: str, ny: int, nx: int,
-                   days: Dict[str, dict], seed: int = SAMPLE_SEED) -> dict:
+                   days: Dict[str, dict]) -> dict:
+    """Mint an artifact. The seed is **not** a parameter.
+
+    It used to be, defaulted to policy -- which let a caller mint an artifact that
+    `load_artifact` would then always reject. An API that can produce only-invalid output is a
+    trap: the failure surfaces at publication, far from the call that caused it."""
     doc = {
         "format": ARTIFACT_FORMAT, "version": ARTIFACT_VERSION,
         "segment_id": segment_id, "block_path": os.path.basename(block_path.rstrip("/")),
         "grid": {"ny": int(ny), "nx": int(nx)},
-        "sample": {"algo": "sha256", "seed": int(seed), "points": SAMPLE_POINTS,
+        "sample": {"algo": "sha256", "seed": SAMPLE_SEED, "points": SAMPLE_POINTS,
                    "window": SAMPLE_WINDOW},
         "days": days, "artifact_checksum": "",
     }
@@ -241,8 +246,14 @@ def write_artifact(path: str, doc: dict) -> str:
     return path
 
 
-def load_artifact(path: str) -> dict:
-    """Read and validate structurally. Every failure is a refusal, never a repair."""
+def load_artifact(path: str, *, expected_vars: Sequence[str]) -> dict:
+    """Read and validate structurally. Every failure is a refusal, never a repair.
+
+    `expected_vars` is **required**, not optional. `var_valid` decides whether a variable is
+    read from the source at all, so a partial map is a partial check: a missing key was
+    silently filled in as `False` by the verifier's `.get(..., False)`, and an unknown key was
+    ignored. The canonical variable set is not knowable from the document, so the caller has to
+    state it -- and being forced to state it is what stops the check from being skipped."""
     if not os.path.isfile(path):
         raise ProvenanceError(
             f"{path}: no provenance artifact. A block published without one carries only "
@@ -260,7 +271,8 @@ def load_artifact(path: str) -> dict:
     if missing or extra:
         raise ProvenanceError(f"{path}: wrong field set (missing={missing}, "
                               f"unexpected={extra})")
-    if doc["format"] != ARTIFACT_FORMAT or int(doc["version"]) != ARTIFACT_VERSION:
+    if (doc["format"] != ARTIFACT_FORMAT
+            or _exact_int(doc["version"], f"{path}: version") != ARTIFACT_VERSION):
         raise ProvenanceError(f"{path}: format/version is "
                               f"{doc['format']!r}/{doc['version']!r}, expected "
                               f"{ARTIFACT_FORMAT!r}/{ARTIFACT_VERSION}")
@@ -299,4 +311,15 @@ def load_artifact(path: str) -> dict:
                     f"{flag!r}, must be a raw bool")
         if _exact_int(rec["day_index"], f"{path}: day {day} day_index") < 0:
             raise ProvenanceError(f"{path}: day {day} day_index must be non-negative")
+        if _exact_int(rec["source_day_index"],
+                      f"{path}: day {day} source_day_index") < 0:
+            raise ProvenanceError(f"{path}: day {day} source_day_index must be non-negative")
+        if set(rec["var_valid"]) != set(expected_vars):
+            missing_v = sorted(set(expected_vars) - set(rec["var_valid"]))
+            extra_v = sorted(set(rec["var_valid"]) - set(expected_vars))
+            raise ProvenanceError(
+                f"{path}: day {day} var_valid must cover exactly the canonical variables "
+                f"(missing={missing_v}, unexpected={extra_v}). A missing key was silently "
+                f"read as False and an unknown key ignored, so a partial map bought a "
+                f"partial check.")
     return doc

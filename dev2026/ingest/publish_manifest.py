@@ -262,11 +262,17 @@ def verify_build_artifact(sources: dict, artifact_path: str, *, segment_id: str,
     identity is the deterministic authorization. Recorded here so the artifact is not read as
     more than it is.
     """
-    doc = sp.load_artifact(artifact_path)
+    doc = sp.load_artifact(artifact_path, expected_vars=VARS)
     if doc["segment_id"] != segment_id:
         raise PublishRefused(
             f"{where}: provenance artifact {artifact_path} describes segment "
             f"{doc['segment_id']!r}, not {segment_id!r}")
+    want_base = os.path.basename(os.path.abspath(block_path).rstrip("/"))
+    if doc["block_path"] != want_base:
+        raise PublishRefused(
+            f"{where}: provenance artifact names block {doc['block_path']!r} but the segment "
+            f"being published is {want_base!r}. The field is part of the audit record, so an "
+            f"unchecked one is a wrong audit record rather than a harmless label.")
 
     recorded = doc["days"]
     if set(recorded) != set(sources):
@@ -306,15 +312,21 @@ def verify_build_artifact(sources: dict, artifact_path: str, *, segment_id: str,
     for day in sorted(recorded):
         rec = recorded[day]
         t_idx = int(rec["day_index"])
+        # Bind the index to the DATE, not merely to the array bounds. A `day_index` inside
+        # range still selects a slot, and if that slot's sampled cells happen to agree -- an
+        # all-NaN region, a repeated value, a short block -- the fingerprint matches and the
+        # artifact has silently attested day D against another day's bytes.
+        if t_idx >= len(insp.days) or insp.days[t_idx] != day:
+            actual = insp.days[t_idx] if t_idx < len(insp.days) else "out of range"
+            raise PublishRefused(
+                f"{where}: the artifact records day_index {t_idx} for {day}, but the block "
+                f"holds {actual!r} at that index. An index that resolves to a different date "
+                f"attests the wrong day's bytes.")
         i0, i1, j0, j1 = sp.sample_window(ny, nx, seed=seed, day_index=t_idx)
         tiles, valid = {}, {}
         for var in VARS:                        # the canonical domain, matching the builder
             flags = block_valid.get(var, [])
-            if flags and t_idx >= len(flags):
-                raise PublishRefused(
-                    f"{where}: provenance records day_index {t_idx} for {day} but the block "
-                    f"holds {len(flags)} day(s)")
-            present = bool(flags) and flags[t_idx] is True
+            present = bool(flags) and t_idx < len(flags) and flags[t_idx] is True
             valid[var] = present
             tiles[var] = (np.asarray(g[var][t_idx, i0:i1, j0:j1]) if present else None)
         actual = sp.window_fingerprint(tiles, seed=seed, day_index=t_idx, var_valid=valid)

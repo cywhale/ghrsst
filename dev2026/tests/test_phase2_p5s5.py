@@ -203,7 +203,7 @@ class TestArtifactIntegrity(_Base):
         plan = self._fold()
         path = self._artifact_path()
         self.assertTrue(os.path.isfile(path))
-        doc = sp.load_artifact(path)
+        doc = sp.load_artifact(path, expected_vars=fx.VARS)
         self.assertEqual(doc["segment_id"], plan["segment"]["segment_id"])
         self.assertEqual(set(doc["days"]), set(self.days))
         for day, rec in doc["days"].items():
@@ -219,7 +219,7 @@ class TestArtifactIntegrity(_Base):
         with open(path, "w") as fh:
             json.dump(doc, fh)
         with self.assertRaises(sp.ProvenanceError) as cm:
-            sp.load_artifact(path)
+            sp.load_artifact(path, expected_vars=fx.VARS)
         self.assertIn("artifact_checksum", str(cm.exception))
 
     def test_a_truncated_artifact_is_refused(self):
@@ -229,11 +229,11 @@ class TestArtifactIntegrity(_Base):
         with open(path, "wb") as fh:
             fh.write(raw[: len(raw) // 2])
         with self.assertRaises(sp.ProvenanceError):
-            sp.load_artifact(path)
+            sp.load_artifact(path, expected_vars=fx.VARS)
 
     def test_a_missing_artifact_is_refused(self):
         with self.assertRaises(sp.ProvenanceError) as cm:
-            sp.load_artifact(os.path.join(self.tmp, "nope.json"))
+            sp.load_artifact(os.path.join(self.tmp, "nope.json"), expected_vars=fx.VARS)
         self.assertIn("no provenance artifact", str(cm.exception))
 
     def test_an_incomplete_day_record_is_refused(self):
@@ -245,7 +245,7 @@ class TestArtifactIntegrity(_Base):
         with open(path, "w") as fh:
             json.dump(doc, fh)
         with self.assertRaises(sp.ProvenanceError) as cm:
-            sp.load_artifact(path)
+            sp.load_artifact(path, expected_vars=fx.VARS)
         self.assertIn("wrong field set", str(cm.exception))
 
     def test_an_unknown_extra_field_is_refused(self):
@@ -257,7 +257,7 @@ class TestArtifactIntegrity(_Base):
         with open(path, "w") as fh:
             json.dump(doc, fh)
         with self.assertRaises(sp.ProvenanceError):
-            sp.load_artifact(path)
+            sp.load_artifact(path, expected_vars=fx.VARS)
 
     def test_a_wrong_format_or_version_is_refused(self):
         self._fold()
@@ -269,7 +269,7 @@ class TestArtifactIntegrity(_Base):
             with open(path, "w") as fh:
                 json.dump(doc, fh)
             with self.assertRaises(sp.ProvenanceError) as cm:
-                sp.load_artifact(path)
+                sp.load_artifact(path, expected_vars=fx.VARS)
             self.assertIn("format/version", str(cm.exception))
 
 
@@ -370,7 +370,7 @@ class TestLocatorIsNotByteProvenance(_Base):
         self._manifest_gen0()
         plan = self._fold()
         path = self._artifact_path()
-        doc = sp.load_artifact(path)
+        doc = sp.load_artifact(path, expected_vars=fx.VARS)
 
         # locator side: identical to the manifest's map, by construction
         for day, rec in doc["days"].items():
@@ -472,7 +472,7 @@ class TestSourceVarValidTransitionsAreCaught(_Base):
         plan = _build(os.path.join(self.root, "b_v1.zarr"), days=self.days,
                       delta_path=delta, artifacts_dir=self.artifacts,
                       start=self.s0, end=self.e0)
-        art = sp.load_artifact(self._artifact_path())
+        art = sp.load_artifact(self._artifact_path(), expected_vars=fx.VARS)
         self.assertFalse(art["days"][self.days[0]]["var_valid"].get("sea_ice", False),
                          "precondition: the build recorded sea_ice as absent")
 
@@ -513,7 +513,7 @@ class TestSourceVarValidTransitionsAreCaught(_Base):
                            end_day=self.e0, classification_target=list(self.days),
                            daily_root=daily, artifacts_dir=self.artifacts,
                            lock=None, hard_reserve_bytes=0, unsafe_skip_isolation=True)
-        art = sp.load_artifact(self._artifact_path())
+        art = sp.load_artifact(self._artifact_path(), expected_vars=fx.VARS)
         self.assertFalse(art["days"][self.days[0]]["var_valid"].get("sea_ice", False))
 
         shutil.rmtree(daily)
@@ -572,7 +572,7 @@ class TestTheArtifactCannotChooseItsOwnSample(_Base):
         """Choosing the seed chooses which cells are compared -- so it is policy, not payload."""
         path = self._reseal(lambda d: d["sample"].update({"seed": 999}))
         with self.assertRaises(sp.ProvenanceError) as cm:
-            sp.load_artifact(path)
+            sp.load_artifact(path, expected_vars=fx.VARS)
         self.assertIn("policy", str(cm.exception))
 
     def test_weakened_sample_parameters_are_refused(self):
@@ -580,7 +580,7 @@ class TestTheArtifactCannotChooseItsOwnSample(_Base):
             with self.subTest(field=field):
                 path = self._reseal(lambda d, f=field, b=bad: d["sample"].update({f: b}))
                 with self.assertRaises(sp.ProvenanceError):
-                    sp.load_artifact(path)
+                    sp.load_artifact(path, expected_vars=fx.VARS)
 
     def test_non_integer_grid_or_sample_values_are_refused(self):
         for mutate in (lambda d: d["grid"].update({"ny": "32"}),
@@ -589,7 +589,7 @@ class TestTheArtifactCannotChooseItsOwnSample(_Base):
                        lambda d: d["grid"].update({"ny": 0})):
             path = self._reseal(mutate)
             with self.assertRaises(sp.ProvenanceError):
-                sp.load_artifact(path)
+                sp.load_artifact(path, expected_vars=fx.VARS)
 
     def test_a_malformed_grid_or_sample_object_is_refused(self):
         for mutate in (lambda d: d.update({"grid": [32, 32]}),
@@ -598,7 +598,7 @@ class TestTheArtifactCannotChooseItsOwnSample(_Base):
                        lambda d: d["sample"].update({"surprise": 1})):
             path = self._reseal(mutate)
             with self.assertRaises(sp.ProvenanceError):
-                sp.load_artifact(path)
+                sp.load_artifact(path, expected_vars=fx.VARS)
 
     def test_a_non_bool_var_valid_flag_is_refused(self):
         """`var_valid` decides whether a variable is read from the source at all, so
@@ -607,13 +607,13 @@ class TestTheArtifactCannotChooseItsOwnSample(_Base):
             path = self._reseal(
                 lambda d, b=bad: d["days"][self.days[0]]["var_valid"].update({"sst": b}))
             with self.assertRaises(sp.ProvenanceError) as cm:
-                sp.load_artifact(path)
+                sp.load_artifact(path, expected_vars=fx.VARS)
             self.assertIn("raw bool", str(cm.exception))
 
     def test_an_empty_var_valid_is_refused(self):
         path = self._reseal(lambda d: d["days"][self.days[0]].update({"var_valid": {}}))
         with self.assertRaises(sp.ProvenanceError):
-            sp.load_artifact(path)
+            sp.load_artifact(path, expected_vars=fx.VARS)
 
     def test_a_block_whose_geometry_diverges_from_the_fill_yields_no_artifact(self):
         """The fill samples against the probe's geometry; the artifact is written from the
@@ -643,7 +643,155 @@ class TestTheArtifactCannotChooseItsOwnSample(_Base):
                                                      sp.ARTIFACT_NAME)))
 
     def test_the_builder_records_the_policy_seed_and_the_blocks_real_grid(self):
-        doc = sp.load_artifact(self._artifact_path())
+        doc = sp.load_artifact(self._artifact_path(), expected_vars=fx.VARS)
         insp = bm.inspect_store_contract(self.plan["out_path"])
         self.assertEqual(doc["sample"]["seed"], sp.SAMPLE_SEED)
         self.assertEqual((doc["grid"]["ny"], doc["grid"]["nx"]), (insp.ny, insp.nx))
+
+
+# ================= review round 3: bind the index to the DATE, and close the schema holes
+class TestDayIndexIsBoundToTheDate(_Base):
+    """An index inside the array bounds still selects a slot. If that slot's sampled cells
+    happen to agree -- an all-NaN region, a repeated value, a short block -- the fingerprint
+    matches and the artifact has attested day D against another day's bytes."""
+
+    def setUp(self):
+        super().setUp()
+        self._manifest_gen0()
+        self.plan = self._fold()
+        self._pristine = self._read(self._artifact_path()).decode()
+
+    def _seg_plan(self):
+        return {"segment": self.plan["segment"], "out_path": self.plan["out_path"],
+                "source_map": self.plan["source_map"]}
+
+    def _repoint(self, day, new_index):
+        doc = json.loads(self._pristine)
+        rec = doc["days"][day]
+        rec["day_index"] = new_index
+        # re-fingerprint against the SLOT the artifact now points at, so the byte check would
+        # pass and only the date binding can refuse
+        insp = bm.inspect_store_contract(self.plan["out_path"])
+        g = zarr.open_group(self.plan["out_path"], mode="r")
+        i0, i1, j0, j1 = sp.sample_window(insp.ny, insp.nx, seed=sp.SAMPLE_SEED,
+                                          day_index=new_index)
+        valid_map = {v: list(f) for v, f in insp.var_valid}
+        tiles, valid = {}, {}
+        for var in fx.VARS:
+            flags = valid_map.get(var, [])
+            present = bool(flags) and new_index < len(flags) and flags[new_index] is True
+            valid[var] = present
+            tiles[var] = (np.asarray(g[var][new_index, i0:i1, j0:j1]) if present else None)
+        rec["source_fingerprint"] = sp.window_fingerprint(
+            tiles, seed=sp.SAMPLE_SEED, day_index=new_index, var_valid=valid)
+        rec["var_valid"] = valid
+        doc["artifact_checksum"] = sp.artifact_checksum(doc)
+        with open(self._artifact_path(), "w") as fh:
+            json.dump(doc, fh)
+
+    def test_a_day_pointed_at_another_slot_is_refused(self):
+        """The artifact is internally perfect: the fingerprint matches the slot it names. Only
+        the date binding can tell that the slot is the wrong day."""
+        self._repoint(self.days[0], 5)
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            self._publish(self._seg_plan())
+        msg = str(cm.exception)
+        self.assertIn("holds", msg)
+        self.assertIn(self.days[5], msg)
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+    def test_an_out_of_range_day_index_is_refused(self):
+        doc = json.loads(self._pristine)
+        doc["days"][self.days[0]]["day_index"] = 999
+        doc["artifact_checksum"] = sp.artifact_checksum(doc)
+        with open(self._artifact_path(), "w") as fh:
+            json.dump(doc, fh)
+        with self.assertRaises(pub.PublishRefused) as cm:
+            self._publish(self._seg_plan())
+        self.assertIn("out of range", str(cm.exception))
+
+    def test_the_unmodified_artifact_still_publishes(self):
+        """The binding must not reject correct indices."""
+        self.assertEqual(self._publish(self._seg_plan())["status"], "published")
+
+
+class TestArtifactSchemaHoles(_Base):
+    def setUp(self):
+        super().setUp()
+        self._manifest_gen0()
+        self.plan = self._fold()
+        self._pristine = self._read(self._artifact_path()).decode()
+
+    def _reseal(self, mutate):
+        doc = json.loads(self._pristine)
+        mutate(doc)
+        doc["artifact_checksum"] = sp.artifact_checksum(doc)
+        path = self._artifact_path()
+        with open(path, "w") as fh:
+            json.dump(doc, fh)
+        return path
+
+    def _seg_plan(self):
+        return {"segment": self.plan["segment"], "out_path": self.plan["out_path"],
+                "source_map": self.plan["source_map"]}
+
+    def test_var_valid_must_cover_exactly_the_canonical_variables(self):
+        """A missing key was read as False and an unknown key ignored, so a partial map bought
+        a partial check."""
+        path = self._reseal(lambda d: d["days"][self.days[0]]["var_valid"].pop("sea_ice"))
+        with self.assertRaises(sp.ProvenanceError) as cm:
+            sp.load_artifact(path, expected_vars=fx.VARS)
+        self.assertIn("missing=['sea_ice']", str(cm.exception))
+
+        path = self._reseal(
+            lambda d: d["days"][self.days[0]]["var_valid"].update({"surprise": True}))
+        with self.assertRaises(sp.ProvenanceError) as cm:
+            sp.load_artifact(path, expected_vars=fx.VARS)
+        self.assertIn("unexpected=['surprise']", str(cm.exception))
+
+    def test_the_expected_variable_set_is_a_required_argument(self):
+        """It cannot be inferred from the document, so the caller has to state it -- and being
+        forced to state it is what stops the check being skipped."""
+        with self.assertRaises(TypeError):
+            sp.load_artifact(self._artifact_path())
+
+    def test_a_renamed_block_path_is_refused(self):
+        """The field is part of the audit record, so an unchecked one is a wrong audit record
+        rather than a harmless label."""
+        self._reseal(lambda d: d.update({"block_path": "some_other_block.zarr"}))
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            self._publish(self._seg_plan())
+        self.assertIn("names block", str(cm.exception))
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+    def test_a_coerced_version_is_refused(self):
+        for bad in ("1", True, 1.0):
+            with self.subTest(version=bad):
+                path = self._reseal(lambda d, b=bad: d.update({"version": b}))
+                with self.assertRaises(sp.ProvenanceError) as cm:
+                    sp.load_artifact(path, expected_vars=fx.VARS)
+                self.assertIn("must be an int", str(cm.exception))
+
+    def test_a_coerced_source_day_index_is_refused(self):
+        for bad in ("0", True, 2.0, -1):
+            with self.subTest(idx=bad):
+                path = self._reseal(
+                    lambda d, b=bad: d["days"][self.days[0]].update({"source_day_index": b}))
+                with self.assertRaises(sp.ProvenanceError):
+                    sp.load_artifact(path, expected_vars=fx.VARS)
+
+    def test_build_artifact_cannot_mint_an_artifact_with_a_foreign_seed(self):
+        """The seed parameter is gone. An API that can produce only-invalid output is a trap:
+        the failure would surface at publication, far from the call that caused it."""
+        import inspect
+        params = inspect.signature(sp.build_artifact).parameters
+        self.assertNotIn("seed", params)
+        doc = sp.build_artifact(segment_id="x", block_path="/tmp/x.zarr", ny=32, nx=32,
+                                days={"2026-06-27": {
+                                    "source_kind": "delta", "source_path": "/tmp/d.zarr",
+                                    "source_day_index": 0, "day_index": 0,
+                                    "source_fingerprint": "f",
+                                    "var_valid": {v: True for v in fx.VARS}}})
+        self.assertEqual(doc["sample"]["seed"], sp.SAMPLE_SEED)
