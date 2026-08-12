@@ -111,8 +111,9 @@ wiring — that is Part 2.
 
 ## 2. Interface changes
 
-- `build_block(..., provenance_seed=20260805)` — writes `p5_block_provenance.json` into
-  `artifacts_dir`, and returns `provenance` / `provenance_path` on the plan.
+- `build_block(...)` writes `p5_block_provenance.json` into `artifacts_dir` and returns
+  `provenance` / `provenance_path` on the plan. It has **no** seed parameter: the sample seed
+  is `source_provenance.SAMPLE_SEED`, policy rather than payload (§6.2).
 - `execute_publication(..., build_artifact_path=...)` is now **required**, with
   `unsafe_skip_provenance=True` as the single greppable waiver (the `build_block`
   `unsafe_skip_isolation` pattern). `recheck_sources=False` exists for fixtures whose block is
