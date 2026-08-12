@@ -50,6 +50,13 @@ SAMPLE_POINTS = 64
 #: Edge of the square sample window, in cells. Matches the builder's default tile so the window
 #: is one tile read.
 SAMPLE_WINDOW = 256
+#: The sampling seed is **policy, not payload**. It was a `build_block` parameter recorded in
+#: the artifact and read back at verification -- which let anyone able to edit the artifact and
+#: recompute its checksum choose the seed, and therefore choose which cells get compared. A
+#: verifier that takes its own strictness from the document it is verifying has no strictness.
+#: Rotating the sample means changing this constant on both sides, which is a code change and
+#: is reviewable; it is not something an artifact can ask for.
+SAMPLE_SEED = 20260805
 
 
 class ProvenanceError(Exception):
@@ -161,10 +168,53 @@ _REQUIRED = ("format", "version", "segment_id", "block_path", "grid", "sample",
              "days", "artifact_checksum")
 _DAY_REQUIRED = ("source_kind", "source_path", "source_day_index", "day_index",
                  "source_fingerprint", "var_valid")
+_GRID_REQUIRED = ("ny", "nx")
+_SAMPLE_REQUIRED = ("algo", "seed", "points", "window")
 
 
-def build_artifact(*, segment_id: str, block_path: str, ny: int, nx: int, seed: int,
-                   days: Dict[str, dict]) -> dict:
+def _exact_int(value, what: str) -> int:
+    """A raw `int`, never something that converts to one. `int("64")` and `int(True)` both
+    succeed, and a coerced value is not the value that was written."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProvenanceError(f"{what} must be an int, got {type(value).__name__} {value!r}")
+    return value
+
+
+def _assert_sample_policy(doc: dict, path: str) -> None:
+    """The sample parameters are POLICY and must match this module, exactly.
+
+    The verifier previously took `ny`, `nx` and `seed` from the artifact. An artifact declaring
+    a 4x4 grid, or a different seed, would then be checked against a sample of its own
+    choosing -- a weaker one, or one aimed away from whatever was altered. Strictness taken
+    from the artifact is not strictness."""
+    grid, sample = doc["grid"], doc["sample"]
+    for name, obj, required in (("grid", grid, _GRID_REQUIRED),
+                                ("sample", sample, _SAMPLE_REQUIRED)):
+        if not isinstance(obj, dict):
+            raise ProvenanceError(f"{path}: `{name}` must be an object, got "
+                                  f"{type(obj).__name__}")
+        missing = [k for k in required if k not in obj]
+        extra = [k for k in obj if k not in required]
+        if missing or extra:
+            raise ProvenanceError(f"{path}: `{name}` has the wrong field set "
+                                  f"(missing={missing}, unexpected={extra})")
+    for axis in _GRID_REQUIRED:
+        if _exact_int(grid[axis], f"{path}: grid[{axis!r}]") <= 0:
+            raise ProvenanceError(f"{path}: grid[{axis!r}] must be positive, got {grid[axis]}")
+    if sample["algo"] != "sha256":
+        raise ProvenanceError(f"{path}: sample algo {sample['algo']!r}, expected 'sha256'")
+    for field, policy in (("seed", SAMPLE_SEED), ("points", SAMPLE_POINTS),
+                          ("window", SAMPLE_WINDOW)):
+        got = _exact_int(sample[field], f"{path}: sample[{field!r}]")
+        if got != policy:
+            raise ProvenanceError(
+                f"{path}: sample[{field!r}] is {got}, but policy is {policy}. The sampling "
+                f"parameters are fixed by `source_provenance`, not chosen by the artifact -- "
+                f"an artifact that picks its own sample picks how weakly it is checked.")
+
+
+def build_artifact(*, segment_id: str, block_path: str, ny: int, nx: int,
+                   days: Dict[str, dict], seed: int = SAMPLE_SEED) -> dict:
     doc = {
         "format": ARTIFACT_FORMAT, "version": ARTIFACT_VERSION,
         "segment_id": segment_id, "block_path": os.path.basename(block_path.rstrip("/")),
@@ -220,6 +270,7 @@ def load_artifact(path: str) -> dict:
             f"{path}: artifact_checksum does not match its contents. The artifact is the only "
             f"record of what the build read, so a tampered or truncated one is refused rather "
             f"than partially believed.")
+    _assert_sample_policy(doc, path)
     if not isinstance(doc["days"], dict) or not doc["days"]:
         raise ProvenanceError(f"{path}: `days` must be a non-empty object")
     for day, rec in sorted(doc["days"].items()):
@@ -234,10 +285,18 @@ def load_artifact(path: str) -> dict:
                 f"that cannot be verified is refused")
         if not isinstance(rec["source_fingerprint"], str) or not rec["source_fingerprint"]:
             raise ProvenanceError(f"{path}: day {day} has no source_fingerprint")
-        if not isinstance(rec["var_valid"], dict):
-            raise ProvenanceError(f"{path}: day {day} var_valid must be an object")
-        idx = rec["day_index"]
-        if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
-            raise ProvenanceError(f"{path}: day {day} day_index {idx!r} must be a "
-                                  f"non-negative int")
+        if not isinstance(rec["var_valid"], dict) or not rec["var_valid"]:
+            raise ProvenanceError(f"{path}: day {day} var_valid must be a non-empty object")
+        for var, flag in sorted(rec["var_valid"].items()):
+            if not isinstance(var, str) or not var:
+                raise ProvenanceError(f"{path}: day {day} var_valid key {var!r} is not a "
+                                      f"variable name")
+            if not isinstance(flag, bool):
+                # Truthiness would make `1`, `"false"` and `[]` all mean something, and
+                # `var_valid` decides whether a variable is even read from the source.
+                raise ProvenanceError(
+                    f"{path}: day {day} var_valid[{var!r}] is {type(flag).__name__} "
+                    f"{flag!r}, must be a raw bool")
+        if _exact_int(rec["day_index"], f"{path}: day {day} day_index") < 0:
+            raise ProvenanceError(f"{path}: day {day} day_index must be non-negative")
     return doc

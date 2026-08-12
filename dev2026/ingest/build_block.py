@@ -391,7 +391,6 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
                 artifacts_dir: Optional[str] = None,
                 tile: int = 256, resume: bool = False,
                 sealed: Optional[bool] = None,
-                provenance_seed: int = 20260805,
                 unsafe_skip_isolation: bool = False) -> dict:
     """Build one immutable block into `out_path` and return a publish plan.
 
@@ -423,7 +422,6 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
             spatial_window_days=spatial_window_days, window_latest_day=window_latest_day,
             lock=lock, journal=journal, artifacts_dir=artifacts_dir, tile=tile,
             resume=resume, hard_reserve_bytes=hard_reserve_bytes, sealed=sealed,
-            provenance_seed=provenance_seed,
             unsafe_skip_isolation=unsafe_skip_isolation)
     except BuildRefused as exc:
         journal.event(event="refused", reason=str(exc))
@@ -437,8 +435,7 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
 def _build_block(out_path, *, start_day, end_day, classification_target, predecessor_present,
                  delta_path, predecessor_path, daily_root, hold_root, confirmed_missing,
                  spatial_window_days, window_latest_day, lock, journal, artifacts_dir,
-                 tile, resume, hard_reserve_bytes, sealed, provenance_seed,
-                 unsafe_skip_isolation) -> dict:
+                 tile, resume, hard_reserve_bytes, sealed, unsafe_skip_isolation) -> dict:
     # ---- isolation is MANDATORY unless explicitly, loudly waived
     if not unsafe_skip_isolation:
         if lock is None or not getattr(lock, "held", False):
@@ -570,21 +567,25 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
     # only prove we can read back what we just wrote).
     prov_days = {}
     for t_idx, day in enumerate(rebuild_source_set):
-        i0, i1, j0, j1 = sp.sample_window(ny, nx, seed=provenance_seed, day_index=t_idx)
+        i0, i1, j0, j1 = sp.sample_window(ny, nx, seed=sp.SAMPLE_SEED, day_index=t_idx)
+        # The variable domain is the canonical VARS, not `keep_vars`. A variable absent from
+        # the whole block still has to appear as False: the verifier compares against the
+        # source's real availability over VARS, and two sides digesting different key sets
+        # disagree on every day for a reason that is not a difference.
         tiles, valid = {}, {}
-        for v in keep_vars:
-            has = present_flags[v][t_idx]
-            valid[v] = bool(has)
+        for v in VARS:
+            has = bool(present_flags[v][t_idx]) and v in keep_vars
+            valid[v] = has
             tiles[v] = reader.read_tile(smap[day], v, i0, i1, j0, j1) if has else None
         rec = source_map_record(day, smap[day])
         prov_days[day] = {
             "source_kind": rec["source_kind"], "source_path": rec["source_path"],
             "source_day_index": rec["source_day_index"], "day_index": t_idx,
             "source_fingerprint": sp.window_fingerprint(
-                tiles, seed=provenance_seed, day_index=t_idx, var_valid=valid),
+                tiles, seed=sp.SAMPLE_SEED, day_index=t_idx, var_valid=valid),
             "var_valid": valid,
         }
-    journal.event(event="source_fingerprints", days=len(prov_days), seed=provenance_seed)
+    journal.event(event="source_fingerprints", days=len(prov_days), seed=sp.SAMPLE_SEED)
 
     # ---- finalize attrs LAST (a partial build is never a valid store)
     g.attrs["days"] = list(rebuild_source_set)
@@ -634,8 +635,14 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
             "sources": source_records,
         },
     }
+    # The artifact's grid comes from the INSPECTION of the block that was written, not from the
+    # source probe that seeded the fill -- the block is the authority a verifier will re-read.
+    # A divergence between the two would mean every fingerprint describes cells a verifier does
+    # not read, and it cannot reach here: `inspect_store_contract` above already refuses a block
+    # whose `region` does not match its own grid, so the build fails before a plan exists. An
+    # explicit check here would be unreachable code that reads as a guard.
     provenance = sp.build_artifact(segment_id=segment["segment_id"], block_path=out_path,
-                                   ny=ny, nx=nx, seed=provenance_seed, days=prov_days)
+                                   ny=int(insp.ny), nx=int(insp.nx), days=prov_days)
     provenance_path = None
     if artifacts_dir:
         provenance_path = sp.write_artifact(

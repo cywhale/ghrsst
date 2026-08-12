@@ -9,10 +9,10 @@ Branch `dev2026-p5-s5-proof`, stacked on `9bc1795`.
 - Provenance primitive + artifact: [`../store/source_provenance.py`](../store/source_provenance.py)
 - Builder emits the artifact: [`../ingest/build_block.py`](../ingest/build_block.py)
 - Publication verifies it: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py)
-- Tests: [`../tests/test_phase2_p5s5.py`](../tests/test_phase2_p5s5.py) — **28/28 green**
+- Tests: [`../tests/test_phase2_p5s5.py`](../tests/test_phase2_p5s5.py) — **41/41 green**
 - P5-S4 regression: **155/155 green**
-- Full local suite: **639 tests OK** (17 skipped), up from 611
-- `-W error::ResourceWarning` over S4+S5: **183 OK**
+- Full local suite: **652 tests OK** (17 skipped), up from 611
+- `-W error::ResourceWarning` over S4+S5: **196 OK**
 
 > **This document does not claim the P5-S5 gate.** G10/H4 and G17 require the crash and
 > concurrency proof in Part 3, which is not written. Nothing below is marked PASS on the
@@ -34,6 +34,8 @@ Branch `dev2026-p5-s5-proof`, stacked on `9bc1795`.
 | checksum mismatch → refuse | **PASS** | `test_a_tampered_artifact_is_refused`, `test_a_truncated_artifact_is_refused` |
 | incomplete fields → refuse | **PASS** | `test_an_incomplete_day_record_is_refused`, `test_an_unknown_extra_field_is_refused` |
 | E2 primitive: point-wise, float32, NaN-aware | **PASS** | `TestFingerprintSemantics` |
+| `var_valid` transition (absent↔present) in the source → refuse | **PASS** (round 2) | `TestSourceVarValidTransitionsAreCaught` — delta and daily |
+| the artifact cannot choose its own sample or grid | **PASS** (round 2) | `TestTheArtifactCannotChooseItsOwnSample` |
 | **2. Repair WAL / corrected-day lifecycle** | | |
 | WAL authorization wired into `prune_delta` | **NOT DELIVERED** | — |
 | E2 wired as a prune gate | **NOT DELIVERED** | primitive exists (`compare_days`); no caller |
@@ -121,7 +123,7 @@ wiring — that is Part 2.
 
 ## 3. Mutation verification
 
-16 guards disabled in turn; **all 16 fail**.
+26 guards disabled in turn; **all 26 fail**.
 
 | guard disabled | result |
 |---|---|
@@ -137,6 +139,16 @@ wiring — that is Part 2.
 | sample window fixed for every day | FAILED |
 | artifact not required at publication | FAILED |
 | builder fingerprints its OUTPUT instead of the source | FAILED |
+| source `var_valid` taken from the artifact | FAILED (3) |
+| `var_valid` transition not compared | FAILED (3) |
+| grid taken from the artifact | FAILED |
+| artifact grid not compared to the block | FAILED |
+| sample policy not enforced | FAILED (6) |
+| sample fields not compared to policy | FAILED (3) |
+| grid/sample field sets unchecked | FAILED |
+| int coercion allowed in grid/sample | FAILED |
+| `var_valid` flags accepted by truthiness | FAILED |
+| builder narrows the fingerprint domain to `keep_vars` | FAILED (2 + 1) |
 
 **Two mutations survive by construction and are recorded rather than listed above:**
 
@@ -165,3 +177,68 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_phase2_p5s5
 3. **The (e2) composite fence does not exist**, and the §14 stop condition has not been
    evaluated. Until Part 3 decides, publication should keep the quiesced posture (§15).
 4. **Post-commit audit-log failure** remains ambiguous (S4 §12.3, §14.3).
+
+
+## 6. Review round 2 — two findings
+
+### 1. [High] A `var_valid: False → True` source backfill was invisible
+
+`_read_source_window` used the **artifact's** `var_valid` to decide whether to read a variable
+from the source at all. A variable absent at build time was skipped — `tiles[var] = None`, no
+read — so if the source was later **backfilled to present**, the fingerprints still matched and
+the publication passed.
+
+That is the worst possible case to miss: an absent→present transition is precisely what a
+corrective refold exists to materialize, and it is invisible to a value-only comparison, because
+backfilling a *new* variable changes nothing about the sampled cells of the variables that were
+already there. So the one case the check most needed to catch was the one it structurally could
+not see.
+
+The source's `var_valid` is now **read from the source** over the canonical `VARS` domain and
+compared to what the build recorded, **before** any value is read. Both directions are tested,
+on both source kinds — delta and daily resolve `var_valid` through different code paths
+(`inspect_cube` vs `inspect_daily`), so one test would not have covered the other. A legitimately
+partial source that has *not* moved must still publish, so the guard cannot pass by refusing
+everything.
+
+*This also forced a real fix underneath:* the builder digested only `keep_vars` while the
+verifier now spans `VARS`, so the two sides digested different key sets and disagreed on every
+day for a reason that was not a difference. `VARS` is now the canonical domain on all three
+sides (builder, block check, source check).
+
+### 2. [Medium] The artifact could choose how weakly it was checked
+
+The verifier read `ny`, `nx` and `seed` **out of the artifact**. Anyone able to edit it and
+recompute the checksum could declare a 4×4 grid or a different seed and be verified against a
+sample of their own choosing — smaller, or aimed away from whatever was altered. **A verifier
+that takes its strictness from the document it is verifying has none.**
+
+- **Grid** now comes from `inspect_store_contract(block_path)`. The artifact's declaration is
+  compared against it and a mismatch refuses.
+- **Seed** is `sp.SAMPLE_SEED`, a module constant. It was a `build_block` parameter; that
+  parameter is **removed**. Rotating the sample is now a code change on both sides, which is
+  reviewable — not something an artifact can request.
+- **`sample` and `grid`** are validated strictly: exact field sets, `algo == "sha256"`, and
+  `seed`/`points`/`window` equal to policy, with **no coercion** (`int("32")` and `int(True)`
+  both succeed, and a coerced value is not the value that was written).
+- **`var_valid` flags must be raw `bool`.** Truthiness would let `1`, `"true"` and `[]` each
+  mean something, and this field decides whether a variable is read from the source at all.
+- The builder writes the artifact's grid from the **block's inspection**, not the source probe.
+
+### A guard I added and then removed
+
+I first added an explicit `BuildRefused` when the fill's probe grid disagreed with the block's
+inspection. It can never fire: `inspect_store_contract` already refuses a block whose `region`
+does not match its own grid, so the build fails before a plan or artifact exists. The test now
+pins **that** behaviour instead, and asserts no artifact is left behind. Unreachable code that
+reads as a guard is worse than no guard — the same call made in P5-S4 round 8.
+
+### Two mutations survive by construction (round 2)
+
+- **seed read from the artifact.** With `load_artifact` forcing `sample.seed == SAMPLE_SEED`,
+  reading it from the document is equivalent to reading the constant. The constant is used
+  anyway, so the two checks are layered rather than redundant-in-effect.
+- **builder uses the probe grid.** The store-contract guard makes probe and inspection grids
+  provably equal, so the substitution cannot change any output.
+
+Both are recorded here rather than listed as verified guards.

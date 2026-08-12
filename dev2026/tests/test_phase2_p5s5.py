@@ -107,9 +107,10 @@ class _Base(unittest.TestCase):
         kw.setdefault("compaction_lock_path", None)
         kw.setdefault("unsafe_skip_compaction_lock", True)
         kw.setdefault("build_artifact_path", self._artifact_path())
+        kw.setdefault("delta_path", self.delta)
         return pub.execute_publication(
             pub.plan_publication(self.root, plan, now=None),
-            ingest_lock_path=self.lock, delta_path=self.delta, **kw)
+            ingest_lock_path=self.lock, **kw)
 
 
 # ==================================================================== the primitive
@@ -447,3 +448,202 @@ class TestLocatorIsNotByteProvenance(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ============ review round 2: var_valid transitions, and the artifact choosing its own sample
+class TestSourceVarValidTransitionsAreCaught(_Base):
+    """A variable that was **absent** at build time and has since been **backfilled to
+    present** changes nothing about the sampled cells of the variables that were already
+    there — so a value-only comparison cannot see it. It is also exactly the gap↔present
+    transition a corrective refold exists for, which made it the one case the check most
+    needed to catch and structurally could not."""
+
+    def setUp(self):
+        super().setUp()
+        self._manifest_gen0()
+
+    def _delta_missing_sea_ice(self):
+        path = os.path.join(self.tmp, "delta_partial.zarr")
+        fx.build_delta(path, self.days, absent_vars=["sea_ice"])
+        return path
+
+    def test_a_delta_variable_backfilled_from_ABSENT_to_present_is_refused(self):
+        delta = self._delta_missing_sea_ice()
+        plan = _build(os.path.join(self.root, "b_v1.zarr"), days=self.days,
+                      delta_path=delta, artifacts_dir=self.artifacts,
+                      start=self.s0, end=self.e0)
+        art = sp.load_artifact(self._artifact_path())
+        self.assertFalse(art["days"][self.days[0]]["var_valid"].get("sea_ice", False),
+                         "precondition: the build recorded sea_ice as absent")
+
+        # backfill: the source now HAS the variable the build never read
+        full = os.path.join(self.tmp, "delta_full.zarr")
+        fx.build_delta(full, self.days)
+        shutil.rmtree(delta)
+        os.rename(full, delta)
+
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            self._publish({"segment": plan["segment"], "out_path": plan["out_path"],
+                           "source_map": plan["source_map"]}, delta_path=delta)
+        msg = str(cm.exception)
+        self.assertIn("no longer has the same variables", msg)
+        self.assertIn("sea_ice", msg)
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+    def test_a_delta_variable_that_DISAPPEARED_is_also_refused(self):
+        """The other direction: present at build, absent now."""
+        plan = self._fold()
+        stripped = os.path.join(self.tmp, "delta_stripped.zarr")
+        fx.build_delta(stripped, self.days, absent_vars=["sea_ice"])
+        shutil.rmtree(self.delta)
+        os.rename(stripped, self.delta)
+        with self.assertRaises(pub.PublishRefused) as cm:
+            self._publish({"segment": plan["segment"], "out_path": plan["out_path"],
+                           "source_map": plan["source_map"]})
+        self.assertIn("no longer has the same variables", str(cm.exception))
+
+    def test_a_DAILY_source_variable_backfilled_is_refused(self):
+        """Same hazard on the other source kind, which resolves `var_valid` by a different
+        code path (`inspect_daily` vs the cube inspection)."""
+        daily = os.path.join(self.tmp, "mur.zarr")
+        fx.build_daily(daily, self.days,
+                       absent_vars_on={d: ["sea_ice"] for d in self.days})
+        plan = build_block(os.path.join(self.root, "b_v1.zarr"), start_day=self.s0,
+                           end_day=self.e0, classification_target=list(self.days),
+                           daily_root=daily, artifacts_dir=self.artifacts,
+                           lock=None, hard_reserve_bytes=0, unsafe_skip_isolation=True)
+        art = sp.load_artifact(self._artifact_path())
+        self.assertFalse(art["days"][self.days[0]]["var_valid"].get("sea_ice", False))
+
+        shutil.rmtree(daily)
+        fx.build_daily(daily, self.days)                       # backfilled
+        with self.assertRaises(pub.PublishRefused) as cm:
+            self._publish({"segment": plan["segment"], "out_path": plan["out_path"],
+                           "source_map": plan["source_map"]}, delta_path=None)
+        self.assertIn("no longer has the same variables", str(cm.exception))
+
+    def test_an_unchanged_partial_source_still_publishes(self):
+        """The guard must not reject a legitimately partial source that has not moved."""
+        delta = self._delta_missing_sea_ice()
+        plan = _build(os.path.join(self.root, "b_v1.zarr"), days=self.days,
+                      delta_path=delta, artifacts_dir=self.artifacts,
+                      start=self.s0, end=self.e0)
+        out = self._publish({"segment": plan["segment"], "out_path": plan["out_path"],
+                             "source_map": plan["source_map"]}, delta_path=delta)
+        self.assertEqual(out["status"], "published")
+        self.assertEqual(out["provenance"]["sources_rechecked"], len(self.days))
+
+
+class TestTheArtifactCannotChooseItsOwnSample(_Base):
+    """A verifier that takes its strictness from the document it is verifying has none."""
+
+    def setUp(self):
+        super().setUp()
+        self._manifest_gen0()
+        self.plan = self._fold()
+        self._pristine = self._read(self._artifact_path()).decode()
+
+    def _reseal(self, mutate):
+        """Always mutate a PRISTINE copy. Reading back the file each time would accumulate the
+        previous iteration's mutation and make a subTest pass or fail for the wrong reason."""
+        path = self._artifact_path()
+        doc = json.loads(self._pristine)
+        mutate(doc)
+        doc["artifact_checksum"] = sp.artifact_checksum(doc)   # a forger reseals
+        with open(path, "w") as fh:
+            json.dump(doc, fh)
+        return path
+
+    def _seg_plan(self):
+        return {"segment": self.plan["segment"], "out_path": self.plan["out_path"],
+                "source_map": self.plan["source_map"]}
+
+    def test_a_shrunken_grid_is_refused(self):
+        """The attack the review named: declare a tiny grid, get a tiny sample."""
+        self._reseal(lambda d: d["grid"].update({"ny": 4, "nx": 4}))
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            self._publish(self._seg_plan())
+        self.assertIn("grid", str(cm.exception))
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+    def test_a_different_seed_is_refused(self):
+        """Choosing the seed chooses which cells are compared -- so it is policy, not payload."""
+        path = self._reseal(lambda d: d["sample"].update({"seed": 999}))
+        with self.assertRaises(sp.ProvenanceError) as cm:
+            sp.load_artifact(path)
+        self.assertIn("policy", str(cm.exception))
+
+    def test_weakened_sample_parameters_are_refused(self):
+        for field, bad in (("points", 1), ("window", 2), ("algo", "md5")):
+            with self.subTest(field=field):
+                path = self._reseal(lambda d, f=field, b=bad: d["sample"].update({f: b}))
+                with self.assertRaises(sp.ProvenanceError):
+                    sp.load_artifact(path)
+
+    def test_non_integer_grid_or_sample_values_are_refused(self):
+        for mutate in (lambda d: d["grid"].update({"ny": "32"}),
+                       lambda d: d["grid"].update({"nx": 32.0}),
+                       lambda d: d["sample"].update({"points": True}),
+                       lambda d: d["grid"].update({"ny": 0})):
+            path = self._reseal(mutate)
+            with self.assertRaises(sp.ProvenanceError):
+                sp.load_artifact(path)
+
+    def test_a_malformed_grid_or_sample_object_is_refused(self):
+        for mutate in (lambda d: d.update({"grid": [32, 32]}),
+                       lambda d: d.update({"sample": "sha256"}),
+                       lambda d: d["grid"].pop("nx"),
+                       lambda d: d["sample"].update({"surprise": 1})):
+            path = self._reseal(mutate)
+            with self.assertRaises(sp.ProvenanceError):
+                sp.load_artifact(path)
+
+    def test_a_non_bool_var_valid_flag_is_refused(self):
+        """`var_valid` decides whether a variable is read from the source at all, so
+        truthiness would let `1`, `"false"` and `[]` each mean something."""
+        for bad in (1, "true", [], None):
+            path = self._reseal(
+                lambda d, b=bad: d["days"][self.days[0]]["var_valid"].update({"sst": b}))
+            with self.assertRaises(sp.ProvenanceError) as cm:
+                sp.load_artifact(path)
+            self.assertIn("raw bool", str(cm.exception))
+
+    def test_an_empty_var_valid_is_refused(self):
+        path = self._reseal(lambda d: d["days"][self.days[0]].update({"var_valid": {}}))
+        with self.assertRaises(sp.ProvenanceError):
+            sp.load_artifact(path)
+
+    def test_a_block_whose_geometry_diverges_from_the_fill_yields_no_artifact(self):
+        """The fill samples against the probe's geometry; the artifact is written from the
+        block's inspection. If they diverged, every fingerprint would describe cells a verifier
+        does not read — so this drives them apart and pins what actually happens.
+
+        The write-side store-contract guard refuses first, before a plan or an artifact exists.
+        I had added a second explicit check here and removed it: it could never fire, and
+        unreachable code that reads as a guard is worse than no guard."""
+        import ingest.build_block as bbmod
+        real_create = bbmod._create
+
+        def smaller(out_path, days, keep_vars, ny, nx, lon, lat):
+            return real_create(out_path, days, keep_vars, ny // 2, nx // 2,
+                               lon[: nx // 2], lat[: ny // 2])
+
+        bbmod._create = smaller
+        try:
+            with self.assertRaises(Exception) as cm:
+                _build(os.path.join(self.tmp, "diverged.zarr"), days=self.days,
+                       delta_path=self.delta, artifacts_dir=self.artifacts,
+                       start=self.s0, end=self.e0)
+        finally:
+            bbmod._create = real_create
+        self.assertIn("does not satisfy the store contract", str(cm.exception))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "diverged.zarr",
+                                                     sp.ARTIFACT_NAME)))
+
+    def test_the_builder_records_the_policy_seed_and_the_blocks_real_grid(self):
+        doc = sp.load_artifact(self._artifact_path())
+        insp = bm.inspect_store_contract(self.plan["out_path"])
+        self.assertEqual(doc["sample"]["seed"], sp.SAMPLE_SEED)
+        self.assertEqual((doc["grid"]["ny"], doc["grid"]["nx"]), (insp.ny, insp.nx))

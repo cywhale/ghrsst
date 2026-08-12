@@ -42,7 +42,7 @@ import zarr
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ingest.build_block import SOURCE_ORDER   # noqa: E402  -- one list, not a second copy
+from ingest.build_block import SOURCE_ORDER, VARS   # noqa: E402  -- one list, not a copy
 from store import block_manifest as bm         # noqa: E402
 from store import repair_wal as rw            # noqa: E402
 from store import source_provenance as sp     # noqa: E402
@@ -286,23 +286,35 @@ def verify_build_artifact(sources: dict, artifact_path: str, *, segment_id: str,
                     f"{field}: {got[field]!r} vs {want[field]!r}. The builder's own record is "
                     f"the only evidence outside the manifest of what was read.")
 
-    ny, nx = int(doc["grid"]["ny"]), int(doc["grid"]["nx"])
-    seed = int(doc["sample"]["seed"])
+    # Grid and seed come from AUTHORITY, not from the artifact. `load_artifact` has already
+    # pinned the sample parameters to policy; the grid is taken from an inspection of the block
+    # itself and the artifact's declaration is then checked against it. Reading `ny`/`nx` out of
+    # the document would let an artifact declare a 4x4 grid and be verified against a sample of
+    # its own choosing.
+    insp = bm.inspect_store_contract(block_path)
+    ny, nx = int(insp.ny), int(insp.nx)
+    seed = sp.SAMPLE_SEED
+    if (int(doc["grid"]["ny"]), int(doc["grid"]["nx"])) != (ny, nx):
+        raise PublishRefused(
+            f"{where}: the provenance artifact declares a {doc['grid']['ny']}x"
+            f"{doc['grid']['nx']} grid but {block_path} is {ny}x{nx}. The sample is drawn "
+            f"against the block's real geometry, so an artifact describing another one is "
+            f"describing another block.")
     g = zarr.open_group(block_path, mode="r")
-    block_valid = {v: list(flags) for v, flags in
-                   bm.inspect_store_contract(block_path).var_valid}
+    block_valid = {v: list(flags) for v, flags in insp.var_valid}
 
     for day in sorted(recorded):
         rec = recorded[day]
         t_idx = int(rec["day_index"])
         i0, i1, j0, j1 = sp.sample_window(ny, nx, seed=seed, day_index=t_idx)
         tiles, valid = {}, {}
-        for var, flags in block_valid.items():
-            if t_idx >= len(flags):
+        for var in VARS:                        # the canonical domain, matching the builder
+            flags = block_valid.get(var, [])
+            if flags and t_idx >= len(flags):
                 raise PublishRefused(
                     f"{where}: provenance records day_index {t_idx} for {day} but the block "
                     f"holds {len(flags)} day(s)")
-            present = flags[t_idx] is True
+            present = bool(flags) and flags[t_idx] is True
             valid[var] = present
             tiles[var] = (np.asarray(g[var][t_idx, i0:i1, j0:j1]) if present else None)
         actual = sp.window_fingerprint(tiles, seed=seed, day_index=t_idx, var_valid=valid)
@@ -319,15 +331,29 @@ def verify_build_artifact(sources: dict, artifact_path: str, *, segment_id: str,
             rec = recorded[day]
             src = {"source_kind": rec["source_kind"], "source_path": rec["source_path"],
                    "source_day_index": rec["source_day_index"], "day": day}
-            tiles = _read_source_window(source_reader, src, day, rec, ny, nx, seed)
-            if tiles is None:
+            got = _read_source_window(source_reader, src, day, rec, ny, nx, seed)
+            if got is None:
                 raise PublishRefused(
                     f"{where}: the source {rec['source_path']} recorded for {day} is gone or "
                     f"unreadable, so the bytes the build claims to have read cannot be "
                     f"re-checked. Not being able to check is not the same as checking.")
-            valid = {v: bool(rec["var_valid"].get(v)) for v in rec["var_valid"]}
-            actual = sp.window_fingerprint(tiles, seed=seed,
-                                           day_index=int(rec["day_index"]), var_valid=valid)
+            tiles, source_valid = got
+
+            # Compare the source's OWN availability against what the build recorded, before
+            # anything is read for value. A variable backfilled from absent to present changes
+            # nothing about the sampled cells of the variables that were already there, so a
+            # value-only comparison cannot see it.
+            recorded_valid = {v: bool(rec["var_valid"].get(v, False)) for v in VARS}
+            if source_valid != recorded_valid:
+                changed = sorted(v for v in VARS if source_valid[v] != recorded_valid[v])
+                raise PublishRefused(
+                    f"{where}: source {rec['source_path']} for {day} no longer has the same "
+                    f"variables the build read: {', '.join(f'{v} {recorded_valid[v]} -> ' + str(source_valid[v]) for v in changed)}. "
+                    f"An absent variable backfilled to present is a source change, and the "
+                    f"one a value comparison alone cannot see.")
+
+            actual = sp.window_fingerprint(tiles, seed=seed, day_index=int(rec["day_index"]),
+                                           var_valid=source_valid)
             checked_sources += 1
             if actual != rec["source_fingerprint"]:
                 raise PublishRefused(
@@ -339,8 +365,18 @@ def verify_build_artifact(sources: dict, artifact_path: str, *, segment_id: str,
 
 
 def _read_source_window(reader, src: dict, day: str, rec: dict, ny: int, nx: int, seed: int):
-    """The sample window from the SOURCE, or `None` when it cannot be read. The caller turns
-    `None` into a refusal -- this function only reports, it does not decide."""
+    """The sample window from the SOURCE, plus the source's OWN `var_valid`.
+
+    Returns `(tiles, source_valid)` or `None` when the source cannot be read; the caller turns
+    `None` into a refusal — this function reports, it does not decide.
+
+    **`var_valid` is read from the source, never from the artifact.** The earlier version used
+    the artifact's flags to decide whether to read a variable at all, so a variable that was
+    *absent* at build time and has since been **backfilled to present** was skipped: the loop
+    set `tiles[var] = None` without ever touching the source, the fingerprints matched, and a
+    real source change passed verification. That is precisely the gap↔present transition a
+    corrective refold is about, so the one case the check most needed to catch was the one it
+    structurally could not see."""
     path = rec["source_path"]
     kind = rec["source_kind"]
     probe = _source_group_path(kind, path, day)
@@ -354,16 +390,21 @@ def _read_source_window(reader, src: dict, day: str, rec: dict, ny: int, nx: int
     except Exception:                            # unreadable now: treated as gone, not as proof
         return None
     i0, i1, j0, j1 = sp.sample_window(ny, nx, seed=seed, day_index=int(rec["day_index"]))
-    tiles = {}
-    for var in rec["var_valid"]:
-        if not rec["var_valid"][var]:
+    tiles, source_valid = {}, {}
+    for var in VARS:
+        try:
+            present = bool(reader.has_var(src, var))
+        except Exception:
+            return None
+        source_valid[var] = present
+        if not present:
             tiles[var] = None
             continue
         try:
             tiles[var] = reader.read_tile(src, var, i0, i1, j0, j1)
         except Exception:
             return None
-    return tiles
+    return tiles, source_valid
 
 
 def _segment_provenance(segment: dict) -> dict:
