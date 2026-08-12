@@ -1628,7 +1628,7 @@ class TestSourceMapIsStrictlyValidated(_Base):
 class TestProvenanceIsBoundToTheBlock(_Base):
     """These exercise the artifact's LOCATOR agreement and segment identity.
 
-    They pass `recheck_sources=False`: the fixture builds the block and the delta independently,
+    They pass `unsafe_skip_source_recheck=True`: the fixture builds the block and the delta independently,
     so the block is not actually derived from its declared source and a byte comparison against
     that source would (correctly) refuse. The end-to-end source-byte check, where the builder
     really does read the delta, is exercised in the P5-S5 suite."""
@@ -1677,7 +1677,7 @@ class TestProvenanceIsBoundToTheBlock(_Base):
         with self.assertRaises(pub.PublishRefused) as cm:
             _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                      build_artifact_path=path, unsafe_skip_provenance=False,
-                     recheck_sources=False, now=T0)
+                     unsafe_skip_source_recheck=True, now=T0)
         self.assertIn("source_day_index", str(cm.exception))
 
     def test_a_build_artifact_for_another_segment_is_refused(self):
@@ -1687,7 +1687,7 @@ class TestProvenanceIsBoundToTheBlock(_Base):
         with self.assertRaises(pub.PublishRefused) as cm:
             _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                      build_artifact_path=path, unsafe_skip_provenance=False,
-                     recheck_sources=False, now=T0)
+                     unsafe_skip_source_recheck=True, now=T0)
         self.assertIn("describes segment", str(cm.exception))
 
     def test_an_agreeing_build_artifact_publishes(self):
@@ -1696,9 +1696,12 @@ class TestProvenanceIsBoundToTheBlock(_Base):
         plan = pub.plan_publication(self.root, src, now=T0)
         out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                        build_artifact_path=path, unsafe_skip_provenance=False,
-                       recheck_sources=False, now=T0)
+                       unsafe_skip_source_recheck=True, now=T0)
         self.assertEqual(out["status"], "published")
-        self.assertTrue(out["provenance"]["verified"])
+        self.assertFalse(out["provenance"]["verified"],
+                         "the source recheck was waived, so this is not a verified publication")
+        self.assertEqual(out["provenance"]["source_recheck"], "waived")
+        self.assertIn("does NOT hold", out["provenance"]["reason"])
         self.assertEqual(out["provenance"]["days"], 60)
 
 

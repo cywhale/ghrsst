@@ -9,10 +9,10 @@ Branch `dev2026-p5-s5-proof`, stacked on `9bc1795`.
 - Provenance primitive + artifact: [`../store/source_provenance.py`](../store/source_provenance.py)
 - Builder emits the artifact: [`../ingest/build_block.py`](../ingest/build_block.py)
 - Publication verifies it: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py)
-- Tests: [`../tests/test_phase2_p5s5.py`](../tests/test_phase2_p5s5.py) — **50/50 green**
+- Tests: [`../tests/test_phase2_p5s5.py`](../tests/test_phase2_p5s5.py) — **59/59 green**
 - P5-S4 regression: **155/155 green**
-- Full local suite: **661 tests OK** (17 skipped), up from 611
-- `-W error::ResourceWarning` over S4+S5: **205 OK**
+- Full local suite: **670 tests OK** (17 skipped), up from 611
+- `-W error::ResourceWarning` over S4+S5: **214 OK**
 
 > **This document does not claim the P5-S5 gate.** G10/H4 and G17 require the crash and
 > concurrency proof in Part 3, which is not written. Nothing below is marked PASS on the
@@ -39,6 +39,8 @@ Branch `dev2026-p5-s5-proof`, stacked on `9bc1795`.
 | `day_index` is bound to the DATE, not just the range | **PASS** (round 3) | `TestDayIndexIsBoundToTheDate` |
 | `var_valid` covers exactly the canonical variables | **PASS** (round 3) | `test_var_valid_must_cover_exactly_the_canonical_variables` |
 | `block_path` is verified against the published block | **PASS** (round 3) | `test_a_renamed_block_path_is_refused` |
+| verification holds **at the commit point**, under both locks | **PASS** (round 4) | `TestProvenanceIsVerifiedInsideTheCriticalSection` |
+| every bypass is named `unsafe_*` and reports unverified | **PASS** (round 4) | `TestTheSourceRecheckWaiverIsLabelled` |
 | **2. Repair WAL / corrected-day lifecycle** | | |
 | WAL authorization wired into `prune_delta` | **NOT DELIVERED** | — |
 | E2 wired as a prune gate | **NOT DELIVERED** | primitive exists (`compare_days`); no caller |
@@ -118,16 +120,20 @@ wiring — that is Part 2.
   `provenance` / `provenance_path` on the plan. It has **no** seed parameter: the sample seed
   is `source_provenance.SAMPLE_SEED`, policy rather than payload (§6.2).
 - `execute_publication(..., build_artifact_path=...)` is now **required**, with
-  `unsafe_skip_provenance=True` as the single greppable waiver (the `build_block`
-  `unsafe_skip_isolation` pattern). `recheck_sources=False` exists for fixtures whose block is
-  not built from its declared source; the P5-S4 locator tests use it and say so.
-- The publish result carries `provenance: {verified, days, sources_rechecked}`.
+  `unsafe_skip_provenance=True` and `unsafe_skip_source_recheck=True` as the two greppable
+  waivers (the `build_block` `unsafe_skip_isolation` pattern). Either one makes the result
+  report `verified: False` with `source_recheck: "waived"` and a reason — a bypass that
+  reported success would be worse than no bypass.
+- The publish result carries
+  `provenance: {verified, source_recheck, days, sources_rechecked[, reason]}`.
   `sources_rechecked` is asserted against the day count, so a source quietly not re-read shows
   up as a number rather than as a pass.
+- **Verification runs inside the critical section**, after both locks and after the staleness
+  guard, immediately before the commit — and nowhere else (§8.1).
 
 ## 3. Mutation verification
 
-33 guards disabled in turn; **all 33 fail**.
+37 guards disabled in turn; **all 37 fail**.
 
 | guard disabled | result |
 |---|---|
@@ -160,6 +166,10 @@ wiring — that is Part 2.
 | `version` coerced | FAILED (3) |
 | `source_day_index` not strictly validated | FAILED (4) |
 | `build_artifact` mints a foreign seed | FAILED (15 + 10) |
+| no in-lock provenance verification at all | FAILED (19 + 3) |
+| waived recheck still reports `verified` | FAILED |
+| the waiver does not disable the reader | FAILED |
+| skipping provenance entirely reports `verified` | FAILED |
 
 **Two mutations survive by construction and are recorded rather than listed above:**
 
@@ -302,3 +312,54 @@ removed and the seed is taken from the constant.
 *Knock-on:* the P5-S4 artifact helper minted artifacts with the old signature and a
 `keep_vars`-shaped `var_valid`. Updated — the S4 suite is regression coverage for this contract,
 so it has to build artifacts the way the builder does.
+
+## 8. Review round 4 — two findings
+
+### 1. [High] Verification ran before the locks, so it verified a state that could then change
+
+The whole byte check happened before the compaction reservation and the ingest lock were taken.
+Between it and `bm.publish` the staging block or a source could be modified, and the only thing
+left in the way was `staleness_guard` — which compares **locators** and structurally cannot see
+bytes. So the guarantee "source changed → refuse" held at a moment that was not the moment that
+mattered.
+
+Verification now runs **inside the critical section**, after both locks and after the staleness
+guard, immediately before the fence assertion and the commit.
+
+**There is deliberately no earlier copy.** A pre-lock check would be a cheap fail-fast, and it
+was tempting to keep one — but with the in-lock check present, no mutation could kill it. It
+would read as a guard while being none, which is the same call made in P5-S4 round 8 and P5-S5
+round 2. A test pins the consequence: with the artifact deleted after planning, the refusal must
+come from inside the critical section, proving the locks were taken first.
+
+**On cost, since this is the mirror of a decision made the other way.** `measure_bytes` was kept
+*out* of the lock because it walks ~94 GB. This is one sample window per (day, var) from the
+block and from each source — tens of megabytes for a 90-day fold, seconds. Three orders of
+magnitude smaller, and unlike a size measurement it is a correctness gate that has to hold at
+the commit point rather than approximately before it.
+
+Ordering inside the lock is cheap-check-first: the staleness guard reads delta attrs and runs
+before the byte comparison. One consequence, recorded rather than hidden: a *vanished* source is
+now caught by the staleness guard, so `verify_build_artifact`'s own gone-source refusal is
+shadowed in the publication path. It is therefore tested **directly** against
+`verify_build_artifact`, where it can be reached — an untestable refusal is not a refusal.
+
+The interleaving tests are deterministic — no threads, no sleeps. They hook
+`bind_segment_to_block`, which sits immediately before the byte verification inside the lock, and
+mutate the block or the source there. A third test asserts the hook actually fired, so the other
+two cannot pass for the wrong reason.
+
+### 2. [High] `recheck_sources=False` was an unlabelled bypass reporting success
+
+It disabled the source recheck — the entire `source changed → refuse` guarantee — while the
+result still said `verified: True`. **A bypass that reports success is worse than no bypass**,
+and it contradicted the doc's claim that `unsafe_skip_provenance` was the only waiver.
+
+Renamed to `unsafe_skip_source_recheck`, matching the established pattern, and the result now
+reports `verified: False`, `source_recheck: "waived"`, `sources_rechecked: 0` and a reason
+saying which guarantee does not hold. The same is true when provenance is skipped entirely.
+
+Tested by making a source change that **must** refuse without the waiver and **must** publish
+unverified with it — so the waiver is what makes the difference, not the fixture. The P5-S4
+locator tests, which legitimately use it, now assert the waived reporting, so their bypass
+cannot be mistaken for a pass.

@@ -343,17 +343,29 @@ class TestPublicationVerifiesSourceBytes(_Base):
             self._publish(self._seg_plan())
         self.assertIn("different days", str(cm.exception))
 
-    def test_a_GONE_source_is_refused_not_skipped(self):
-        """Not being able to check is not the same as checking. Publication already requires
-        every recorded source to resolve (§7.4 staleness guard), so a vanished source is not
-        the ordinary case it might look like -- and a soft skip would turn an unchecked
-        publication into a verified-looking one."""
+    def test_a_GONE_source_aborts_at_the_staleness_guard(self):
+        """Publication runs the cheap locator check before the expensive byte check, so a
+        vanished delta is caught there first. Asserted as what actually happens rather than as
+        what the provenance layer would have said."""
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
         shutil.rmtree(self.delta)
-        with self.assertRaises(pub.PublishRefused) as cm:
-            self._publish(self._seg_plan())
-        self.assertIn("gone or unreadable", str(cm.exception))
+        out = self._publish(self._seg_plan())
+        self.assertEqual(out["status"], "aborted_stale")
         self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+    def test_verify_build_artifact_REFUSES_a_gone_source_directly(self):
+        """Not being able to check is not the same as checking. The staleness guard shadows
+        this path in publication, so it is exercised where it can be reached -- otherwise the
+        refusal would be an untestable claim."""
+        from ingest.build_block import _SourceReader
+        shutil.rmtree(self.delta)
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.verify_build_artifact(
+                self.plan["source_map"], self._artifact_path(),
+                segment_id=self.plan["segment"]["segment_id"],
+                block_path=self.plan["out_path"], where="probe",
+                source_reader=_SourceReader())
+        self.assertIn("gone or unreadable", str(cm.exception))
 
     def test_every_source_is_rechecked_none_are_silently_skipped(self):
         """The count is asserted against the day count, so a source quietly not re-read shows
@@ -443,7 +455,9 @@ class TestLocatorIsNotByteProvenance(_Base):
         plan = self._fold()
         out = self._publish({"segment": plan["segment"], "out_path": plan["out_path"],
                              "source_map": plan["source_map"]})
-        self.assertEqual(set(out["provenance"]), {"verified", "days", "sources_rechecked"})
+        self.assertEqual(set(out["provenance"]),
+                         {"verified", "days", "sources_rechecked", "source_recheck"})
+        self.assertEqual(out["provenance"]["source_recheck"], "performed")
 
 
 if __name__ == "__main__":
@@ -795,3 +809,142 @@ class TestArtifactSchemaHoles(_Base):
                                     "source_fingerprint": "f",
                                     "var_valid": {v: True for v in fx.VARS}}})
         self.assertEqual(doc["sample"]["seed"], sp.SAMPLE_SEED)
+
+
+# ================= review round 4: verification must hold AT the commit, not before the locks
+class TestProvenanceIsVerifiedInsideTheCriticalSection(_Base):
+    """Verification used to run before either lock was taken, so it verified a state that could
+    then change. Between that check and the commit, the staging block or a source could be
+    modified, and the only thing left in the way was `staleness_guard` — which compares
+    LOCATORS and cannot see bytes."""
+
+    def setUp(self):
+        super().setUp()
+        self._manifest_gen0()
+        self.plan = self._fold()
+
+    def _seg_plan(self):
+        return {"segment": self.plan["segment"], "out_path": self.plan["out_path"],
+                "source_map": self.plan["source_map"]}
+
+    def _corrupt(self, path, t_idx, delta_amount=9.0):
+        g = zarr.open_group(path, mode="a")
+        insp = bm.inspect_store_contract(path) if path != self.delta else None
+        ny = nx = 32
+        i0, i1, j0, j1 = sp.sample_window(ny, nx, seed=sp.SAMPLE_SEED, day_index=t_idx)
+        g["sst"][t_idx, i0:i1, j0:j1] = (
+            np.asarray(g["sst"][t_idx, i0:i1, j0:j1]) + delta_amount)
+
+    def _publish_with_interleaved(self, mutate):
+        """Run `mutate` after the locks are held and after the staleness guard, but before the
+        commit — by hooking `bind_segment_to_block`, which sits immediately before the byte
+        verification inside the critical section. Deterministic: no threads, no sleeps."""
+        real = pub.bind_segment_to_block
+        fired = {"n": 0}
+
+        def hooked(*a, **kw):
+            out = real(*a, **kw)
+            if fired["n"] == 0:
+                fired["n"] = 1
+                mutate()
+            return out
+
+        pub.bind_segment_to_block = hooked
+        try:
+            return self._publish(self._seg_plan()), fired
+        finally:
+            pub.bind_segment_to_block = real
+
+    def test_a_BLOCK_corrupted_after_the_locks_are_held_is_still_refused(self):
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            self._publish_with_interleaved(
+                lambda: self._corrupt(self.plan["out_path"], 2))
+        self.assertIn("do not match the fingerprint", str(cm.exception))
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before,
+                         "nothing may commit once the bytes have moved")
+
+    def test_a_SOURCE_corrupted_after_the_locks_are_held_is_still_refused(self):
+        """The staleness guard has already passed by this point — every locator still agrees,
+        and only the byte check can see the change."""
+        before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm:
+            self._publish_with_interleaved(lambda: self._corrupt(self.delta, 4))
+        self.assertIn("no longer holds the bytes", str(cm.exception))
+        self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
+
+    def test_the_hook_really_fires_inside_the_critical_section(self):
+        """Precondition for the two tests above: if the hook never ran, they would pass for
+        the wrong reason."""
+        out, fired = self._publish_with_interleaved(lambda: None)
+        self.assertEqual(fired["n"], 1)
+        self.assertEqual(out["status"], "published")
+
+    def test_there_is_no_pre_lock_verification_left_to_shadow_it(self):
+        """A second, earlier copy would be a cheap fail-fast that no mutation could kill while
+        the in-lock one exists — a guard in appearance only. Proven behaviourally: with the
+        artifact deleted after planning but before publication, the refusal must come from
+        inside the critical section, which means the locks were taken first."""
+        seen = {"locked": False}
+        real = pub.bind_segment_to_block
+
+        def hooked(*a, **kw):
+            seen["locked"] = True
+            return real(*a, **kw)
+
+        pub.bind_segment_to_block = hooked
+        try:
+            os.remove(self._artifact_path())
+            with self.assertRaises(pub.PublishRefused) as cm:
+                self._publish(self._seg_plan())
+        finally:
+            pub.bind_segment_to_block = real
+        self.assertIn("no provenance artifact", str(cm.exception))
+        self.assertTrue(seen["locked"],
+                        "the artifact was checked before the locks were taken")
+
+
+class TestTheSourceRecheckWaiverIsLabelled(_Base):
+    """`recheck_sources=False` disabled the `source changed -> refuse` guarantee while the
+    result still said `verified: True`. A bypass that reports success is worse than no bypass."""
+
+    def setUp(self):
+        super().setUp()
+        self._manifest_gen0()
+        self.plan = self._fold()
+
+    def _seg_plan(self):
+        return {"segment": self.plan["segment"], "out_path": self.plan["out_path"],
+                "source_map": self.plan["source_map"]}
+
+    def test_the_waiver_is_named_unsafe(self):
+        import inspect
+        params = inspect.signature(pub.execute_publication).parameters
+        self.assertIn("unsafe_skip_source_recheck", params)
+        self.assertNotIn("recheck_sources", params)
+
+    def test_a_waived_publication_does_not_report_verified(self):
+        g = zarr.open_group(self.delta, mode="a")
+        i0, i1, j0, j1 = sp.sample_window(32, 32, seed=sp.SAMPLE_SEED, day_index=0)
+        g["sst"][0, i0:i1, j0:j1] = np.asarray(g["sst"][0, i0:i1, j0:j1]) + 8.0
+        out = self._publish(self._seg_plan(), unsafe_skip_source_recheck=True)
+        self.assertEqual(out["status"], "published")
+        self.assertFalse(out["provenance"]["verified"])
+        self.assertEqual(out["provenance"]["source_recheck"], "waived")
+        self.assertEqual(out["provenance"]["sources_rechecked"], 0)
+        self.assertIn("does NOT hold", out["provenance"]["reason"])
+
+    def test_the_same_change_WITHOUT_the_waiver_refuses(self):
+        """The waiver is what makes the difference, not the fixture."""
+        g = zarr.open_group(self.delta, mode="a")
+        i0, i1, j0, j1 = sp.sample_window(32, 32, seed=sp.SAMPLE_SEED, day_index=0)
+        g["sst"][0, i0:i1, j0:j1] = np.asarray(g["sst"][0, i0:i1, j0:j1]) + 8.0
+        with self.assertRaises(pub.PublishRefused):
+            self._publish(self._seg_plan())
+
+    def test_skipping_provenance_entirely_also_reports_unverified(self):
+        out = self._publish(self._seg_plan(), build_artifact_path=None,
+                            unsafe_skip_provenance=True)
+        self.assertEqual(out["status"], "published")
+        self.assertFalse(out["provenance"]["verified"])
+        self.assertEqual(out["provenance"]["source_recheck"], "waived")

@@ -912,7 +912,7 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
                         hold_days: int = DEFAULT_HOLD_DAYS,
                         operator: str = "", now: Optional[datetime] = None,
                         unsafe_skip_compaction_lock: bool = False,
-                        recheck_sources: bool = True,
+                        unsafe_skip_source_recheck: bool = False,
                         unsafe_skip_provenance: bool = False) -> dict:
     """§7.4 steps 1-4. The commit point is `os.replace`, inside `bm.publish`.
 
@@ -936,26 +936,12 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
             f"the block it claims")
     source_map = _validate_plan_source_map(published[0], plan.get("source_map", _ABSENT),
                                            where="at publication")
-    # The provenance artifact is REQUIRED. It used to be optional, which made source-byte
-    # provenance opt-in -- and an opt-in proof is not one. The waiver is named so it cannot be
-    # typed by accident, and is greppable.
-    if not build_artifact_path:
-        if not unsafe_skip_provenance:
-            raise PublishRefused(
-                "build_artifact_path is required: without the builder's checksummed provenance "
-                "artifact the manifest carries only locator provenance, which cannot show that "
-                "the block's bytes are the bytes its sources held (§7.5a). Pass the artifact "
-                "path, or unsafe_skip_provenance=True in a test that is not exercising it.")
-        provenance_report = {"verified": False, "reason": "waived"}
-    else:
-        try:
-            provenance_report = verify_build_artifact(
-                source_map, build_artifact_path, segment_id=plan["new_segment_id"],
-                block_path=_seg_path(root, published[0]), where="at publication",
-                source_reader=_source_reader() if recheck_sources else None)
-        except sp.ProvenanceError as exc:
-            raise PublishRefused(f"at publication: {exc}") from exc
-        provenance_report["verified"] = True
+    if not build_artifact_path and not unsafe_skip_provenance:
+        raise PublishRefused(
+            "build_artifact_path is required: without the builder's checksummed provenance "
+            "artifact the manifest carries only locator provenance, which cannot show that "
+            "the block's bytes are the bytes its sources held (§7.5a). Pass the artifact "
+            "path, or unsafe_skip_provenance=True in a test that is not exercising it.")
 
     # Fail closed on the policy BEFORE anything else: a bad grace period is a caller error, and
     # finding it after the lock is taken would stall the delta append for no reason.
@@ -1075,6 +1061,44 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
             # ...and the entry must describe THAT block, not merely be internally consistent.
             bind_segment_to_block(new_segment, source_map, _seg_path(root, new_segment),
                                   manifest["grid"], where="at publication")
+
+            # The byte provenance is verified HERE, inside the critical section, and nowhere
+            # else. It used to run before either lock was taken -- which verified a state that
+            # could then change: between that check and the commit, the staging block or a
+            # source could be modified, and the only thing standing between them and
+            # publication was `staleness_guard`, which compares LOCATORS and cannot see bytes.
+            #
+            # There is deliberately no earlier copy. A pre-lock check would be a cheap
+            # fail-fast, but no mutation could kill it while this one exists, so it would read
+            # as a guard while being none. The cost is bounded and known: one sample window per
+            # (day, var) from the block and from each source -- tens of megabytes for a 90-day
+            # fold, seconds under the lock. `measure_bytes` was kept OUT of the lock because it
+            # walks ~94 GB; this is three orders of magnitude smaller and, unlike a size
+            # measurement, is a correctness gate that has to hold at the commit point.
+            if build_artifact_path:
+                try:
+                    provenance_report = verify_build_artifact(
+                        source_map, build_artifact_path,
+                        segment_id=plan["new_segment_id"],
+                        block_path=_seg_path(root, new_segment), where="at publication",
+                        source_reader=None if unsafe_skip_source_recheck else _source_reader())
+                except sp.ProvenanceError as exc:
+                    raise PublishRefused(f"at publication: {exc}") from exc
+                if unsafe_skip_source_recheck:
+                    # The block was checked; the sources were not. Saying `verified` here would
+                    # claim the guarantee whose whole point is that a source can change.
+                    provenance_report.update(
+                        {"verified": False, "source_recheck": "waived",
+                         "reason": "unsafe_skip_source_recheck=True: the block's bytes were "
+                                   "checked against the artifact, but no source was re-read, "
+                                   "so `source changed -> refuse` does NOT hold for this "
+                                   "publication"})
+                else:
+                    provenance_report.update({"verified": True,
+                                              "source_recheck": "performed"})
+            else:
+                provenance_report = {"verified": False, "source_recheck": "waived",
+                                     "reason": "unsafe_skip_provenance=True"}
 
             # Hold the reservation right up to the commit, and prove it is still ours: a build
             # that rm+recreated the lock file could otherwise lock a fresh inode while we hold
