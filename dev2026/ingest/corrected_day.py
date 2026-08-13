@@ -236,8 +236,12 @@ def prune_eligibility(days: Sequence[str], *, manifest_root: str, delta_path: st
     """
     try:
         state = rw.read_wal(wal_root)
-    except rw.WalCorrupt as exc:
-        return {"authorized": [], "refused": {d: f"the repair WAL does not validate ({exc})"
+        # An ABSENT or unbound log is not an empty one. Read as "no repairs" it authorizes
+        # every day, and that failure is silent, total, and indistinguishable from a healthy
+        # deployment that has genuinely had none.
+        state.assert_bound_to(manifest_root)
+    except (rw.WalCorrupt, rw.WalNotInitialized) as exc:
+        return {"authorized": [], "refused": {d: f"the repair WAL cannot be trusted ({exc})"
                                               for d in days},
                 "wal": "untrustworthy"}
 
@@ -270,3 +274,83 @@ def _materialized_map(manifest_root: str, days: Sequence[str]) -> dict:
             if day in mr:
                 out[day] = mr[day]
     return out
+
+
+# --------------------------------------------------------------------------- §7.8 orchestration
+def corrective_refold(*, day: str, manifest_root: str, delta_path: str, wal_root: str,
+                      new_block_path: str, artifacts_dir: str, start_day: str, end_day: str,
+                      classification_target: Sequence[str],
+                      predecessor_segment_id: str, ingest_lock_path: str,
+                      compaction_lock_path: Optional[str],
+                      hard_reserve_bytes: int, lock=None,
+                      predecessor_path: Optional[str] = None,
+                      predecessor_present: Sequence[str] = (),
+                      operator: str = "", release_after_s: Optional[int] = None,
+                      hold_days: Optional[int] = None,
+                      unsafe_skip_isolation: bool = False,
+                      unsafe_skip_compaction_lock: bool = False) -> dict:
+    """§7.8 — the whole corrective refold, in the one order that is safe.
+
+        build a NEW version of the same calendar window (delta-first)
+          → publish it through the real §7.4 path
+          → §7.8a PHASE A: base-only verification + provenance identity   ← the proof
+          → (the caller may only now prune; §7.5a enforces it independently)
+
+    Every step already refuses on its own, and out-of-order use is already caught — Phase A
+    refuses post-prune, the prune gate refuses without Phase A. This exists because *knowing*
+    the order and *encoding* it are different things: a runbook that says "then verify" is a
+    step someone can skip under pressure, and the failure is silent until a correction is gone.
+
+    It deliberately does **not** prune. Publication and pruning are separated by §7.5's
+    ordering, and a function that did both would make the gate its own caller — the one
+    arrangement in which a gate can be waived by the thing it gates.
+
+    The sealed predecessor is never touched (§7.8.1): a new version at a new path supersedes
+    it, and it keeps serving until this returns.
+    """
+    from ingest.build_block import build_block         # local: build_block imports this module
+    from ingest import publish_manifest as pub
+
+    plan = build_block(new_block_path, start_day=start_day, end_day=end_day,
+                       classification_target=list(classification_target),
+                       predecessor_present=list(predecessor_present),
+                       predecessor_path=predecessor_path, delta_path=delta_path,
+                       artifacts_dir=artifacts_dir, lock=lock,
+                       hard_reserve_bytes=hard_reserve_bytes, wal_root=wal_root,
+                       unsafe_skip_isolation=unsafe_skip_isolation)
+    segment = dict(plan["segment"])
+    segment["supersedes"] = predecessor_segment_id
+    plan["segment"] = segment
+
+    if day not in (segment.get("build_provenance") or {}).get("materialized_repairs", {}):
+        raise CorrectedDayRefused(
+            f"the refold did not materialize a repair for {day}: the builder attests only days "
+            f"it read FROM DELTA with a committed repair, so either the repair is not committed "
+            f"or the day did not resolve to delta. Publishing this would supersede the sealed "
+            f"version with one that carries no correction.")
+
+    kw = {}
+    if release_after_s is not None:
+        kw["release_after_s"] = release_after_s
+    if hold_days is not None:
+        kw["hold_days"] = hold_days
+    published = pub.execute_publication(
+        pub.plan_publication(manifest_root, plan),
+        ingest_lock_path=ingest_lock_path, delta_path=delta_path,
+        compaction_lock_path=compaction_lock_path,
+        build_artifact_path=plan["provenance_path"], operator=operator,
+        unsafe_skip_compaction_lock=unsafe_skip_compaction_lock, **kw)
+    if not published.get("published"):
+        raise CorrectedDayRefused(
+            f"the corrective refold did not publish ({published.get('reason')}); the sealed "
+            f"version is untouched and still serving")
+
+    phase_a = phase_a_base_only(day, manifest_root=manifest_root, delta_path=delta_path,
+                                wal_root=wal_root,
+                                expected_segment_id=segment["segment_id"])
+    return {"status": "refolded", "day": day, "segment_id": segment["segment_id"],
+            "block_path": plan["out_path"], "publication": published, "phase_a": phase_a,
+            "pruned": False,
+            "note": ("Phase A passed, so §7.5a will now authorize this day. Pruning is a "
+                     "separate operation on purpose: a function that did both would make the "
+                     "gate its own caller.")}

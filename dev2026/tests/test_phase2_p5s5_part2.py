@@ -29,6 +29,7 @@ from ingest import corrected_day as cd  # noqa: E402
 from ingest import publish_manifest as pub  # noqa: E402
 from ingest.build_block import build_block  # noqa: E402
 from ingest.prune_delta import prune_delta  # noqa: E402
+from ingest.swap_delta import execute_swap_plan  # noqa: E402
 from store import block_manifest as bm  # noqa: E402
 from store import repair_wal as rw  # noqa: E402
 from store import source_provenance as sp  # noqa: E402
@@ -61,6 +62,8 @@ class _Base(unittest.TestCase):
         self.v1 = self._fold("b_v1")
         self.v1_id = self.v1["segment"]["segment_id"]
         self._publish_gen(self.v1, generation=1)
+        # The WAL is bound to this manifest authority before anything asks it a question.
+        rw.initialize_wal(self.wal, manifest_root=self.root, at_utc="t", operator="ops")
 
     # ---- helpers ---------------------------------------------------------
     def _fold(self, name, *, delta_path=None, wal_root=None):
@@ -514,3 +517,267 @@ class TestTheFullOrdering(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ============ review round 2: swap-time re-authorization, WAL identity, live-delta binding
+class TestSwapTimeReauthorization(_Base):
+    """The staleness guard compares DAY SETS. A repair committed between plan and swap does not
+    change the day set at all — same day, same date — so the guard sees nothing. Re-running the
+    gate under the ingest lock, before the path switch, is the only thing between "a newer
+    correction landed" and "that correction was dropped"."""
+
+    def _plan_dropping_repaired(self):
+        self._repair_and_refold()
+        keep = [d for d in self.days if d != self.repaired]
+        plan = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+                           base_days=self.days, spatial_window_days=1,
+                           wal_root=self.wal, manifest_root=self.root)
+        self.assertEqual(plan["status"], "ok", plan.get("reason"))
+        return plan
+
+    def test_a_NEWER_repair_after_the_plan_aborts_the_swap(self):
+        """The day set is identical, so the staleness guard passes. Only the re-run gate can
+        see that base no longer carries the latest correction."""
+        plan = self._plan_dropping_repaired()
+        rid2 = self._open_repair()
+        self._apply_repair(bump=11.0)
+        self._commit_repair(rid2)
+        before = sorted(bm.inspect_store_contract(self.delta).days)
+
+        out = execute_swap_plan(plan, mode="s2",
+                                hold_dir=os.path.join(self.tmp, "hold"),
+                                wal_root=self.wal, manifest_root=self.root)
+        self.assertEqual(out["status"], "aborted_stale")
+        self.assertFalse(out["swap_performed"])
+        self.assertIn(self.repaired, out["corrected_day_refused"])
+        self.assertIn("day set is unchanged", out["reason"])
+        self.assertEqual(sorted(bm.inspect_store_contract(self.delta).days), before,
+                         "the live delta must be untouched")
+
+    def test_the_day_set_really_is_unchanged_so_the_staleness_guard_cannot_see_it(self):
+        """Precondition for the test above: if the repair changed the day set, the abort would
+        prove nothing about the corrected-day gate."""
+        self._plan_dropping_repaired()
+        before = sorted(bm.inspect_store_contract(self.delta).days)
+        rid2 = self._open_repair()
+        self._apply_repair(bump=11.0)
+        self._commit_repair(rid2)
+        self.assertEqual(sorted(bm.inspect_store_contract(self.delta).days), before)
+
+    def test_swapping_away_days_REQUIRES_the_roots(self):
+        plan = self._plan_dropping_repaired()
+        out = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"))
+        self.assertEqual(out["status"], "refused")
+        self.assertIn("REQUIRED to swap away days", out["reason"])
+        self.assertFalse(out["swap_performed"])
+
+    def test_an_unchanged_authorization_still_swaps(self):
+        """The re-run gate must not refuse the legitimate case."""
+        plan = self._plan_dropping_repaired()
+        out = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+                                wal_root=self.wal, manifest_root=self.root)
+        self.assertEqual(out["status"], "swapped", out.get("reason"))
+        self.assertNotIn(self.repaired, bm.inspect_store_contract(self.delta).days)
+
+
+class TestWalDeploymentIdentity(_Base):
+    """An ABSENT log is not an EMPTY one. Read as "no repairs" it authorizes every day, and
+    that failure is silent, total, and indistinguishable from a deployment that has genuinely
+    had none."""
+
+    def test_a_missing_WAL_authorizes_nothing(self):
+        empty = os.path.join(self.tmp, "no_wal")
+        os.makedirs(empty, exist_ok=True)
+        out = cd.prune_eligibility(self.days, manifest_root=self.root,
+                                   delta_path=self.delta, wal_root=empty)
+        self.assertEqual(out["authorized"], [])
+        self.assertEqual(out["wal"], "untrustworthy")
+        self.assertIn("no wal_initialized record", out["refused"][self.days[0]])
+
+    def test_an_UNINITIALIZED_but_present_WAL_authorizes_nothing(self):
+        root = os.path.join(self.tmp, "wal_unbound")
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, rw.WAL_NAME), "w") as fh:
+            fh.write("")
+        out = cd.prune_eligibility(self.days, manifest_root=self.root,
+                                   delta_path=self.delta, wal_root=root)
+        self.assertEqual(out["authorized"], [])
+
+    def test_a_WAL_bound_to_ANOTHER_deployment_authorizes_nothing(self):
+        other_root = os.path.join(self.tmp, "other_manifest")
+        os.makedirs(other_root, exist_ok=True)
+        shutil.copy(os.path.join(self.root, bm.LIVE_NAME),
+                    os.path.join(other_root, bm.LIVE_NAME))
+        other_wal = os.path.join(self.tmp, "other_wal")
+        os.makedirs(other_wal, exist_ok=True)
+        rw.initialize_wal(other_wal, manifest_root=other_root, at_utc="t", operator="ops")
+        out = cd.prune_eligibility(self.days, manifest_root=self.root,
+                                   delta_path=self.delta, wal_root=other_wal)
+        self.assertEqual(out["authorized"], [])
+        self.assertIn("different deployment", out["refused"][self.days[0]])
+
+    def test_an_unbound_WAL_can_never_be_bound_retroactively(self):
+        """Appending to an unbound log is allowed; what is refused is ever *trusting* it.
+        `initialize_wal` will not bind a log that already carries records, so those records can
+        never authorize anything -- the fail-closed property lives at authorization time."""
+        root = os.path.join(self.tmp, "wal_unbound2")
+        os.makedirs(root, exist_ok=True)
+        rw.open_repair(root, day=self.repaired, at_utc="t", operator="ops")
+        with self.assertRaises(rw.WalError) as cm:
+            rw.initialize_wal(root, manifest_root=self.root, at_utc="t", operator="ops")
+        self.assertIn("cannot be retroactively bound", str(cm.exception))
+        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+                                   delta_path=self.delta, wal_root=root)
+        self.assertEqual(out["authorized"], [])
+
+    def test_initialization_is_idempotent_and_rebinding_is_refused(self):
+        again = rw.initialize_wal(self.wal, manifest_root=self.root, at_utc="t", operator="ops")
+        self.assertEqual(again["status"], "already_initialized")
+        other = os.path.join(self.tmp, "other2")
+        os.makedirs(other, exist_ok=True)
+        shutil.copy(os.path.join(self.root, bm.LIVE_NAME), os.path.join(other, bm.LIVE_NAME))
+        with self.assertRaises(rw.WalError) as cm:
+            rw.initialize_wal(self.wal, manifest_root=other, at_utc="t", operator="ops")
+        self.assertIn("would transfer its authorizations", str(cm.exception))
+
+    def test_the_authority_survives_publishing_a_new_generation(self):
+        """`generation_id` changes on every publish and cannot be the binding; the grid, the
+        block calendar and the resolved root do not."""
+        before = rw.read_wal(self.wal).authority
+        self._repair_and_refold()
+        rw.read_wal(self.wal).assert_bound_to(self.root)
+        self.assertEqual(rw.read_wal(self.wal).authority, before)
+
+    def test_a_wal_initialized_record_may_only_be_first(self):
+        with self.assertRaises(rw.WalError):
+            rw.append(self.wal, record=rw.WAL_INITIALIZED, repair_id="wal-0", day="",
+                      at_utc="t", operator="ops", payload={"authority": {}})
+
+
+class TestTheGateChecksTheLiveDelta(_Base):
+    def test_a_separate_source_delta_refuses_when_dropping_days(self):
+        """The day whose correction is being authorized away lives in the delta that will be
+        SWAPPED. Checking some other copy authorizes the wrong bytes."""
+        other = os.path.join(self.tmp, "other_delta.zarr")
+        fx.build_delta(other, self.days)
+        keep = [d for d in self.days if d != self.repaired]
+        out = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+                          base_days=self.days, spatial_window_days=1,
+                          source_delta=other, wal_root=self.wal, manifest_root=self.root)
+        self.assertEqual(out["status"], "refused")
+        self.assertIn("differs from the live delta being swapped", out["reason"])
+
+
+# ==================================================================== §7.8 orchestration, A→B→C
+class TestCorrectiveRefoldOrchestration(_Base):
+    """One entry point for the sequence, and the sequence proven through the REAL paths:
+    §7.4 publication, a live delta swap, and a post-swap read."""
+
+    def setUp(self):
+        super().setUp()
+        # the orchestrator publishes through the real §7.4 path, which re-composes generation
+        # N+1 from the live manifest, so the live one must be a real published generation
+        self.compaction_lock = os.path.join(self.tmp, "p5_compaction.lock")
+
+    def _refold_via_entry_point(self, name="b_v2"):
+        return cd.corrective_refold(
+            day=self.repaired, manifest_root=self.root, delta_path=self.delta,
+            wal_root=self.wal, new_block_path=os.path.join(self.root, name + ".zarr"),
+            artifacts_dir=self.artifacts, start_day=self.s0, end_day=self.e0,
+            classification_target=list(self.days),
+            predecessor_segment_id=self.v1_id, ingest_lock_path=self.lock,
+            compaction_lock_path=self.compaction_lock, hard_reserve_bytes=1 << 20,
+            unsafe_skip_isolation=True, operator="ops")
+
+    def test_the_entry_point_runs_build_publish_and_phase_A_in_order(self):
+        rid = self._open_repair()
+        self._apply_repair()
+        fp = self._commit_repair(rid)
+        out = self._refold_via_entry_point()
+        self.assertEqual(out["status"], "refolded")
+        self.assertTrue(out["publication"]["published"])
+        self.assertTrue(out["publication"]["provenance"]["verified"],
+                        "the refold publishes through the real §7.4 provenance verification")
+        self.assertEqual(out["phase_a"]["repair_id"], rid)
+        self.assertEqual(out["phase_a"]["fingerprint"], fp)
+        self.assertFalse(out["pruned"], "the entry point must not prune")
+
+    def test_it_refuses_to_publish_a_refold_that_materialized_nothing(self):
+        """A refold that supersedes the sealed version while carrying no correction is worse
+        than no refold: it looks like the repair landed."""
+        with self.assertRaises(cd.CorrectedDayRefused) as cm:
+            self._refold_via_entry_point()          # no repair committed at all
+        self.assertIn("did not materialize a repair", str(cm.exception))
+        self.assertEqual(bm.load_live(self.root)["generation"], 1,
+                         "nothing may publish")
+
+    def test_a_running_compaction_blocks_the_refold_and_leaves_the_sealed_version(self):
+        from store.compaction_lock import CompactionLock
+        rid = self._open_repair()
+        self._apply_repair()
+        self._commit_repair(rid)
+        with CompactionLock(self.compaction_lock):
+            with self.assertRaises(cd.CorrectedDayRefused) as cm:
+                self._refold_via_entry_point()
+        self.assertIn("did not publish", str(cm.exception))
+        self.assertEqual(bm.load_live(self.root)["generation"], 1)
+        self.assertTrue(os.path.isdir(self.v1["out_path"]))
+
+    def test_PHASE_A_then_B_then_C_through_the_real_swap(self):
+        """The whole ordering, end to end, with no shortcuts:
+
+        repair → refold (real §7.4 publication) → PHASE A base-only
+              → PHASE B prune + real live delta swap
+              → PHASE C the day is gone from the live delta and base still serves the
+                correction, necessarily from the corrected block.
+        """
+        rid = self._open_repair()
+        self._apply_repair()
+        fp = self._commit_repair(rid)
+
+        refold = self._refold_via_entry_point()
+        self.assertEqual(refold["phase_a"]["fingerprint"], fp)
+        corrected_id = refold["segment_id"]
+
+        base_before = SegmentedCubeStore(self.root).point_series(
+            100.0, 0.0, [self.repaired], ["sst"])[0]
+
+        # PHASE B — plan, then the REAL swap with the gate re-run under the ingest lock
+        keep = [d for d in self.days if d != self.repaired]
+        plan = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+                           base_days=self.days, spatial_window_days=1,
+                           wal_root=self.wal, manifest_root=self.root)
+        self.assertEqual(plan["status"], "ok", plan.get("reason"))
+        swap = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+                                 wal_root=self.wal, manifest_root=self.root)
+        self.assertEqual(swap["status"], "swapped", swap.get("reason"))
+
+        # PHASE C — the LIVE delta no longer holds the day; base still serves the correction
+        live_days = list(bm.inspect_store_contract(self.delta).days)
+        self.assertNotIn(self.repaired, live_days)
+        store = SegmentedCubeStore(self.root)
+        seg_idx, _ = store.resolve(self.repaired)
+        self.assertEqual(store.segment_id(seg_idx), corrected_id,
+                         "the corrected version must be the one serving it")
+        after = store.point_series(100.0, 0.0, [self.repaired], ["sst"])[0]
+        self.assertEqual(after, base_before,
+                         "the corrected value must survive the prune and the swap unchanged")
+
+        # and Phase A is now correctly unavailable: it is a PRE-prune check
+        with self.assertRaises(cd.CorrectedDayRefused):
+            cd.phase_a_base_only(self.repaired, manifest_root=self.root,
+                                 delta_path=self.delta, wal_root=self.wal)
+
+    def test_the_sealed_predecessor_is_untouched_and_superseded(self):
+        rid = self._open_repair()
+        self._apply_repair()
+        self._commit_repair(rid)
+        before = bm.metadata_fingerprint_from_inspection(
+            bm.inspect_store_contract(self.v1["out_path"]))
+        out = self._refold_via_entry_point()
+        live = bm.load_live(self.root)
+        self.assertEqual([s["segment_id"] for s in live["segments"]], [out["segment_id"]])
+        self.assertEqual([e["segment_id"] for e in live["superseded"]], [self.v1_id])
+        self.assertEqual(
+            bm.metadata_fingerprint_from_inspection(
+                bm.inspect_store_contract(self.v1["out_path"])), before)

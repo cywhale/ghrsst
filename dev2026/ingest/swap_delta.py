@@ -70,6 +70,9 @@ def _atomic_retarget(symlink_path: str, new_target: str) -> None:
 
 
 def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
+                      wal_root: Optional[str] = None, manifest_root: Optional[str] = None,
+                      allowed_legacy_paths: Optional[Sequence[str]] = None,
+                      corrected_day_gate: bool = True,
                       lock_path: Optional[str] = None,
                       refresh_fn: Optional[Callable[[], None]] = None,
                       pre_swap_quiesce_fn: Optional[Callable[[], None]] = None,
@@ -139,6 +142,37 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                     "reason": "live delta changed since the plan was built — rebuild the plan",
                     "unexpected_new_days": new_days, "unexpected_missing_days": gone,
                     "swap_performed": False}
+
+        # ---- §7.5a corrected-day re-authorization, UNDER THE LOCK, BEFORE the path switch.
+        # The staleness guard above compares the live delta's DAY SET against the plan's. A
+        # repair committed between plan and swap does not change the day set at all: the day is
+        # still there, still the same date, and the guard sees nothing. Re-running the gate here
+        # is the only thing standing between "a newer correction landed" and "that correction
+        # was dropped". The plan's authorization is minutes or hours old; this one is current.
+        if dropped and corrected_day_gate:
+            if not (wal_root and manifest_root):
+                return {"status": "refused", "swap_performed": False,
+                        "reason": ("wal_root and manifest_root are REQUIRED to swap away days: "
+                                   "without them the §7.5a gate cannot be re-run under the "
+                                   "lock, and the plan's authorization is not current")}
+            try:
+                from ingest import corrected_day as _cd
+                gate = _cd.prune_eligibility(dropped, manifest_root=manifest_root,
+                                             delta_path=live, wal_root=wal_root,
+                                             allowed_legacy_paths=allowed_legacy_paths)
+            except Exception as exc:                  # unreadable WAL/manifest -> fail closed
+                return {"status": "refused", "swap_performed": False,
+                        "reason": (f"the corrected-day gate could not be re-run under the lock "
+                                   f"({exc}); refusing rather than switching the path on a "
+                                   f"stale authorization")}
+            if gate["refused"]:
+                first = sorted(gate["refused"])[0]
+                return {"status": "aborted_stale", "swap_performed": False,
+                        "reason": (f"{len(gate['refused'])} day(s) are no longer authorized to "
+                                   f"leave delta (first {first}: {gate['refused'][first]}). The "
+                                   f"day set is unchanged, so the staleness guard cannot see "
+                                   f"this -- a repair landed after the plan was built."),
+                        "corrected_day_refused": sorted(gate["refused"])}
 
         # ---- same-filesystem prechecks (os.rename must not cross devices) ----
         live_parent = os.path.dirname(os.path.abspath(live)) or "."

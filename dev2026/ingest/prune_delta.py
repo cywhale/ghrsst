@@ -481,9 +481,19 @@ def prune_delta(delta_path: str, out_path: str, keep_days: Sequence[str], *,
                         "alone would authorize dropping a day whose correction base does not "
                         "carry. Pass both, or corrected_day_gate=False in a test that is not "
                         "exercising it.")
+                # The gate must examine the delta that will actually be SWAPPED, not a
+                # separate read source. `source_delta` may point at a different store; the day
+                # whose correction we are authorizing away lives in `delta_path`, and checking
+                # some other copy of it authorizes the wrong bytes.
+                if os.path.realpath(source_delta) != os.path.realpath(delta_path):
+                    return _refuse(
+                        f"source_delta ({source_delta}) differs from the live delta being "
+                        f"swapped ({delta_path}); the corrected-day gate has no way to bind "
+                        f"the two, and authorizing against one while swapping the other is "
+                        f"exactly the substitution it exists to prevent")
                 try:
                     gate = cd.prune_eligibility(
-                        dropped, manifest_root=manifest_root, delta_path=source_delta,
+                        dropped, manifest_root=manifest_root, delta_path=delta_path,
                         wal_root=wal_root, allowed_legacy_paths=allowed_legacy_paths)
                 except Exception as exc:            # unreadable manifest/WAL -> fail closed
                     return _refuse(f"the corrected-day gate could not run ({exc}); refusing "

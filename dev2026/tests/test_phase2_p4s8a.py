@@ -43,7 +43,19 @@ def prune_delta(*a, **kw):
     kw.setdefault("corrected_day_gate", False)
     return _prune_delta_strict(*a, **kw)
 
-from ingest.swap_delta import execute_swap_plan  # noqa: E402
+from ingest.swap_delta import execute_swap_plan as _execute_swap_plan_strict
+
+
+def execute_swap_plan(*a, **kw):
+    """Test shim: waive the §7.5a corrected-day re-authorization for cases that are not about it.
+
+    `execute_swap_plan` re-runs the gate under the ingest lock before the path switch, because
+    a repair committed between plan and swap does not change the day set and the staleness
+    guard cannot see it. These tests predate the WAL and exercise the swap mechanics, so they
+    waive it explicitly here -- in ONE named place."""
+    kw.setdefault("corrected_day_gate", False)
+    return _execute_swap_plan_strict(*a, **kw)
+  # noqa: E402
 
 NY, NX = 16, 20
 VARS = ("sst", "sst_anomaly", "sea_ice")

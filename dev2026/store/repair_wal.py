@@ -36,12 +36,13 @@ from typing import Dict, List, NamedTuple, Optional, Sequence
 WAL_NAME = "p5_repairs.jsonl"
 LOCK_NAME = "p5_repairs.lock"
 
+WAL_INITIALIZED = "wal_initialized"
 INTENT = "repair_intent"
 COMMITTED = "repair_committed"
 ABORTED = "repair_aborted"
 LOG_TAIL_REPAIRED = "log_tail_repaired"
 
-RECORD_TYPES = (INTENT, COMMITTED, ABORTED, LOG_TAIL_REPAIRED)
+RECORD_TYPES = (WAL_INITIALIZED, INTENT, COMMITTED, ABORTED, LOG_TAIL_REPAIRED)
 TERMINAL = (COMMITTED, ABORTED)
 
 #: every record carries exactly these keys -- no more, no less. An unknown key is a different
@@ -93,6 +94,37 @@ class RepairState(NamedTuple):
     terminal_payload: Optional[str]             # canonical payload of the terminal record
 
 
+class WalNotInitialized(WalError):
+    """The WAL was never initialized, or belongs to a different deployment.
+
+    An **absent** log is not an empty one. A missing or uninitialized WAL read as "no repairs"
+    means every day looks never-repaired and every prune is authorized -- the failure mode is
+    silent, total, and indistinguishable from a healthy deployment that has genuinely had no
+    repairs. So the log must say, in its own first record, which manifest authority it belongs
+    to, and the gate refuses until it does."""
+
+
+def manifest_authority(manifest_root: str) -> dict:
+    """The identity a WAL is bound to. Stable across generations, distinct across deployments.
+
+    `generation_id` changes on every publish and cannot be it. The grid, the block calendar and
+    the resolved root do not change for the life of a store, and together they are what makes
+    one repair log belong to one base."""
+    live = _bm().load_live(manifest_root)
+    return {"manifest_root": os.path.realpath(manifest_root),
+            "format": live["format"], "version": live["version"],
+            "grid": live["grid"], "block_grid": live["block_grid"]}
+
+
+def authority_digest(authority: dict) -> str:
+    return hashlib.sha256(canonical(authority).encode()).hexdigest()
+
+
+def _bm():
+    from store import block_manifest as bm      # local: block_manifest does not import us
+    return bm
+
+
 class WalState(NamedTuple):
     records: tuple
     last_seq: int
@@ -102,6 +134,24 @@ class WalState(NamedTuple):
     #: days whose evidence is individually untrustworthy (conflicting terminals, orphan
     #: terminal). Distinct from a whole-log failure, which raises instead.
     poisoned_days: frozenset
+    #: the `wal_initialized` payload, or None when the log has never been initialized
+    authority: Optional[dict]
+
+    def assert_bound_to(self, manifest_root: str) -> None:
+        """Refuse unless this log was initialized for THIS manifest authority."""
+        if self.authority is None:
+            raise WalNotInitialized(
+                "the repair WAL has no wal_initialized record. An absent log is not an empty "
+                "one: read as 'no repairs' it authorizes every prune, and that failure is "
+                "silent and total. Run initialize_wal() against the manifest this delta "
+                "belongs to.")
+        want = manifest_authority(manifest_root)
+        if self.authority != want:
+            raise WalNotInitialized(
+                f"the repair WAL is bound to a different deployment "
+                f"(log: {self.authority.get('manifest_root')!r}, asked about: "
+                f"{want['manifest_root']!r}). A log from another base cannot say whether THIS "
+                f"base carries a day's correction.")
 
     def latest_committed(self, day: str) -> Optional[RepairState]:
         """The highest-`seq` committed repair for `day`, or None if it was never repaired."""
@@ -155,7 +205,8 @@ def _check_types(rec: dict, n: int, path: str) -> None:
         _fail(f"{path}: line {n} has unknown record type {rec['record']!r}.")
     if not rec["repair_id"]:
         _fail(f"{path}: line {n} has an empty repair_id.")
-    if rec["record"] != LOG_TAIL_REPAIRED and repair_id_seq(rec["repair_id"]) is None:
+    if rec["record"] not in (LOG_TAIL_REPAIRED, WAL_INITIALIZED) \
+            and repair_id_seq(rec["repair_id"]) is None:
         _fail(f"{path}: line {n} repair_id {rec['repair_id']!r} does not end in "
               f"'-<seq>'. The suffix is what makes repair ids verifiably unique and "
               f"monotonic; an opaque id cannot be ordered at all. All prune is refused.")
@@ -172,7 +223,10 @@ def parse_wal(path: str) -> WalState:
     never mistaken for a crash tear. This function is the pure parser and does no locking, so
     it can also be called on a copy during administrative recovery."""
     if not os.path.isfile(path):
-        return WalState((), 0, None, {}, frozenset(), frozenset())
+        # An absent file is a valid *parse* -- there is nothing malformed about it -- and an
+        # invalid *authority*. The distinction matters: callers that only append see a fresh
+        # log, and callers that authorize see `authority is None` and refuse.
+        return WalState((), 0, None, {}, frozenset(), frozenset(), None)
     with open(path, "r") as fh:
         raw = fh.read()
     return parse_text(raw, path=path)
@@ -231,8 +285,19 @@ def parse_text(raw: str, *, path: str = "<wal>") -> WalState:
 
     repairs, poisoned = _replay(records, path)
     blocked = frozenset(r.day for r in repairs.values() if r.state == "open")
+    authority = None
+    if records:
+        first = records[0]
+        if first["record"] == WAL_INITIALIZED:
+            authority = first["payload"].get("authority")
+            if not isinstance(authority, dict) or not authority:
+                _fail(f"{path}: the wal_initialized record carries no authority payload")
+        for rec in records[1:]:
+            if rec["record"] == WAL_INITIALIZED:
+                _fail(f"{path}: a wal_initialized record appears at seq {rec['seq']}; it is "
+                      f"the first record of a log or it is not one at all")
     return WalState(tuple(records), prev_seq, prev_checksum, repairs, blocked,
-                    frozenset(poisoned))
+                    frozenset(poisoned), authority)
 
 
 def _replay(records: Sequence[dict], path: str):
@@ -384,10 +449,44 @@ def open_repair(root: str, *, day: str, at_utc: str, operator: str,
                   operator=operator, payload=payload)
 
 
+def initialize_wal(root: str, *, manifest_root: str, at_utc: str, operator: str) -> dict:
+    """Write the `wal_initialized` record that binds this log to one manifest authority.
+
+    Idempotent for an identical binding -- re-running deployment tooling must not be a hazard --
+    and a refusal for a different one, because rebinding a log that already carries repair
+    history would silently transfer those authorizations to another base."""
+    state = read_wal(root)
+    if state.authority is not None:
+        want = manifest_authority(manifest_root)
+        if state.authority == want:
+            return {"status": "already_initialized", "authority": state.authority}
+        raise WalError(
+            f"this WAL is already bound to {state.authority.get('manifest_root')!r}; rebinding "
+            f"a log that carries repair history would transfer its authorizations to another "
+            f"base. Start a new log.")
+    if state.last_seq != 0:
+        raise WalError(
+            "this WAL has records but no wal_initialized first record; it cannot be "
+            "retroactively bound. Administrative recovery, not initialization.")
+    rec = append(root, record=WAL_INITIALIZED, repair_id="wal-0", day="",
+                 at_utc=at_utc, operator=operator,
+                 payload={"authority": manifest_authority(manifest_root)})
+    return {"status": "initialized", "authority": rec["payload"]["authority"]}
+
+
 def _check_transition(state: WalState, *, record: str, repair_id: str, day: str, payload: dict,
                       next_seq: int):
+    if record == WAL_INITIALIZED:
+        if next_seq != 1:
+            raise WalError("wal_initialized must be the first record of the log")
+        return
     if record == LOG_TAIL_REPAIRED:
         return
+    # Appending to an UNBOUND log is allowed, deliberately. Such a log can never be bound
+    # retroactively (`initialize_wal` refuses a log that already has records), so its records
+    # can never authorize anything -- the fail-closed property lives at authorization time,
+    # where the reviewer asked for it. Refusing appends as well would add no safety and would
+    # make an already-signed-off suite churn for a rule that changes no outcome.
     if record == INTENT and repair_id_seq(repair_id) != next_seq:
         raise WalError(
             f"repair_id {repair_id!r} must end in '-{next_seq}' (the seq this intent will "
