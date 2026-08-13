@@ -1,0 +1,133 @@
+# P5-S5 Part 2 — corrected-day lifecycle: RESULTS
+
+Status: **DELIVERED.** Part 3 (crash / concurrency proof) remains NOT DELIVERED, and
+**G10 / H4 / G17 are still NOT claimed.**
+`[MUT-STG]`: staging/synthetic only. No VM24 path, no `GHRSST_*` store, no cron, nothing
+written outside a temp dir.
+
+Branch `dev2026-p5-s5-part2-repair-lifecycle`, stacked on `fd3a234` (Part 1).
+
+- Lifecycle module: [`../ingest/corrected_day.py`](../ingest/corrected_day.py)
+- Gate wired into [`../ingest/prune_delta.py`](../ingest/prune_delta.py)
+- Builder derives `materialized_repairs`: [`../ingest/build_block.py`](../ingest/build_block.py)
+- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **30/30 green**
+- Full local suite: **702 tests OK** (17 skipped), up from 672
+- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **246 OK**
+- **18 guards mutation-verified**
+
+## The rule
+
+> A repaired day may leave delta **only** when E1 repair-identity authorization and §7.8a
+> Phase A base-only verification have **both** passed.
+
+Both, because either alone is a different kind of insufficient:
+
+- **E1 alone** proves the block *claims* the right repair — a `repair_id` in
+  `build_provenance.materialized_repairs` matching the WAL's latest commit. It is a statement in
+  one document about another. It never reads the block.
+- **Phase A alone** proves base *currently* serves a value equal to the repaired delta day. It
+  cannot separate "the correction was folded" from "these happen to agree", and on a sampled
+  comparison agreeing by accident is not exotic — an all-NaN region agrees with any other
+  all-NaN region.
+
+E1 is the deterministic identity; Phase A is the read that makes it about bytes.
+
+## Gate status
+
+| requirement | status | evidence |
+|---|---|---|
+| WAL authorization wired into `prune_delta` | **PASS** | `TestPruneDeltaHonoursTheGate` |
+| `wal_root` + `manifest_root` required when dropping days | **PASS** | `test_dropping_days_REQUIRES_wal_root_and_manifest_root` |
+| open intent / corrupt WAL / conflicting terminal → that day refuses | **PASS** | `TestPruneEligibility` |
+| E2 gate: point-wise, float32, NaN-aware, never full-slab | **PASS** | `TestE2Parity`; window/offsets asserted at production geometry |
+| §7.8 corrective refold: new version, sealed path untouched | **PASS** | `test_the_sealed_v1_path_is_never_modified` |
+| §7.8a Phase A: base-only, manifest resolution, E2, provenance identity | **PASS** | `TestPhaseABaseOnly` |
+| §7.8a ordering A → B → C end to end | **PASS** | `test_repair_refold_verify_prune_and_the_correction_survives` |
+| E1 alone does not authorize | **PASS** | `test_E1_passing_is_not_enough_without_phase_A` |
+| **Part 3 (crash/concurrency), (e2) fence, G10/H4/G17** | **NOT DELIVERED / NOT CLAIMED** | — |
+
+## The trap §7.8a exists to close
+
+The round-5 spec draft said a corrective refold is proven when "a point GET returns the
+corrected value". **Pre-prune the repaired day is still in delta and `TieredCube` is delta-wins**,
+so a public GET returns delta — it would have passed whether or not the refold worked.
+
+Every check here therefore goes through a **base-only `SegmentedCubeStore`**, which by
+construction never sees delta (§4.0/§6.1). `test_phase_A_reads_BASE_not_the_public_view` pins
+that the base store resolves the day to the corrected version on its own.
+
+Phase A also **refuses to run post-prune**: with the day already gone from delta there is
+nothing to compare base against, and a comparison against nothing passes vacuously.
+
+## Design decisions worth defending
+
+**The sample window is keyed on the DATE, not a physical index.** The Part 1 artifact keys its
+window on the block's `day_index`, which is right there — it describes one block. A repair
+fingerprint has to be comparable across *different* stores: the repaired delta day at one index
+and the refolded block's copy at another. A physical index would make the two sides sample
+different cells and disagree for a reason that is not a difference. `date_slot()` is the one
+coordinate both stores agree on, and one `fingerprint_day()` serves all three callers — repair
+tooling, refold, prune gate — so they cannot drift.
+
+**`materialized_repairs` is derived, never accepted.** The caller does not get to say which
+correction a block carries. For each day the build read **from delta** that has a committed
+repair, the builder records the WAL's latest `repair_id` and the fingerprint of the bytes it
+actually read. A day resolved from the **predecessor block** is deliberately *not* attested — the
+fold did not read that repair, so it must not say it did. Both are tested, and a fold with no
+`wal_root` attests nothing rather than an empty success.
+
+**The gate is on by default and fail-closed.** `prune_delta` requires `wal_root` and
+`manifest_root` whenever it drops anything; `corrected_day_gate=False` is the single named
+waiver, used by one shim each in the P4-S6 and P4-S8a suites, which predate the WAL and exercise
+prune mechanics. The waiver is in one named place per suite rather than sprinkled through call
+sites.
+
+**E2 refuses regardless of E1.** A parity mismatch means either a repair that bypassed the WAL or
+a genuine base defect, and both need a human (§7.5a). A parity *match* authorizes nothing on its
+own.
+
+## Mutation verification
+
+18 guards disabled in turn; **all 18 fail**.
+
+| guard disabled | result |
+|---|---|
+| Phase A skipped entirely | FAILED |
+| E2 parity not consulted in Phase A | FAILED (3) |
+| repair identity not verified | FAILED (2) |
+| materialized fingerprint not compared | FAILED |
+| missing materialized entry accepted | FAILED |
+| stale `repair_id` accepted | FAILED |
+| non-delta materialized source accepted | FAILED |
+| Phase A runs post-prune (vacuous) | FAILED |
+| expected segment not compared | FAILED |
+| corrupt WAL authorizes days | FAILED |
+| `prune_delta` ignores the gate | FAILED (2) |
+| `prune_delta` does not require the roots | FAILED |
+| the gate is off by default | FAILED (3) |
+| builder attests block-sourced days too | FAILED |
+| builder accepts a caller-supplied repair id | FAILED (5 + 2) |
+
+Four mutations survived the first run — the three identity arms and the block-sourced
+attestation. Each was a **test gap where an earlier guard shadowed the check**: `prune_eligibility`
+runs E1 before Phase A, so E1's refusal fired first and the arms inside `_verify_repair_identity`
+were never reached. They are now tested against `_verify_repair_identity` directly, where they
+can be reached. An unreachable-by-test refusal is not a refusal.
+
+## Reproduce
+
+```bash
+dev2026/.venv/bin/python -m unittest dev2026.tests.test_phase2_p5s5_part2
+```
+
+## Residual risks
+
+1. **E2 is a seeded sample** (§7.5a: defence in depth, never sufficient alone). A corruption
+   confined to unsampled cells survives it. E1 is the deterministic gate and is enforced.
+2. **The refold is orchestrated by the caller**, not by a single entry point: build a new
+   version, publish it, run Phase A, then prune. Each step is gated, and the gate refuses if
+   they are done out of order — but there is no one function that runs the sequence.
+3. **Part 3 is not delivered.** No crash-boundary injection, no concurrency proof, and the
+   **(e2) composite base+delta fence still does not exist**. Until Part 3 decides, publication
+   should keep the quiesced posture (§15), and no complete-old/complete-new claim is made.
+4. **Post-commit audit-log failure** remains ambiguous (P5-S4 §12.3).
