@@ -10,10 +10,10 @@ Branch `dev2026-p5-s5-part2-repair-lifecycle`, stacked on `fd3a234` (Part 1).
 - Lifecycle module: [`../ingest/corrected_day.py`](../ingest/corrected_day.py)
 - Gate wired into [`../ingest/prune_delta.py`](../ingest/prune_delta.py)
 - Builder derives `materialized_repairs`: [`../ingest/build_block.py`](../ingest/build_block.py)
-- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **47/47 green**
-- Full local suite: **719 tests OK** (17 skipped), up from 672
-- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **263 OK**
-- **31 guards mutation-verified**
+- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **59/59 green**
+- Full local suite: **731 tests OK** (17 skipped), up from 672
+- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **275 OK**
+- **44 guards mutation-verified**
 
 ## The rule
 
@@ -45,6 +45,10 @@ E1 is the deterministic identity; Phase A is the read that makes it about bytes.
 | re-authorization inside the swap lock, before the path switch | **PASS** (round 2) | `TestSwapTimeReauthorization` |
 | WAL initialization identity bound to manifest authority | **PASS** (round 2) | `TestWalDeploymentIdentity` |
 | the gate checks the LIVE delta being swapped | **PASS** (round 2) | `TestTheGateChecksTheLiveDelta` |
+| one compaction reservation spans build → publish → Phase A | **PASS** (round 3) | `TestOneReservationSpansTheRefold`, including a no-waiver happy path |
+| the swap holds a reservation, not a probe | **PASS** (round 3) | `TestSwapHoldsAReservation` |
+| a rolled-back WAL prefix authorizes nothing | **PASS** (round 3) | `TestWalFreshnessAnchor` |
+| Phase C through the **public** `TieredCube` | **PASS** (round 3) | `test_PHASE_A_then_B_then_C_through_the_real_swap` |
 | §7.8a Phase A: base-only, manifest resolution, E2, provenance identity | **PASS** | `TestPhaseABaseOnly` |
 | §7.8a ordering A → B → C end to end, through the real publication and swap | **PASS** (round 2) | `test_PHASE_A_then_B_then_C_through_the_real_swap` |
 | E1 alone does not authorize | **PASS** | `test_E1_passing_is_not_enough_without_phase_A` |
@@ -92,7 +96,7 @@ own.
 
 ## Mutation verification
 
-31 guards disabled in turn; **all 31 fail** — 18 in round 1, 13 in round 2.
+44 guards disabled in turn; **all 44 fail** — 18 in round 1, 13 in round 2, 13 in round 3.
 
 | guard disabled | result |
 |---|---|
@@ -216,3 +220,59 @@ asserted to be correctly unavailable, because it is a pre-prune check.
 
 All 13 round-2 guards are mutation-verified, including "swap re-authorization checks the staging
 delta instead of live" and "orchestrator skips Phase A".
+
+
+## Review round 3 — four findings
+
+### 1. [High] The refold released the reservation between build and publish
+
+`execute_publication` acquired its own `CompactionLock`, so the refold had to drop its own —
+and that gap is exactly when a concurrent build could start rewriting the block the refold is
+about to reference. Publication now **borrows** a held lock: it verifies the lock is held,
+re-asserts the fence, and does **not** release it, because it did not take it.
+
+`corrective_refold()` acquires one reservation and holds it across build → publish → Phase A.
+The proof is taken from inside: a probe wrapped around `bm.publish` and another around
+`phase_a_base_only` both find the lock unavailable to a third party. The fence is re-asserted
+between publish and Phase A, tested by `rm`-ing and recreating the lock file in that window —
+holding the fd is not the same as still owning the reservation.
+
+`test_the_happy_path_uses_NO_unsafe_waiver` runs the whole thing with a real reservation, real
+build isolation, a real positive disk reserve and real provenance verification. If any of those
+only worked behind a waiver, it fails.
+
+### 2. [High] The swap probed the compaction lock instead of reserving it
+
+A probe answers "was a build running a moment ago". Between that answer and the `os.rename`
+pair, a build can take the lock and begin reading the delta whose path is about to move — the
+P4-S8a configuration with a permanent consequence. `execute_swap_plan` now takes the reservation
+**non-blocking** and holds it in compaction → ingest order across the swap **and any rollback**.
+
+Tested by probing from inside the switch itself — wrapping `os.rename` — so there is no timing
+to get wrong, plus a running-build case that refuses without waiting and leaves the live delta
+byte-identical.
+
+### 3. [High] A valid WAL *prefix* is still a valid WAL
+
+Restore `p5_repairs.jsonl` from an older backup, or truncate it, and every integrity rule still
+passes: checksums chain, `seq` is gap-free, the state machine is coherent. The days repaired in
+the lost tail simply read as **never-repaired**, and the gate authorizes dropping them. Nothing
+inside a self-describing log can detect its own truncation — the detection has to come from
+outside it.
+
+`p5_repairs.anchor.json` is a durable high-water mark, written inside the WAL lock **after** the
+record is durable (the other order would name a record a crash could leave unwritten) and
+monotonic, so a stale write cannot un-anchor a log that has gone further. `assert_fresh()`
+requires the log to contain the exact record the anchor names.
+
+*One arm removed rather than kept:* I first wrote separate "log is shorter than the anchor" and
+"record at the anchor differs" checks. A shorter log has no record at that seq at all, so the
+first could never fire — an unreachable arm reading as a guard. One check now covers both,
+because they are the same fact.
+
+### 4. Phase C now reads through the public view
+
+Phase C previously asserted only a base-only read. It now also reads through a real
+`TieredCube(SegmentedCubeStore, TimeCubeStore)` — what a user actually gets. The test records the
+public value **pre-prune** as well, where it is served by delta, so the post-prune equality is
+visibly not just re-reading delta: by then delta no longer has the day to answer with.

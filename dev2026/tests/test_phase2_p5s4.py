@@ -629,10 +629,16 @@ class TestPublication(_Base):
         whether a build was running."""
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
                                     now=T0)
-        with self.assertRaises(TypeError):
-            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                                    build_artifact_path=None, now=T0)
+        # `compaction_lock_path` gained a `None` default when publication learned to BORROW a
+        # caller's held lock (P5-S5 Part 2 round 3), so omitting it is now a refusal with a
+        # message rather than a TypeError. Fail-closed either way, and the message is the more
+        # useful of the two.
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm0:
+            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                    build_artifact_path=None, unsafe_skip_provenance=True,
+                                    now=T0)
+        self.assertIn("compaction_lock_path is required", str(cm0.exception))
         with self.assertRaises(pub.PublishRefused) as cm:
             pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                     compaction_lock_path=None, build_artifact_path=None,

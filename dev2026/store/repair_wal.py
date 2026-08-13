@@ -34,6 +34,14 @@ import uuid
 from typing import Dict, List, NamedTuple, Optional, Sequence
 
 WAL_NAME = "p5_repairs.jsonl"
+#: A durable high-water mark for the log, updated inside the WAL lock on every append and
+#: fsync'd separately. It exists because a **valid prefix is still a valid log**: restore
+#: `p5_repairs.jsonl` from an older backup, or truncate it to an earlier record, and every
+#: integrity rule still passes -- checksums chain, `seq` is gap-free, the state machine is
+#: coherent. The days repaired in the lost tail simply read as never-repaired, and the gate
+#: authorizes dropping them. Nothing in a self-describing log can detect its own truncation;
+#: the detection has to come from outside it.
+ANCHOR_NAME = "p5_repairs.anchor.json"
 LOCK_NAME = "p5_repairs.lock"
 
 WAL_INITIALIZED = "wal_initialized"
@@ -94,6 +102,10 @@ class RepairState(NamedTuple):
     terminal_payload: Optional[str]             # canonical payload of the terminal record
 
 
+class WalRolledBack(WalError):
+    """The log is a valid earlier PREFIX of itself. Valid, and not current."""
+
+
 class WalNotInitialized(WalError):
     """The WAL was never initialized, or belongs to a different deployment.
 
@@ -136,6 +148,35 @@ class WalState(NamedTuple):
     poisoned_days: frozenset
     #: the `wal_initialized` payload, or None when the log has never been initialized
     authority: Optional[dict]
+    #: the durable high-water mark, or None when no anchor has ever been written
+    anchor: Optional[dict]
+
+    def assert_fresh(self) -> None:
+        """Refuse a log that has been rolled back to a valid earlier prefix.
+
+        The anchor names a `(seq, record_checksum)` the log is known to have reached. A log
+        shorter than that, or one whose record at that seq is a different record, is a
+        truncated or substituted history -- and its missing tail is exactly the set of repairs
+        whose days would otherwise read as never-repaired."""
+        if self.anchor is None:
+            if self.last_seq == 0:
+                return                            # never written; nothing to be stale against
+            raise WalNotInitialized(
+                "the repair WAL has records but no durable anchor. A valid PREFIX of a log is "
+                "still a valid log, so without an external high-water mark a truncated history "
+                "is undetectable from the inside.")
+        want_seq, want_sum = int(self.anchor["seq"]), self.anchor["record_checksum"]
+        # One check, not two. A log shorter than the anchor has no record at `want_seq` at all,
+        # so a separate `last_seq < want_seq` branch could never fire -- an unreachable arm that
+        # reads as a guard. The message covers both shapes because both are the same fact: the
+        # log is not the log the anchor was written against.
+        at = next((r for r in self.records if r["seq"] == want_seq), None)
+        if at is None or at["record_checksum"] != want_sum:
+            raise WalRolledBack(
+                f"the repair WAL does not contain the record the durable anchor names (seq "
+                f"{want_seq}); it ends at seq {self.last_seq}. The log was truncated or "
+                f"replaced rather than extended, and the days repaired in the missing tail "
+                f"would read as never-repaired -- precisely the authorization this refuses.")
 
     def assert_bound_to(self, manifest_root: str) -> None:
         """Refuse unless this log was initialized for THIS manifest authority."""
@@ -226,7 +267,8 @@ def parse_wal(path: str) -> WalState:
         # An absent file is a valid *parse* -- there is nothing malformed about it -- and an
         # invalid *authority*. The distinction matters: callers that only append see a fresh
         # log, and callers that authorize see `authority is None` and refuse.
-        return WalState((), 0, None, {}, frozenset(), frozenset(), None)
+        return WalState((), 0, None, {}, frozenset(), frozenset(), None,
+                        _read_anchor(os.path.dirname(path)))
     with open(path, "r") as fh:
         raw = fh.read()
     return parse_text(raw, path=path)
@@ -297,7 +339,7 @@ def parse_text(raw: str, *, path: str = "<wal>") -> WalState:
                 _fail(f"{path}: a wal_initialized record appears at seq {rec['seq']}; it is "
                       f"the first record of a log or it is not one at all")
     return WalState(tuple(records), prev_seq, prev_checksum, repairs, blocked,
-                    frozenset(poisoned), authority)
+                    frozenset(poisoned), authority, _read_anchor(os.path.dirname(path)))
 
 
 def _replay(records: Sequence[dict], path: str):
@@ -428,6 +470,10 @@ def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc
             # A brand-new file can be lost entirely on a crash even after its own fsync,
             # because the directory entry is a separate write.
             _fsync_dir(root)
+        # The anchor advances AFTER the record is durable. The other order would name a record
+        # that a crash could leave unwritten, and a log "missing" a record it never had is
+        # indistinguishable from one that lost it.
+        _write_anchor(root, rec)
         return rec
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -514,6 +560,42 @@ def _check_transition(state: WalState, *, record: str, repair_id: str, day: str,
         f"repair {repair_id!r} is already {cur.state!r}; a conflicting terminal record is "
         f"invalid. Exactly one terminal state per intent, and only a byte-identical replay of "
         f"the same terminal is a no-op.")
+
+
+def _read_anchor(root: str) -> Optional[dict]:
+    path = os.path.join(root or ".", ANCHOR_NAME)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as fh:
+            doc = json.load(fh)
+    except ValueError as exc:
+        raise WalCorrupt(f"{path}: the durable anchor is not valid JSON ({exc})") from exc
+    if not isinstance(doc, dict) or set(doc) != {"seq", "record_checksum", "at_utc"}:
+        raise WalCorrupt(f"{path}: the durable anchor has the wrong field set")
+    if isinstance(doc["seq"], bool) or not isinstance(doc["seq"], int) or doc["seq"] < 1:
+        raise WalCorrupt(f"{path}: anchor seq {doc['seq']!r} must be a positive int")
+    if not isinstance(doc["record_checksum"], str) or not doc["record_checksum"]:
+        raise WalCorrupt(f"{path}: anchor record_checksum missing")
+    return doc
+
+
+def _write_anchor(root: str, rec: dict) -> None:
+    """Advance the high-water mark. Monotonic: it never moves backwards, so a stale write
+    cannot un-anchor a log that has already gone further."""
+    path = os.path.join(root, ANCHOR_NAME)
+    current = _read_anchor(root)
+    if current is not None and int(current["seq"]) >= int(rec["seq"]):
+        return
+    doc = {"seq": int(rec["seq"]), "record_checksum": rec["record_checksum"],
+           "at_utc": rec["at_utc"]}
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(canonical(doc))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(root)
 
 
 def _fsync_dir(dirpath: str):

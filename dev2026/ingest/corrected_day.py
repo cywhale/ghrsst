@@ -240,7 +240,8 @@ def prune_eligibility(days: Sequence[str], *, manifest_root: str, delta_path: st
         # every day, and that failure is silent, total, and indistinguishable from a healthy
         # deployment that has genuinely had none.
         state.assert_bound_to(manifest_root)
-    except (rw.WalCorrupt, rw.WalNotInitialized) as exc:
+        state.assert_fresh()
+    except (rw.WalCorrupt, rw.WalNotInitialized, rw.WalRolledBack) as exc:
         return {"authorized": [], "refused": {d: f"the repair WAL cannot be trusted ({exc})"
                                               for d in days},
                 "wal": "untrustworthy"}
@@ -305,12 +306,49 @@ def corrective_refold(*, day: str, manifest_root: str, delta_path: str, wal_root
     ordering, and a function that did both would make the gate its own caller — the one
     arrangement in which a gate can be waived by the thing it gates.
 
+    **One compaction reservation spans the whole sequence.** The build, the publication and
+    Phase A all run under the same held `CompactionLock`, acquired once here. Letting
+    publication take its own would mean releasing between build and publish — and that gap is
+    precisely when a concurrent build could start rewriting the block this refold is about to
+    reference. `execute_publication` therefore *borrows* the lock rather than acquiring one.
+
     The sealed predecessor is never touched (§7.8.1): a new version at a new path supersedes
     it, and it keeps serving until this returns.
     """
     from ingest.build_block import build_block         # local: build_block imports this module
     from ingest import publish_manifest as pub
+    from store.compaction_lock import CompactionLock
 
+    owned = None
+    if lock is None and compaction_lock_path and not unsafe_skip_isolation:
+        owned = CompactionLock(compaction_lock_path,
+                               holder="p5-corrective-refold").acquire()
+        lock = owned
+    try:
+        return _corrective_refold(
+            day=day, manifest_root=manifest_root, delta_path=delta_path, wal_root=wal_root,
+            new_block_path=new_block_path, artifacts_dir=artifacts_dir, start_day=start_day,
+            end_day=end_day, classification_target=classification_target,
+            predecessor_segment_id=predecessor_segment_id,
+            ingest_lock_path=ingest_lock_path,
+            compaction_lock_path=None if lock is not None else compaction_lock_path,
+            hard_reserve_bytes=hard_reserve_bytes, lock=lock,
+            predecessor_path=predecessor_path, predecessor_present=predecessor_present,
+            operator=operator, release_after_s=release_after_s, hold_days=hold_days,
+            unsafe_skip_isolation=unsafe_skip_isolation,
+            unsafe_skip_compaction_lock=unsafe_skip_compaction_lock,
+            build_block=build_block, pub=pub)
+    finally:
+        if owned is not None:
+            owned.release()
+
+
+def _corrective_refold(*, day, manifest_root, delta_path, wal_root, new_block_path,
+                       artifacts_dir, start_day, end_day, classification_target,
+                       predecessor_segment_id, ingest_lock_path, compaction_lock_path,
+                       hard_reserve_bytes, lock, predecessor_path, predecessor_present,
+                       operator, release_after_s, hold_days, unsafe_skip_isolation,
+                       unsafe_skip_compaction_lock, build_block, pub):
     plan = build_block(new_block_path, start_day=start_day, end_day=end_day,
                        classification_target=list(classification_target),
                        predecessor_present=list(predecessor_present),
@@ -334,10 +372,15 @@ def corrective_refold(*, day: str, manifest_root: str, delta_path: str, wal_root
         kw["release_after_s"] = release_after_s
     if hold_days is not None:
         kw["hold_days"] = hold_days
+    # The SAME reservation, borrowed -- not a second acquire, and not a gap.
+    if lock is not None:
+        lock.assert_still_held()
+        kw["compaction_lock"] = lock
+    else:
+        kw["compaction_lock_path"] = compaction_lock_path
     published = pub.execute_publication(
         pub.plan_publication(manifest_root, plan),
         ingest_lock_path=ingest_lock_path, delta_path=delta_path,
-        compaction_lock_path=compaction_lock_path,
         build_artifact_path=plan["provenance_path"], operator=operator,
         unsafe_skip_compaction_lock=unsafe_skip_compaction_lock, **kw)
     if not published.get("published"):
@@ -345,6 +388,8 @@ def corrective_refold(*, day: str, manifest_root: str, delta_path: str, wal_root
             f"the corrective refold did not publish ({published.get('reason')}); the sealed "
             f"version is untouched and still serving")
 
+    if lock is not None:
+        lock.assert_still_held()        # still ours across Phase A, not merely across publish
     phase_a = phase_a_base_only(day, manifest_root=manifest_root, delta_path=delta_path,
                                 wal_root=wal_root,
                                 expected_segment_id=segment["segment_id"])

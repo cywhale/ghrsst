@@ -34,6 +34,8 @@ from store import block_manifest as bm  # noqa: E402
 from store import repair_wal as rw  # noqa: E402
 from store import source_provenance as sp  # noqa: E402
 from store.segmented_cube import SegmentedCubeStore  # noqa: E402
+from store.tiered_cube import TieredCube  # noqa: E402
+from store.time_cube import TimeCubeStore  # noqa: E402
 
 ANCHOR = "2026-06-27"
 S = 90
@@ -741,6 +743,12 @@ class TestCorrectiveRefoldOrchestration(_Base):
 
         base_before = SegmentedCubeStore(self.root).point_series(
             100.0, 0.0, [self.repaired], ["sst"])[0]
+        # Pre-prune, the public view answers from DELTA -- recorded to show the two agree only
+        # because the refold worked, and that Phase C is not merely re-reading delta.
+        public_before = TieredCube(SegmentedCubeStore(self.root),
+                                   TimeCubeStore(self.delta)).point_series(
+                                       100.0, 0.0, [self.repaired], ["sst"])[0]
+        self.assertEqual(public_before["sst"], base_before["sst"])
 
         # PHASE B — plan, then the REAL swap with the gate re-run under the ingest lock
         keep = [d for d in self.days if d != self.repaired]
@@ -752,7 +760,8 @@ class TestCorrectiveRefoldOrchestration(_Base):
                                  wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(swap["status"], "swapped", swap.get("reason"))
 
-        # PHASE C — the LIVE delta no longer holds the day; base still serves the correction
+        # PHASE C — the LIVE delta no longer holds the day; the PUBLIC view still serves the
+        # correction, and now necessarily from the corrected block.
         live_days = list(bm.inspect_store_contract(self.delta).days)
         self.assertNotIn(self.repaired, live_days)
         store = SegmentedCubeStore(self.root)
@@ -762,6 +771,16 @@ class TestCorrectiveRefoldOrchestration(_Base):
         after = store.point_series(100.0, 0.0, [self.repaired], ["sst"])[0]
         self.assertEqual(after, base_before,
                          "the corrected value must survive the prune and the swap unchanged")
+
+        # ...and through the PUBLIC tiered view, which is what a user actually gets. Pre-prune
+        # this read proved nothing (delta-wins); post-prune it is the end-to-end assertion,
+        # because delta no longer has the day to answer with.
+        public = TieredCube(SegmentedCubeStore(self.root),
+                            TimeCubeStore(self.delta)).point_series(
+                                100.0, 0.0, [self.repaired], ["sst"])
+        self.assertEqual(len(public), 1, "the public view must still serve the day")
+        self.assertEqual(public[0], base_before,
+                         "the public read must return the corrected value, from the block")
 
         # and Phase A is now correctly unavailable: it is a PRE-prune check
         with self.assertRaises(cd.CorrectedDayRefused):
@@ -781,3 +800,244 @@ class TestCorrectiveRefoldOrchestration(_Base):
         self.assertEqual(
             bm.metadata_fingerprint_from_inspection(
                 bm.inspect_store_contract(self.v1["out_path"])), before)
+
+
+# ============ review round 3: one reservation, swap reservation, WAL freshness, public Phase C
+class TestOneReservationSpansTheRefold(_Base):
+    """Letting publication take its own lock would mean releasing between build and publish —
+    and that gap is exactly when a concurrent build could start rewriting the block the refold
+    is about to reference."""
+
+    def setUp(self):
+        super().setUp()
+        self.compaction_lock = os.path.join(self.tmp, "p5_compaction.lock")
+        rid = self._open_repair()
+        self._apply_repair()
+        self.fp = self._commit_repair(rid)
+        self.rid = rid
+
+    def test_the_happy_path_uses_NO_unsafe_waiver(self):
+        """Real compaction reservation, real build isolation, real positive disk reserve, real
+        provenance verification. If any of those only worked with a waiver, this fails."""
+        out = cd.corrective_refold(
+            day=self.repaired, manifest_root=self.root, delta_path=self.delta,
+            wal_root=self.wal, new_block_path=os.path.join(self.root, "b_v2.zarr"),
+            artifacts_dir=self.artifacts, start_day=self.s0, end_day=self.e0,
+            classification_target=list(self.days),
+            predecessor_segment_id=self.v1_id, ingest_lock_path=self.lock,
+            compaction_lock_path=self.compaction_lock, hard_reserve_bytes=1 << 20,
+            operator="ops")
+        self.assertEqual(out["status"], "refolded")
+        self.assertTrue(out["publication"]["published"])
+        self.assertTrue(out["publication"]["provenance"]["verified"])
+        self.assertEqual(out["phase_a"]["repair_id"], self.rid)
+
+    def test_publication_BORROWS_the_lock_and_does_not_release_it(self):
+        """Asserted from inside: while publication runs, the reservation is unavailable to a
+        third party, and it is still held when Phase A runs."""
+        from store.compaction_lock import CompactionLock, CompactionLockBusy
+        observed = {}
+        real_publish = bm.publish
+
+        def probing(*a, **kw):
+            try:
+                CompactionLock(self.compaction_lock).acquire().release()
+                observed["busy_during_commit"] = False
+            except CompactionLockBusy:
+                observed["busy_during_commit"] = True
+            return real_publish(*a, **kw)
+
+        real_phase_a = cd.phase_a_base_only
+
+        def probing_phase_a(*a, **kw):
+            try:
+                CompactionLock(self.compaction_lock).acquire().release()
+                observed["busy_during_phase_a"] = False
+            except CompactionLockBusy:
+                observed["busy_during_phase_a"] = True
+            return real_phase_a(*a, **kw)
+
+        bm.publish, cd.phase_a_base_only = probing, probing_phase_a
+        try:
+            cd.corrective_refold(
+                day=self.repaired, manifest_root=self.root, delta_path=self.delta,
+                wal_root=self.wal, new_block_path=os.path.join(self.root, "b_v2.zarr"),
+                artifacts_dir=self.artifacts, start_day=self.s0, end_day=self.e0,
+                classification_target=list(self.days),
+                predecessor_segment_id=self.v1_id, ingest_lock_path=self.lock,
+                compaction_lock_path=self.compaction_lock, hard_reserve_bytes=1 << 20)
+        finally:
+            bm.publish, cd.phase_a_base_only = real_publish, real_phase_a
+        self.assertTrue(observed.get("busy_during_commit"),
+                        "the reservation must be held through the commit")
+        self.assertTrue(observed.get("busy_during_phase_a"),
+                        "and still held through Phase A -- one reservation, no gap")
+
+    def test_the_lock_fence_is_re_asserted_before_phase_A(self):
+        """Holding the fd is not the same as still owning the reservation: `rm` + recreate gives
+        a new inode another process can lock freely while we hold the orphaned one. The refold
+        re-asserts between publish and Phase A, so a fence broken in that window refuses."""
+        from store.compaction_lock import CompactionLockError
+        real_publish = bm.publish
+
+        def breaking(*a, **kw):
+            out = real_publish(*a, **kw)
+            os.remove(self.compaction_lock)         # orphan our inode, mid-sequence
+            open(self.compaction_lock, "w").close()
+            return out
+
+        bm.publish = breaking
+        try:
+            with self.assertRaises(CompactionLockError):
+                cd.corrective_refold(
+                    day=self.repaired, manifest_root=self.root, delta_path=self.delta,
+                    wal_root=self.wal,
+                    new_block_path=os.path.join(self.root, "b_v2.zarr"),
+                    artifacts_dir=self.artifacts, start_day=self.s0, end_day=self.e0,
+                    classification_target=list(self.days),
+                    predecessor_segment_id=self.v1_id, ingest_lock_path=self.lock,
+                    compaction_lock_path=self.compaction_lock, hard_reserve_bytes=1 << 20)
+        finally:
+            bm.publish = real_publish
+
+    def test_publication_refuses_a_released_lock(self):
+        from store.compaction_lock import CompactionLock
+        lock = CompactionLock(self.compaction_lock).acquire()
+        lock.release()
+        with self.assertRaises(pub.PublishRefused) as cm:
+            pub.execute_publication({"root": self.root, "manifest": {}, "new_segment_id": "x",
+                                     "predecessor_generation": 1},
+                                    ingest_lock_path=self.lock, compaction_lock=lock,
+                                    build_artifact_path=None, unsafe_skip_provenance=True)
+        self.assertIn("is not held", str(cm.exception))
+
+    def test_passing_both_a_path_and_a_held_lock_is_refused(self):
+        from store.compaction_lock import CompactionLock
+        with CompactionLock(self.compaction_lock) as lock:
+            with self.assertRaises(pub.PublishRefused) as cm:
+                pub.execute_publication({"root": self.root, "manifest": {}, "new_segment_id": "x",
+                                         "predecessor_generation": 1},
+                                        ingest_lock_path=self.lock, compaction_lock=lock,
+                                        compaction_lock_path=self.compaction_lock,
+                                        build_artifact_path=None, unsafe_skip_provenance=True)
+            self.assertIn("not both", str(cm.exception))
+
+
+class TestSwapHoldsAReservation(_Base):
+    def _plan(self):
+        self._repair_and_refold()
+        keep = [d for d in self.days if d != self.repaired]
+        plan = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+                           base_days=self.days, spatial_window_days=1,
+                           wal_root=self.wal, manifest_root=self.root)
+        self.assertEqual(plan["status"], "ok", plan.get("reason"))
+        return plan
+
+    def test_the_lock_is_unavailable_DURING_the_path_switch(self):
+        """A probe answers "was a build running a moment ago". Between that answer and the
+        rename pair, a build can take the lock and start reading the delta whose path is about
+        to move. Probed from inside the swap, so there is no timing to get wrong."""
+        from store.compaction_lock import CompactionLock, CompactionLockBusy
+        import ingest.swap_delta as sd
+        clock = os.path.join(self.tmp, "p5_compaction.lock")
+        plan = self._plan()
+        observed = {}
+        real_rename = sd.os.rename
+
+        def probing(src, dst):
+            if "busy_at_switch" not in observed:
+                try:
+                    CompactionLock(clock).acquire().release()
+                    observed["busy_at_switch"] = False
+                except CompactionLockBusy:
+                    observed["busy_at_switch"] = True
+            return real_rename(src, dst)
+
+        sd.os.rename = probing
+        try:
+            out = execute_swap_plan(plan, mode="s2",
+                                    hold_dir=os.path.join(self.tmp, "hold"),
+                                    wal_root=self.wal, manifest_root=self.root,
+                                    compaction_lock_path=clock)
+        finally:
+            sd.os.rename = real_rename
+        self.assertEqual(out["status"], "swapped", out.get("reason"))
+        self.assertTrue(observed.get("busy_at_switch"),
+                        "a build could have taken the lock at the moment of the switch")
+
+    def test_a_running_build_refuses_the_swap_without_waiting(self):
+        from store.compaction_lock import CompactionLock
+        clock = os.path.join(self.tmp, "p5_compaction.lock")
+        plan = self._plan()
+        before = sorted(bm.inspect_store_contract(self.delta).days)
+        with CompactionLock(clock, holder="a-build"):
+            out = execute_swap_plan(plan, mode="s2",
+                                    hold_dir=os.path.join(self.tmp, "hold"),
+                                    wal_root=self.wal, manifest_root=self.root,
+                                    compaction_lock_path=clock)
+        self.assertEqual(out["reason"], "compaction_lock_held")
+        self.assertFalse(out["swap_performed"])
+        self.assertEqual(sorted(bm.inspect_store_contract(self.delta).days), before)
+
+
+class TestWalFreshnessAnchor(_Base):
+    """A valid PREFIX of a log is still a valid log: checksums chain, `seq` is gap-free, the
+    state machine is coherent. The days repaired in the lost tail simply read as never-repaired.
+    Nothing inside a self-describing log can detect its own truncation."""
+
+    def test_a_rolled_back_WAL_prefix_authorizes_nothing(self):
+        self._repair_and_refold()
+        wal_file = os.path.join(self.wal, rw.WAL_NAME)
+        with open(wal_file) as fh:
+            lines = fh.read().splitlines()
+        self.assertGreater(len(lines), 2)
+        with open(wal_file, "w") as fh:              # roll back to a valid earlier prefix
+            fh.write("\n".join(lines[:2]) + "\n")
+        rolled = rw.parse_wal(wal_file)
+        self.assertIsNotNone(rolled.authority, "precondition: the prefix is still a VALID log")
+        self.assertIsNone(rolled.latest_committed(self.repaired),
+                          "precondition: the repair now reads as never having happened")
+
+        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+                                   delta_path=self.delta, wal_root=self.wal)
+        self.assertEqual(out["authorized"], [])
+        self.assertIn("does not contain the record the durable anchor names",
+                      out["refused"][self.repaired])
+
+    def test_a_substituted_record_at_the_anchor_seq_is_refused(self):
+        self._repair_and_refold()
+        state = rw.read_wal(self.wal)
+        anchor = state.anchor
+        self.assertIsNotNone(anchor)
+        with open(os.path.join(self.wal, rw.ANCHOR_NAME), "w") as fh:
+            fh.write(rw.canonical({"seq": anchor["seq"], "record_checksum": "0" * 64,
+                                   "at_utc": anchor["at_utc"]}))
+        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+                                   delta_path=self.delta, wal_root=self.wal)
+        self.assertEqual(out["authorized"], [])
+        self.assertIn("does not contain the record the durable anchor names",
+                      out["refused"][self.repaired])
+
+    def test_records_with_NO_anchor_at_all_authorize_nothing(self):
+        self._repair_and_refold()
+        os.remove(os.path.join(self.wal, rw.ANCHOR_NAME))
+        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+                                   delta_path=self.delta, wal_root=self.wal)
+        self.assertEqual(out["authorized"], [])
+        self.assertIn("no durable anchor", out["refused"][self.repaired])
+
+    def test_the_anchor_is_monotonic(self):
+        self._repair_and_refold()                   # advance the log well past seq 1
+        state = rw.read_wal(self.wal)
+        head = state.anchor["seq"]
+        self.assertGreater(head, 1, "precondition: the anchor is past the initial record")
+        rw._write_anchor(self.wal, {"seq": 1, "record_checksum": "x", "at_utc": "t"})
+        self.assertEqual(rw.read_wal(self.wal).anchor["seq"], head,
+                         "a stale write must not un-anchor a log that has gone further")
+
+    def test_a_healthy_log_passes_freshness(self):
+        self._repair_and_refold()
+        rw.read_wal(self.wal).assert_fresh()
+        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+                                   delta_path=self.delta, wal_root=self.wal)
+        self.assertEqual(out["authorized"], [self.repaired])
