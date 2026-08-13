@@ -92,7 +92,7 @@ own.
 
 ## Mutation verification
 
-18 guards disabled in turn; **all 18 fail**.
+31 guards disabled in turn; **all 31 fail** — 18 in round 1, 13 in round 2.
 
 | guard disabled | result |
 |---|---|
@@ -111,6 +111,18 @@ own.
 | the gate is off by default | FAILED (3) |
 | builder attests block-sourced days too | FAILED |
 | builder accepts a caller-supplied repair id | FAILED (5 + 2) |
+| no re-authorization inside the swap lock | FAILED (2) |
+| swap does not require the roots | FAILED |
+| swap ignores the gate verdict | FAILED |
+| swap re-auth checks the staging delta, not live | FAILED (2) |
+| an unbound WAL is treated as empty | FAILED (3) |
+| authority mismatch tolerated | FAILED |
+| a missing `wal_initialized` record tolerated | FAILED (2) |
+| rebinding an initialized WAL allowed | FAILED |
+| gate uses `source_delta` instead of the live delta | FAILED |
+| orchestrator publishes a refold that materialized nothing | FAILED |
+| orchestrator skips Phase A | FAILED (2) |
+| orchestrator ignores a failed publication | FAILED |
 
 Four mutations survived the first run — the three identity arms and the block-sourced
 attestation. Each was a **test gap where an earlier guard shadowed the check**: `prune_eligibility`
@@ -128,9 +140,11 @@ dev2026/.venv/bin/python -m unittest dev2026.tests.test_phase2_p5s5_part2
 
 1. **E2 is a seeded sample** (§7.5a: defence in depth, never sufficient alone). A corruption
    confined to unsampled cells survives it. E1 is the deterministic gate and is enforced.
-2. **The refold is orchestrated by the caller**, not by a single entry point: build a new
-   version, publish it, run Phase A, then prune. Each step is gated, and the gate refuses if
-   they are done out of order — but there is no one function that runs the sequence.
+2. **The refold entry point does not prune, by design.** `corrective_refold()` runs
+   build → publish → Phase A; the caller then runs `prune_delta` + `execute_swap_plan`
+   separately. That separation is deliberate (a function doing both would make the gate its own
+   caller), but it does mean the *whole* A→B→C sequence is assembled by the operator rather
+   than by one call. The runbook for it is `test_PHASE_A_then_B_then_C_through_the_real_swap`.
 3. **Part 3 is not delivered.** No crash-boundary injection, no concurrency proof, and the
    **(e2) composite base+delta fence still does not exist**. Until Part 3 decides, publication
    should keep the quiesced posture (§15), and no complete-old/complete-new claim is made.
