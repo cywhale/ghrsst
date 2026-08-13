@@ -927,10 +927,21 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
     compaction_guard: Optional[CompactionLock] = None
     borrowed = compaction_lock is not None
     if borrowed:
-        if compaction_lock_path:
+        # A borrowed lock must be bound to the CANONICAL path, not merely be some held lock.
+        # Without the binding, a caller holding an unrelated lock file satisfies "a lock is
+        # held" while the real reservation sits free for a build to take -- the guarantee
+        # reads as satisfied and protects nothing.
+        if not compaction_lock_path:
             raise PublishRefused(
-                "pass either compaction_lock_path or a held compaction_lock, not both: two "
-                "names for the same reservation invites acquiring it twice")
+                "a borrowed compaction_lock must be accompanied by compaction_lock_path: "
+                "without it there is nothing to bind the lock's identity to, and any held "
+                "lock would do")
+        if os.path.realpath(getattr(compaction_lock, "path", "")) != \
+                os.path.realpath(compaction_lock_path):
+            raise PublishRefused(
+                f"the borrowed compaction_lock is on {getattr(compaction_lock, 'path', None)!r} "
+                f"but the canonical reservation is {compaction_lock_path!r}. Holding some "
+                f"other lock leaves the real one free for a build to take.")
         if not getattr(compaction_lock, "held", False):
             raise PublishRefused(
                 "the compaction_lock passed in is not held. Publication borrows a caller's "

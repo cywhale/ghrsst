@@ -81,6 +81,7 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                       verifier: Optional[Callable[[str, List[str]], dict]] = None,
                       hold_days: int = DEFAULT_HOLD_DAYS,
                       compaction_lock_path: Optional[str] = None,
+                      unsafe_skip_compaction_lock: bool = False,
                       operator: Optional[str] = None) -> dict:
     """Execute a prune_delta swap plan. Returns a result dict; never raises for policy refusals.
 
@@ -105,7 +106,17 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
     # a permanent consequence. The reservation is non-blocking (a running build makes us refuse
     # rather than wait) and is held, in compaction -> ingest order, across the swap AND any
     # rollback, released only once both are finished.
+    # REQUIRED, not optional. It defaulted to None and only reserved when a path was supplied,
+    # so a caller who simply omitted it swapped the delta path with no reservation at all --
+    # while a build held the real lock and was reading that delta. The waiver is named so it
+    # cannot be typed by accident.
     compaction_guard = None
+    if not compaction_lock_path and not unsafe_skip_compaction_lock:
+        return {"status": "refused", "swap_performed": False,
+                "reason": ("compaction_lock_path is required: a swap retargets the delta path, "
+                           "and a block build may be reading it right now (§7.1b). Pass the "
+                           "lock path, or unsafe_skip_compaction_lock=True in a test that is "
+                           "not exercising it.")}
     if compaction_lock_path:
         try:
             compaction_guard = CompactionLock(

@@ -52,6 +52,7 @@ class _Base(unittest.TestCase):
         self.wal = os.path.join(self.tmp, "wal")
         os.makedirs(self.wal, exist_ok=True)
         self.lock = os.path.join(self.tmp, "ingest.lock")
+        self.clock = os.path.join(self.tmp, "p5_compaction.lock")
         self.artifacts = os.path.join(self.tmp, "artifacts")
         os.makedirs(self.artifacts, exist_ok=True)
         self.s0, self.e0 = bm.block_bounds(ANCHOR, S, 0)
@@ -548,7 +549,8 @@ class TestSwapTimeReauthorization(_Base):
 
         out = execute_swap_plan(plan, mode="s2",
                                 hold_dir=os.path.join(self.tmp, "hold"),
-                                wal_root=self.wal, manifest_root=self.root)
+                                wal_root=self.wal, manifest_root=self.root,
+                                compaction_lock_path=self.clock)
         self.assertEqual(out["status"], "aborted_stale")
         self.assertFalse(out["swap_performed"])
         self.assertIn(self.repaired, out["corrected_day_refused"])
@@ -568,7 +570,8 @@ class TestSwapTimeReauthorization(_Base):
 
     def test_swapping_away_days_REQUIRES_the_roots(self):
         plan = self._plan_dropping_repaired()
-        out = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"))
+        out = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+                                compaction_lock_path=self.clock)
         self.assertEqual(out["status"], "refused")
         self.assertIn("REQUIRED to swap away days", out["reason"])
         self.assertFalse(out["swap_performed"])
@@ -577,7 +580,8 @@ class TestSwapTimeReauthorization(_Base):
         """The re-run gate must not refuse the legitimate case."""
         plan = self._plan_dropping_repaired()
         out = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
-                                wal_root=self.wal, manifest_root=self.root)
+                                wal_root=self.wal, manifest_root=self.root,
+                                compaction_lock_path=self.clock)
         self.assertEqual(out["status"], "swapped", out.get("reason"))
         self.assertNotIn(self.repaired, bm.inspect_store_contract(self.delta).days)
 
@@ -757,7 +761,8 @@ class TestCorrectiveRefoldOrchestration(_Base):
                            wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(plan["status"], "ok", plan.get("reason"))
         swap = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
-                                 wal_root=self.wal, manifest_root=self.root)
+                                 wal_root=self.wal, manifest_root=self.root,
+                                 compaction_lock_path=self.compaction_lock)
         self.assertEqual(swap["status"], "swapped", swap.get("reason"))
 
         # PHASE C — the LIVE delta no longer holds the day; the PUBLIC view still serves the
@@ -908,19 +913,52 @@ class TestOneReservationSpansTheRefold(_Base):
             pub.execute_publication({"root": self.root, "manifest": {}, "new_segment_id": "x",
                                      "predecessor_generation": 1},
                                     ingest_lock_path=self.lock, compaction_lock=lock,
+                                    compaction_lock_path=self.compaction_lock,
                                     build_artifact_path=None, unsafe_skip_provenance=True)
         self.assertIn("is not held", str(cm.exception))
 
-    def test_passing_both_a_path_and_a_held_lock_is_refused(self):
+    def test_a_borrowed_lock_must_be_the_CANONICAL_one(self):
+        """Holding *some* lock satisfies "a lock is held" while the real reservation sits free
+        for a build to take -- the guarantee reads as satisfied and protects nothing."""
         from store.compaction_lock import CompactionLock
-        with CompactionLock(self.compaction_lock) as lock:
+        unrelated = os.path.join(self.tmp, "unrelated.lock")
+        with CompactionLock(unrelated) as lock:
             with self.assertRaises(pub.PublishRefused) as cm:
                 pub.execute_publication({"root": self.root, "manifest": {}, "new_segment_id": "x",
                                          "predecessor_generation": 1},
                                         ingest_lock_path=self.lock, compaction_lock=lock,
                                         compaction_lock_path=self.compaction_lock,
                                         build_artifact_path=None, unsafe_skip_provenance=True)
-            self.assertIn("not both", str(cm.exception))
+            self.assertIn("canonical reservation", str(cm.exception))
+
+    def test_a_borrowed_lock_without_a_canonical_path_is_refused(self):
+        from store.compaction_lock import CompactionLock
+        with CompactionLock(self.compaction_lock) as lock:
+            with self.assertRaises(pub.PublishRefused) as cm:
+                pub.execute_publication({"root": self.root, "manifest": {}, "new_segment_id": "x",
+                                         "predecessor_generation": 1},
+                                        ingest_lock_path=self.lock, compaction_lock=lock,
+                                        build_artifact_path=None, unsafe_skip_provenance=True)
+            self.assertIn("nothing to bind the lock's identity to", str(cm.exception))
+
+    def test_the_refold_refuses_an_unrelated_held_lock(self):
+        """The reviewer's case: hold the canonical lock, pass a different one, and the refold
+        published anyway."""
+        from store.compaction_lock import CompactionLock
+        unrelated = os.path.join(self.tmp, "unrelated.lock")
+        with CompactionLock(self.compaction_lock), CompactionLock(unrelated) as other:
+            with self.assertRaises(cd.CorrectedDayRefused) as cm:
+                cd.corrective_refold(
+                    day=self.repaired, manifest_root=self.root, delta_path=self.delta,
+                    wal_root=self.wal,
+                    new_block_path=os.path.join(self.root, "b_v2.zarr"),
+                    artifacts_dir=self.artifacts, start_day=self.s0, end_day=self.e0,
+                    classification_target=list(self.days),
+                    predecessor_segment_id=self.v1_id, ingest_lock_path=self.lock,
+                    compaction_lock_path=self.compaction_lock, lock=other,
+                    hard_reserve_bytes=1 << 20)
+            self.assertIn("leaves the real one free", str(cm.exception))
+        self.assertEqual(bm.load_live(self.root)["generation"], 1)
 
 
 class TestSwapHoldsAReservation(_Base):
@@ -1001,8 +1039,50 @@ class TestWalFreshnessAnchor(_Base):
         out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [])
-        self.assertIn("does not contain the record the durable anchor names",
-                      out["refused"][self.repaired])
+        self.assertIn("must equal the head", out["refused"][self.repaired])
+
+    def test_an_anchor_that_LAGS_the_head_is_refused(self):
+        """`seq` present in the log is not enough: an anchor that lags leaves the tail
+        unattested, which is indistinguishable from a rollback."""
+        self._repair_and_refold()
+        state = rw.read_wal(self.wal)
+        self.assertGreater(state.last_seq, 1)
+        first = state.records[0]
+        with open(os.path.join(self.wal, rw.ANCHOR_NAME), "w") as fh:
+            fh.write(rw.canonical({"seq": 1, "record_checksum": first["record_checksum"],
+                                   "at_utc": "t"}))
+        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+                                   delta_path=self.delta, wal_root=self.wal)
+        self.assertEqual(out["authorized"], [])
+        self.assertIn("must equal the head", out["refused"][self.repaired])
+
+    def test_a_WHOLE_ROOT_rollback_is_caught_only_by_a_SEPARATE_anchor_domain(self):
+        """A co-located sidecar cannot see a VM snapshot rollback: log and anchor come back
+        together and the restored pair is perfectly self-consistent. This pins both halves of
+        that -- the co-located anchor misses it, a separate rollback domain catches it -- so the
+        limitation is documented by a test rather than only by prose."""
+        anchor_root = os.path.join(self.tmp, "anchor_domain")
+        os.makedirs(anchor_root, exist_ok=True)
+        # both domains start in step, so the divergence below is the rollback and nothing else
+        rw._write_anchor(anchor_root, rw.read_wal(self.wal).records[-1])
+        rw.read_wal(self.wal, anchor_root=anchor_root).assert_fresh()
+        snapshot = os.path.join(self.tmp, "wal_snapshot")
+        shutil.copytree(self.wal, snapshot)         # the "VM snapshot", log + sidecar together
+
+        rid = self._open_repair()                   # advance both anchors
+        self._apply_repair()
+        self._commit_repair(rid)
+        rw._write_anchor(anchor_root, rw.read_wal(self.wal).records[-1])
+
+        shutil.rmtree(self.wal)                     # roll the WHOLE root back
+        shutil.copytree(snapshot, self.wal)
+
+        co_located = rw.read_wal(self.wal)
+        co_located.assert_fresh()                   # the restored pair is self-consistent
+
+        with self.assertRaises(rw.WalRolledBack) as cm:
+            rw.read_wal(self.wal, anchor_root=anchor_root).assert_fresh()
+        self.assertIn("must equal the head", str(cm.exception))
 
     def test_a_substituted_record_at_the_anchor_seq_is_refused(self):
         self._repair_and_refold()
@@ -1041,3 +1121,88 @@ class TestWalFreshnessAnchor(_Base):
         out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [self.repaired])
+
+
+# ============================= review round 4: E2 for every day, and the swap lock is required
+class TestE2RunsForEveryDroppedDay(_Base):
+    """A day with no committed repair is not a day that was never edited — it is a day the WAL
+    has no opinion about, and a repair applied straight to delta leaves exactly that trace.
+    Skipping E2 there made the one case E2 is documented to catch — "a repair that bypassed the
+    WAL" — the one case it could not see."""
+
+    def test_a_bypass_WAL_repair_is_refused(self):
+        """The reviewer's case: rewrite the delta day, write nothing to the WAL."""
+        self._apply_repair(bump=17.0)               # no intent, no commit -- straight to delta
+        state = rw.read_wal(self.wal)
+        self.assertIsNone(state.latest_committed(self.repaired),
+                          "precondition: the WAL knows nothing about this day")
+        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+                                   delta_path=self.delta, wal_root=self.wal)
+        self.assertEqual(out["authorized"], [])
+        self.assertIn("no committed repair explains", out["refused"][self.repaired])
+
+    def test_prune_delta_refuses_a_bypass_WAL_repair(self):
+        self._apply_repair(bump=17.0)
+        keep = [d for d in self.days if d != self.repaired]
+        out = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+                          base_days=self.days, spatial_window_days=1,
+                          wal_root=self.wal, manifest_root=self.root)
+        self.assertEqual(out["status"], "refused")
+        self.assertEqual(out["corrected_day_refused"], [self.repaired])
+
+    def test_an_untouched_day_still_authorizes(self):
+        """E2 on every day must not refuse the ordinary case."""
+        out = cd.prune_eligibility([self.days[0]], manifest_root=self.root,
+                                   delta_path=self.delta, wal_root=self.wal)
+        self.assertEqual(out["authorized"], [self.days[0]])
+
+    def test_a_base_defect_on_an_unrepaired_day_is_refused(self):
+        """The other half of what E2 exists for: base is wrong and no repair explains it."""
+        live = bm.load_live(self.root)
+        block = os.path.join(self.root, live["segments"][0]["path"])
+        idx = list(bm.inspect_store_contract(block).days).index(self.days[0])
+        slot = cd.date_slot(self.days[0])
+        i0, i1, j0, j1 = sp.sample_window(32, 32, seed=sp.SAMPLE_SEED, day_index=slot)
+        g = zarr.open_group(block, mode="a")
+        g["sst"][idx, i0:i1, j0:j1] = np.asarray(g["sst"][idx, i0:i1, j0:j1]) + 4.0
+        out = cd.prune_eligibility([self.days[0]], manifest_root=self.root,
+                                   delta_path=self.delta, wal_root=self.wal)
+        self.assertEqual(out["authorized"], [])
+        self.assertIn("base is defective", out["refused"][self.days[0]])
+
+
+class TestSwapRequiresTheCompactionLock(_Base):
+    def _plan(self):
+        self._repair_and_refold()
+        keep = [d for d in self.days if d != self.repaired]
+        plan = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+                           base_days=self.days, spatial_window_days=1,
+                           wal_root=self.wal, manifest_root=self.root)
+        self.assertEqual(plan["status"], "ok", plan.get("reason"))
+        return plan
+
+    def test_omitting_the_lock_path_refuses(self):
+        """It defaulted to None and only reserved when supplied, so a caller who omitted it
+        swapped with no reservation at all -- while a build held the real lock and was reading
+        that delta."""
+        plan = self._plan()
+        before = sorted(bm.inspect_store_contract(self.delta).days)
+        out = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+                                wal_root=self.wal, manifest_root=self.root)
+        self.assertEqual(out["status"], "refused")
+        self.assertIn("compaction_lock_path is required", out["reason"])
+        self.assertFalse(out["swap_performed"])
+        self.assertEqual(sorted(bm.inspect_store_contract(self.delta).days), before)
+
+    def test_a_build_holding_the_lock_blocks_a_swap_that_omitted_it(self):
+        """The reviewer's measurement: another process held the canonical lock and the swap
+        succeeded anyway because the caller had not passed the path."""
+        from store.compaction_lock import CompactionLock
+        plan = self._plan()
+        before = sorted(bm.inspect_store_contract(self.delta).days)
+        with CompactionLock(self.clock, holder="a-build"):
+            out = execute_swap_plan(plan, mode="s2",
+                                    hold_dir=os.path.join(self.tmp, "hold"),
+                                    wal_root=self.wal, manifest_root=self.root)
+        self.assertFalse(out["swap_performed"])
+        self.assertEqual(sorted(bm.inspect_store_contract(self.delta).days), before)

@@ -222,7 +222,7 @@ def _verify_repair_identity(day: str, *, seg: dict, wal_root: str, delta_path: s
 
 # --------------------------------------------------------------------------- the prune gate
 def prune_eligibility(days: Sequence[str], *, manifest_root: str, delta_path: str,
-                      wal_root: str,
+                      wal_root: str, anchor_root: Optional[str] = None,
                       allowed_legacy_paths: Optional[Sequence[str]] = None) -> dict:
     """May these delta days be dropped? `{"authorized": [...], "refused": {day: reason}}`.
 
@@ -235,7 +235,7 @@ def prune_eligibility(days: Sequence[str], *, manifest_root: str, delta_path: st
     a WAL that does not parse raises, and that refuses every day rather than some.
     """
     try:
-        state = rw.read_wal(wal_root)
+        state = rw.read_wal(wal_root, anchor_root=anchor_root)
         # An ABSENT or unbound log is not an empty one. Read as "no repairs" it authorizes
         # every day, and that failure is silent, total, and indistinguishable from a healthy
         # deployment that has genuinely had none.
@@ -251,18 +251,56 @@ def prune_eligibility(days: Sequence[str], *, manifest_root: str, delta_path: st
                                 materialized_repairs=_materialized_map(manifest_root, days))
     authorized, refused = [], dict(e1["refused"])
     for day in e1["authorized"]:
-        if state.latest_committed(day) is None:
-            authorized.append(day)                 # never repaired -> no corrected-day gate
-            continue
+        repaired = state.latest_committed(day) is not None
         try:
-            phase_a_base_only(day, manifest_root=manifest_root, delta_path=delta_path,
-                              wal_root=wal_root,
-                              allowed_legacy_paths=allowed_legacy_paths)
+            if repaired:
+                # E1 identity AND the full Phase A, which includes E2.
+                phase_a_base_only(day, manifest_root=manifest_root, delta_path=delta_path,
+                                  wal_root=wal_root,
+                                  allowed_legacy_paths=allowed_legacy_paths)
+            else:
+                # E2 runs for EVERY dropped day, not only for days the WAL knows about. A day
+                # with no committed repair is not a day that was never edited -- it is a day the
+                # WAL has no opinion about, and a repair applied straight to delta without a WAL
+                # record leaves exactly that trace. Skipping E2 here made the one case E2 is
+                # documented to catch -- "a repair that bypassed the WAL" -- the one case it
+                # could not see.
+                _e2_against_base(day, manifest_root=manifest_root, delta_path=delta_path,
+                                 allowed_legacy_paths=allowed_legacy_paths)
         except (CorrectedDayRefused, rw.WalError) as exc:
-            refused[day] = f"§7.8a Phase A did not pass: {exc}"
+            refused[day] = (f"§7.8a Phase A did not pass: {exc}" if repaired
+                            else f"§7.5a E2 parity did not pass: {exc}")
             continue
         authorized.append(day)
     return {"authorized": sorted(authorized), "refused": refused, "wal": "valid"}
+
+
+def _e2_against_base(day: str, *, manifest_root: str, delta_path: str,
+                     allowed_legacy_paths=None) -> None:
+    """E2 for a day the WAL has no committed repair for. Refuses on any mismatch.
+
+    A mismatch here means base and delta disagree about a day nothing claims to have repaired:
+    either a repair went straight to delta without a WAL record, or base is defective. §7.5a
+    says both need a human, and both must stop the prune."""
+    store = SegmentedCubeStore(manifest_root, allowed_legacy_paths=allowed_legacy_paths)
+    try:
+        seg_idx, _ = store.resolve(day)
+    except Exception as exc:
+        raise CorrectedDayRefused(
+            f"the published manifest does not resolve {day} to any segment ({exc})") from exc
+    segment_id = store.segment_id(seg_idx)
+    live = bm.load_live(manifest_root)
+    seg = next((s for s in live["segments"] if s["segment_id"] == segment_id), None)
+    if seg is None:
+        raise CorrectedDayRefused(f"segment {segment_id!r} is not in the live manifest")
+    block_path = seg["path"] if os.path.isabs(seg["path"]) else os.path.join(manifest_root,
+                                                                            seg["path"])
+    diffs = e2_parity(day, delta_path=delta_path, base_store_path=block_path)
+    if diffs:
+        raise CorrectedDayRefused(
+            f"base and delta disagree about {day}, which no committed repair explains "
+            f"({'; '.join(diffs[:3])}). Either a repair bypassed the WAL or base is defective; "
+            f"§7.5a says both need a human.")
 
 
 def _materialized_map(manifest_root: str, days: Sequence[str]) -> dict:
@@ -319,6 +357,20 @@ def corrective_refold(*, day: str, manifest_root: str, delta_path: str, wal_root
     from ingest import publish_manifest as pub
     from store.compaction_lock import CompactionLock
 
+    # A caller-supplied lock is verified against the canonical path, never trusted as "some
+    # held lock". Ignoring `compaction_lock_path` when a lock is passed let an unrelated lock
+    # satisfy the reservation while the real one stayed free.
+    if lock is not None and not unsafe_skip_isolation:
+        if not compaction_lock_path:
+            raise CorrectedDayRefused(
+                "compaction_lock_path is required even when a held lock is passed: it is what "
+                "the lock's identity is checked against")
+        if os.path.realpath(getattr(lock, "path", "")) != os.path.realpath(
+                compaction_lock_path):
+            raise CorrectedDayRefused(
+                f"the supplied lock is on {getattr(lock, 'path', None)!r} but the canonical "
+                f"reservation is {compaction_lock_path!r}; holding an unrelated lock leaves "
+                f"the real one free for a build to take")
     owned = None
     if lock is None and compaction_lock_path and not unsafe_skip_isolation:
         owned = CompactionLock(compaction_lock_path,
@@ -331,7 +383,7 @@ def corrective_refold(*, day: str, manifest_root: str, delta_path: str, wal_root
             end_day=end_day, classification_target=classification_target,
             predecessor_segment_id=predecessor_segment_id,
             ingest_lock_path=ingest_lock_path,
-            compaction_lock_path=None if lock is not None else compaction_lock_path,
+            compaction_lock_path=compaction_lock_path,
             hard_reserve_bytes=hard_reserve_bytes, lock=lock,
             predecessor_path=predecessor_path, predecessor_present=predecessor_present,
             operator=operator, release_after_s=release_after_s, hold_days=hold_days,
@@ -376,8 +428,7 @@ def _corrective_refold(*, day, manifest_root, delta_path, wal_root, new_block_pa
     if lock is not None:
         lock.assert_still_held()
         kw["compaction_lock"] = lock
-    else:
-        kw["compaction_lock_path"] = compaction_lock_path
+    kw["compaction_lock_path"] = compaction_lock_path
     published = pub.execute_publication(
         pub.plan_publication(manifest_root, plan),
         ingest_lock_path=ingest_lock_path, delta_path=delta_path,

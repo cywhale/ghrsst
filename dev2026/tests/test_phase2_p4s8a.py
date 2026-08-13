@@ -54,6 +54,7 @@ def execute_swap_plan(*a, **kw):
     guard cannot see it. These tests predate the WAL and exercise the swap mechanics, so they
     waive it explicitly here -- in ONE named place."""
     kw.setdefault("corrected_day_gate", False)
+    kw.setdefault("unsafe_skip_compaction_lock", True)
     return _execute_swap_plan_strict(*a, **kw)
   # noqa: E402
 

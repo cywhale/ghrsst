@@ -35,7 +35,17 @@ from typing import Dict, List, NamedTuple, Optional, Sequence
 
 WAL_NAME = "p5_repairs.jsonl"
 #: A durable high-water mark for the log, updated inside the WAL lock on every append and
-#: fsync'd separately. It exists because a **valid prefix is still a valid log**: restore
+#: fsync'd separately. Pass `anchor_root` to place it in a **different rollback domain** from
+#: the log itself.
+#:
+#: **What co-locating it does and does not prove.** In the same directory it detects
+#: single-file truncation or substitution of `p5_repairs.jsonl` -- and nothing more. A VM
+#: snapshot rollback restores the log AND the anchor together, and the restored pair is
+#: perfectly self-consistent. Defending against that requires the anchor to live somewhere the
+#: rollback does not reach, or to be cross-checked against a second independent durable
+#: authority. A same-directory sidecar cannot make that claim and this module does not make it.
+#:
+#: It exists because a **valid prefix is still a valid log**: restore
 #: `p5_repairs.jsonl` from an older backup, or truncate it to an earlier record, and every
 #: integrity rule still passes -- checksums chain, `seq` is gap-free, the state machine is
 #: coherent. The days repaired in the lost tail simply read as never-repaired, and the gate
@@ -170,6 +180,16 @@ class WalState(NamedTuple):
         # so a separate `last_seq < want_seq` branch could never fire -- an unreachable arm that
         # reads as a guard. The message covers both shapes because both are the same fact: the
         # log is not the log the anchor was written against.
+        # The anchor must name the log's LAST record, not merely some record in it. An anchor
+        # that lags means either the log grew without the anchor advancing -- a crash between
+        # the two writes -- or the anchor was restored from an older copy. Both leave the tail
+        # unattested, and an unattested tail is exactly what a rollback produces.
+        if want_seq != self.last_seq:
+            raise WalRolledBack(
+                f"the durable anchor names seq {want_seq} but the log's head is "
+                f"{self.last_seq}. The anchor must equal the head: anything else leaves the "
+                f"tail unattested, which is indistinguishable from a rollback. This needs "
+                f"manual recovery, not a heuristic.")
         at = next((r for r in self.records if r["seq"] == want_seq), None)
         if at is None or at["record_checksum"] != want_sum:
             raise WalRolledBack(
@@ -257,7 +277,7 @@ def _fail(msg, **kw):
     raise WalCorrupt(msg, **kw)
 
 
-def parse_wal(path: str) -> WalState:
+def parse_wal(path: str, *, anchor_root: Optional[str] = None) -> WalState:
     """Strict, whole-file, fail-closed. Never skips a record.
 
     Reading is done under a SHARED flock by `read_wal()`, so a benign in-progress append is
@@ -268,13 +288,14 @@ def parse_wal(path: str) -> WalState:
         # invalid *authority*. The distinction matters: callers that only append see a fresh
         # log, and callers that authorize see `authority is None` and refuse.
         return WalState((), 0, None, {}, frozenset(), frozenset(), None,
-                        _read_anchor(os.path.dirname(path)))
+                        _read_anchor(anchor_root or os.path.dirname(path)))
     with open(path, "r") as fh:
         raw = fh.read()
-    return parse_text(raw, path=path)
+    return parse_text(raw, path=path, anchor_root=anchor_root)
 
 
-def parse_text(raw: str, *, path: str = "<wal>") -> WalState:
+def parse_text(raw: str, *, path: str = "<wal>",
+               anchor_root: Optional[str] = None) -> WalState:
     lines = raw.split("\n")
     if lines and lines[-1] == "":
         lines.pop()                              # the trailing newline of a complete record
@@ -339,7 +360,8 @@ def parse_text(raw: str, *, path: str = "<wal>") -> WalState:
                 _fail(f"{path}: a wal_initialized record appears at seq {rec['seq']}; it is "
                       f"the first record of a log or it is not one at all")
     return WalState(tuple(records), prev_seq, prev_checksum, repairs, blocked,
-                    frozenset(poisoned), authority, _read_anchor(os.path.dirname(path)))
+                    frozenset(poisoned), authority,
+                    _read_anchor(anchor_root or os.path.dirname(path)))
 
 
 def _replay(records: Sequence[dict], path: str):
@@ -389,18 +411,18 @@ def _replay(records: Sequence[dict], path: str):
     return repairs, poisoned
 
 
-def read_wal(root: str) -> WalState:
+def read_wal(root: str, *, anchor_root: Optional[str] = None) -> WalState:
     """Parse under a SHARED lock, so an in-progress append is never read as a crash tear."""
     path = os.path.join(root, WAL_NAME)
     lock = os.path.join(root, LOCK_NAME)
     if not os.path.isfile(path):
-        return parse_wal(path)
+        return parse_wal(path, anchor_root=anchor_root)
     os.makedirs(root, exist_ok=True)
     fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_SH)
         try:
-            return parse_wal(path)
+            return parse_wal(path, anchor_root=anchor_root)
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
@@ -409,7 +431,8 @@ def read_wal(root: str) -> WalState:
 
 # --------------------------------------------------------------------------- append
 def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc: str,
-           operator: str, payload: Optional[dict] = None) -> dict:
+           operator: str, payload: Optional[dict] = None,
+           anchor_root: Optional[str] = None) -> dict:
     """Validate the ENTIRE existing log, then append exactly one fsync'd record.
 
     There is no write-only fast path. If the log does not fully validate the append is refused
@@ -441,7 +464,7 @@ def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc
     fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)           # blocking: held only for the append itself
-        state = parse_wal(path)                  # <- refuses the append if anything is wrong
+        state = parse_wal(path, anchor_root=anchor_root)   # refuses the append if anything is wrong
         seq = state.last_seq + 1
         # NOT `payload or {}`: a dict subclass whose __bool__ is False would be silently
         # replaced by an empty payload, which is the same laundering the type check above
@@ -473,7 +496,7 @@ def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc
         # The anchor advances AFTER the record is durable. The other order would name a record
         # that a crash could leave unwritten, and a log "missing" a record it never had is
         # indistinguishable from one that lost it.
-        _write_anchor(root, rec)
+        _write_anchor(anchor_root or root, rec)
         return rec
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)

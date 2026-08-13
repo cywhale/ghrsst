@@ -10,10 +10,10 @@ Branch `dev2026-p5-s5-part2-repair-lifecycle`, stacked on `fd3a234` (Part 1).
 - Lifecycle module: [`../ingest/corrected_day.py`](../ingest/corrected_day.py)
 - Gate wired into [`../ingest/prune_delta.py`](../ingest/prune_delta.py)
 - Builder derives `materialized_repairs`: [`../ingest/build_block.py`](../ingest/build_block.py)
-- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **59/59 green**
-- Full local suite: **731 tests OK** (17 skipped), up from 672
-- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **275 OK**
-- **44 guards mutation-verified**
+- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **69/69 green**
+- Full local suite: **741 tests OK** (17 skipped), up from 672
+- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **285 OK**
+- **52 guards mutation-verified**
 
 ## The rule
 
@@ -49,6 +49,11 @@ E1 is the deterministic identity; Phase A is the read that makes it about bytes.
 | the swap holds a reservation, not a probe | **PASS** (round 3) | `TestSwapHoldsAReservation` |
 | a rolled-back WAL prefix authorizes nothing | **PASS** (round 3) | `TestWalFreshnessAnchor` |
 | Phase C through the **public** `TieredCube` | **PASS** (round 3) | `test_PHASE_A_then_B_then_C_through_the_real_swap` |
+| `compaction_lock_path` required to swap | **PASS** (round 4) | `TestSwapRequiresTheCompactionLock` |
+| a borrowed lock is bound to the canonical path | **PASS** (round 4) | `test_a_borrowed_lock_must_be_the_CANONICAL_one`, `test_the_refold_refuses_an_unrelated_held_lock` |
+| the anchor must equal the WAL head | **PASS** (round 4) | `test_an_anchor_that_LAGS_the_head_is_refused` |
+| E2 runs for **every** dropped day (bypass-WAL repair) | **PASS** (round 4) | `TestE2RunsForEveryDroppedDay` |
+| whole-root snapshot rollback | **PARTIAL — needs a separate `anchor_root`** | `test_a_WHOLE_ROOT_rollback_is_caught_only_by_a_SEPARATE_anchor_domain` |
 | §7.8a Phase A: base-only, manifest resolution, E2, provenance identity | **PASS** | `TestPhaseABaseOnly` |
 | §7.8a ordering A → B → C end to end, through the real publication and swap | **PASS** (round 2) | `test_PHASE_A_then_B_then_C_through_the_real_swap` |
 | E1 alone does not authorize | **PASS** | `test_E1_passing_is_not_enough_without_phase_A` |
@@ -90,13 +95,15 @@ waiver, used by one shim each in the P4-S6 and P4-S8a suites, which predate the 
 prune mechanics. The waiver is in one named place per suite rather than sprinkled through call
 sites.
 
-**E2 refuses regardless of E1.** A parity mismatch means either a repair that bypassed the WAL or
-a genuine base defect, and both need a human (§7.5a). A parity *match* authorizes nothing on its
-own.
+**E2 refuses regardless of E1, and runs for every dropped day.** A parity mismatch means either
+a repair that bypassed the WAL or a genuine base defect, and both need a human (§7.5a). A parity
+*match* authorizes nothing on its own. Running E2 only for days the WAL knew about (rounds 1–3)
+made the one case E2 is documented to catch — a repair that bypassed the WAL — the one case it
+could not see.
 
 ## Mutation verification
 
-44 guards disabled in turn; **all 44 fail** — 18 in round 1, 13 in round 2, 13 in round 3.
+52 guards disabled in turn; **all 52 fail** — 18 / 13 / 13 / 8 across four rounds.
 
 | guard disabled | result |
 |---|---|
@@ -276,3 +283,53 @@ Phase C previously asserted only a base-only read. It now also reads through a r
 `TieredCube(SegmentedCubeStore, TimeCubeStore)` — what a user actually gets. The test records the
 public value **pre-prune** as well, where it is served by delta, so the post-prune equality is
 visibly not just re-reading delta: by then delta no longer has the day to answer with.
+
+## Review round 4 — four findings, all reproduced by the reviewer with real runs
+
+### 1. [High] `execute_swap_plan()` could omit the compaction lock entirely
+
+It defaulted to `None` and only reserved when a path was supplied, so a caller who omitted it
+swapped the delta path with **no reservation at all** — measured succeeding while another
+process held the real lock. Now required, with `unsafe_skip_compaction_lock=True` as the single
+named waiver (one shim in the P4-S8a suite). The Phase C test passes a real lock, so the
+end-to-end path is the production-safe one.
+
+### 2. [High] A borrowed lock was not bound to the canonical path
+
+`corrective_refold()` accepted any held lock and then *ignored* `compaction_lock_path`. Holding
+some unrelated lock satisfied "a lock is held" while the real reservation sat free for a build
+to take — the guarantee read as satisfied and protected nothing. The reviewer demonstrated it:
+hold the canonical lock, pass a different one, and the refold published.
+
+Both `corrective_refold()` and `execute_publication()` now require `compaction_lock_path`
+alongside a borrowed lock and compare `realpath`. Passing a lock with no canonical path is
+refused: there would be nothing to bind identity to.
+
+### 3. [High] The anchor was not a head fence, and cannot survive a snapshot rollback
+
+Two separate defects.
+
+**It only had to point at *some* record.** WAL head 3 with anchor 1 passed. It now must equal
+the head: an anchor that lags leaves the tail unattested, which is indistinguishable from a
+rollback, and that needs manual recovery rather than a heuristic.
+
+**A co-located sidecar cannot detect a whole-root rollback**, and I claimed it could. A VM
+snapshot restores log and anchor together and the restored pair is perfectly self-consistent —
+the reviewer measured exactly that. `read_wal(..., anchor_root=...)` now places the anchor in a
+different rollback domain, and the module docstring states plainly what co-location does prove
+(single-file truncation or substitution) and what it does not. The gate status table records
+this as **PARTIAL**, not PASS: it is a deployment property, not something the code can assert
+about itself. A test pins **both halves** — the co-located anchor misses the rollback, the
+separate domain catches it — so the limitation is documented by a test rather than by prose.
+
+### 4. [High] E2 never ran for a day the WAL had no opinion about
+
+`prune_eligibility` authorized any day with no committed repair without running E2 at all. So a
+repair applied straight to delta, with nothing written to the WAL, was authorized — reproduced
+by the reviewer. That contradicted this document's own claim that E2 catches a bypass-WAL
+repair, which is the correction that matters most.
+
+E2 now runs for **every** dropped day. A day with a committed repair additionally requires E1
+identity and the full Phase A. A day with none still has to match base, and a mismatch refuses
+with "no committed repair explains this" — covering both halves of what §7.5a says E2 is for: a
+repair that bypassed the WAL, and a base defect.
