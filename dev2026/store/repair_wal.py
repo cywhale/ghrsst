@@ -653,10 +653,24 @@ def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)           # blocking: held only for the append itself
         state = parse_wal(path, anchor_root=resolved_anchor)  # refuses the append on any fault
-        # The anchor this append would advance must be the one the log is BOUND to. Checked
-        # before a byte is written, so a mismatched call leaves the WAL and both anchors
-        # byte-identical rather than half-advanced.
-        bound = (state.authority or {}).get("anchor_domain_id")
+        # The anchor this append would advance must be the one the log is BOUND to -- BOTH
+        # halves of the binding, not just the domain id. A second root can declare the same
+        # `domain_id` and carry a copy of the current sidecar; checking the id alone let a
+        # terminal write succeed there, advancing the WAL and the twin while the canonical
+        # anchor fell behind. That is the previous bypass one level down: same domain,
+        # different path. Checked before a byte is written, so a mismatched call leaves the
+        # WAL and both anchors byte-identical rather than half-advanced.
+        auth = state.authority or {}
+        bound_path = auth.get("anchor_root")
+        # `resolve_anchor_root()` already returns a realpath and `manifest_authority()` stores
+        # one; re-resolving here keeps the comparison correct if either ever stops doing that.
+        if bound_path is not None and os.path.realpath(resolved_anchor) != bound_path:
+            raise WalNotInitialized(
+                f"this WAL is bound to the anchor at {bound_path!r} but the append supplies "
+                f"{resolved_anchor!r}. A second root declaring the same domain is still a "
+                f"different anchor: advancing it would leave the bound one behind and strand "
+                f"every later prune and refold in fail-closed recovery.")
+        bound = auth.get("anchor_domain_id")
         if bound is not None:
             here = anchor_domain_id(resolved_anchor)
             if here != bound:

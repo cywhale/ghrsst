@@ -10,10 +10,10 @@ Branch `dev2026-p5-s5-part2-repair-lifecycle`, stacked on `fd3a234` (Part 1).
 - Lifecycle module: [`../ingest/corrected_day.py`](../ingest/corrected_day.py)
 - Gate wired into [`../ingest/prune_delta.py`](../ingest/prune_delta.py)
 - Builder derives `materialized_repairs`: [`../ingest/build_block.py`](../ingest/build_block.py)
-- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **97/97 green**
-- Full local suite: **769 tests OK** (17 skipped), up from 672
-- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **313 OK**
-- **76 guards mutation-verified**
+- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **101/101 green**
+- Full local suite: **773 tests OK** (17 skipped), up from 672
+- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **317 OK**
+- **77 guards mutation-verified**
 
 ## The rule
 
@@ -61,6 +61,7 @@ E1 is the deterministic identity; Phase A is the read that makes it about bytes.
 | the filesystem preflight fails closed when it cannot answer | **PASS** (round 7) | `TestAnchorPreflightFailsClosed` |
 | the domain declaration is strictly typed and immutable | **PASS** (round 7) | `TestDeclarationSchemaIsStrict` |
 | the WAL authority binds canonical path **and** domain id | **PASS** (round 7) | `TestAuthorityBindsPathAndDomain` |
+| the **writer** enforces both halves: a twin root with the same domain id is refused | **PASS** (round 8) | `TestWriterIsBoundToTheCanonicalAnchorPath` |
 | an external `anchor_root` is **required** on the production path | **PASS** (round 5) | `test_omitting_the_anchor_root_fails_closed_everywhere` |
 | the anchor domain is part of the WAL's deployment identity | **PASS** (round 5) | `test_a_WAL_bound_to_an_anchor_cannot_be_read_without_one` |
 | plan and swap on different anchor domains → refuse | **PASS** (round 5) | `test_plan_and_swap_on_DIFFERENT_anchor_domains_is_refused` |
@@ -113,7 +114,7 @@ could not see.
 
 ## Mutation verification
 
-76 guards disabled in turn; **all 76 fail** — 18 / 13 / 13 / 8 / 10 / 6 / 8 across seven rounds.
+77 guards disabled in turn; **all 77 fail** — 18 / 13 / 13 / 8 / 10 / 6 / 8 / 1 across eight rounds.
 
 | guard disabled | result |
 |---|---|
@@ -144,6 +145,7 @@ could not see.
 | orchestrator publishes a refold that materialized nothing | FAILED |
 | orchestrator skips Phase A | FAILED (2) |
 | orchestrator ignores a failed publication | FAILED |
+| writer binds the anchor domain but not the canonical path | FAILED (2 + 2) |
 
 Four mutations survived the first run — the three identity arms and the block-sourced
 attestation. Each was a **test gap where an earlier guard shadowed the check**: `prune_eligibility`
@@ -484,4 +486,56 @@ kind of waiver, one you believe you have. That advice is corrected above.
 said "domain id, not path". Keeping both is the safer behaviour — the domain id survives a
 remount, the path catches a second anchor root carrying the same declaration — so the **claim**
 was corrected rather than the code, and there is now a behavioural test: two roots declaring the
-same `domain_id` are still distinct, and reading the log against the second one is refused.
+same `domain_id` are still distinct, and reading the log against the second one is refused. The
+**writer** was not covered by that test, and round 8 found the hole it left.
+
+
+## Review round 8 — one finding
+
+### 1. [Medium] The writer bound the anchor domain but not the canonical path
+
+`manifest_authority()` records both `anchor_root` and `anchor_domain_id`; `read_wal()` checked
+both; `append()` checked only the domain id. So a **second anchor root declaring the same
+`domain_id`**, carrying a copy of the current sidecar, was accepted as the bound anchor — the
+round-6/7 bypass one level down, where the two anchors are no longer distinguishable by the one
+field the writer looked at.
+
+Reproduced before the fix, committing a repair against a twin root:
+
+```
+wal_head_seq        : 3
+canonical_anchor_seq: 2   <- left behind
+twin_anchor_seq     : 3
+next canonical-anchored append: WalRolledBack -> the durable anchor names seq 2 but the
+                                log's head is 3.
+```
+
+That last line is the real cost. The twin write succeeds and looks fine; the damage surfaces
+later as the deployment's *legitimate* anchor now reading as a rollback, stranding every
+subsequent prune and refold in fail-closed recovery — with the evidence pointing at a rollback
+that never happened.
+
+`append()` now compares `realpath(resolved_anchor)` against the bound `anchor_root` **before**
+`assert_fresh()` and before any allocation or write, so the caller's actual mistake is the
+diagnosis they get rather than a freshness error about an anchor they never meant to use. The
+domain-id check is kept and still runs: the path catches a twin root, the id catches a remount,
+and neither subsumes the other.
+
+`TestWriterIsBoundToTheCanonicalAnchorPath` builds two roots with the same declared `domain_id`
+and copies the live sidecar into the second, first **asserting the precondition** that the two
+are byte-identical and share a domain id — otherwise the test could pass for a reason other than
+the path check. Intent, commit and abort are each refused, and after every one of them the WAL,
+the canonical anchor and the twin anchor are asserted **byte-identical** to the pre-call
+snapshot. Two further tests pin the parts that make the guard usable rather than merely strict:
+the canonical path still commits normally, and a *stale* twin still reports the path mismatch,
+proving the ordering.
+
+Mutation: with the path comparison removed, intent and commit are accepted against the twin and
+abort errors on the state they left behind — 2 failures + 2 errors across the class.
+
+### Not changed
+
+The four round-7 fixes are unchanged and re-verified. Whole-VM snapshot rollback remains
+**PARTIAL — deployment prerequisite**: this round makes the writer's binding as strict as the
+reader's, which is a different question from whether the anchor root survives a restore of the
+VM. That still needs ops to name a root outside the snapshot scope.

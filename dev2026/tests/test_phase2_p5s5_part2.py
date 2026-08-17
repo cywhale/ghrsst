@@ -1550,7 +1550,9 @@ class TestTerminalWritersCannotBypassTheAnchor(unittest.TestCase):
         with self.assertRaises(rw.WalNotInitialized) as cm:
             rw.commit_repair(self.wal, repair_id=self.rid, day=self.day, fingerprint="fp",
                              at_utc="t", operator="ops", anchor_root=self.other)
-        self.assertIn("bound to anchor domain", str(cm.exception))
+        # The canonical-path check fires first now; a different domain is also a different
+        # path, so either half is a refusal and the stricter one wins.
+        self.assertIn("bound to the anchor at", str(cm.exception))
         with open(os.path.join(self.wal, rw.WAL_NAME), "rb") as fh:
             self.assertEqual(fh.read(), before_wal)
         self.assertFalse(os.path.isfile(os.path.join(self.other, rw.ANCHOR_NAME)),
@@ -1871,3 +1873,103 @@ class TestAuthorityBindsPathAndDomain(unittest.TestCase):
         with self.assertRaises(rw.WalNotInitialized) as cm:
             rw.read_wal(wal, anchor_root=b).assert_bound_to(self.root, os.path.realpath(b))
         self.assertIn("different deployment", str(cm.exception))
+
+
+# ==================== review round 8: a twin anchor root with the SAME declared domain
+class TestWriterIsBoundToTheCanonicalAnchorPath(unittest.TestCase):
+    """The previous bypass, one level down. A second root can declare the same `domain_id` and
+    carry a copy of the current sidecar; checking the id alone let a terminal write succeed
+    there, advancing the WAL and the twin while the canonical anchor fell behind."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = os.path.join(self.tmp, "manifest_root")
+        self.wal = os.path.join(self.tmp, "wal")
+        self.anchor = os.path.join(self.tmp, "anchor_domain")
+        self.twin = os.path.join(self.tmp, "twin_domain")
+        for d in (self.root, self.wal, self.anchor, self.twin):
+            os.makedirs(d, exist_ok=True)
+        s0, e0 = bm.block_bounds(ANCHOR, S, 0)
+        self.days = fx.calendar_span(s0, e0)[:3]
+        delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(delta, self.days)
+        blk = build_block(os.path.join(self.root, "b.zarr"), start_day=s0, end_day=e0,
+                          classification_target=list(self.days), delta_path=delta,
+                          artifacts_dir=os.path.join(self.tmp, "art"), lock=None,
+                          hard_reserve_bytes=0, unsafe_skip_isolation=True)
+        m = {"format": bm.MANIFEST_FORMAT, "version": bm.SCHEMA_VERSION, "generation": 1,
+             "generation_id": "g1", "created_utc": "2027-01-01T00:00:00Z", "created_by": "t",
+             "predecessor_generation": None, "predecessor_manifest": None,
+             "grid": {"ny": 32, "nx": 32, "region": [0, 32, 0, 32]},
+             "variables": list(fx.VARS),
+             "block_grid": {"anchor_day": ANCHOR, "block_days": S},
+             "segments": [dict(blk["segment"])], "superseded": [], "manifest_checksum": ""}
+        m["manifest_checksum"] = bm.compute_checksum(m)
+        bm.publish(self.root, m)
+
+        # TWO roots, the SAME declared domain id
+        decl = dict(domain_id="same-domain", at_utc="t", operator="ops",
+                    allow_same_filesystem=True, note="unit-test domain")
+        rw.declare_anchor_domain(self.anchor, **decl)
+        rw.declare_anchor_domain(self.twin, **decl)
+        rw.initialize_wal(self.wal, manifest_root=self.root, at_utc="t", operator="ops",
+                          anchor_root=self.anchor)
+        self.rid = rw.open_repair(self.wal, day=self.days[0], at_utc="t", operator="ops",
+                                  payload={}, anchor_root=self.anchor)["repair_id"]
+        # the twin carries a COPY of the current sidecar, so the id check alone cannot tell
+        shutil.copy(os.path.join(self.anchor, rw.ANCHOR_NAME),
+                    os.path.join(self.twin, rw.ANCHOR_NAME))
+
+    def _snapshot(self):
+        out = {}
+        for label, path in (("wal", os.path.join(self.wal, rw.WAL_NAME)),
+                            ("anchor", os.path.join(self.anchor, rw.ANCHOR_NAME)),
+                            ("twin", os.path.join(self.twin, rw.ANCHOR_NAME))):
+            with open(path, "rb") as fh:
+                out[label] = fh.read()
+        return out
+
+    def test_the_twin_really_is_indistinguishable_by_domain_id(self):
+        """Precondition: without the path check there is nothing to tell them apart."""
+        self.assertEqual(rw.anchor_domain_id(self.anchor), rw.anchor_domain_id(self.twin))
+        self.assertEqual(self._snapshot()["anchor"], self._snapshot()["twin"])
+
+    def test_intent_commit_and_abort_all_refuse_on_the_twin_path(self):
+        before = self._snapshot()
+        for label, call in (
+            ("intent", lambda: rw.open_repair(self.wal, day=self.days[1], at_utc="t",
+                                              operator="ops", payload={},
+                                              anchor_root=self.twin)),
+            ("commit", lambda: rw.commit_repair(self.wal, repair_id=self.rid,
+                                                day=self.days[0], fingerprint="fp",
+                                                at_utc="t", operator="ops",
+                                                anchor_root=self.twin)),
+            ("abort", lambda: rw.abort_repair(self.wal, repair_id=self.rid, day=self.days[0],
+                                              reason="x", at_utc="t", operator="ops",
+                                              anchor_root=self.twin)),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(rw.WalNotInitialized) as cm:
+                    call()
+                self.assertIn("still a different anchor", str(cm.exception))
+                self.assertEqual(self._snapshot(), before,
+                                 "WAL, canonical anchor and twin must all be byte-identical")
+
+    def test_the_canonical_path_still_works(self):
+        """The binding must not refuse the legitimate anchor."""
+        rw.commit_repair(self.wal, repair_id=self.rid, day=self.days[0], fingerprint="fp",
+                         at_utc="t", operator="ops", anchor_root=self.anchor)
+        state = rw.read_wal(self.wal, anchor_root=self.anchor)
+        self.assertEqual(state.repairs[self.rid].state, rw.COMMITTED)
+        self.assertEqual(state.anchor["seq"], state.last_seq)
+
+    def test_the_refusal_is_before_freshness_so_a_stale_twin_reports_the_path(self):
+        """Ordering: the path mismatch is the caller's actual mistake, so it is the diagnosis
+        they get -- not a freshness error about an anchor they never meant to use."""
+        with open(os.path.join(self.twin, rw.ANCHOR_NAME), "w") as fh:
+            fh.write(rw.canonical({"seq": 99, "record_checksum": "0" * 64, "at_utc": "t"}))
+        with self.assertRaises(rw.WalNotInitialized) as cm:
+            rw.commit_repair(self.wal, repair_id=self.rid, day=self.days[0], fingerprint="fp",
+                             at_utc="t", operator="ops", anchor_root=self.twin)
+        self.assertIn("still a different anchor", str(cm.exception))
