@@ -10,10 +10,10 @@ Branch `dev2026-p5-s5-part2-repair-lifecycle`, stacked on `fd3a234` (Part 1).
 - Lifecycle module: [`../ingest/corrected_day.py`](../ingest/corrected_day.py)
 - Gate wired into [`../ingest/prune_delta.py`](../ingest/prune_delta.py)
 - Builder derives `materialized_repairs`: [`../ingest/build_block.py`](../ingest/build_block.py)
-- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **77/77 green**
-- Full local suite: **749 tests OK** (17 skipped), up from 672
-- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **293 OK**
-- **62 guards mutation-verified**
+- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **87/87 green**
+- Full local suite: **759 tests OK** (17 skipped), up from 672
+- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **303 OK**
+- **68 guards mutation-verified**
 
 ## The rule
 
@@ -53,7 +53,10 @@ E1 is the deterministic identity; Phase A is the read that makes it about bytes.
 | a borrowed lock is bound to the canonical path | **PASS** (round 4) | `test_a_borrowed_lock_must_be_the_CANONICAL_one`, `test_the_refold_refuses_an_unrelated_held_lock` |
 | the anchor must equal the WAL head | **PASS** (round 4) | `test_an_anchor_that_LAGS_the_head_is_refused` |
 | E2 runs for **every** dropped day (bypass-WAL repair) | **PASS** (round 4) | `TestE2RunsForEveryDroppedDay` |
-| whole-root snapshot rollback, **through the real workflow** | **PASS** (round 5) | `TestExternalAnchorWorkflow` — initialize → intent → commit → refold → plan → swap, no `_write_anchor()` |
+| the external-anchor **mechanism** runs through the whole workflow | **PASS** (round 5–6) | `TestExternalAnchorWorkflow` — initialize → intent → commit → refold → plan → swap, no `_write_anchor()` |
+| **whole-VM snapshot rollback** | **PARTIAL — deployment prerequisite, NOT proven here** | see §"What the anchor does and does not prove" |
+| terminal writers cannot bypass the external anchor | **PASS** (round 6) | `TestTerminalWritersCannotBypassTheAnchor` |
+| the anchor domain is declared and auditable, not inferred | **PASS** (round 6) | `TestAnchorDomainIsDeclaredNotInferred` |
 | an external `anchor_root` is **required** on the production path | **PASS** (round 5) | `test_omitting_the_anchor_root_fails_closed_everywhere` |
 | the anchor domain is part of the WAL's deployment identity | **PASS** (round 5) | `test_a_WAL_bound_to_an_anchor_cannot_be_read_without_one` |
 | plan and swap on different anchor domains → refuse | **PASS** (round 5) | `test_plan_and_swap_on_DIFFERENT_anchor_domains_is_refused` |
@@ -106,7 +109,7 @@ could not see.
 
 ## Mutation verification
 
-62 guards disabled in turn; **all 62 fail** — 18 / 13 / 13 / 8 / 10 across five rounds.
+68 guards disabled in turn; **all 68 fail** — 18 / 13 / 13 / 8 / 10 / 6 across six rounds.
 
 | guard disabled | result |
 |---|---|
@@ -379,3 +382,59 @@ to show for it.
 run for every dropped day, so that had been false since. Corrected: the WAL's silence about a
 day is not evidence that nothing happened to it — a repair straight to delta leaves exactly that
 silence.
+
+
+## What the anchor does and does not prove
+
+Three things are routinely collapsed into one, and only the third is the protection:
+
+| | detects | does not detect |
+|---|---|---|
+| **a different path** | a `p5_repairs.jsonl` truncated or replaced on its own | anything that touches both directories |
+| **a different filesystem** (`st_dev`) | the above | one VM snapshot restoring both mounts |
+| **a different ROLLBACK DOMAIN** | a restore of the WAL's host | — |
+
+**No check inside this process can establish the third.** A path on a snapshotted volume is
+indistinguishable from one on an independent volume. So:
+
+- the anchor root must carry a **declared** `p5_anchor_domain.json` — an auditable
+  `domain_id` an operator sets deliberately — and the WAL binds to **that id**, not to a local
+  path, which changes on every remount and says nothing about durability;
+- `st_dev` equality is refused as a **minimum preflight**, with the explicit note that a
+  *different* `st_dev` would still not prove a different backup domain. A genuinely independent
+  volume that reports the host device can be accepted by re-declaring with
+  `allow_same_filesystem=True` — recorded **in the artifact**, because it is a deployment claim
+  being waived and belongs where an auditor reads the deployment, not at a call site;
+- **the guarantee itself stays PARTIAL** until ops confirm the anchor lives outside the WAL
+  host's snapshot scope: another machine, an object store, or a volume IT has stated is not
+  restored with the VM.
+
+**What the tests do prove:** the whole workflow uses the external anchor, refuses when it is
+missing, undeclared, co-located, on the same filesystem without acknowledgement, from another
+domain, or behind the log's head. My round-5 test rolled back a WAL subdirectory while sparing
+a sibling **under the same `mkdtemp()`** — that demonstrates selective-rollback detection, and I
+marked it PASS for whole-VM rollback, which it never showed. The row is PARTIAL again and the
+suite's own domain declaration says `NOT a real rollback domain` in its `note`.
+
+## Review round 6 — two findings
+
+### 1. [High] "Different path" was marked as PASS for snapshot rollback
+
+Covered above. The correction is in three places: the gate row, the module docstring, and the
+test fixture's own declaration.
+
+### 2. [Medium] Terminal writers could bypass the external anchor
+
+`append()` accepted `anchor_root=None` and wrote a **co-located** sidecar — and that is the API
+`repair_committed` / `repair_aborted` used. A terminal write therefore *succeeded* while leaving
+the real external anchor behind: nothing lost, but every later prune and refold failed closed
+and the deployment needed manual recovery. **A write that reports success and strands the
+workflow is worse than one that refuses.**
+
+- `append()` now goes through `resolve_anchor_root()` like every reader — no silent fallback;
+- `commit_repair()` / `abort_repair()` are the terminal writers the workflow uses, so the anchor
+  choice lives in one place rather than at every call site;
+- the supplied anchor is checked against the domain the WAL is **bound** to **before a byte is
+  written**, so a mismatched call leaves the WAL and both anchors byte-identical — asserted on
+  bytes, and on the absence of any co-located sidecar;
+- the end-to-end workflow test now uses `commit_repair()` rather than raw `append()`.
