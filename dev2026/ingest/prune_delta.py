@@ -363,6 +363,8 @@ def _bulk_build(orig: dict, out_path: str, keep_sorted: List[str], *,
 def prune_delta(delta_path: str, out_path: str, keep_days: Sequence[str], *,
                 compaction_lock_path: Optional[str] = None,
                 wal_root: Optional[str] = None, manifest_root: Optional[str] = None,
+                anchor_root: Optional[str] = None,
+                unsafe_allow_colocated_anchor: bool = False,
                 allowed_legacy_paths: Optional[Sequence[str]] = None,
                 corrected_day_gate: bool = True,
                 source_daily: Optional[str] = None, source_delta: Optional[str] = None,
@@ -494,7 +496,9 @@ def prune_delta(delta_path: str, out_path: str, keep_days: Sequence[str], *,
                 try:
                     gate = cd.prune_eligibility(
                         dropped, manifest_root=manifest_root, delta_path=delta_path,
-                        wal_root=wal_root, allowed_legacy_paths=allowed_legacy_paths)
+                        wal_root=wal_root, anchor_root=anchor_root,
+                        allowed_legacy_paths=allowed_legacy_paths,
+                        unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
                 except Exception as exc:            # unreadable manifest/WAL -> fail closed
                     return _refuse(f"the corrected-day gate could not run ({exc}); refusing "
                                    f"rather than dropping days on an unchecked basis")
@@ -547,6 +551,7 @@ def prune_delta(delta_path: str, out_path: str, keep_days: Sequence[str], *,
             "source": ("+".join(sorted(src_used)) if src_used else None),
             "keep_days": keep_sorted,
             "dropped_days": dropped,
+            "anchor_root": (os.path.realpath(anchor_root) if anchor_root else None),
             "recent_window": rw,
             "validation": validation,
             "swap_plan": {

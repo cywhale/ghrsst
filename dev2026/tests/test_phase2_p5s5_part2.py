@@ -37,6 +37,37 @@ from store.segmented_cube import SegmentedCubeStore  # noqa: E402
 from store.tiered_cube import TieredCube  # noqa: E402
 from store.time_cube import TimeCubeStore  # noqa: E402
 
+def _refold_entry(*a, **kw):
+    kw.setdefault("unsafe_allow_colocated_anchor", True)
+    return cd.corrective_refold(*a, **kw)
+
+
+def _prune(*a, **kw):
+    kw.setdefault("unsafe_allow_colocated_anchor", True)
+    return prune_delta(*a, **kw)
+
+
+def _swap(*a, **kw):
+    kw.setdefault("unsafe_allow_colocated_anchor", True)
+    return execute_swap_plan(*a, **kw)
+
+
+def _eligibility(*a, **kw):
+    """Shim: this suite's WAL uses a co-located anchor (see `_Base.setUp`)."""
+    kw.setdefault("unsafe_allow_colocated_anchor", True)
+    return cd.prune_eligibility(*a, **kw)
+
+
+def _identity(*a, **kw):
+    kw.setdefault("unsafe_allow_colocated_anchor", True)
+    return cd._verify_repair_identity(*a, **kw)
+
+
+def _phase_a(*a, **kw):
+    kw.setdefault("unsafe_allow_colocated_anchor", True)
+    return cd.phase_a_base_only(*a, **kw)
+
+
 ANCHOR = "2026-06-27"
 S = 90
 
@@ -66,7 +97,11 @@ class _Base(unittest.TestCase):
         self.v1_id = self.v1["segment"]["segment_id"]
         self._publish_gen(self.v1, generation=1)
         # The WAL is bound to this manifest authority before anything asks it a question.
-        rw.initialize_wal(self.wal, manifest_root=self.root, at_utc="t", operator="ops")
+        # Most of this suite is not about the anchor domain, so it waives the external-anchor
+        # requirement in ONE named place. TestExternalAnchorWorkflow uses a real separate
+        # domain end to end.
+        rw.initialize_wal(self.wal, manifest_root=self.root, at_utc="t", operator="ops",
+                          unsafe_allow_colocated_anchor=True)
 
     # ---- helpers ---------------------------------------------------------
     def _fold(self, name, *, delta_path=None, wal_root=None):
@@ -75,7 +110,8 @@ class _Base(unittest.TestCase):
                            classification_target=list(self.days),
                            delta_path=delta_path or self.delta,
                            artifacts_dir=self.artifacts, lock=None, hard_reserve_bytes=0,
-                           unsafe_skip_isolation=True, wal_root=wal_root)
+                           unsafe_skip_isolation=True, wal_root=wal_root,
+                           unsafe_allow_colocated_anchor=True)
 
     def _publish_gen(self, plan, *, generation):
         """Publish the block as generation 1 directly (the S4 path is exercised elsewhere)."""
@@ -98,7 +134,8 @@ class _Base(unittest.TestCase):
 
     def _open_repair(self, day=None):
         rec = rw.open_repair(self.wal, day=day or self.repaired, at_utc="t", operator="ops",
-                             payload={"expected_vars": list(fx.VARS)})
+                             payload={"expected_vars": list(fx.VARS)},
+                             unsafe_allow_colocated_anchor=True)
         return rec["repair_id"]
 
     def _apply_repair(self, day=None, *, bump=25.0):
@@ -186,7 +223,7 @@ class TestE2Parity(_Base):
 class TestPhaseABaseOnly(_Base):
     def test_a_completed_refold_passes_phase_A(self):
         rid, fp, _plan = self._repair_and_refold()
-        out = cd.phase_a_base_only(self.repaired, manifest_root=self.root,
+        out = _phase_a(self.repaired, manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal,
                                    expected_segment_id=self.v2_id)
         self.assertEqual(out["repair_id"], rid)
@@ -201,7 +238,7 @@ class TestPhaseABaseOnly(_Base):
         self._apply_repair()
         self._commit_repair(rid)
         with self.assertRaises(cd.CorrectedDayRefused) as cm:
-            cd.phase_a_base_only(self.repaired, manifest_root=self.root,
+            _phase_a(self.repaired, manifest_root=self.root,
                                  delta_path=self.delta, wal_root=self.wal)
         self.assertIn("E2 parity failed", str(cm.exception))
 
@@ -209,7 +246,7 @@ class TestPhaseABaseOnly(_Base):
         """A refold that published but did not take effect looks identical from outside."""
         self._repair_and_refold()
         with self.assertRaises(cd.CorrectedDayRefused) as cm:
-            cd.phase_a_base_only(self.repaired, manifest_root=self.root,
+            _phase_a(self.repaired, manifest_root=self.root,
                                  delta_path=self.delta, wal_root=self.wal,
                                  expected_segment_id="b_v3_never_published")
         self.assertIn("not the corrected version", str(cm.exception))
@@ -221,7 +258,7 @@ class TestPhaseABaseOnly(_Base):
         self._apply_repair(bump=5.0)
         self._commit_repair(rid2)
         with self.assertRaises(cd.CorrectedDayRefused) as cm:
-            cd.phase_a_base_only(self.repaired, manifest_root=self.root,
+            _phase_a(self.repaired, manifest_root=self.root,
                                  delta_path=self.delta, wal_root=self.wal)
         # E2 fires first: base now differs from the re-repaired delta. Both are refusals.
         self.assertIn("E2 parity failed", str(cm.exception))
@@ -234,7 +271,7 @@ class TestPhaseABaseOnly(_Base):
         seg["build_provenance"]["materialized_repairs"][self.repaired][
             "source_fingerprint"] = "0" * 64
         with self.assertRaises(cd.CorrectedDayRefused) as cm:
-            cd._verify_repair_identity(self.repaired, seg=seg, wal_root=self.wal,
+            _identity(self.repaired, seg=seg, wal_root=self.wal,
                                        delta_path=self.delta)
         self.assertIn("does not match the WAL", str(cm.exception))
 
@@ -248,7 +285,7 @@ class TestPhaseABaseOnly(_Base):
         seg["build_provenance"] = dict(seg.get("build_provenance") or {},
                                        materialized_repairs={})
         with self.assertRaises(cd.CorrectedDayRefused) as cm:
-            cd._verify_repair_identity(self.repaired, seg=seg, wal_root=self.wal,
+            _identity(self.repaired, seg=seg, wal_root=self.wal,
                                        delta_path=self.delta)
         self.assertIn("has not been folded into base", str(cm.exception))
 
@@ -259,7 +296,7 @@ class TestPhaseABaseOnly(_Base):
         self._commit_repair(rid2)
         seg = dict(bm.load_live(self.root)["segments"][0])
         with self.assertRaises(cd.CorrectedDayRefused) as cm:
-            cd._verify_repair_identity(self.repaired, seg=seg, wal_root=self.wal,
+            _identity(self.repaired, seg=seg, wal_root=self.wal,
                                        delta_path=self.delta)
         self.assertIn("supersedes what the block carries", str(cm.exception))
         self.assertIn(rid, str(cm.exception))
@@ -276,7 +313,7 @@ class TestPhaseABaseOnly(_Base):
                                            "repair_id": rid, "source_kind": "block",
                                            "source_fingerprint": fp}})
         with self.assertRaises(cd.CorrectedDayRefused) as cm:
-            cd._verify_repair_identity(self.repaired, seg=seg, wal_root=self.wal,
+            _identity(self.repaired, seg=seg, wal_root=self.wal,
                                        delta_path=self.delta)
         self.assertIn("reads the repaired day from delta", str(cm.exception))
 
@@ -287,7 +324,7 @@ class TestPhaseABaseOnly(_Base):
         pruned = os.path.join(self.tmp, "delta_pruned.zarr")
         fx.build_delta(pruned, [d for d in self.days if d != self.repaired])
         with self.assertRaises(cd.CorrectedDayRefused) as cm:
-            cd.phase_a_base_only(self.repaired, manifest_root=self.root,
+            _phase_a(self.repaired, manifest_root=self.root,
                                  delta_path=pruned, wal_root=self.wal)
         self.assertIn("PRE-prune", str(cm.exception))
 
@@ -307,13 +344,13 @@ class TestPhaseABaseOnly(_Base):
 # ==================================================================== the prune gate
 class TestPruneEligibility(_Base):
     def test_a_never_repaired_day_needs_only_the_WALs_silence(self):
-        out = cd.prune_eligibility([self.days[0]], manifest_root=self.root,
+        out = _eligibility([self.days[0]], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [self.days[0]])
 
     def test_an_OPEN_intent_blocks_its_day(self):
         self._open_repair()
-        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+        out = _eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [])
         self.assertIn("no timeout", out["refused"][self.repaired])
@@ -322,14 +359,14 @@ class TestPruneEligibility(_Base):
         rid = self._open_repair()
         self._apply_repair()
         self._commit_repair(rid)
-        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+        out = _eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [])
         self.assertIn("has not been folded into base", out["refused"][self.repaired])
 
     def test_a_completed_refold_authorizes_the_day(self):
         self._repair_and_refold()
-        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+        out = _eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [self.repaired])
         self.assertEqual(out["refused"], {})
@@ -338,7 +375,7 @@ class TestPruneEligibility(_Base):
         self._repair_and_refold()
         with open(os.path.join(self.wal, rw.WAL_NAME), "a") as fh:
             fh.write('{"seq": 9, "tr')
-        out = cd.prune_eligibility(self.days, manifest_root=self.root,
+        out = _eligibility(self.days, manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [])
         self.assertEqual(set(out["refused"]), set(self.days))
@@ -349,7 +386,7 @@ class TestPruneEligibility(_Base):
         latest committed id and the matching fingerprint — and Phase A still refuses because
         base does not serve the corrected value."""
         rid, fp, _ = self._repair_and_refold()
-        state = rw.read_wal(self.wal)
+        state = rw.read_wal(self.wal, anchor_root=self.wal)
         mr = cd._materialized_map(self.root, [self.repaired])
         self.assertEqual(
             rw.prune_authorization(state, [self.repaired], materialized_repairs=mr)["authorized"],
@@ -364,7 +401,7 @@ class TestPruneEligibility(_Base):
         gb = zarr.open_group(block, mode="a")
         gb["sst"][idx, i0:i1, j0:j1] = np.asarray(gb["sst"][idx, i0:i1, j0:j1]) + 3.0
 
-        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+        out = _eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [])
         self.assertIn("Phase A did not pass", out["refused"][self.repaired])
@@ -376,7 +413,7 @@ class TestPruneDeltaHonoursTheGate(_Base):
         return [d for d in self.days if d != self.days[0]]
 
     def test_dropping_days_REQUIRES_wal_root_and_manifest_root(self):
-        out = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), self._keep(),
+        out = _prune(self.delta, os.path.join(self.tmp, "staging.zarr"), self._keep(),
                           base_days=self.days, spatial_window_days=1)
         self.assertEqual(out["status"], "refused")
         self.assertIn("wal_root and manifest_root are REQUIRED", out["reason"])
@@ -388,7 +425,7 @@ class TestPruneDeltaHonoursTheGate(_Base):
         self._apply_repair()
         self._commit_repair(rid)
         keep = [d for d in self.days if d != self.repaired]
-        out = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+        out = _prune(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
                           base_days=self.days, spatial_window_days=1,
                           wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(out["status"], "refused")
@@ -399,7 +436,7 @@ class TestPruneDeltaHonoursTheGate(_Base):
     def test_an_open_intent_refuses_the_prune(self):
         self._open_repair()
         keep = [d for d in self.days if d != self.repaired]
-        out = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+        out = _prune(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
                           base_days=self.days, spatial_window_days=1,
                           wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(out["status"], "refused")
@@ -409,7 +446,7 @@ class TestPruneDeltaHonoursTheGate(_Base):
         """The ordering completes: repair -> refold -> publish -> Phase A -> prune."""
         self._repair_and_refold()
         keep = [d for d in self.days if d != self.repaired]
-        out = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+        out = _prune(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
                           base_days=self.days, spatial_window_days=1,
                           wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(out["status"], "ok", out.get("reason"))
@@ -417,7 +454,7 @@ class TestPruneDeltaHonoursTheGate(_Base):
 
     def test_a_pure_reorder_needs_no_gate(self):
         """Nothing is dropped, so there is no corrected day to authorize."""
-        out = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), self.days,
+        out = _prune(self.delta, os.path.join(self.tmp, "staging.zarr"), self.days,
                           spatial_window_days=1)
         self.assertEqual(out["status"], "ok", out.get("reason"))
         self.assertEqual(out["dropped_days"], [])
@@ -434,11 +471,11 @@ class TestTheFullOrdering(_Base):
 
         # PHASE A must fail before the refold: base still holds the stale value.
         with self.assertRaises(cd.CorrectedDayRefused):
-            cd.phase_a_base_only(self.repaired, manifest_root=self.root,
+            _phase_a(self.repaired, manifest_root=self.root,
                                  delta_path=self.delta, wal_root=self.wal)
 
         v2 = self._refold()
-        phase_a = cd.phase_a_base_only(self.repaired, manifest_root=self.root,
+        phase_a = _phase_a(self.repaired, manifest_root=self.root,
                                        delta_path=self.delta, wal_root=self.wal,
                                        expected_segment_id=v2["segment"]["segment_id"])
         self.assertEqual(phase_a["repair_id"], rid)
@@ -450,7 +487,7 @@ class TestTheFullOrdering(_Base):
 
         # PHASE B — authorized only now
         keep = [d for d in self.days if d != self.repaired]
-        plan = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+        plan = _prune(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
                            base_days=self.days, spatial_window_days=1,
                            wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(plan["status"], "ok", plan.get("reason"))
@@ -498,7 +535,8 @@ class TestTheFullOrdering(_Base):
                            predecessor_present=[self.repaired],
                            predecessor_path=self.v1["out_path"], delta_path=pruned,
                            artifacts_dir=self.artifacts, lock=None, hard_reserve_bytes=0,
-                           unsafe_skip_isolation=True, wal_root=self.wal)
+                           unsafe_skip_isolation=True, wal_root=self.wal,
+                           unsafe_allow_colocated_anchor=True)
         smap = plan["source_map"]
         self.assertEqual(smap[self.repaired]["source_kind"], "block",
                          "precondition: the repaired day came from the predecessor block")
@@ -512,7 +550,7 @@ class TestTheFullOrdering(_Base):
         self._commit_repair(rid)
         plan = self._fold("b_nowal")
         self.assertEqual(plan["segment"]["build_provenance"]["materialized_repairs"], {})
-        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+        out = _eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [],
                          "a block that attests nothing cannot authorize a prune")
@@ -532,7 +570,7 @@ class TestSwapTimeReauthorization(_Base):
     def _plan_dropping_repaired(self):
         self._repair_and_refold()
         keep = [d for d in self.days if d != self.repaired]
-        plan = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+        plan = _prune(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
                            base_days=self.days, spatial_window_days=1,
                            wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(plan["status"], "ok", plan.get("reason"))
@@ -547,7 +585,7 @@ class TestSwapTimeReauthorization(_Base):
         self._commit_repair(rid2)
         before = sorted(bm.inspect_store_contract(self.delta).days)
 
-        out = execute_swap_plan(plan, mode="s2",
+        out = _swap(plan, mode="s2",
                                 hold_dir=os.path.join(self.tmp, "hold"),
                                 wal_root=self.wal, manifest_root=self.root,
                                 compaction_lock_path=self.clock)
@@ -570,7 +608,7 @@ class TestSwapTimeReauthorization(_Base):
 
     def test_swapping_away_days_REQUIRES_the_roots(self):
         plan = self._plan_dropping_repaired()
-        out = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+        out = _swap(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
                                 compaction_lock_path=self.clock)
         self.assertEqual(out["status"], "refused")
         self.assertIn("REQUIRED to swap away days", out["reason"])
@@ -579,7 +617,7 @@ class TestSwapTimeReauthorization(_Base):
     def test_an_unchanged_authorization_still_swaps(self):
         """The re-run gate must not refuse the legitimate case."""
         plan = self._plan_dropping_repaired()
-        out = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+        out = _swap(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
                                 wal_root=self.wal, manifest_root=self.root,
                                 compaction_lock_path=self.clock)
         self.assertEqual(out["status"], "swapped", out.get("reason"))
@@ -594,7 +632,7 @@ class TestWalDeploymentIdentity(_Base):
     def test_a_missing_WAL_authorizes_nothing(self):
         empty = os.path.join(self.tmp, "no_wal")
         os.makedirs(empty, exist_ok=True)
-        out = cd.prune_eligibility(self.days, manifest_root=self.root,
+        out = _eligibility(self.days, manifest_root=self.root,
                                    delta_path=self.delta, wal_root=empty)
         self.assertEqual(out["authorized"], [])
         self.assertEqual(out["wal"], "untrustworthy")
@@ -605,7 +643,7 @@ class TestWalDeploymentIdentity(_Base):
         os.makedirs(root, exist_ok=True)
         with open(os.path.join(root, rw.WAL_NAME), "w") as fh:
             fh.write("")
-        out = cd.prune_eligibility(self.days, manifest_root=self.root,
+        out = _eligibility(self.days, manifest_root=self.root,
                                    delta_path=self.delta, wal_root=root)
         self.assertEqual(out["authorized"], [])
 
@@ -616,8 +654,9 @@ class TestWalDeploymentIdentity(_Base):
                     os.path.join(other_root, bm.LIVE_NAME))
         other_wal = os.path.join(self.tmp, "other_wal")
         os.makedirs(other_wal, exist_ok=True)
-        rw.initialize_wal(other_wal, manifest_root=other_root, at_utc="t", operator="ops")
-        out = cd.prune_eligibility(self.days, manifest_root=self.root,
+        rw.initialize_wal(other_wal, manifest_root=other_root, at_utc="t", operator="ops",
+                          unsafe_allow_colocated_anchor=True)
+        out = _eligibility(self.days, manifest_root=self.root,
                                    delta_path=self.delta, wal_root=other_wal)
         self.assertEqual(out["authorized"], [])
         self.assertIn("different deployment", out["refused"][self.days[0]])
@@ -628,31 +667,35 @@ class TestWalDeploymentIdentity(_Base):
         never authorize anything -- the fail-closed property lives at authorization time."""
         root = os.path.join(self.tmp, "wal_unbound2")
         os.makedirs(root, exist_ok=True)
-        rw.open_repair(root, day=self.repaired, at_utc="t", operator="ops")
+        rw.open_repair(root, day=self.repaired, at_utc="t", operator="ops",
+                       unsafe_allow_colocated_anchor=True)
         with self.assertRaises(rw.WalError) as cm:
-            rw.initialize_wal(root, manifest_root=self.root, at_utc="t", operator="ops")
+            rw.initialize_wal(root, manifest_root=self.root, at_utc="t", operator="ops",
+                              unsafe_allow_colocated_anchor=True)
         self.assertIn("cannot be retroactively bound", str(cm.exception))
-        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+        out = _eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=root)
         self.assertEqual(out["authorized"], [])
 
     def test_initialization_is_idempotent_and_rebinding_is_refused(self):
-        again = rw.initialize_wal(self.wal, manifest_root=self.root, at_utc="t", operator="ops")
+        again = rw.initialize_wal(self.wal, manifest_root=self.root, at_utc="t",
+                                  operator="ops", unsafe_allow_colocated_anchor=True)
         self.assertEqual(again["status"], "already_initialized")
         other = os.path.join(self.tmp, "other2")
         os.makedirs(other, exist_ok=True)
         shutil.copy(os.path.join(self.root, bm.LIVE_NAME), os.path.join(other, bm.LIVE_NAME))
         with self.assertRaises(rw.WalError) as cm:
-            rw.initialize_wal(self.wal, manifest_root=other, at_utc="t", operator="ops")
+            rw.initialize_wal(self.wal, manifest_root=other, at_utc="t", operator="ops",
+                              unsafe_allow_colocated_anchor=True)
         self.assertIn("would transfer its authorizations", str(cm.exception))
 
     def test_the_authority_survives_publishing_a_new_generation(self):
         """`generation_id` changes on every publish and cannot be the binding; the grid, the
         block calendar and the resolved root do not."""
-        before = rw.read_wal(self.wal).authority
+        before = rw.read_wal(self.wal, anchor_root=self.wal).authority
         self._repair_and_refold()
-        rw.read_wal(self.wal).assert_bound_to(self.root)
-        self.assertEqual(rw.read_wal(self.wal).authority, before)
+        rw.read_wal(self.wal, anchor_root=self.wal).assert_bound_to(self.root)
+        self.assertEqual(rw.read_wal(self.wal, anchor_root=self.wal).authority, before)
 
     def test_a_wal_initialized_record_may_only_be_first(self):
         with self.assertRaises(rw.WalError):
@@ -667,7 +710,7 @@ class TestTheGateChecksTheLiveDelta(_Base):
         other = os.path.join(self.tmp, "other_delta.zarr")
         fx.build_delta(other, self.days)
         keep = [d for d in self.days if d != self.repaired]
-        out = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+        out = _prune(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
                           base_days=self.days, spatial_window_days=1,
                           source_delta=other, wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(out["status"], "refused")
@@ -686,7 +729,7 @@ class TestCorrectiveRefoldOrchestration(_Base):
         self.compaction_lock = os.path.join(self.tmp, "p5_compaction.lock")
 
     def _refold_via_entry_point(self, name="b_v2"):
-        return cd.corrective_refold(
+        return _refold_entry(
             day=self.repaired, manifest_root=self.root, delta_path=self.delta,
             wal_root=self.wal, new_block_path=os.path.join(self.root, name + ".zarr"),
             artifacts_dir=self.artifacts, start_day=self.s0, end_day=self.e0,
@@ -756,11 +799,11 @@ class TestCorrectiveRefoldOrchestration(_Base):
 
         # PHASE B — plan, then the REAL swap with the gate re-run under the ingest lock
         keep = [d for d in self.days if d != self.repaired]
-        plan = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+        plan = _prune(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
                            base_days=self.days, spatial_window_days=1,
                            wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(plan["status"], "ok", plan.get("reason"))
-        swap = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+        swap = _swap(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
                                  wal_root=self.wal, manifest_root=self.root,
                                  compaction_lock_path=self.compaction_lock)
         self.assertEqual(swap["status"], "swapped", swap.get("reason"))
@@ -789,7 +832,7 @@ class TestCorrectiveRefoldOrchestration(_Base):
 
         # and Phase A is now correctly unavailable: it is a PRE-prune check
         with self.assertRaises(cd.CorrectedDayRefused):
-            cd.phase_a_base_only(self.repaired, manifest_root=self.root,
+            _phase_a(self.repaired, manifest_root=self.root,
                                  delta_path=self.delta, wal_root=self.wal)
 
     def test_the_sealed_predecessor_is_untouched_and_superseded(self):
@@ -824,7 +867,7 @@ class TestOneReservationSpansTheRefold(_Base):
     def test_the_happy_path_uses_NO_unsafe_waiver(self):
         """Real compaction reservation, real build isolation, real positive disk reserve, real
         provenance verification. If any of those only worked with a waiver, this fails."""
-        out = cd.corrective_refold(
+        out = _refold_entry(
             day=self.repaired, manifest_root=self.root, delta_path=self.delta,
             wal_root=self.wal, new_block_path=os.path.join(self.root, "b_v2.zarr"),
             artifacts_dir=self.artifacts, start_day=self.s0, end_day=self.e0,
@@ -864,7 +907,7 @@ class TestOneReservationSpansTheRefold(_Base):
 
         bm.publish, cd.phase_a_base_only = probing, probing_phase_a
         try:
-            cd.corrective_refold(
+            _refold_entry(
                 day=self.repaired, manifest_root=self.root, delta_path=self.delta,
                 wal_root=self.wal, new_block_path=os.path.join(self.root, "b_v2.zarr"),
                 artifacts_dir=self.artifacts, start_day=self.s0, end_day=self.e0,
@@ -894,7 +937,7 @@ class TestOneReservationSpansTheRefold(_Base):
         bm.publish = breaking
         try:
             with self.assertRaises(CompactionLockError):
-                cd.corrective_refold(
+                _refold_entry(
                     day=self.repaired, manifest_root=self.root, delta_path=self.delta,
                     wal_root=self.wal,
                     new_block_path=os.path.join(self.root, "b_v2.zarr"),
@@ -948,7 +991,7 @@ class TestOneReservationSpansTheRefold(_Base):
         unrelated = os.path.join(self.tmp, "unrelated.lock")
         with CompactionLock(self.compaction_lock), CompactionLock(unrelated) as other:
             with self.assertRaises(cd.CorrectedDayRefused) as cm:
-                cd.corrective_refold(
+                _refold_entry(
                     day=self.repaired, manifest_root=self.root, delta_path=self.delta,
                     wal_root=self.wal,
                     new_block_path=os.path.join(self.root, "b_v2.zarr"),
@@ -965,7 +1008,7 @@ class TestSwapHoldsAReservation(_Base):
     def _plan(self):
         self._repair_and_refold()
         keep = [d for d in self.days if d != self.repaired]
-        plan = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+        plan = _prune(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
                            base_days=self.days, spatial_window_days=1,
                            wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(plan["status"], "ok", plan.get("reason"))
@@ -993,7 +1036,7 @@ class TestSwapHoldsAReservation(_Base):
 
         sd.os.rename = probing
         try:
-            out = execute_swap_plan(plan, mode="s2",
+            out = _swap(plan, mode="s2",
                                     hold_dir=os.path.join(self.tmp, "hold"),
                                     wal_root=self.wal, manifest_root=self.root,
                                     compaction_lock_path=clock)
@@ -1009,7 +1052,7 @@ class TestSwapHoldsAReservation(_Base):
         plan = self._plan()
         before = sorted(bm.inspect_store_contract(self.delta).days)
         with CompactionLock(clock, holder="a-build"):
-            out = execute_swap_plan(plan, mode="s2",
+            out = _swap(plan, mode="s2",
                                     hold_dir=os.path.join(self.tmp, "hold"),
                                     wal_root=self.wal, manifest_root=self.root,
                                     compaction_lock_path=clock)
@@ -1036,7 +1079,7 @@ class TestWalFreshnessAnchor(_Base):
         self.assertIsNone(rolled.latest_committed(self.repaired),
                           "precondition: the repair now reads as never having happened")
 
-        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+        out = _eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [])
         self.assertIn("must equal the head", out["refused"][self.repaired])
@@ -1045,13 +1088,13 @@ class TestWalFreshnessAnchor(_Base):
         """`seq` present in the log is not enough: an anchor that lags leaves the tail
         unattested, which is indistinguishable from a rollback."""
         self._repair_and_refold()
-        state = rw.read_wal(self.wal)
+        state = rw.read_wal(self.wal, anchor_root=self.wal)
         self.assertGreater(state.last_seq, 1)
         first = state.records[0]
         with open(os.path.join(self.wal, rw.ANCHOR_NAME), "w") as fh:
             fh.write(rw.canonical({"seq": 1, "record_checksum": first["record_checksum"],
                                    "at_utc": "t"}))
-        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+        out = _eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [])
         self.assertIn("must equal the head", out["refused"][self.repaired])
@@ -1064,7 +1107,7 @@ class TestWalFreshnessAnchor(_Base):
         anchor_root = os.path.join(self.tmp, "anchor_domain")
         os.makedirs(anchor_root, exist_ok=True)
         # both domains start in step, so the divergence below is the rollback and nothing else
-        rw._write_anchor(anchor_root, rw.read_wal(self.wal).records[-1])
+        rw._write_anchor(anchor_root, rw.read_wal(self.wal, anchor_root=self.wal).records[-1])
         rw.read_wal(self.wal, anchor_root=anchor_root).assert_fresh()
         snapshot = os.path.join(self.tmp, "wal_snapshot")
         shutil.copytree(self.wal, snapshot)         # the "VM snapshot", log + sidecar together
@@ -1072,12 +1115,12 @@ class TestWalFreshnessAnchor(_Base):
         rid = self._open_repair()                   # advance both anchors
         self._apply_repair()
         self._commit_repair(rid)
-        rw._write_anchor(anchor_root, rw.read_wal(self.wal).records[-1])
+        rw._write_anchor(anchor_root, rw.read_wal(self.wal, anchor_root=self.wal).records[-1])
 
         shutil.rmtree(self.wal)                     # roll the WHOLE root back
         shutil.copytree(snapshot, self.wal)
 
-        co_located = rw.read_wal(self.wal)
+        co_located = rw.read_wal(self.wal, anchor_root=self.wal)
         co_located.assert_fresh()                   # the restored pair is self-consistent
 
         with self.assertRaises(rw.WalRolledBack) as cm:
@@ -1086,13 +1129,13 @@ class TestWalFreshnessAnchor(_Base):
 
     def test_a_substituted_record_at_the_anchor_seq_is_refused(self):
         self._repair_and_refold()
-        state = rw.read_wal(self.wal)
+        state = rw.read_wal(self.wal, anchor_root=self.wal)
         anchor = state.anchor
         self.assertIsNotNone(anchor)
         with open(os.path.join(self.wal, rw.ANCHOR_NAME), "w") as fh:
             fh.write(rw.canonical({"seq": anchor["seq"], "record_checksum": "0" * 64,
                                    "at_utc": anchor["at_utc"]}))
-        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+        out = _eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [])
         self.assertIn("does not contain the record the durable anchor names",
@@ -1101,24 +1144,24 @@ class TestWalFreshnessAnchor(_Base):
     def test_records_with_NO_anchor_at_all_authorize_nothing(self):
         self._repair_and_refold()
         os.remove(os.path.join(self.wal, rw.ANCHOR_NAME))
-        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+        out = _eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [])
         self.assertIn("no durable anchor", out["refused"][self.repaired])
 
     def test_the_anchor_is_monotonic(self):
         self._repair_and_refold()                   # advance the log well past seq 1
-        state = rw.read_wal(self.wal)
+        state = rw.read_wal(self.wal, anchor_root=self.wal)
         head = state.anchor["seq"]
         self.assertGreater(head, 1, "precondition: the anchor is past the initial record")
         rw._write_anchor(self.wal, {"seq": 1, "record_checksum": "x", "at_utc": "t"})
-        self.assertEqual(rw.read_wal(self.wal).anchor["seq"], head,
+        self.assertEqual(rw.read_wal(self.wal, anchor_root=self.wal).anchor["seq"], head,
                          "a stale write must not un-anchor a log that has gone further")
 
     def test_a_healthy_log_passes_freshness(self):
         self._repair_and_refold()
-        rw.read_wal(self.wal).assert_fresh()
-        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+        rw.read_wal(self.wal, anchor_root=self.wal).assert_fresh()
+        out = _eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [self.repaired])
 
@@ -1133,10 +1176,10 @@ class TestE2RunsForEveryDroppedDay(_Base):
     def test_a_bypass_WAL_repair_is_refused(self):
         """The reviewer's case: rewrite the delta day, write nothing to the WAL."""
         self._apply_repair(bump=17.0)               # no intent, no commit -- straight to delta
-        state = rw.read_wal(self.wal)
+        state = rw.read_wal(self.wal, anchor_root=self.wal)
         self.assertIsNone(state.latest_committed(self.repaired),
                           "precondition: the WAL knows nothing about this day")
-        out = cd.prune_eligibility([self.repaired], manifest_root=self.root,
+        out = _eligibility([self.repaired], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [])
         self.assertIn("no committed repair explains", out["refused"][self.repaired])
@@ -1144,7 +1187,7 @@ class TestE2RunsForEveryDroppedDay(_Base):
     def test_prune_delta_refuses_a_bypass_WAL_repair(self):
         self._apply_repair(bump=17.0)
         keep = [d for d in self.days if d != self.repaired]
-        out = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+        out = _prune(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
                           base_days=self.days, spatial_window_days=1,
                           wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(out["status"], "refused")
@@ -1152,7 +1195,7 @@ class TestE2RunsForEveryDroppedDay(_Base):
 
     def test_an_untouched_day_still_authorizes(self):
         """E2 on every day must not refuse the ordinary case."""
-        out = cd.prune_eligibility([self.days[0]], manifest_root=self.root,
+        out = _eligibility([self.days[0]], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [self.days[0]])
 
@@ -1165,7 +1208,7 @@ class TestE2RunsForEveryDroppedDay(_Base):
         i0, i1, j0, j1 = sp.sample_window(32, 32, seed=sp.SAMPLE_SEED, day_index=slot)
         g = zarr.open_group(block, mode="a")
         g["sst"][idx, i0:i1, j0:j1] = np.asarray(g["sst"][idx, i0:i1, j0:j1]) + 4.0
-        out = cd.prune_eligibility([self.days[0]], manifest_root=self.root,
+        out = _eligibility([self.days[0]], manifest_root=self.root,
                                    delta_path=self.delta, wal_root=self.wal)
         self.assertEqual(out["authorized"], [])
         self.assertIn("base is defective", out["refused"][self.days[0]])
@@ -1175,7 +1218,7 @@ class TestSwapRequiresTheCompactionLock(_Base):
     def _plan(self):
         self._repair_and_refold()
         keep = [d for d in self.days if d != self.repaired]
-        plan = prune_delta(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
+        plan = _prune(self.delta, os.path.join(self.tmp, "staging.zarr"), keep,
                            base_days=self.days, spatial_window_days=1,
                            wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(plan["status"], "ok", plan.get("reason"))
@@ -1187,7 +1230,7 @@ class TestSwapRequiresTheCompactionLock(_Base):
         that delta."""
         plan = self._plan()
         before = sorted(bm.inspect_store_contract(self.delta).days)
-        out = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+        out = _swap(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
                                 wal_root=self.wal, manifest_root=self.root)
         self.assertEqual(out["status"], "refused")
         self.assertIn("compaction_lock_path is required", out["reason"])
@@ -1201,8 +1244,221 @@ class TestSwapRequiresTheCompactionLock(_Base):
         plan = self._plan()
         before = sorted(bm.inspect_store_contract(self.delta).days)
         with CompactionLock(self.clock, holder="a-build"):
-            out = execute_swap_plan(plan, mode="s2",
+            out = _swap(plan, mode="s2",
                                     hold_dir=os.path.join(self.tmp, "hold"),
                                     wal_root=self.wal, manifest_root=self.root)
         self.assertFalse(out["swap_performed"])
         self.assertEqual(sorted(bm.inspect_store_contract(self.delta).days), before)
+
+
+# ==================== review round 5: the external anchor domain, through the REAL workflow
+class TestExternalAnchorWorkflow(unittest.TestCase):
+    """VM24 has taken two whole-VM snapshot rollbacks. A co-located anchor cannot see one — the
+    rollback restores log and sidecar together and the pair is self-consistent — so the
+    protection only exists if the **whole workflow** uses an anchor in a different rollback
+    domain. Nothing here calls `_write_anchor()`: every anchor advance comes from the real
+    initialize → intent → commit → refold → plan → swap path."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = os.path.join(self.tmp, "manifest_root")
+        self.wal = os.path.join(self.tmp, "wal")
+        self.anchor = os.path.join(self.tmp, "anchor_domain")
+        for d in (self.root, self.wal, self.anchor):
+            os.makedirs(d, exist_ok=True)
+        self.lock = os.path.join(self.tmp, "ingest.lock")
+        self.clock = os.path.join(self.tmp, "p5_compaction.lock")
+        self.artifacts = os.path.join(self.tmp, "artifacts")
+        os.makedirs(self.artifacts, exist_ok=True)
+        self.s0, self.e0 = bm.block_bounds(ANCHOR, S, 0)
+        self.span = fx.calendar_span(self.s0, self.e0)
+        self.days = self.span[:8]
+        self.repaired = self.days[3]
+        self.delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(self.delta, self.days)
+
+        self.v1 = build_block(os.path.join(self.root, "b_v1.zarr"),
+                              start_day=self.s0, end_day=self.e0,
+                              classification_target=list(self.days), delta_path=self.delta,
+                              artifacts_dir=self.artifacts, lock=None, hard_reserve_bytes=0,
+                              unsafe_skip_isolation=True)
+        self.v1_id = self.v1["segment"]["segment_id"]
+        self._publish(self.v1, generation=1)
+        rw.initialize_wal(self.wal, manifest_root=self.root, at_utc="t", operator="ops",
+                          anchor_root=self.anchor)
+
+    def _publish(self, plan, *, generation):
+        seg = dict(plan["segment"])
+        m = {"format": bm.MANIFEST_FORMAT, "version": bm.SCHEMA_VERSION,
+             "generation": generation, "generation_id": f"gen{generation:06d}-x",
+             "created_utc": "2027-01-01T00:00:00Z", "created_by": "p5s5p2-anchor",
+             "predecessor_generation": generation - 1 if generation > 1 else None,
+             "predecessor_manifest": (bm.archive_name(generation - 1)
+                                      if generation > 1 else None),
+             "grid": {"ny": 32, "nx": 32, "region": [0, 32, 0, 32]},
+             "variables": list(fx.VARS),
+             "block_grid": {"anchor_day": ANCHOR, "block_days": S},
+             "segments": [seg], "superseded": [], "manifest_checksum": ""}
+        m["manifest_checksum"] = bm.compute_checksum(m)
+        bm.publish(self.root, m)
+
+    def _repair(self):
+        rec = rw.open_repair(self.wal, day=self.repaired, at_utc="t", operator="ops",
+                             payload={}, anchor_root=self.anchor)
+        idx = list(bm.inspect_store_contract(self.delta).days).index(self.repaired)
+        g = zarr.open_group(self.delta, mode="a")
+        g["sst"][idx] = np.asarray(g["sst"][idx]) + 21.0
+        fp, _v, _t = cd.fingerprint_day(self.delta, self.repaired, physical_index=idx)
+        rw.append(self.wal, record=rw.COMMITTED, repair_id=rec["repair_id"],
+                  day=self.repaired, at_utc="t", operator="ops",
+                  payload={"fingerprint": fp}, anchor_root=self.anchor)
+        return rec["repair_id"], fp
+
+    def _refold(self):
+        return cd.corrective_refold(
+            day=self.repaired, manifest_root=self.root, delta_path=self.delta,
+            wal_root=self.wal, anchor_root=self.anchor,
+            new_block_path=os.path.join(self.root, "b_v2.zarr"),
+            artifacts_dir=self.artifacts, start_day=self.s0, end_day=self.e0,
+            classification_target=list(self.days), predecessor_segment_id=self.v1_id,
+            ingest_lock_path=self.lock, compaction_lock_path=self.clock,
+            hard_reserve_bytes=1 << 20, operator="ops")
+
+    _stage_n = 0
+
+    def _plan(self, **kw):
+        keep = [d for d in self.days if d != self.repaired]
+        kw.setdefault("anchor_root", self.anchor)
+        type(self)._stage_n += 1
+        staging = os.path.join(self.tmp, f"staging{type(self)._stage_n}.zarr")
+        return prune_delta(self.delta, staging, keep,
+                           base_days=self.days, spatial_window_days=1,
+                           wal_root=self.wal, manifest_root=self.root, **kw)
+
+    # ---- the workflow --------------------------------------------------
+    def test_the_WHOLE_workflow_runs_on_the_external_anchor(self):
+        rid, fp = self._repair()
+        refold = self._refold()
+        self.assertEqual(refold["phase_a"]["repair_id"], rid)
+        self.assertEqual(refold["phase_a"]["fingerprint"], fp)
+
+        plan = self._plan()
+        self.assertEqual(plan["status"], "ok", plan.get("reason"))
+        self.assertEqual(plan["anchor_root"], os.path.realpath(self.anchor))
+
+        swap = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+                                 wal_root=self.wal, manifest_root=self.root,
+                                 anchor_root=self.anchor, compaction_lock_path=self.clock)
+        self.assertEqual(swap["status"], "swapped", swap.get("reason"))
+        self.assertNotIn(self.repaired, bm.inspect_store_contract(self.delta).days)
+
+        # the anchor advanced through real appends only -- no test wrote it
+        state = rw.read_wal(self.wal, anchor_root=self.anchor)
+        self.assertEqual(state.anchor["seq"], state.last_seq)
+        self.assertGreater(state.last_seq, 2)
+        self.assertFalse(os.path.isfile(os.path.join(self.wal, rw.ANCHOR_NAME)),
+                         "no co-located sidecar should exist at all")
+
+    def test_a_WAL_root_rollback_with_the_anchor_intact_refuses_plan_AND_swap(self):
+        """The VM24 case, minus the VM: restore the WAL root from an earlier copy while the
+        anchor — in another rollback domain — keeps the real head."""
+        self._repair()
+        self._refold()
+        plan = self._plan()
+        self.assertEqual(plan["status"], "ok", plan.get("reason"))
+
+        snapshot = os.path.join(self.tmp, "wal_snapshot")
+        shutil.copytree(self.wal, snapshot)
+        rw.open_repair(self.wal, day=self.days[0], at_utc="t", operator="ops",
+                       payload={}, anchor_root=self.anchor)      # advances both
+        shutil.rmtree(self.wal)
+        shutil.copytree(snapshot, self.wal)                      # roll the WAL root back
+
+        again = self._plan()
+        self.assertEqual(again["status"], "refused")
+        self.assertIn("must equal the head", again["reason"])
+
+        before = sorted(bm.inspect_store_contract(self.delta).days)
+        swap = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+                                 wal_root=self.wal, manifest_root=self.root,
+                                 anchor_root=self.anchor, compaction_lock_path=self.clock)
+        self.assertEqual(swap["status"], "aborted_stale")
+        self.assertFalse(swap["swap_performed"])
+        self.assertEqual(sorted(bm.inspect_store_contract(self.delta).days), before)
+
+    def test_the_REFOLD_refuses_to_attest_from_a_rolled_back_WAL(self):
+        """The builder derives `materialized_repairs` from the WAL. Reading it without the
+        external anchor would let a refold attest a repair from a log the prune gate will
+        refuse -- evidence produced that nothing downstream can accept, and a superseded sealed
+        version to show for it."""
+        self._repair()
+        snapshot = os.path.join(self.tmp, "wal_snap2")
+        shutil.copytree(self.wal, snapshot)
+        rw.open_repair(self.wal, day=self.days[0], at_utc="t", operator="ops",
+                       payload={}, anchor_root=self.anchor)      # advances both
+        shutil.rmtree(self.wal)
+        shutil.copytree(snapshot, self.wal)                      # WAL root back, anchor ahead
+
+        with self.assertRaises(rw.WalRolledBack) as cm:
+            self._refold()
+        self.assertIn("must equal the head", str(cm.exception))
+        self.assertEqual(bm.load_live(self.root)["generation"], 1,
+                         "nothing may publish on evidence the gate would refuse")
+
+    def test_plan_and_swap_on_DIFFERENT_anchor_domains_is_refused(self):
+        self._repair()
+        self._refold()
+        plan = self._plan()
+        other = os.path.join(self.tmp, "other_anchor")
+        os.makedirs(other, exist_ok=True)
+        before = sorted(bm.inspect_store_contract(self.delta).days)
+        swap = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+                                 wal_root=self.wal, manifest_root=self.root,
+                                 anchor_root=other, compaction_lock_path=self.clock)
+        self.assertEqual(swap["status"], "refused")
+        self.assertIn("switching anchor domain between plan and swap", swap["reason"])
+        self.assertEqual(sorted(bm.inspect_store_contract(self.delta).days), before)
+
+    def test_a_swap_that_DROPS_the_anchor_domain_is_refused(self):
+        self._repair()
+        self._refold()
+        plan = self._plan()
+        swap = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+                                 wal_root=self.wal, manifest_root=self.root,
+                                 compaction_lock_path=self.clock)
+        self.assertEqual(swap["status"], "refused")
+        self.assertIn("switching anchor domain", swap["reason"])
+
+    # ---- fail-closed on the production path ----------------------------
+    def test_omitting_the_anchor_root_fails_closed_everywhere(self):
+        self._repair()
+        for label, call in (
+            ("initialize", lambda: rw.initialize_wal(
+                os.path.join(self.tmp, "fresh_wal"), manifest_root=self.root,
+                at_utc="t", operator="ops")),
+            ("open_repair", lambda: rw.open_repair(
+                self.wal, day=self.days[0], at_utc="t", operator="ops", payload={})),
+        ):
+            with self.subTest(label):
+                os.makedirs(os.path.join(self.tmp, "fresh_wal"), exist_ok=True)
+                with self.assertRaises(rw.WalNotInitialized) as cm:
+                    call()
+                self.assertIn("anchor_root is required", str(cm.exception))
+
+        plan = self._plan(anchor_root=None)
+        self.assertEqual(plan["status"], "refused")
+        self.assertIn("anchor_root is required", plan["reason"])
+
+    def test_an_anchor_root_that_IS_the_wal_root_is_refused(self):
+        with self.assertRaises(rw.WalNotInitialized) as cm:
+            rw.resolve_anchor_root(self.wal, self.wal)
+        self.assertIn("cannot detect a snapshot rollback", str(cm.exception))
+
+    def test_a_WAL_bound_to_an_anchor_cannot_be_read_without_one(self):
+        """Dropping the external anchor mid-workflow removes the protection the log was
+        initialized with, so it is refused rather than silently downgraded."""
+        state = rw.read_wal(self.wal, anchor_root=self.wal)
+        with self.assertRaises(rw.WalNotInitialized) as cm:
+            state.assert_bound_to(self.root, None)
+        self.assertIn("dropping the external anchor mid-workflow", str(cm.exception))

@@ -126,16 +126,48 @@ class WalNotInitialized(WalError):
     to, and the gate refuses until it does."""
 
 
-def manifest_authority(manifest_root: str) -> dict:
+def resolve_anchor_root(wal_root: str, anchor_root: Optional[str], *,
+                        unsafe_allow_colocated_anchor: bool = False) -> str:
+    """The one place that decides where the high-water mark lives. Fail-closed by default.
+
+    An anchor beside the log detects single-file truncation and **nothing else**: a whole-VM
+    snapshot restores log and anchor together and the pair is perfectly self-consistent. VM24
+    has taken two such rollbacks, so this is the operative case, not a hypothetical. The
+    production path therefore requires an anchor in a **different rollback domain**, and the
+    waiver is named so it cannot be reached by omission."""
+    if anchor_root is None:
+        if unsafe_allow_colocated_anchor:
+            return os.path.realpath(wal_root)
+        raise WalNotInitialized(
+            "anchor_root is required: an anchor beside the WAL cannot detect a whole-root "
+            "snapshot rollback, because the rollback restores both and the restored pair is "
+            "self-consistent. Point it at a separate rollback domain, or pass "
+            "unsafe_allow_colocated_anchor=True in a test that is not exercising it.")
+    resolved = os.path.realpath(anchor_root)
+    if resolved == os.path.realpath(wal_root) and not unsafe_allow_colocated_anchor:
+        raise WalNotInitialized(
+            f"anchor_root {anchor_root!r} resolves to the WAL root itself, which is the one "
+            f"placement that cannot detect a snapshot rollback of that root")
+    return resolved
+
+
+def manifest_authority(manifest_root: str, anchor_root: Optional[str] = None) -> dict:
     """The identity a WAL is bound to. Stable across generations, distinct across deployments.
 
     `generation_id` changes on every publish and cannot be it. The grid, the block calendar and
     the resolved root do not change for the life of a store, and together they are what makes
     one repair log belong to one base."""
     live = _bm().load_live(manifest_root)
-    return {"manifest_root": os.path.realpath(manifest_root),
-            "format": live["format"], "version": live["version"],
-            "grid": live["grid"], "block_grid": live["block_grid"]}
+    out = {"manifest_root": os.path.realpath(manifest_root),
+           "format": live["format"], "version": live["version"],
+           "grid": live["grid"], "block_grid": live["block_grid"]}
+    if anchor_root is not None:
+        # The anchor domain is part of the log's identity. Without it, a caller could
+        # initialize against an external anchor and then run the prune against a co-located
+        # one -- every stage self-consistent, and the protection quietly absent for the stage
+        # that mattered.
+        out["anchor_root"] = os.path.realpath(anchor_root)
+    return out
 
 
 def authority_digest(authority: dict) -> str:
@@ -198,15 +230,27 @@ class WalState(NamedTuple):
                 f"replaced rather than extended, and the days repaired in the missing tail "
                 f"would read as never-repaired -- precisely the authorization this refuses.")
 
-    def assert_bound_to(self, manifest_root: str) -> None:
-        """Refuse unless this log was initialized for THIS manifest authority."""
+    def assert_bound_to(self, manifest_root: str, anchor_root: Optional[str] = None) -> None:
+        """Refuse unless this log was initialized for THIS manifest authority AND this anchor
+        domain. Switching anchor domain between stages is refused, not silently accepted."""
         if self.authority is None:
             raise WalNotInitialized(
                 "the repair WAL has no wal_initialized record. An absent log is not an empty "
                 "one: read as 'no repairs' it authorizes every prune, and that failure is "
                 "silent and total. Run initialize_wal() against the manifest this delta "
                 "belongs to.")
-        want = manifest_authority(manifest_root)
+        want = manifest_authority(manifest_root, anchor_root)
+        if anchor_root is not None and "anchor_root" not in self.authority:
+            raise WalNotInitialized(
+                "this WAL was initialized without an anchor domain, so it cannot be trusted "
+                "with one now: its earlier records were never attested outside the WAL root. "
+                "Re-initialize a fresh log against the external anchor.")
+        if anchor_root is None and "anchor_root" in self.authority:
+            raise WalNotInitialized(
+                f"this WAL is bound to the anchor domain "
+                f"{self.authority['anchor_root']!r} but is being read without one; dropping "
+                f"the external anchor mid-workflow removes the rollback protection the log "
+                f"was initialized with")
         if self.authority != want:
             raise WalNotInitialized(
                 f"the repair WAL is bound to a different deployment "
@@ -504,7 +548,8 @@ def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc
 
 
 def open_repair(root: str, *, day: str, at_utc: str, operator: str,
-                payload: Optional[dict] = None) -> dict:
+                payload: Optional[dict] = None, anchor_root: Optional[str] = None,
+                unsafe_allow_colocated_anchor: bool = False) -> dict:
     """Open a repair, allocating a conforming `repair_id` **in the same lock hold** as the
     append.
 
@@ -515,18 +560,26 @@ def open_repair(root: str, *, day: str, at_utc: str, operator: str,
     repair ids; they ask for one. `record["repair_id"]` is what the terminal records and the
     block's `materialized_repairs` must carry."""
     return append(root, record=INTENT, repair_id=None, day=day, at_utc=at_utc,
-                  operator=operator, payload=payload)
+                  operator=operator, payload=payload,
+                  anchor_root=resolve_anchor_root(
+                      root, anchor_root,
+                      unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor))
 
 
-def initialize_wal(root: str, *, manifest_root: str, at_utc: str, operator: str) -> dict:
+def initialize_wal(root: str, *, manifest_root: str, at_utc: str, operator: str,
+                   anchor_root: Optional[str] = None,
+                   unsafe_allow_colocated_anchor: bool = False) -> dict:
     """Write the `wal_initialized` record that binds this log to one manifest authority.
 
     Idempotent for an identical binding -- re-running deployment tooling must not be a hazard --
     and a refusal for a different one, because rebinding a log that already carries repair
     history would silently transfer those authorizations to another base."""
-    state = read_wal(root)
+    resolved = resolve_anchor_root(
+        root, anchor_root, unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
+    bound_anchor = None if (anchor_root is None and unsafe_allow_colocated_anchor) else resolved
+    state = read_wal(root, anchor_root=resolved)
     if state.authority is not None:
-        want = manifest_authority(manifest_root)
+        want = manifest_authority(manifest_root, bound_anchor)
         if state.authority == want:
             return {"status": "already_initialized", "authority": state.authority}
         raise WalError(
@@ -538,8 +591,8 @@ def initialize_wal(root: str, *, manifest_root: str, at_utc: str, operator: str)
             "this WAL has records but no wal_initialized first record; it cannot be "
             "retroactively bound. Administrative recovery, not initialization.")
     rec = append(root, record=WAL_INITIALIZED, repair_id="wal-0", day="",
-                 at_utc=at_utc, operator=operator,
-                 payload={"authority": manifest_authority(manifest_root)})
+                 at_utc=at_utc, operator=operator, anchor_root=resolved,
+                 payload={"authority": manifest_authority(manifest_root, bound_anchor)})
     return {"status": "initialized", "authority": rec["payload"]["authority"]}
 
 

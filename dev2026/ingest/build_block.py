@@ -392,7 +392,8 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
                 artifacts_dir: Optional[str] = None,
                 tile: int = 256, resume: bool = False,
                 sealed: Optional[bool] = None,
-                wal_root: Optional[str] = None,
+                wal_root: Optional[str] = None, anchor_root: Optional[str] = None,
+                unsafe_allow_colocated_anchor: bool = False,
                 unsafe_skip_isolation: bool = False) -> dict:
     """Build one immutable block into `out_path` and return a publish plan.
 
@@ -424,7 +425,9 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
             spatial_window_days=spatial_window_days, window_latest_day=window_latest_day,
             lock=lock, journal=journal, artifacts_dir=artifacts_dir, tile=tile,
             resume=resume, hard_reserve_bytes=hard_reserve_bytes, sealed=sealed,
-            wal_root=wal_root, unsafe_skip_isolation=unsafe_skip_isolation)
+            wal_root=wal_root, anchor_root=anchor_root,
+            unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor,
+            unsafe_skip_isolation=unsafe_skip_isolation)
     except BuildRefused as exc:
         journal.event(event="refused", reason=str(exc))
         raise
@@ -437,8 +440,8 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
 def _build_block(out_path, *, start_day, end_day, classification_target, predecessor_present,
                  delta_path, predecessor_path, daily_root, hold_root, confirmed_missing,
                  spatial_window_days, window_latest_day, lock, journal, artifacts_dir,
-                 tile, resume, hard_reserve_bytes, sealed, wal_root,
-                 unsafe_skip_isolation) -> dict:
+                 tile, resume, hard_reserve_bytes, sealed, wal_root, anchor_root,
+                 unsafe_allow_colocated_anchor, unsafe_skip_isolation) -> dict:
     # ---- isolation is MANDATORY unless explicitly, loudly waived
     if not unsafe_skip_isolation:
         if lock is None or not getattr(lock, "held", False):
@@ -626,7 +629,14 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
     materialized_repairs = {}
     if wal_root:
         from ingest.corrected_day import date_slot          # local: avoids an import cycle
-        state = rw.read_wal(wal_root)                       # WalCorrupt -> the build refuses
+        # The refold reads the WAL through the SAME anchor domain the prune gate will use.
+        # Attesting a repair from a log the gate would refuse is a block that can never be
+        # authorized -- work done to produce evidence nothing will accept.
+        _anchor = rw.resolve_anchor_root(
+            wal_root, anchor_root,
+            unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
+        state = rw.read_wal(wal_root, anchor_root=_anchor)   # WalCorrupt -> the build refuses
+        state.assert_fresh()
         for t_idx, day in enumerate(rebuild_source_set):
             latest = state.latest_committed(day)
             if latest is None or smap[day]["source_kind"] != "delta":

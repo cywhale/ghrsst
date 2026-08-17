@@ -10,10 +10,10 @@ Branch `dev2026-p5-s5-part2-repair-lifecycle`, stacked on `fd3a234` (Part 1).
 - Lifecycle module: [`../ingest/corrected_day.py`](../ingest/corrected_day.py)
 - Gate wired into [`../ingest/prune_delta.py`](../ingest/prune_delta.py)
 - Builder derives `materialized_repairs`: [`../ingest/build_block.py`](../ingest/build_block.py)
-- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **69/69 green**
-- Full local suite: **741 tests OK** (17 skipped), up from 672
-- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **285 OK**
-- **52 guards mutation-verified**
+- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **77/77 green**
+- Full local suite: **749 tests OK** (17 skipped), up from 672
+- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **293 OK**
+- **62 guards mutation-verified**
 
 ## The rule
 
@@ -53,7 +53,10 @@ E1 is the deterministic identity; Phase A is the read that makes it about bytes.
 | a borrowed lock is bound to the canonical path | **PASS** (round 4) | `test_a_borrowed_lock_must_be_the_CANONICAL_one`, `test_the_refold_refuses_an_unrelated_held_lock` |
 | the anchor must equal the WAL head | **PASS** (round 4) | `test_an_anchor_that_LAGS_the_head_is_refused` |
 | E2 runs for **every** dropped day (bypass-WAL repair) | **PASS** (round 4) | `TestE2RunsForEveryDroppedDay` |
-| whole-root snapshot rollback | **PARTIAL — needs a separate `anchor_root`** | `test_a_WHOLE_ROOT_rollback_is_caught_only_by_a_SEPARATE_anchor_domain` |
+| whole-root snapshot rollback, **through the real workflow** | **PASS** (round 5) | `TestExternalAnchorWorkflow` — initialize → intent → commit → refold → plan → swap, no `_write_anchor()` |
+| an external `anchor_root` is **required** on the production path | **PASS** (round 5) | `test_omitting_the_anchor_root_fails_closed_everywhere` |
+| the anchor domain is part of the WAL's deployment identity | **PASS** (round 5) | `test_a_WAL_bound_to_an_anchor_cannot_be_read_without_one` |
+| plan and swap on different anchor domains → refuse | **PASS** (round 5) | `test_plan_and_swap_on_DIFFERENT_anchor_domains_is_refused` |
 | §7.8a Phase A: base-only, manifest resolution, E2, provenance identity | **PASS** | `TestPhaseABaseOnly` |
 | §7.8a ordering A → B → C end to end, through the real publication and swap | **PASS** (round 2) | `test_PHASE_A_then_B_then_C_through_the_real_swap` |
 | E1 alone does not authorize | **PASS** | `test_E1_passing_is_not_enough_without_phase_A` |
@@ -103,7 +106,7 @@ could not see.
 
 ## Mutation verification
 
-52 guards disabled in turn; **all 52 fail** — 18 / 13 / 13 / 8 across four rounds.
+62 guards disabled in turn; **all 62 fail** — 18 / 13 / 13 / 8 / 10 across five rounds.
 
 | guard disabled | result |
 |---|---|
@@ -333,3 +336,46 @@ E2 now runs for **every** dropped day. A day with a committed repair additionall
 identity and the full Phase A. A day with none still has to match base, and a mismatch refuses
 with "no committed repair explains this" — covering both halves of what §7.5a says E2 is for: a
 repair that bypassed the WAL, and a base defect.
+
+
+## Review round 5 — one High, one Low
+
+### [High] The external anchor existed but no workflow used it
+
+`read_wal(..., anchor_root=...)` supported an external anchor from round 4, and **nothing else
+did**. `initialize_wal`, `open_repair`, the builder, Phase A's identity check, the prune gate
+and the swap-time re-authorization all fell back to a sidecar beside the log. The capability was
+present and unreachable, and the separate-domain test proved it by calling the private
+`_write_anchor()` directly — which is exactly the shape of a test that demonstrates a mechanism
+rather than a behaviour.
+
+That matters here more than usual: **VM24 has taken two whole-VM snapshot rollbacks**, which is
+the scenario this defends against and the one a co-located sidecar cannot see.
+
+`anchor_root` is now threaded through the whole path — initialize, intent, commit/abort, build /
+refold, Phase A, prune plan, swap-time re-authorization — and:
+
+- **it is required.** `resolve_anchor_root()` is the single place that decides, and it refuses a
+  missing anchor *and* one that resolves to the WAL root itself. `unsafe_allow_colocated_anchor`
+  is the one named waiver, used by a shim per legacy suite.
+- **it is part of the WAL's deployment identity.** The `wal_initialized` record carries the
+  resolved anchor root, so a log initialized against an external anchor cannot later be read
+  without one, and vice versa. Without that, a deployment could initialize with the protection
+  and prune without it — every stage self-consistent, and the protection absent from the stage
+  that mattered.
+- **the plan records the domain it was authorized against**, and the swap refuses if it differs.
+  Two stages resting on different evidence means the weaker one decides.
+
+`TestExternalAnchorWorkflow` runs the real sequence end to end and **never calls
+`_write_anchor()`**: every anchor advance comes from a real append. It asserts no co-located
+sidecar exists at all, then rolls the WAL root back with the anchor intact and requires **both**
+the plan and the swap to refuse — plus the refold, which would otherwise attest a repair from a
+log the gate will reject, producing evidence nothing can accept and a superseded sealed version
+to show for it.
+
+### [Low] A docstring that outlived its behaviour
+
+`prune_eligibility` still said an unrepaired day "needs only the WAL's silence". Round 4 made E2
+run for every dropped day, so that had been false since. Corrected: the WAL's silence about a
+day is not evidence that nothing happened to it — a repair straight to delta leaves exactly that
+silence.

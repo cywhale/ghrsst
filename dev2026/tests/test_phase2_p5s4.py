@@ -146,8 +146,11 @@ class _Base(unittest.TestCase):
     def _open_repair(self, day, root=None, **kw):
         """Allocate a conforming repair_id. Ids are `<opaque>-<intent seq>`, so tests must not
         invent them any more than production may."""
+        # These tests predate the external-anchor requirement and exercise WAL mechanics, so
+        # they waive it in this one named place.
         rec = rw.open_repair(root or self.tmp, day=day, at_utc=kw.pop("at_utc", "t"),
-                             operator="o", payload=kw.pop("payload", {}))
+                             operator="o", payload=kw.pop("payload", {}),
+                             unsafe_allow_colocated_anchor=True)
         return rec["repair_id"]
 
     def _commit(self, rid, day, fp, root=None, at_utc="t", **payload):
@@ -505,7 +508,7 @@ class TestPruneGateIsIdentityBased(_Base):
         clock reading were consulted, this is where it would show."""
         def build(root, when):
             rec = rw.open_repair(root, day=self.span[0], at_utc=when, operator="o",
-                                 payload={})
+                                 payload={}, unsafe_allow_colocated_anchor=True)
             rw.append(root, record=rw.COMMITTED, repair_id=rec["repair_id"],
                       day=self.span[0], at_utc=when, operator="o",
                       payload={"fingerprint": "fp1"})

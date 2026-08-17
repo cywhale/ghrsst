@@ -125,8 +125,10 @@ def e2_parity(day: str, *, delta_path: str, base_store_path: str) -> List[str]:
 
 # --------------------------------------------------------------------------- §7.8a Phase A
 def phase_a_base_only(day: str, *, manifest_root: str, delta_path: str, wal_root: str,
+                      anchor_root: Optional[str] = None,
                       expected_segment_id: Optional[str] = None,
-                      allowed_legacy_paths: Optional[Sequence[str]] = None) -> dict:
+                      allowed_legacy_paths: Optional[Sequence[str]] = None,
+                      unsafe_allow_colocated_anchor: bool = False) -> dict:
     """§7.8a **Phase A** — the proof, taken pre-prune and BASE-ONLY.
 
     Four checks, in the spec's order. Each answers something the others cannot:
@@ -182,14 +184,31 @@ def phase_a_base_only(day: str, *, manifest_root: str, delta_path: str, wal_root
             f"({'; '.join(diffs[:3])}). Either the correction was not materialized, a repair "
             f"bypassed the WAL, or base is defective -- all three need a human.")
 
-    identity = _verify_repair_identity(day, seg=seg, wal_root=wal_root, delta_path=delta_path)
+    identity = _verify_repair_identity(
+        day, seg=seg, wal_root=wal_root, delta_path=delta_path, anchor_root=anchor_root,
+        manifest_root=manifest_root,
+        unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
     return {"day": day, "segment_id": segment_id, "block_path": block_path,
             "e2": "match", **identity, "phase": "A", "verified_pre_prune": True}
 
 
-def _verify_repair_identity(day: str, *, seg: dict, wal_root: str, delta_path: str) -> dict:
-    """§7.5a E1 against the covering segment. Identity, never time."""
-    state = rw.read_wal(wal_root)                  # raises WalCorrupt -> caller refuses
+def _verify_repair_identity(day: str, *, seg: dict, wal_root: str, delta_path: str,
+                            anchor_root: Optional[str] = None,
+                            manifest_root: Optional[str] = None,
+                            unsafe_allow_colocated_anchor: bool = False) -> dict:
+    """§7.5a E1 against the covering segment. Identity, never time.
+
+    Re-reads the WAL **through the same anchor domain** the rest of the workflow uses. Reading
+    it without one here would let Phase A pass on a log the prune gate would refuse -- the
+    protection present at one stage and absent at the next."""
+    resolved = rw.resolve_anchor_root(
+        wal_root, anchor_root, unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
+    state = rw.read_wal(wal_root, anchor_root=resolved)   # WalCorrupt -> caller refuses
+    if manifest_root is not None:
+        state.assert_bound_to(
+            manifest_root, None if (anchor_root is None and unsafe_allow_colocated_anchor)
+            else resolved)
+    state.assert_fresh()
     latest = state.latest_committed(day)
     if latest is None:
         return {"repair_id": None, "identity": "day was never repaired"}
@@ -223,23 +242,30 @@ def _verify_repair_identity(day: str, *, seg: dict, wal_root: str, delta_path: s
 # --------------------------------------------------------------------------- the prune gate
 def prune_eligibility(days: Sequence[str], *, manifest_root: str, delta_path: str,
                       wal_root: str, anchor_root: Optional[str] = None,
-                      allowed_legacy_paths: Optional[Sequence[str]] = None) -> dict:
+                      allowed_legacy_paths: Optional[Sequence[str]] = None,
+                      unsafe_allow_colocated_anchor: bool = False) -> dict:
     """May these delta days be dropped? `{"authorized": [...], "refused": {day: reason}}`.
 
-    **Both gates, for every day that was ever repaired.** A day with no committed repair needs
-    only the WAL's silence (it has no opinion) — the pre-existing base-coverage gate in
-    `prune_delta` still applies to it. A day that *was* repaired needs E1 identity **and** a
-    full Phase A pass, and a refusal from either is a refusal.
+    **E2 for every dropped day; E1 and Phase A additionally for every repaired one.** The WAL's
+    silence about a day is not evidence that nothing happened to it — a repair applied straight
+    to delta leaves exactly that silence — so an unrepaired day still has to match base (§7.5a
+    E2). A day the WAL *does* know about needs E1 identity **and** a full Phase A pass on top,
+    and a refusal from any of them is a refusal.
 
     Never raises for a refusal: a refused day stays in delta, where it is served correctly. Only
     a WAL that does not parse raises, and that refuses every day rather than some.
     """
     try:
-        state = rw.read_wal(wal_root, anchor_root=anchor_root)
+        resolved = rw.resolve_anchor_root(
+            wal_root, anchor_root,
+            unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
+        state = rw.read_wal(wal_root, anchor_root=resolved)
         # An ABSENT or unbound log is not an empty one. Read as "no repairs" it authorizes
         # every day, and that failure is silent, total, and indistinguishable from a healthy
         # deployment that has genuinely had none.
-        state.assert_bound_to(manifest_root)
+        state.assert_bound_to(
+            manifest_root,
+            None if (anchor_root is None and unsafe_allow_colocated_anchor) else resolved)
         state.assert_fresh()
     except (rw.WalCorrupt, rw.WalNotInitialized, rw.WalRolledBack) as exc:
         return {"authorized": [], "refused": {d: f"the repair WAL cannot be trusted ({exc})"
@@ -255,9 +281,11 @@ def prune_eligibility(days: Sequence[str], *, manifest_root: str, delta_path: st
         try:
             if repaired:
                 # E1 identity AND the full Phase A, which includes E2.
-                phase_a_base_only(day, manifest_root=manifest_root, delta_path=delta_path,
-                                  wal_root=wal_root,
-                                  allowed_legacy_paths=allowed_legacy_paths)
+                phase_a_base_only(
+                    day, manifest_root=manifest_root, delta_path=delta_path,
+                    wal_root=wal_root, anchor_root=anchor_root,
+                    allowed_legacy_paths=allowed_legacy_paths,
+                    unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
             else:
                 # E2 runs for EVERY dropped day, not only for days the WAL knows about. A day
                 # with no committed repair is not a day that was never edited -- it is a day the
@@ -325,9 +353,10 @@ def corrective_refold(*, day: str, manifest_root: str, delta_path: str, wal_root
                       predecessor_path: Optional[str] = None,
                       predecessor_present: Sequence[str] = (),
                       operator: str = "", release_after_s: Optional[int] = None,
-                      hold_days: Optional[int] = None,
+                      hold_days: Optional[int] = None, anchor_root: Optional[str] = None,
                       unsafe_skip_isolation: bool = False,
-                      unsafe_skip_compaction_lock: bool = False) -> dict:
+                      unsafe_skip_compaction_lock: bool = False,
+                      unsafe_allow_colocated_anchor: bool = False) -> dict:
     """§7.8 — the whole corrective refold, in the one order that is safe.
 
         build a NEW version of the same calendar window (delta-first)
@@ -389,6 +418,8 @@ def corrective_refold(*, day: str, manifest_root: str, delta_path: str, wal_root
             operator=operator, release_after_s=release_after_s, hold_days=hold_days,
             unsafe_skip_isolation=unsafe_skip_isolation,
             unsafe_skip_compaction_lock=unsafe_skip_compaction_lock,
+            anchor_root=anchor_root,
+            unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor,
             build_block=build_block, pub=pub)
     finally:
         if owned is not None:
@@ -400,13 +431,16 @@ def _corrective_refold(*, day, manifest_root, delta_path, wal_root, new_block_pa
                        predecessor_segment_id, ingest_lock_path, compaction_lock_path,
                        hard_reserve_bytes, lock, predecessor_path, predecessor_present,
                        operator, release_after_s, hold_days, unsafe_skip_isolation,
-                       unsafe_skip_compaction_lock, build_block, pub):
+                       unsafe_skip_compaction_lock, anchor_root,
+                       unsafe_allow_colocated_anchor, build_block, pub):
     plan = build_block(new_block_path, start_day=start_day, end_day=end_day,
                        classification_target=list(classification_target),
                        predecessor_present=list(predecessor_present),
                        predecessor_path=predecessor_path, delta_path=delta_path,
                        artifacts_dir=artifacts_dir, lock=lock,
                        hard_reserve_bytes=hard_reserve_bytes, wal_root=wal_root,
+                       anchor_root=anchor_root,
+                       unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor,
                        unsafe_skip_isolation=unsafe_skip_isolation)
     segment = dict(plan["segment"])
     segment["supersedes"] = predecessor_segment_id
@@ -441,9 +475,10 @@ def _corrective_refold(*, day, manifest_root, delta_path, wal_root, new_block_pa
 
     if lock is not None:
         lock.assert_still_held()        # still ours across Phase A, not merely across publish
-    phase_a = phase_a_base_only(day, manifest_root=manifest_root, delta_path=delta_path,
-                                wal_root=wal_root,
-                                expected_segment_id=segment["segment_id"])
+    phase_a = phase_a_base_only(
+        day, manifest_root=manifest_root, delta_path=delta_path, wal_root=wal_root,
+        anchor_root=anchor_root, expected_segment_id=segment["segment_id"],
+        unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
     return {"status": "refolded", "day": day, "segment_id": segment["segment_id"],
             "block_path": plan["out_path"], "publication": published, "phase_a": phase_a,
             "pruned": False,

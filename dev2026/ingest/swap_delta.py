@@ -73,6 +73,8 @@ def _atomic_retarget(symlink_path: str, new_target: str) -> None:
 
 def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                       wal_root: Optional[str] = None, manifest_root: Optional[str] = None,
+                      anchor_root: Optional[str] = None,
+                      unsafe_allow_colocated_anchor: bool = False,
                       allowed_legacy_paths: Optional[Sequence[str]] = None,
                       corrected_day_gate: bool = True,
                       lock_path: Optional[str] = None,
@@ -185,9 +187,21 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                                        "lock, and the plan's authorization is not current")}
                 try:
                     from ingest import corrected_day as _cd
-                    gate = _cd.prune_eligibility(dropped, manifest_root=manifest_root,
-                                                 delta_path=live, wal_root=wal_root,
-                                                 allowed_legacy_paths=allowed_legacy_paths)
+                    # The plan recorded which anchor domain authorized it. Re-authorizing against a
+                    # different one would mean the two stages rest on different evidence -- and the
+                    # weaker of the two is the one that decides.
+                    planned_anchor = plan.get("anchor_root")
+                    here = (os.path.realpath(anchor_root) if anchor_root else None)
+                    if planned_anchor != here:
+                        return {"status": "refused", "swap_performed": False,
+                                "reason": (f"the plan was authorized against anchor domain "
+                                           f"{planned_anchor!r} but the swap is using {here!r}; "
+                                           f"switching anchor domain between plan and swap means the "
+                                           f"two stages rest on different evidence")}
+                    gate = _cd.prune_eligibility(
+                        dropped, manifest_root=manifest_root, delta_path=live, wal_root=wal_root,
+                        anchor_root=anchor_root, allowed_legacy_paths=allowed_legacy_paths,
+                        unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
                 except Exception as exc:                  # unreadable WAL/manifest -> fail closed
                     return {"status": "refused", "swap_performed": False,
                             "reason": (f"the corrected-day gate could not be re-run under the lock "
