@@ -10,10 +10,10 @@ Branch `dev2026-p5-s5-part2-repair-lifecycle`, stacked on `fd3a234` (Part 1).
 - Lifecycle module: [`../ingest/corrected_day.py`](../ingest/corrected_day.py)
 - Gate wired into [`../ingest/prune_delta.py`](../ingest/prune_delta.py)
 - Builder derives `materialized_repairs`: [`../ingest/build_block.py`](../ingest/build_block.py)
-- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **87/87 green**
-- Full local suite: **759 tests OK** (17 skipped), up from 672
-- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **303 OK**
-- **68 guards mutation-verified**
+- Tests: [`../tests/test_phase2_p5s5_part2.py`](../tests/test_phase2_p5s5_part2.py) — **97/97 green**
+- Full local suite: **769 tests OK** (17 skipped), up from 672
+- `-W error::ResourceWarning` over S4 + S5 Part 1 + Part 2: **313 OK**
+- **76 guards mutation-verified**
 
 ## The rule
 
@@ -57,6 +57,10 @@ E1 is the deterministic identity; Phase A is the read that makes it about bytes.
 | **whole-VM snapshot rollback** | **PARTIAL — deployment prerequisite, NOT proven here** | see §"What the anchor does and does not prove" |
 | terminal writers cannot bypass the external anchor | **PASS** (round 6) | `TestTerminalWritersCannotBypassTheAnchor` |
 | the anchor domain is declared and auditable, not inferred | **PASS** (round 6) | `TestAnchorDomainIsDeclaredNotInferred` |
+| the writer refuses a stale WAL before allocating a seq | **PASS** (round 7) | `TestWriterRefusesAStaleWal` |
+| the filesystem preflight fails closed when it cannot answer | **PASS** (round 7) | `TestAnchorPreflightFailsClosed` |
+| the domain declaration is strictly typed and immutable | **PASS** (round 7) | `TestDeclarationSchemaIsStrict` |
+| the WAL authority binds canonical path **and** domain id | **PASS** (round 7) | `TestAuthorityBindsPathAndDomain` |
 | an external `anchor_root` is **required** on the production path | **PASS** (round 5) | `test_omitting_the_anchor_root_fails_closed_everywhere` |
 | the anchor domain is part of the WAL's deployment identity | **PASS** (round 5) | `test_a_WAL_bound_to_an_anchor_cannot_be_read_without_one` |
 | plan and swap on different anchor domains → refuse | **PASS** (round 5) | `test_plan_and_swap_on_DIFFERENT_anchor_domains_is_refused` |
@@ -109,7 +113,7 @@ could not see.
 
 ## Mutation verification
 
-68 guards disabled in turn; **all 68 fail** — 18 / 13 / 13 / 8 / 10 / 6 across six rounds.
+76 guards disabled in turn; **all 76 fail** — 18 / 13 / 13 / 8 / 10 / 6 / 8 across seven rounds.
 
 | guard disabled | result |
 |---|---|
@@ -438,3 +442,46 @@ workflow is worse than one that refuses.**
   written**, so a mismatched call leaves the WAL and both anchors byte-identical — asserted on
   bytes, and on the absence of any co-located sidecar;
 - the end-to-end workflow test now uses `commit_repair()` rather than raw `append()`.
+
+
+## Review round 7 — four findings
+
+### 1. [High] The writer did not check freshness before extending the log
+
+`append()` parsed the WAL and the external anchor and then allocated the next `seq` without
+`assert_fresh()`. After a rollback that left an older WAL beside an intact anchor, the next
+writer **re-used the missing seq and reported success**. Nothing was wrongly pruned — the gate
+still failed closed afterwards — but the rollback evidence was overwritten and recovery got
+harder.
+
+`assert_fresh()` now runs inside the WAL lock **before any allocation or write**, after the
+bound-domain check (which gives the more specific diagnosis when the caller simply passed the
+wrong anchor). Intent, commit and abort all refuse, and the WAL, the external anchor and the
+absence of any co-located sidecar are asserted **on bytes**. A test also asserts the missing
+`seq` is not re-used, which is the precise defect rather than its symptom.
+
+### 2. [High] The filesystem preflight passed when it could not run
+
+`os.stat()` failing was caught and read as "different filesystem" — and a missing WAL root is
+the *ordinary* state when initializing a new deployment, so a same-filesystem anchor was
+accepted with no acknowledgement. **An unanswerable question is not a passing answer.** It now
+fails closed; `initialize_wal()` creates the WAL root first, since it is the one entry point
+that legitimately meets a missing one; and a non-existent anchor root is refused outright.
+
+### 3. [Medium] The declaration could launder a wrong type into a waiver
+
+`bool(allow_same_filesystem)` turned the string `"false"` into `True` — a typo in a deployment
+script silently granting the waiver it was trying to withhold. The field must now be a raw
+`bool`, the declaration has an exact schema with per-field types on both write and read, and
+**re-declaring the same id with different content is refused**: the old code returned
+`already_declared` and ignored the new fields, which made this document's own advice to
+"re-declare with `allow_same_filesystem=True`" a no-op that looked like it worked — the worst
+kind of waiver, one you believe you have. That advice is corrected above.
+
+### 4. [Low] The claim did not match the binding
+
+`manifest_authority()` records **both** `anchor_root` and `anchor_domain_id`, while the comment
+said "domain id, not path". Keeping both is the safer behaviour — the domain id survives a
+remount, the path catches a second anchor root carrying the same declaration — so the **claim**
+was corrected rather than the code, and there is now a behavioural test: two roots declaring the
+same `domain_id` are still distinct, and reading the log against the second one is refused.

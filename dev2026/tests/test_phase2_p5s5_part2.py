@@ -1640,3 +1640,234 @@ class TestAnchorDomainIsDeclaredNotInferred(unittest.TestCase):
         auth = rw.manifest_authority.__doc__
         self.assertIsNotNone(auth)
         self.assertEqual(rw.anchor_domain_id(self.anchor), "d")
+
+
+# ================ review round 7: writer freshness, stat preflight, declaration strictness
+class TestWriterRefusesAStaleWal(unittest.TestCase):
+    """A rollback that leaves an older WAL beside an intact external anchor used to let the
+    next writer re-use the missing seq and report success. Nothing was wrongly pruned — the
+    gate still failed closed — but the rollback evidence was overwritten and recovery got
+    harder. A writer that cannot be trusted to read the log must not be trusted to extend it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = os.path.join(self.tmp, "manifest_root")
+        self.wal = os.path.join(self.tmp, "wal")
+        self.anchor = os.path.join(self.tmp, "anchor")
+        for d in (self.root, self.wal, self.anchor):
+            os.makedirs(d, exist_ok=True)
+        s0, e0 = bm.block_bounds(ANCHOR, S, 0)
+        days = fx.calendar_span(s0, e0)[:3]
+        delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(delta, days)
+        blk = build_block(os.path.join(self.root, "b.zarr"), start_day=s0, end_day=e0,
+                          classification_target=list(days), delta_path=delta,
+                          artifacts_dir=os.path.join(self.tmp, "art"), lock=None,
+                          hard_reserve_bytes=0, unsafe_skip_isolation=True)
+        m = {"format": bm.MANIFEST_FORMAT, "version": bm.SCHEMA_VERSION, "generation": 1,
+             "generation_id": "g1", "created_utc": "2027-01-01T00:00:00Z", "created_by": "t",
+             "predecessor_generation": None, "predecessor_manifest": None,
+             "grid": {"ny": 32, "nx": 32, "region": [0, 32, 0, 32]},
+             "variables": list(fx.VARS),
+             "block_grid": {"anchor_day": ANCHOR, "block_days": S},
+             "segments": [dict(blk["segment"])], "superseded": [], "manifest_checksum": ""}
+        m["manifest_checksum"] = bm.compute_checksum(m)
+        bm.publish(self.root, m)
+        rw.declare_anchor_domain(self.anchor, domain_id="d", at_utc="t", operator="ops",
+                                 allow_same_filesystem=True, note="unit-test domain")
+        rw.initialize_wal(self.wal, manifest_root=self.root, at_utc="t", operator="ops",
+                          anchor_root=self.anchor)
+        self.days = days
+        self.rid = rw.open_repair(self.wal, day=days[0], at_utc="t", operator="ops",
+                                  payload={}, anchor_root=self.anchor)["repair_id"]
+        # snapshot the WAL root, advance it, then roll the WAL root back
+        snap = os.path.join(self.tmp, "wal_snap")
+        shutil.copytree(self.wal, snap)
+        rw.commit_repair(self.wal, repair_id=self.rid, day=days[0], fingerprint="fp",
+                         at_utc="t", operator="ops", anchor_root=self.anchor)
+        shutil.rmtree(self.wal)
+        shutil.copytree(snap, self.wal)
+
+    def _bytes(self):
+        with open(os.path.join(self.wal, rw.WAL_NAME), "rb") as fh:
+            wal = fh.read()
+        with open(os.path.join(self.anchor, rw.ANCHOR_NAME), "rb") as fh:
+            anchor = fh.read()
+        return wal, anchor
+
+    def test_intent_commit_and_abort_all_refuse_on_a_rolled_back_log(self):
+        before = self._bytes()
+        for label, call in (
+            ("intent", lambda: rw.open_repair(self.wal, day=self.days[1], at_utc="t",
+                                              operator="ops", payload={},
+                                              anchor_root=self.anchor)),
+            ("commit", lambda: rw.commit_repair(self.wal, repair_id=self.rid,
+                                                day=self.days[0], fingerprint="fp2",
+                                                at_utc="t", operator="ops",
+                                                anchor_root=self.anchor)),
+            ("abort", lambda: rw.abort_repair(self.wal, repair_id=self.rid, day=self.days[0],
+                                              reason="x", at_utc="t", operator="ops",
+                                              anchor_root=self.anchor)),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(rw.WalRolledBack) as cm:
+                    call()
+                self.assertIn("must equal the head", str(cm.exception))
+                self.assertEqual(self._bytes(), before,
+                                 "WAL and external anchor must be byte-identical")
+                self.assertFalse(os.path.isfile(os.path.join(self.wal, rw.ANCHOR_NAME)),
+                                 "no co-located anchor may be created")
+
+    def test_the_missing_seq_is_NOT_reused(self):
+        """The precise defect: the replacement append reported success at the missing seq."""
+        head = rw.parse_wal(os.path.join(self.wal, rw.WAL_NAME)).last_seq
+        anchor_seq = rw.read_wal(self.wal, anchor_root=self.anchor).anchor["seq"]
+        self.assertLess(head, anchor_seq, "precondition: the log is behind the anchor")
+        with self.assertRaises(rw.WalRolledBack):
+            rw.open_repair(self.wal, day=self.days[1], at_utc="t", operator="ops",
+                           payload={}, anchor_root=self.anchor)
+        self.assertEqual(rw.parse_wal(os.path.join(self.wal, rw.WAL_NAME)).last_seq, head)
+
+
+class TestAnchorPreflightFailsClosed(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.anchor = os.path.join(self.tmp, "anchor")
+        os.makedirs(self.anchor, exist_ok=True)
+        rw.declare_anchor_domain(self.anchor, domain_id="d", at_utc="t", operator="ops")
+
+    def test_a_MISSING_wal_root_does_not_pass_the_filesystem_preflight(self):
+        """`os.stat` failing is an unanswerable question, not a passing answer — and a missing
+        WAL root is the ordinary state when initializing a new deployment."""
+        missing = os.path.join(self.tmp, "not_created_yet")
+        self.assertFalse(os.path.exists(missing))
+        with self.assertRaises(rw.WalNotInitialized) as cm:
+            rw.resolve_anchor_root(missing, self.anchor)
+        self.assertIn("cannot compare filesystems", str(cm.exception))
+
+    def test_a_missing_anchor_root_is_refused(self):
+        with self.assertRaises(rw.WalNotInitialized) as cm:
+            rw.resolve_anchor_root(self.tmp, os.path.join(self.tmp, "nope"))
+        self.assertIn("not an existing directory", str(cm.exception))
+
+    def test_initialize_wal_creates_the_wal_root_then_preflights(self):
+        """It is the one entry point that legitimately meets a missing WAL root, so it creates
+        it — and then the same-filesystem check still applies."""
+        fresh = os.path.join(self.tmp, "fresh_wal")
+        with self.assertRaises(rw.WalNotInitialized) as cm:
+            rw.initialize_wal(fresh, manifest_root=self.tmp, at_utc="t", operator="ops",
+                              anchor_root=self.anchor)
+        self.assertIn("same filesystem", str(cm.exception))
+        self.assertTrue(os.path.isdir(fresh), "the WAL root was created before the preflight")
+
+
+class TestDeclarationSchemaIsStrict(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.anchor = os.path.join(self.tmp, "anchor")
+        os.makedirs(self.anchor, exist_ok=True)
+
+    def test_allow_same_filesystem_is_not_coerced(self):
+        """`bool("false")` is True — a typo in a deployment script silently granting the
+        waiver it was trying to withhold."""
+        for bad in ("false", 0, 1, None, []):
+            with self.subTest(value=bad):
+                with self.assertRaises(rw.WalError) as cm:
+                    rw.declare_anchor_domain(self.anchor, domain_id="d", at_utc="t",
+                                             operator="ops", allow_same_filesystem=bad)
+                self.assertIn("raw bool", str(cm.exception))
+                self.assertFalse(os.path.isfile(
+                    os.path.join(self.anchor, rw.ANCHOR_DOMAIN_NAME)))
+
+    def test_a_declaration_with_the_wrong_field_set_or_type_is_refused(self):
+        """Each case starts from a PRISTINE declaration: reading the file back would carry the
+        previous iteration's damage forward, and every case would then pass for the first
+        case's reason."""
+        rw.declare_anchor_domain(self.anchor, domain_id="d", at_utc="t", operator="ops")
+        path = os.path.join(self.anchor, rw.ANCHOR_DOMAIN_NAME)
+        with open(path) as fh:
+            pristine = fh.read()
+        for label, mutate in (("missing field", lambda d: d.pop("operator")),
+                              ("unknown field", lambda d: d.update({"extra": 1})),
+                              ("truthy string flag",
+                               lambda d: d.update({"allow_same_filesystem": "true"})),
+                              ("non-string id", lambda d: d.update({"domain_id": 7})),
+                              ("empty id", lambda d: d.update({"domain_id": ""}))):
+            with self.subTest(label):
+                doc = json.loads(pristine)
+                mutate(doc)
+                with open(path, "w") as fh:
+                    json.dump(doc, fh)
+                with self.assertRaises(rw.WalCorrupt):
+                    rw.anchor_domain_id(self.anchor)
+
+    def test_re_declaring_the_SAME_document_is_idempotent(self):
+        kw = dict(domain_id="d", at_utc="t", operator="ops", note="n",
+                  allow_same_filesystem=True)
+        self.assertEqual(rw.declare_anchor_domain(self.anchor, **kw)["status"], "declared")
+        self.assertEqual(rw.declare_anchor_domain(self.anchor, **kw)["status"],
+                         "already_declared")
+
+    def test_re_declaring_the_same_id_with_DIFFERENT_content_is_refused(self):
+        """The old code returned `already_declared` and ignored the new fields, so the
+        documented "re-declare with allow_same_filesystem=True" was a no-op that looked like
+        it worked."""
+        rw.declare_anchor_domain(self.anchor, domain_id="d", at_utc="t", operator="ops")
+        with self.assertRaises(rw.WalError) as cm:
+            rw.declare_anchor_domain(self.anchor, domain_id="d", at_utc="t", operator="ops",
+                                     allow_same_filesystem=True)
+        self.assertIn("immutable", str(cm.exception))
+        self.assertIn("allow_same_filesystem", str(cm.exception))
+        self.assertFalse(rw._anchor_domain_doc(self.anchor)["allow_same_filesystem"],
+                         "the stored declaration must be unchanged")
+
+
+class TestAuthorityBindsPathAndDomain(unittest.TestCase):
+    """The docstring claimed "domain id, not path". It binds BOTH — which is the safer
+    behaviour, so the claim was corrected rather than the code."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = os.path.join(self.tmp, "manifest_root")
+        os.makedirs(self.root, exist_ok=True)
+        s0, e0 = bm.block_bounds(ANCHOR, S, 0)
+        days = fx.calendar_span(s0, e0)[:2]
+        delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(delta, days)
+        blk = build_block(os.path.join(self.root, "b.zarr"), start_day=s0, end_day=e0,
+                          classification_target=list(days), delta_path=delta,
+                          artifacts_dir=os.path.join(self.tmp, "art"), lock=None,
+                          hard_reserve_bytes=0, unsafe_skip_isolation=True)
+        m = {"format": bm.MANIFEST_FORMAT, "version": bm.SCHEMA_VERSION, "generation": 1,
+             "generation_id": "g1", "created_utc": "2027-01-01T00:00:00Z", "created_by": "t",
+             "predecessor_generation": None, "predecessor_manifest": None,
+             "grid": {"ny": 32, "nx": 32, "region": [0, 32, 0, 32]},
+             "variables": list(fx.VARS),
+             "block_grid": {"anchor_day": ANCHOR, "block_days": S},
+             "segments": [dict(blk["segment"])], "superseded": [], "manifest_checksum": ""}
+        m["manifest_checksum"] = bm.compute_checksum(m)
+        bm.publish(self.root, m)
+
+    def test_the_authority_records_BOTH_and_a_twin_domain_is_refused(self):
+        wal = os.path.join(self.tmp, "wal")
+        a = os.path.join(self.tmp, "anchor_a")
+        b = os.path.join(self.tmp, "anchor_b")
+        for d in (wal, a, b):
+            os.makedirs(d, exist_ok=True)
+        for d in (a, b):
+            rw.declare_anchor_domain(d, domain_id="same-id", at_utc="t", operator="ops",
+                                     allow_same_filesystem=True)
+        rw.initialize_wal(wal, manifest_root=self.root, at_utc="t", operator="ops",
+                          anchor_root=a)
+        auth = rw.read_wal(wal, anchor_root=a).authority
+        self.assertEqual(auth["anchor_domain_id"], "same-id")
+        self.assertEqual(auth["anchor_root"], os.path.realpath(a))
+
+        # a second root carrying the SAME declaration is still a different anchor
+        with self.assertRaises(rw.WalNotInitialized) as cm:
+            rw.read_wal(wal, anchor_root=b).assert_bound_to(self.root, os.path.realpath(b))
+        self.assertIn("different deployment", str(cm.exception))

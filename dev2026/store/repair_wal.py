@@ -155,10 +155,26 @@ def _anchor_domain_doc(anchor_root: str) -> Optional[dict]:
         return None
     with open(path) as fh:
         doc = json.load(fh)
-    if not isinstance(doc, dict) or not isinstance(doc.get("domain_id"), str) \
-            or not doc["domain_id"]:
-        raise WalCorrupt(f"{path}: anchor domain declaration has no usable domain_id")
+    if not isinstance(doc, dict):
+        raise WalCorrupt(f"{path}: anchor domain declaration is not an object")
+    missing = [k for k in _DOMAIN_FIELDS if k not in doc]
+    extra = [k for k in doc if k not in _DOMAIN_FIELDS]
+    if missing or extra:
+        raise WalCorrupt(f"{path}: declaration has the wrong field set (missing={missing}, "
+                         f"unexpected={extra})")
+    for name in ("domain_id", "declared_utc", "operator", "note"):
+        if not isinstance(doc[name], str):
+            raise WalCorrupt(f"{path}: {name} must be a string, got "
+                             f"{type(doc[name]).__name__}")
+    if not doc["domain_id"]:
+        raise WalCorrupt(f"{path}: domain_id is empty")
+    if type(doc["allow_same_filesystem"]) is not bool:
+        raise WalCorrupt(f"{path}: allow_same_filesystem must be a raw bool, got "
+                         f"{type(doc['allow_same_filesystem']).__name__}")
     return doc
+
+
+_DOMAIN_FIELDS = ("domain_id", "declared_utc", "operator", "note", "allow_same_filesystem")
 
 
 def declare_anchor_domain(anchor_root: str, *, domain_id: str, at_utc: str,
@@ -170,19 +186,37 @@ def declare_anchor_domain(anchor_root: str, *, domain_id: str, at_utc: str,
     local path, which changes on every mount and proves nothing about durability."""
     if not isinstance(domain_id, str) or not domain_id.strip():
         raise WalError("domain_id must be a non-empty string")
+    # `bool(x)` would turn the string "false" into True -- a typo in a deployment script
+    # silently granting the waiver it was trying to withhold.
+    if type(allow_same_filesystem) is not bool:
+        raise WalError(
+            f"allow_same_filesystem must be a raw bool, got "
+            f"{type(allow_same_filesystem).__name__} {allow_same_filesystem!r}; it is not "
+            f"coerced, because bool('false') is True and this field grants a waiver")
+    for name, value in (("at_utc", at_utc), ("operator", operator), ("note", note)):
+        if not isinstance(value, str):
+            raise WalError(f"{name} must be a string, got {type(value).__name__}")
     os.makedirs(anchor_root, exist_ok=True)
-    existing = anchor_domain_id(anchor_root)
-    if existing is not None:
-        if existing != domain_id:
-            raise WalError(
-                f"{anchor_root} already declares domain {existing!r}; re-declaring it as "
-                f"{domain_id!r} would silently move every log bound to the old id")
-        return {"status": "already_declared", "domain_id": existing}
-    # `allow_same_filesystem` is an operator acknowledgement, recorded in the artifact rather
-    # than passed as a code flag: it is the deployment claim that is being waived, so it
-    # belongs where an auditor reads the deployment, not in a call site.
     doc = {"domain_id": domain_id, "declared_utc": at_utc, "operator": operator, "note": note,
-           "allow_same_filesystem": bool(allow_same_filesystem)}
+           "allow_same_filesystem": allow_same_filesystem}
+    existing = _anchor_domain_doc(anchor_root)
+    if existing is not None:
+        if existing == doc:
+            return {"status": "already_declared", "domain_id": domain_id}
+        if existing["domain_id"] != domain_id:
+            raise WalError(
+                f"{anchor_root} already declares domain {existing['domain_id']!r}; "
+                f"re-declaring it as {domain_id!r} would silently move every log bound to "
+                f"the old id")
+        # Same id, different content. The declaration is IMMUTABLE: it is the record ops
+        # audited. Returning "already_declared" while ignoring the new fields made the
+        # documented "re-declare with allow_same_filesystem=True" a no-op that looked like it
+        # worked -- the worst kind of waiver, one you believe you have.
+        differing = sorted(k for k in _DOMAIN_FIELDS if existing.get(k) != doc.get(k))
+        raise WalError(
+            f"{anchor_root} already declares domain {domain_id!r} with different content "
+            f"({differing}). The declaration is immutable -- it is what an auditor read. To "
+            f"change it, replace {ANCHOR_DOMAIN_NAME} administratively and record why.")
     path = os.path.join(anchor_root, ANCHOR_DOMAIN_NAME)
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
@@ -216,6 +250,8 @@ def resolve_anchor_root(wal_root: str, anchor_root: Optional[str], *,
     resolved = os.path.realpath(anchor_root)
     if unsafe_allow_colocated_anchor:
         return resolved
+    if not os.path.isdir(resolved):
+        raise WalNotInitialized(f"anchor_root {anchor_root!r} is not an existing directory")
     if resolved == os.path.realpath(wal_root):
         raise WalNotInitialized(
             f"anchor_root {anchor_root!r} resolves to the WAL root itself, which is the one "
@@ -228,8 +264,15 @@ def resolve_anchor_root(wal_root: str, anchor_root: Optional[str], *,
             f"have confirmed is outside the WAL host's snapshot scope.")
     try:
         same_dev = os.stat(resolved).st_dev == os.stat(wal_root).st_dev
-    except OSError:
-        same_dev = False
+    except OSError as exc:
+        # Not "different device". A missing WAL root -- the ordinary state when initializing a
+        # new deployment -- made `stat` fail, which was read as "different filesystem" and
+        # waved a same-filesystem anchor through with no acknowledgement. An unanswerable
+        # question is not a passing answer.
+        raise WalNotInitialized(
+            f"cannot compare filesystems for {wal_root!r} and {resolved!r} ({exc}). Both roots "
+            f"must exist before the anchor preflight can mean anything; initialize_wal() "
+            f"creates the WAL root for you.") from exc
     if same_dev and not (_anchor_domain_doc(resolved) or {}).get("allow_same_filesystem"):
         raise WalNotInitialized(
             f"{anchor_root} is on the same filesystem as the WAL root. This is only a minimum "
@@ -251,11 +294,12 @@ def manifest_authority(manifest_root: str, anchor_root: Optional[str] = None) ->
            "format": live["format"], "version": live["version"],
            "grid": live["grid"], "block_grid": live["block_grid"]}
     if anchor_root is not None:
-        # Bound to the DECLARED DOMAIN, not to a local path: a path changes on every remount
-        # and proves nothing about durability, while the domain id is what an operator
-        # asserted about where this storage actually lives. Without the binding a deployment
-        # could initialize against an external anchor and prune against a co-located one --
-        # every stage self-consistent, the protection absent from the stage that mattered.
+        # Bound to BOTH the canonical path and the declared domain id, deliberately. The
+        # domain id is the durable claim -- it is what an operator asserted about where this
+        # storage lives, and it survives a remount. The path is the narrower, stricter check:
+        # it catches a second anchor root that happens to carry the same declaration. Keeping
+        # both means a relocation needs a deliberate re-initialization, which is the safer
+        # default when the alternative is silently accepting a different directory.
         out["anchor_root"] = os.path.realpath(anchor_root)
         out["anchor_domain_id"] = anchor_domain_id(os.path.realpath(anchor_root))
     return out
@@ -620,6 +664,14 @@ def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc
                     f"this WAL is bound to anchor domain {bound!r} but the append supplies "
                     f"{here!r}. Advancing a different anchor would leave the bound one behind "
                     f"and strand every later prune and refold in fail-closed recovery.")
+        # Freshness BEFORE any seq is allocated -- after the domain check, which gives the
+        # more specific diagnosis when the caller simply passed the wrong anchor. Without
+        # this, a rollback that left an older WAL beside an intact external anchor let the
+        # next writer re-use the missing seq and report success. The prune and refold still
+        # failed closed, so nothing was wrongly dropped -- but the rollback evidence was
+        # overwritten and recovery got harder. A writer that cannot be trusted to read the log
+        # must not be trusted to extend it.
+        state.assert_fresh()
         seq = state.last_seq + 1
         # NOT `payload or {}`: a dict subclass whose __bool__ is False would be silently
         # replaced by an empty payload, which is the same laundering the type check above
@@ -683,6 +735,9 @@ def initialize_wal(root: str, *, manifest_root: str, at_utc: str, operator: str,
     Idempotent for an identical binding -- re-running deployment tooling must not be a hazard --
     and a refusal for a different one, because rebinding a log that already carries repair
     history would silently transfer those authorizations to another base."""
+    # The WAL root is created FIRST, so the filesystem preflight has two real paths to
+    # compare. Initializing a new deployment is exactly when it does not exist yet.
+    os.makedirs(root, exist_ok=True)
     resolved = resolve_anchor_root(
         root, anchor_root, unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
     bound_anchor = None if (anchor_root is None and unsafe_allow_colocated_anchor) else resolved
