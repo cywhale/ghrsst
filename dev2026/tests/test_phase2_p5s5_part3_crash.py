@@ -212,6 +212,12 @@ class _CrashCase(unittest.TestCase):
         shutil.copytree(self.crashed, self.tmp, dirs_exist_ok=True, symlinks=True)
 
     # ---- helpers -----------------------------------------------------
+    def _apply(self, **kw):
+        """Applying always goes through the ingest lock, as production must."""
+        return pub.reconcile_publication(
+            self.root, operator="ops", apply=True,
+            ingest_lock_path=os.path.join(self.tmp, "ingest.lock"), **kw)
+
     @property
     def root(self):
         return os.path.join(self.tmp, "manifest_root")
@@ -335,7 +341,7 @@ class TestCommittedButUnlogged(_CrashCase):
         self.assertFalse(r["applied"])
 
     def test_repair_reconstructs_the_line_and_says_so(self):
-        r = pub.reconcile_publication(self.root, operator="ops", apply=True)
+        r = self._apply()
         self.assertTrue(r["applied"])
         with open(os.path.join(self.root, pub.MANIFEST_LOG)) as fh:
             lines = [json.loads(l) for l in fh if l.strip()]
@@ -347,9 +353,9 @@ class TestCommittedButUnlogged(_CrashCase):
         self.assertEqual(self.live_generation(), 2, "repairing the LOG must not touch the state")
 
     def test_repairing_twice_does_not_double_log(self):
-        pub.reconcile_publication(self.root, operator="ops", apply=True)
-        pub.reconcile_publication(self.root, operator="ops", apply=True)
-        pub.reconcile_publication(self.root, operator="ops", apply=True)
+        self._apply()
+        self._apply()
+        self._apply()
         self.assertEqual(self.log_generations().count(2), 1)
         self.assertEqual(pub.reconcile_publication(self.root)["verdict"], pub.RECOVERY_CLEAN)
 
@@ -359,7 +365,7 @@ class TestOrphanArchiveRetrySafety(_CrashCase):
     POINT = AFTER_ARCHIVE
 
     def test_apply_completes_the_publication_without_consuming_the_archive(self):
-        r = pub.reconcile_publication(self.root, operator="ops", apply=True)
+        r = self._apply(confirm_orphan_generation=2)
         self.assertTrue(r["applied"])
         self.assertEqual(self.live_generation(), 2)
         self.assertEqual(self.served_generation(), 2)
@@ -368,24 +374,24 @@ class TestOrphanArchiveRetrySafety(_CrashCase):
         self.assertEqual(pub.reconcile_publication(self.root)["verdict"], pub.RECOVERY_CLEAN)
 
     def test_the_predecessor_is_not_lost(self):
-        pub.reconcile_publication(self.root, operator="ops", apply=True)
+        self._apply(confirm_orphan_generation=2)
         live = bm.load_live(self.root)
         self.assertEqual(live["predecessor_generation"], 1)
         with open(os.path.join(self.root, bm.archive_name(1))) as fh:
             self.assertEqual(int(json.load(fh)["generation"]), 1)
 
     def test_completing_twice_is_not_worse_than_completing_once(self):
-        pub.reconcile_publication(self.root, operator="ops", apply=True)
+        self._apply(confirm_orphan_generation=2)
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
-        pub.reconcile_publication(self.root, operator="ops", apply=True)
-        pub.reconcile_publication(self.root, operator="ops", apply=True)
+        self._apply(confirm_orphan_generation=2)
+        self._apply(confirm_orphan_generation=2)
         self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
         self.assertEqual(self.log_generations().count(2), 1)
 
     def test_republishing_the_same_generation_is_REFUSED_not_repeated(self):
         """The archive is immutable. A retry that rewrote it would erase the record of what was
         actually published, which is the one thing recovery reads."""
-        pub.reconcile_publication(self.root, operator="ops", apply=True)
+        self._apply(confirm_orphan_generation=2)
         live = bm.load_live(self.root)
         with self.assertRaises(bm.ManifestError) as cm:
             bm.publish(self.root, live)
@@ -403,7 +409,7 @@ class TestAmbiguousStatesFailClosed(_CrashCase):
     POINT = AFTER_ARCHIVE
 
     def _verdict(self):
-        return pub.reconcile_publication(self.root, operator="ops", apply=True)
+        return self._apply(confirm_orphan_generation=2)
 
     def test_a_log_claiming_a_generation_that_never_happened(self):
         """The direction the authority rule forbids: the log must not create a publication."""
@@ -535,7 +541,7 @@ class TestCrashDuringRollbackAfterReplace(_CrashCase):
         as published. Treating it as an orphan and completing it would **silently undo the
         operator's rollback**, which is the reconciler acting on an intention it does not have.
         """
-        r = pub.reconcile_publication(self.root, operator="ops", apply=True)
+        r = self._apply(confirm_orphan_generation=2)
         self.assertEqual(r["verdict"], pub.RECOVERY_CLEAN)
         self.assertEqual(r.get("rolled_back_generations"), [2])
         self.assertEqual(self.live_generation(), 1, "it must not roll itself forward")
@@ -584,6 +590,96 @@ class TestLifecycleRetryDoesNotDoubleHold(unittest.TestCase):
             self.assertTrue(os.path.exists(entry["to"]), "the held block must still be there")
             self.assertFalse(os.path.exists(entry["from"]),
                              "a hold move is a rename, not a copy")
+
+
+class TestReconcilerTakesTheIngestLock(_CrashCase):
+    """Review round 8, findings 1 and 2. Classification is a statement about a moment; acting on
+    a moment that has passed is how a reconciler overwrites something newer than itself."""
+    POINT = AFTER_ARCHIVE
+
+    @property
+    def lock(self):
+        return os.path.join(self.tmp, "ingest.lock")
+
+    def test_applying_without_a_lock_path_is_refused(self):
+        r = pub.reconcile_publication(self.root, operator="ops", apply=True)
+        self.assertEqual(r["verdict"], pub.RECOVERY_FAIL_CLOSED)
+        self.assertFalse(r["applied"])
+        self.assertIn("ingest_lock_path is required", " ".join(r["reasons"]))
+        self.assertEqual(self.live_generation(), 1, "and it must not have acted")
+
+    def test_completing_an_orphan_requires_naming_the_generation(self):
+        r = self._apply()                                # no confirmation
+        self.assertEqual(r["verdict"], pub.RECOVERY_ORPHAN_ARCHIVE)
+        self.assertFalse(r["applied"])
+        self.assertIn("confirm_orphan_generation=2", " ".join(r["reasons"]))
+        self.assertEqual(self.live_generation(), 1)
+
+    def test_confirming_the_WRONG_generation_is_refused(self):
+        r = self._apply(confirm_orphan_generation=7)
+        self.assertFalse(r["applied"])
+        self.assertIn("which is not it", " ".join(r["reasons"]))
+        self.assertEqual(self.live_generation(), 1)
+
+    def test_a_STALE_observation_does_not_act_on_a_state_that_moved(self):
+        """The race, made deterministic by sequencing rather than by timing.
+
+        The operator classifies (orphan, generation 2), someone else completes that publication,
+        and only then does the operator apply. Inside the lock the verdict is re-derived and is
+        no longer an orphan, so the confirmation refers to a state that no longer exists and
+        nothing is done twice."""
+        observed = pub.reconcile_publication(self.root)
+        self.assertEqual(observed["verdict"], pub.RECOVERY_ORPHAN_ARCHIVE)
+
+        self._apply(confirm_orphan_generation=2)         # the other operator gets there first
+        self.assertEqual(self.live_generation(), 2)
+        log_before = list(self.log_generations())
+
+        late = self._apply(confirm_orphan_generation=2)  # the stale apply lands afterwards
+        self.assertEqual(late["verdict"], pub.RECOVERY_CLEAN)
+        self.assertFalse(late["applied"])
+        self.assertEqual(self.log_generations(), log_before,
+                         "the stale apply must not have written a second line")
+
+    def test_a_concurrent_holder_of_the_ingest_lock_blocks_the_apply(self):
+        """Ground truth, not instrumentation: while another process holds the ingest lock, the
+        apply does not complete AND the state does not change. If the lock were not taken, the
+        child would finish immediately and generation 2 would be live."""
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl, sys\n"
+             "lk = open(sys.argv[1], 'w')\n"
+             "fcntl.flock(lk, fcntl.LOCK_EX)\n"
+             "print('held', flush=True)\n"
+             "sys.stdin.readline()\n", self.lock],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            applier = subprocess.Popen(
+                [sys.executable, "-c",
+                 f"import sys; sys.path.insert(0, {_DEV2026!r}); "
+                 "from ingest import publish_manifest as pub; "
+                 "print(pub.reconcile_publication(sys.argv[1], operator='ops', apply=True, "
+                 "ingest_lock_path=sys.argv[2], confirm_orphan_generation=2)['applied'])",
+                 self.root, self.lock],
+                stdout=subprocess.PIPE, text=True)
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    applier.communicate(timeout=5)
+                self.assertEqual(self.live_generation(), 1,
+                                 "it must not have applied while another process held the lock")
+            finally:
+                applier.kill()
+                applier.communicate()
+        finally:
+            holder.kill()
+            holder.communicate()
+
+    def test_and_it_DOES_apply_once_the_lock_is_free(self):
+        """The companion the blocking test needs: otherwise 'it did not apply' would also pass
+        for a reconciler that never applies at all."""
+        self.assertTrue(self._apply(confirm_orphan_generation=2)["applied"])
+        self.assertEqual(self.live_generation(), 2)
 
 
 if __name__ == "__main__":
@@ -839,11 +935,34 @@ class TestG17BuildIsolationFencing(unittest.TestCase):
         self.lock = os.path.join(self.tmp, "p5_compaction.lock")
 
     def _holder(self):
+        """A child holding the lock, with a cleanup that actually finishes it.
+
+        `proc.kill()` alone leaves a zombie and two unclosed pipes -- which is a
+        `ResourceWarning` under the project's gate, and a real leak besides. A `SIGSTOP`ped
+        child also ignores `SIGKILL` until it is continued, so the cleanup must `SIGCONT` first
+        or the `wait()` never returns."""
         proc = subprocess.Popen([sys.executable, "-c", _HOLDER, self.lock],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        self.addCleanup(proc.kill)
+        self.addCleanup(self._reap, proc)
         self.assertEqual(proc.stdout.readline().strip(), "acquired")
         return proc
+
+    @staticmethod
+    def _reap(proc):
+        import signal
+        if proc.poll() is None:
+            try:
+                proc.send_signal(signal.SIGCONT)     # a stopped child cannot be killed
+            except (ProcessLookupError, OSError):
+                pass
+            proc.kill()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None and not pipe.closed:
+                pipe.close()
 
     def _busy(self):
         from store.compaction_lock import refuse_if_compaction_running
@@ -873,8 +992,7 @@ class TestG17BuildIsolationFencing(unittest.TestCase):
         so the operation must refuse — and must refuse WITHOUT waiting for it."""
         import signal
         proc = self._holder()
-        proc.send_signal(signal.SIGSTOP)
-        self.addCleanup(lambda: proc.send_signal(signal.SIGCONT))
+        proc.send_signal(signal.SIGSTOP)                 # `_reap` continues it before killing
         refusal = self._busy()
         self.assertIsNotNone(refusal, "a paused holder still holds the lock")
         self.assertEqual(refusal["reason"], "compaction_lock_held")

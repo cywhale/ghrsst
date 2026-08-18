@@ -10,16 +10,16 @@ written outside a temp dir.
 Branch `dev2026-p5-s5-part3-crash-proof`, stacked on `3c37193` (Part 2, signed off).
 
 - Harness: [`../tests/test_phase2_p5s5_part3.py`](../tests/test_phase2_p5s5_part3.py) — **53/53 green**
-- Crash / snapshot / G17: [`../tests/test_phase2_p5s5_part3_crash.py`](../tests/test_phase2_p5s5_part3_crash.py) — **42/42 green**
+- Crash / snapshot / G17: [`../tests/test_phase2_p5s5_part3_crash.py`](../tests/test_phase2_p5s5_part3_crash.py) — **48/48 green**
 - New: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py) `reconcile_publication()` — the §9.4 authority and recovery rule
 - Changed: [`../ingest/swap_delta.py`](../ingest/swap_delta.py) — §7.9 quiescence is required, must prove itself, and is recorded
 - Changed: [`p4s10_production_rollout_runbook.md`](p4s10_production_rollout_runbook.md) — §1 env + preflight, Step 4a, Step 4b
 - New: [`../ops/quiescence.py`](../ops/quiescence.py) — the drain measurement, importable and therefore testable
 - New: [`../store/durable_jsonl.py`](../store/durable_jsonl.py) — one durable append-only writer, shared by the executor manifest and the ops evidence file
 - **Unchanged: [`../store/tiered_cube.py`](../store/tiered_cube.py).** No signed-off P5-S2 behaviour was touched — not even the docstring, which still records R1 as "adjudicated at S5/G10". Amending it to point at this verdict is a one-line follow-up **after** sign-off, not something to slip in alongside the evidence.
-- Full local suite: **868 tests OK** (17 skipped), up from 773
-- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **431 OK**
-- **29 guards mutation-verified**
+- Full local suite: **874 tests OK** (17 skipped), up from 773
+- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **437 OK** (also clean under `PYTHONWARNINGS=error::ResourceWarning`, the reviewer's invocation)
+- **44 guards mutation-verified**
 
 ## Delivered / not delivered
 
@@ -438,9 +438,9 @@ Every refusal is asserted to leave the live delta byte-for-byte as it was.
 
 ## Mutation verification
 
-Forty-two guards, each disabled in turn; **all forty-two fail** — five from round 1, six from
-round 2, seven from round 3, five from round 4, six from round 5, five from round 6, and eight
-from the crash/recovery work.
+Forty-four guards, each disabled in turn; **all forty-four fail** — five from round 1, six from
+round 2, seven from round 3, five from round 4, six from round 5, five from round 6, eight from
+the crash/recovery work, and two from round 8.
 
 Two mutations survived across rounds 5 and 6 and are **not** counted, because neither changes
 behaviour: removing `: "${DEPLOY_SHA:?...}"` (the next line still refuses an unset variable) and
@@ -487,6 +487,8 @@ verified, and this is the third time in P5-S5 that shape has appeared.
 | the orphan's segments not checked on disk (round 7) | FAILED |
 | the orphan archive not validated (round 7) | FAILED |
 | reconstructed lines not marked as such (round 7) | FAILED |
+| the reconciler applies without the ingest lock (round 8) | FAILED |
+| an orphan is completed without confirmation (round 8) | FAILED |
 | the anchor-domain check only prints (round 5) | FAILED |
 | the exact-SHA comparison removed (round 5) | FAILED |
 | the ancestor floor removed (round 5) | FAILED |
@@ -505,13 +507,12 @@ assertion reads a directory `tearDown` is deleting and reports as a lurid unrela
 instead of the assertion that actually failed. That was a real leak in the first draft of this
 suite, found when a refused plan skipped the join.
 
-## NOT delivered in this round
-
-- **Crash-boundary injection** — kill points between publish, prune, swap and WAL append, and
-  the retry / committed-but-unlogged case. This is the rest of Part 3.
-- **Snapshot cases (a) (b) (c) (e)** from the design spec's crash matrix.
-- **Whole-VM snapshot rollback** — still **PARTIAL — deployment prerequisite** (Part 2).
-- **G10 / H4 / G17** — not claimed.
+> **Superseded.** Rounds 1–6 ended here with crash injection, the snapshot cases and
+> G10/H4/G17 listed as not delivered. They were delivered in the crash-proof round; the
+> authoritative status is the **Delivered / not delivered** table at the top of this document,
+> and what remains outstanding is under **Still NOT delivered** at the end. This paragraph is
+> kept only so the round-by-round narrative does not read as if the earlier rounds claimed more
+> than they did.
 
 ## What would reopen `(e2)`
 
@@ -524,6 +525,45 @@ Stated plainly, because the verdict is conditional:
    responsibility, it is why `evidence` is mandatory and now durable, and it is the reason
    production closure is recorded above as PARTIAL rather than done.
 
+
+## Review round 8 — the reconciler could act on a moment that had passed
+
+**1. `apply=True` took no lock.** It read, classified, and then wrote — `rollback_to()` and an
+audit line — with nothing serialising it against a concurrent publication or rollback. A verdict
+computed outside the lock is a statement about a moment that has passed. Applying now
+**requires** `ingest_lock_path`, and re-reads, re-classifies and re-verifies **inside** the lock;
+nothing computed before the lock is carried in. Report-only classification still takes no lock,
+because it changes nothing.
+
+The race is tested by **sequencing rather than timing**: an operator classifies (orphan,
+generation 2), another completes that publication first, and the late apply then finds `clean`
+inside the lock and does nothing — no second log line, no second commit. A companion test holds
+the ingest lock in another process and shows the apply neither completes nor changes the live
+generation, with a further test that it *does* apply once the lock is free (otherwise "it did
+not apply" would also pass for a reconciler that never applies).
+
+Both of those are mutation-verified. A third property — that the classification is re-derived
+**inside** the lock — is **structural rather than mutation-verified**, and is reported that way:
+there is exactly one classification call and it is inside the lock, so a mutation that adds a
+pre-lock read and acts on it is a contrived variant rather than a weakened guard. What is
+verified is that the lock is genuinely taken (the blocking test) and that a stale confirmation
+does nothing (the sequencing test).
+
+**2. Completing an orphan was too easy.** An interrupted publication and an archive someone
+deliberately abandoned are **indistinguishable on disk**, so a generic `apply=True` could
+re-serve something that was given up on. Completion now requires
+`confirm_orphan_generation=<N>` — the caller naming the generation they looked at — and it must
+still be the completable orphan when the lock is held. Repairing a missing log line needs no
+confirmation: it changes nothing that is served.
+
+**3. The results footer contradicted the document.** The round-1–6 footer still listed crash
+injection, the snapshot cases and G10/H4/G17 as not delivered. Superseded in place, pointing at
+the table at the top; a results artifact that argues with itself cannot support a sign-off.
+
+**4. The crash harness leaked subprocesses and pipes.** `proc.kill()` with no `wait()` left
+zombies and unclosed pipes — and a `SIGSTOP`ped child ignores `SIGKILL` until it is continued, so
+the teardown has to `SIGCONT` first or the reap never returns. One `_reap` helper now continues,
+kills, waits and closes all three pipes.
 
 ## Residual risks and stop conditions
 

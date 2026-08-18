@@ -1490,7 +1490,8 @@ def _read_log(root: str, name: str) -> List[dict]:
 
 
 def reconcile_publication(root: str, *, operator: str = "", now: Optional[datetime] = None,
-                          apply: bool = False) -> dict:
+                          apply: bool = False, ingest_lock_path: Optional[str] = None,
+                          confirm_orphan_generation: Optional[int] = None) -> dict:
     """Classify the on-disk state after a crash, and repair only what is provably safe (§9.4).
 
     ## The authority rule
@@ -1529,8 +1530,49 @@ def reconcile_publication(root: str, *, operator: str = "", now: Optional[dateti
       manifest, a live generation with no archive, a log claiming a generation that is neither
       live nor archived, an unparsable log line, or an ahead archive that does not verify.
       **No automatic action.** An ambiguous state must never resolve itself into success.
+
+    ## Classification is report-only; applying takes the ingest lock
+
+    Without `apply` this reads and returns. With `apply=True` it **requires `ingest_lock_path`**
+    and does the whole thing again **inside the lock** -- re-read, re-classify, re-verify -- and
+    acts only on what it sees there. A classification taken outside the lock is a statement
+    about a moment that has passed: a publication or a rollback can land in between, and acting
+    on the earlier verdict would overwrite a newer `manifest.json` or write an audit line for a
+    state that no longer exists.
+
+    ## Completing an orphan needs the generation named
+
+    Re-publishing an abandoned archive is not obviously the right call: an interrupted
+    publication and a build someone deliberately gave up on look identical on disk. So
+    `apply=True` alone will not do it. The caller must pass
+    `confirm_orphan_generation=<N>` -- naming the generation they looked at and decided to
+    complete -- and it must still be the completable orphan when the lock is held. Repairing a
+    missing log line needs no such confirmation: it changes nothing that is served.
     """
     now = now or datetime.now(timezone.utc)
+    if not apply:
+        return _reconcile_classify(root, operator=operator, now=now, apply=False,
+                                   confirm=confirm_orphan_generation)
+    if not ingest_lock_path:
+        return {"root": root, "verdict": RECOVERY_FAIL_CLOSED, "applied": False, "actions": [],
+                "reasons": ["ingest_lock_path is required to apply: a verdict computed outside "
+                            "the lock describes a moment that has passed, and acting on it can "
+                            "overwrite a publication or rollback that landed in between"]}
+    os.makedirs(root, exist_ok=True)
+    lk = open(ingest_lock_path, "w")
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        # Everything is re-derived HERE. Nothing computed before the lock is carried in.
+        return _reconcile_classify(root, operator=operator, now=now, apply=True,
+                                   confirm=confirm_orphan_generation)
+    finally:
+        fcntl.flock(lk, fcntl.LOCK_UN)
+        lk.close()
+
+
+def _reconcile_classify(root: str, *, operator: str, now: datetime, apply: bool,
+                        confirm: Optional[int]) -> dict:
+    """The classification itself. Called under the ingest lock whenever it may act."""
     report: dict = {"root": root, "verdict": RECOVERY_FAIL_CLOSED, "applied": False,
                     "actions": [], "reasons": []}
 
@@ -1605,6 +1647,14 @@ def reconcile_publication(root: str, *, operator: str = "", now: Optional[dateti
             return report
         report["verdict"] = RECOVERY_ORPHAN_ARCHIVE
         report["completable_generation"] = target
+        if apply and confirm != target:
+            report["reasons"].append(
+                f"generation {target} is a completable orphan, but completing it re-serves an "
+                f"archive that may have been abandoned on purpose -- indistinguishable on disk "
+                f"from an interrupted publication. Pass confirm_orphan_generation={target} to "
+                f"say you looked at it and decided. "
+                + (f"(You confirmed {confirm}, which is not it.)" if confirm is not None else ""))
+            return report
         if apply:
             bm.rollback_to(root, target)           # copy -> verify -> fsync -> replace
             _append_log(root, MANIFEST_LOG, {
