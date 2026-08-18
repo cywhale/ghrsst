@@ -55,6 +55,10 @@ def execute_swap_plan(*a, **kw):
     waive it explicitly here -- in ONE named place."""
     kw.setdefault("corrected_day_gate", False)
     kw.setdefault("unsafe_skip_compaction_lock", True)
+    # P5-S5 Part 3 §7.9: quiescence is required for a production swap. These cases predate it
+    # and exercise the swap mechanics; the four that ARE about quiescence pass the hook
+    # themselves, and `setdefault` leaves those untouched.
+    kw.setdefault("unsafe_skip_quiescence", True)
     return _execute_swap_plan_strict(*a, **kw)
   # noqa: E402
 
@@ -346,6 +350,11 @@ class TestHoldDirFilesystemPrecheck(_Fixture):
         self.assertEqual(res["status"], "swapped")
 
 
+def _attested(**kw):
+    """A quiescence attestation for cases that are not about the attestation itself."""
+    return {"drained": True, "evidence": "test harness: no readers", "observed_inflight": 0, **kw}
+
+
 class TestPreSwapQuiesce(_Fixture):
     """S10 production posture (Codex S10-review #1): quiescence runs INSIDE the lock, after the
     staleness guard + prechecks, BEFORE any rename — via the pre_swap_quiesce_fn hook."""
@@ -359,6 +368,8 @@ class TestPreSwapQuiesce(_Fixture):
             # at quiesce time the live delta must still be the ORIGINAL (nothing renamed yet)
             live_days_at_quiesce["days"] = sorted(_days_attr(self.live))
             events.append("quiesce")
+            return {"drained": True, "evidence": "test harness: no reader threads started",
+                    "observed_inflight": 0}
 
         def start():
             events.append("start")
@@ -382,7 +393,7 @@ class TestPreSwapQuiesce(_Fixture):
         append_to_delta(d2, self.live, extra, spatial_chunk=8, shard_spatial=8)
         called = []
         res = execute_swap_plan(plan, mode="s2", hold_dir=self.hold,
-                                pre_swap_quiesce_fn=lambda: called.append(1))
+                                pre_swap_quiesce_fn=lambda: called.append(1) or _attested())
         self.assertEqual(res["status"], "aborted_stale")
         self.assertEqual(called, [])                                 # quiesce NOT invoked
 

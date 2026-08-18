@@ -35,6 +35,50 @@ from store.compaction_lock import (  # noqa: E402
 DEFAULT_HOLD_DAYS = 14
 
 
+class QuiescenceNotProven(RuntimeError):
+    """The quiescence hook ran without proving the process was drained.
+
+    Distinct from the hook *failing*: a hook that raises says "I tried to stop the app and
+    could not". This says "you told me nothing" -- and silence is the state a forgotten
+    `return` produces, so it must not read as success."""
+
+
+def _quiescence_refusal(attestation) -> Optional[str]:
+    """None when the attestation PROVES drain; otherwise why it does not.
+
+    The hook must report what it checked, not merely finish. `pm2 stop` returning 0 is not
+    evidence the port is closed and the workers are gone -- and "no reader was observed" is not
+    "no reader exists", which is the assumption the (e2) analysis is not allowed to make.
+
+    `drained` must be a raw `True`. Truthiness would accept the string ``"false"``, which is
+    what a shell-scripted hook produces when it interpolates a variable it never set -- the
+    same laundering that made `allow_same_filesystem` grant a waiver it was refusing (P5-S5
+    Part 2 round 7)."""
+    if attestation is None:
+        return ("the quiescence hook returned no attestation. A hook that merely does not raise "
+                "proves nothing: it cannot distinguish a drained process from one it never "
+                "looked at")
+    if not isinstance(attestation, dict):
+        return (f"the quiescence attestation must be a dict, got {type(attestation).__name__}")
+    drained = attestation.get("drained")
+    if drained is not True:
+        return (f"the quiescence attestation reports drained={drained!r}; it must be exactly "
+                f"True. Readers are not proven gone")
+    evidence = attestation.get("evidence")
+    if not isinstance(evidence, str) or not evidence.strip():
+        return ("the quiescence attestation carries no `evidence` string. Record WHAT was "
+                "checked (process stopped, port closed, in-flight count read), so a swap that "
+                "later loses a day can be traced to what quiescence actually verified")
+    inflight = attestation.get("observed_inflight")
+    if inflight is not None:
+        if not isinstance(inflight, int) or isinstance(inflight, bool):
+            return (f"observed_inflight must be an int, got {type(inflight).__name__}")
+        if inflight > 0:
+            return (f"the quiescence attestation reports {inflight} in-flight request(s) still "
+                    f"alive. A reader alive across the swap is the (e2) combination itself")
+    return None
+
+
 def _st_dev(path: str) -> int:
     """Device id for a path (factored out so tests can simulate a cross-device hold_dir/staging)."""
     return os.stat(path).st_dev
@@ -79,7 +123,8 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                       corrected_day_gate: bool = True,
                       lock_path: Optional[str] = None,
                       refresh_fn: Optional[Callable[[], None]] = None,
-                      pre_swap_quiesce_fn: Optional[Callable[[], None]] = None,
+                      pre_swap_quiesce_fn: Optional[Callable[[], dict]] = None,
+                      unsafe_skip_quiescence: bool = False,
                       verifier: Optional[Callable[[str, List[str]], dict]] = None,
                       hold_days: int = DEFAULT_HOLD_DAYS,
                       compaction_lock_path: Optional[str] = None,
@@ -93,9 +138,12 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
     pre_swap_quiesce_fn (S10 production posture, Codex review): called INSIDE the lock, AFTER the
     staleness guard + same-fs prechecks, BEFORE any path switch — production passes "pm2 stop + verify
     port down" here so quiescence and swap share one critical section (an external stop before this
-    function would sit outside the lock AND deadlock on a nested flock). If it raises, NOTHING has been
-    touched: the executor returns ``status="quiesce_failed"`` (safe state; the caller decides app
-    recovery). Order: lock -> staleness -> prechecks -> quiesce -> swap -> refresh_fn -> verify.
+    function would sit outside the lock AND deadlock on a nested flock). REQUIRED (§7.9): it must
+    return an attestation ``{"drained": True, "evidence": "<what was checked>",
+    "observed_inflight": 0}``; returning nothing, or reporting anything short of a proven drain, is
+    refused. If it raises or cannot prove drain, NOTHING has been touched: the executor returns
+    ``status="quiesce_failed"`` (safe state; the caller decides app recovery).
+    Order: lock -> staleness -> prechecks -> quiesce -> swap -> refresh_fn -> verify.
     refresh_fn: runs AFTER the swap (tests: cube.refresh; production: "pm2 start + healthz wait") and is
     re-invoked best-effort during rollback. verifier: extra post-swap check, called
     (live_path, keep_sorted) -> {"ok": bool, ...}; the built-in local verifier always runs first.
@@ -112,6 +160,20 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
     # so a caller who simply omitted it swapped the delta path with no reservation at all --
     # while a build held the real lock and was reading that delta. The waiver is named so it
     # cannot be typed by accident.
+    # P5-S5 Part 3 §7.9: quiescence is REQUIRED, and it must be PROVEN.
+    # The (e2) hole -- a reader holding a pre-publish base while the delta it re-resolves is
+    # already pruned -- is closed by the protocol, not by the snapshot mechanism
+    # (`tiered_cube` module docstring). The protocol's load-bearing step is this one. It
+    # defaulted to None and was skipped when omitted, so a caller who simply forgot swapped the
+    # delta path with live readers still holding the old base: the exact combination the design
+    # spec claims is unreachable. Absence of a hook is not evidence of an empty process.
+    if pre_swap_quiesce_fn is None and not unsafe_skip_quiescence:
+        return {"status": "refused", "swap_performed": False, "live_touched": False,
+                "reason": ("pre_swap_quiesce_fn is required: the swap retargets the delta path, "
+                           "and a reader alive across it can hold a pre-publish base together "
+                           "with a post-prune delta, where folded days sit in neither tier "
+                           "(§7.5, (e2)). Pass the quiescence hook, or unsafe_skip_quiescence="
+                           "True in a test that is not exercising it.")}
     compaction_guard = None
     if not compaction_lock_path and not unsafe_skip_compaction_lock:
         return {"status": "refused", "swap_performed": False,
@@ -231,7 +293,9 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
             # ---- pre-swap quiescence (INSIDE the lock, after staleness+prechecks, BEFORE any rename) ----
             if pre_swap_quiesce_fn is not None:
                 try:
-                    pre_swap_quiesce_fn()
+                    why = _quiescence_refusal(pre_swap_quiesce_fn())
+                    if why is not None:
+                        raise QuiescenceNotProven(why)
                 except Exception as exc:
                     # SAFE state: no file has been touched. The caller decides app recovery (it may have
                     # half-stopped the serving process) — that is why this is a distinct status.
