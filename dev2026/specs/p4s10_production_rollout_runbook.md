@@ -24,7 +24,11 @@ cube and the **live** daily staging store.
   hard delete is a later, manual, ops-only action (§9). **S10 itself frees NO disk** — space is
   reclaimed only when ops hard-deletes expired hold entries after `hold_until`.
 - All paths live under `/home/odbadmin/Data/ghrsst` (`$G`) or the runtime worktree; anything else in a
-  command is an abort.
+  command is an abort. **One exception, and only one: `$ANCHOR_ROOT`** (§7.5a-2), which must sit
+  *outside* `$G` — an anchor inside `$G` shares the WAL's rollback domain and cannot witness the
+  rollback it exists to detect. It must be an ops-approved, locally-mounted path in an
+  independent durability domain, and it is **read/attested, never a bulk mutation target**: every
+  path that gets *written* by a prune or swap still lives under `$G`.
 
 Environment (run first):
 ```bash
@@ -37,9 +41,99 @@ export HOLD=$G/hold; mkdir -p "$HOLD"
 export LIVE_DELTA=$G/mur_timecube_s8_t90_sh128.delta.zarr
 export NEW_DELTA=$G/mur_timecube_s8_t90_sh128.delta.zarr.new-$RUN_ID   # staging, SAME filesystem
 export LOCK=$G/mur_delta.ingest.lock                                   # shared ingest lock (see §3)
+# ---- P5 roots. The corrected-day gate (§7.5a) and the compaction reservation (§7.1b) are
+# REQUIRED whenever a day is dropped; a plan or swap without these fails closed, by design.
+export MANIFEST_ROOT=$G/p5_blocks                                      # generation manifests
+export WAL_ROOT=$G/p5_repairs                                          # repair WAL (§7.5a-1)
+export CLOCK=$G/p5_compaction.lock                                     # compaction reservation
+# ANCHOR_ROOT is NOT under $G, and that is the whole point: the WAL freshness anchor exists to
+# survive a rollback of the WAL's own host. VM24 has had two whole-VM snapshot rollbacks; an
+# anchor restored alongside the WAL it is meant to check proves nothing. The operator supplies
+# a path in a genuinely independent durability domain (separate mount / host / object store).
+export ANCHOR_ROOT=${ANCHOR_ROOT:?set ANCHOR_ROOT to an INDEPENDENT rollback domain (§7.5a-2)}
 ```
-Code: branch `dev2026-p4-s8-swap-design` tip; `git merge-base --is-ancestor 2fa8b43 HEAD` must pass;
-record `git rev-parse HEAD > $ART/git_head.txt`. Checking out the worktree does NOT restart the app.
+**Preflight (every check must pass, or §4 does not start):**
+```bash
+test -d "$MANIFEST_ROOT" && test -d "$WAL_ROOT" && test -d "$ANCHOR_ROOT" || \
+  { echo "NO-GO: P5 roots missing — prune would fail closed"; exit 1; }
+# NO-GO, not a warning. `resolve_anchor_root()` refuses a same-filesystem anchor unless the
+# domain declaration explicitly waives it, so a shared filesystem here does not degrade the
+# guarantee quietly — it stops the run. Fix the deployment, do not waive it: an anchor that
+# a whole-VM rollback restores together with the WAL cannot detect that rollback.
+[ "$(stat -c %d "$WAL_ROOT")" != "$(stat -c %d "$ANCHOR_ROOT")" ] || \
+  { echo "NO-GO: WAL and anchor share a filesystem — a whole-VM rollback restores both, so the"
+    echo "       anchor cannot witness it (§7.5a-2). Move ANCHOR_ROOT to an independent domain."
+    exit 1; }
+# ASSERT, do not print: `anchor_domain_id()` returns None for an undeclared root and exits 0,
+# so `print(...) || NO-GO` accepted exactly the configuration it was written to reject.
+$PY -c "import sys; sys.path.insert(0,'$WT'); from store import repair_wal as rw; \
+  d = rw.anchor_domain_id('$ANCHOR_ROOT'); \
+  print('anchor domain:', d); \
+  raise SystemExit(0 if d else 'anchor domain is NOT declared')" || \
+  { echo "NO-GO: anchor domain not declared (§7.5a-2) — declare it before pruning"; exit 1; }
+```
+Code: **must contain P5-S5 Parts 1–3** — the WAL, the corrected-day gate, the current executor
+contract and `ops/quiescence.py`. `dev2026-p4-s8-swap-design` is **no longer a valid deployment
+branch**: its tip predates all of that, and a worktree checked out from it fails on import.
+Deploy from an **exact, operator-supplied SHA** — `$DEPLOY_SHA` — not from a branch tip. A
+branch moves; "the tip of `dev2026-p5-s5-part3-crash-proof`" is not a statement about which
+implementation ran. `git merge-base --is-ancestor 3c37193 HEAD` must also pass (P5-S5 Part 2,
+signed off) as a floor, and the capability preflight checks that the deployed tree really has
+the modules — but neither proves the code was *reviewed*, and only the SHA does.
+
+> **OUTSTANDING — the reviewed SHA comes from OUTSIDE this document.** `$DEPLOY_SHA` is supplied
+> by the operator, who must take it from the **external approval record**: the sign-off note for
+> P5-S5 Part 3, or a signed tag (`git verify-tag`) pointing at the reviewed commit.
+>
+> Writing the reviewed SHA into this runbook does **not** work, and an earlier revision of this
+> note proposed exactly that. A commit that records SHA *X* here **changes `HEAD` to something
+> other than *X*** — so the pin it just wrote can never satisfy `HEAD == $DEPLOY_SHA`. The
+> document cannot hold its own pin; only an external record can.
+
+Record `git rev-parse HEAD > $ART/git_head.txt`. Checking out the worktree does NOT restart the
+app.
+
+```bash
+: "${DEPLOY_SHA:?set DEPLOY_SHA to the exact reviewed commit to deploy}"
+# Order matters: establish that $DEPLOY_SHA is a real, immutable commit BEFORE asking anything
+# about it. Asked first, the ancestor floor answered "predates P5-S5" for a SHA that does not
+# exist at all -- a true refusal for the wrong reason, which is how a wrong pin gets debugged in
+# the wrong place.
+#
+# `git rev-parse` happily resolves HEAD, a branch, a tag or an abbreviation, so comparing its
+# OUTPUT to HEAD accepted every movable ref -- the thing this gate exists to reject. Canonicalize
+# first, then require the operator's ORIGINAL input to equal the canonical form: only a full
+# 40-char commit SHA survives that.
+cd $WT/..
+CANONICAL=$(git rev-parse --verify "$DEPLOY_SHA^{commit}" 2>/dev/null) || \
+  { echo "NO-GO: \$DEPLOY_SHA does not name a commit in this repository"; exit 1; }
+[ "$DEPLOY_SHA" = "$CANONICAL" ] || \
+  { echo "NO-GO: \$DEPLOY_SHA must be the full immutable commit SHA, not a ref or abbreviation"
+    echo "       (got '$DEPLOY_SHA', canonical is '$CANONICAL')"; exit 1; }
+git merge-base --is-ancestor 3c37193 "$DEPLOY_SHA" || \
+  { echo "NO-GO: \$DEPLOY_SHA predates P5-S5 Part 2 — it cannot contain this runbook's code"
+    exit 1; }
+[ "$(git rev-parse HEAD)" = "$DEPLOY_SHA" ] || \
+  { echo "NO-GO: worktree HEAD is not \$DEPLOY_SHA"; exit 1; }
+```
+
+**Capability preflight (REQUIRED — the deployed tree must have the code this runbook calls):**
+```bash
+cd $WT && $PY - <<'EOF' || { echo "NO-GO: deployed tree predates P5-S5"; exit 1; }
+import inspect, sys
+sys.path.insert(0, ".")
+from ingest.swap_delta import execute_swap_plan, QUIESCENCE_CORE_FIELDS
+from ops.quiescence import attest_drain, worker_pids           # P5-S5 Part 3
+from store import repair_wal, durable_jsonl                    # P5-S4 / P5-S5
+sig = set(inspect.signature(execute_swap_plan).parameters)
+need = {"compaction_lock_path", "wal_root", "manifest_root", "anchor_root",
+        "pre_swap_quiesce_fn"}
+assert need <= sig, f"executor is missing {sorted(need - sig)}"
+assert set(QUIESCENCE_CORE_FIELDS) == {"drained", "evidence", "observed_inflight",
+                                       "attestation_id"}, QUIESCENCE_CORE_FIELDS
+print("capability preflight OK")
+EOF
+```
 
 ## 2. Fresh-audit precondition (**[RO]** — the gate for everything below)
 
@@ -145,9 +239,14 @@ keep_start = dp["keep_window_start"]                       # FRESH audit is the 
 dd = sorted(zarr.open_group(live, mode="r").attrs["days"])
 keep = [d for d in dd if d >= keep_start]
 base_days = list(zarr.open_group(os.path.join(G, "mur_timecube_s8_t90_sh128.zarr"), mode="r").attrs["days"])
+# P5-S5: wal_root/manifest_root/anchor_root are REQUIRED whenever days are dropped. Without
+# them the plan refuses -- correctly, since no day may leave delta unless E1 identity
+# authorization and §7.8a Phase A base-only verification have both passed for it.
 plan = prune_delta(live, new, keep, source_daily=os.path.join(G, "mur.zarr"), source_delta=live,
                    base_days=base_days, spatial_window_days=31,
                    audit_recent_window=audit["recent_spatial_window"],   # corroboration, never override
+                   wal_root=os.environ["WAL_ROOT"], manifest_root=os.environ["MANIFEST_ROOT"],
+                   anchor_root=os.environ["ANCHOR_ROOT"],
                    engine="bulk", artifacts_dir=ART, workers=4)
 print("status:", plan["status"], "| keep:", len(plan.get("keep_days", [])),
       "| dropped:", plan.get("dropped_days"), "| reason:", plan.get("reason"))
@@ -165,11 +264,18 @@ tail -3 $ART/prune_step.log
 ### 4b. Quiesce (pm2 stop) → swap → pm2 start, under the lock (**[MUT-SWAP] + [MUT-LIVE]**) → verify → hold
 ```bash
 cd $WT && $PY - <<'EOF' > $ART/swap_step.log 2>&1
-import json, os, subprocess, sys, time, urllib.request
+import json, os, subprocess, sys, time, urllib.request, uuid
+from datetime import datetime, timezone
 sys.path.insert(0, os.environ["WT"])
 from ingest.swap_delta import execute_swap_plan
+from ops import quiescence as qs                   # tested; see tests/test_phase2_p5s5_part3.py
 ART, HOLD, LOCK = os.environ["ART"], os.environ["HOLD"], os.environ["LOCK"]
+APP = "ghrsst"
 HZ = "http://127.0.0.1:8035/healthz"
+
+def pm2_jlist():
+    out = subprocess.run(["pm2", "jlist"], capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
 with open(os.path.join(ART, "prune_plan.json")) as fh:
     plan = json.load(fh)
 
@@ -197,13 +303,33 @@ def healthz_verifier(live_path, keep_sorted):      # extra verifier: the SERVED 
             ("delta_latest", "delta_day_count", "spatial_window", "cube_latest_in_sync")}}
 
 def quiesce():                                     # pre_swap_quiesce_fn: runs INSIDE the executor lock,
-    subprocess.run(["pm2", "stop", "ghrsst"], check=True)   # after staleness guard, BEFORE any rename
+    """Stop the app and PROVE it drained. Returns the attestation the executor requires.
+
+    The logic lives in `ops.quiescence` -- imported, not inlined -- because a hook written in
+    this document cannot be tested, and the first version of it was wrong in a way no test
+    could see: it counted PM2 `online` workers, and a worker leaves that set the moment it
+    starts stopping, while the OS process is still finishing the request it accepted."""
+    before = qs.worker_pids(pm2_jlist(), APP)          # BEFORE the stop: the pids that matter
+    att_id = str(uuid.uuid4())                         # join key, recorded on BOTH sides
+    subprocess.run(["pm2", "stop", APP], check=True)   # after staleness guard, BEFORE any rename
+    last = None
     for _ in range(30):
         time.sleep(1)
-        if not serving():
-            print("quiesced: port 8035 down, no worker serving"); return
-    raise RuntimeError("app still serving after pm2 stop")  # -> executor returns quiesce_failed,
-                                                            #    NOTHING touched
+        try:
+            att = qs.attest_drain(app=APP, before_pids=before, jlist_after=pm2_jlist(),
+                                  port_open=serving(), attestation_id=att_id,
+                                  checked_utc=datetime.now(timezone.utc).isoformat())
+        except qs.NotQuiesced as exc:                  # not yet -- keep waiting
+            last = exc
+            continue
+        # Durability is NOT hand-rolled here: `write_evidence` uses the same writer as the
+        # executor's manifest, so the file AND (on first create) the directory are fsync'd.
+        # The version this document used to carry had the file sync and not the directory one.
+        qs.write_evidence(HOLD, att, run_id=os.environ["RUN_ID"])
+        return att
+    raise RuntimeError(f"app did not drain after pm2 stop: {last}")
+                                                       # -> executor returns quiesce_failed,
+                                                       #    NOTHING touched
 
 def ensure_serving():
     if serving():
@@ -215,12 +341,31 @@ def ensure_serving():
             return True
     return False
 
+# §7.9 (P5-S5 Part 3): `pre_swap_quiesce_fn` is REQUIRED and must PROVE the drain. Omitting it
+# is refused outright; returning None, a non-dict, `drained` anything but a raw True, blank
+# `evidence`, or an `observed_inflight` that is missing, negative, a bool or non-zero all refuse
+# with NOTHING touched. The executor records the validated core of the attestation into
+# hold_dir/manifest.jsonl on the successful swap AND on a rollback, and returns it as
+# `res["quiescence"]` on EVERY post-quiesce outcome (swapped, rolled_back, rollback_failed) and
+# as `attempted_attestation_id` on quiesce_failed. `quiescence_evidence.jsonl` above is the
+# ops-side copy; both carry the same `attestation_id`, so the two records are matched by key
+# rather than guessed at by order after a retry.
+#
 # The quiescence + swap share ONE critical section: the executor's own lock (an external pm2-stop
 # before this call would sit OUTSIDE the lock, and wrapping our own flock would deadlock its nested
 # acquire). Order inside: lock -> staleness -> prechecks -> quiesce() -> swap -> start_and_wait() ->
 # verifiers -> release.
 try:
     res = execute_swap_plan(plan, mode="s2", hold_dir=HOLD, lock_path=LOCK,
+                            # §7.1b: the compaction reservation is REQUIRED -- a block build may
+                            # be reading the delta whose path we are about to switch.
+                            compaction_lock_path=os.environ["CLOCK"],
+                            # §7.5a: the corrected-day gate is re-run INSIDE the ingest lock,
+                            # because a repair committed between plan and swap does not change
+                            # the day set and the staleness guard cannot see it.
+                            wal_root=os.environ["WAL_ROOT"],
+                            manifest_root=os.environ["MANIFEST_ROOT"],
+                            anchor_root=os.environ["ANCHOR_ROOT"],
                             pre_swap_quiesce_fn=quiesce, refresh_fn=start_and_wait,
                             verifier=healthz_verifier, operator="p4s10-codex")
 except Exception as exc:                           # an exception ESCAPING the executor after quiesce =

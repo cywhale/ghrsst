@@ -321,7 +321,7 @@ class TestPruneAndSwapHonourTheLock(_Base):
 
         lp = os.path.join(self.tmp, "p5_compaction.lock")
         with CompactionLock(lp):
-            r = execute_swap_plan({"status": "ok"}, mode="s2",
+            r = execute_swap_plan({"status": "ok"}, mode="s2", unsafe_skip_quiescence=True,
                                   hold_dir=self.tmp, compaction_lock_path=lp)
         self.assertEqual(r["status"], "refused")
         self.assertEqual(r["reason"], "compaction_lock_held")

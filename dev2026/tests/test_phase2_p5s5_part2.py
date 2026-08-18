@@ -51,6 +51,7 @@ def _prune(*a, **kw):
 
 def _swap(*a, **kw):
     kw.setdefault("unsafe_allow_colocated_anchor", True)
+    kw.setdefault("unsafe_skip_quiescence", True)      # Part 3 §7.9; these cases predate it
     return execute_swap_plan(*a, **kw)
 
 
@@ -1364,6 +1365,7 @@ class TestExternalAnchorWorkflow(unittest.TestCase):
         self.assertEqual(plan["anchor_root"], os.path.realpath(self.anchor))
 
         swap = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+                                 unsafe_skip_quiescence=True,
                                  wal_root=self.wal, manifest_root=self.root,
                                  anchor_root=self.anchor, compaction_lock_path=self.clock)
         self.assertEqual(swap["status"], "swapped", swap.get("reason"))
@@ -1397,6 +1399,7 @@ class TestExternalAnchorWorkflow(unittest.TestCase):
 
         before = sorted(bm.inspect_store_contract(self.delta).days)
         swap = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+                                 unsafe_skip_quiescence=True,
                                  wal_root=self.wal, manifest_root=self.root,
                                  anchor_root=self.anchor, compaction_lock_path=self.clock)
         self.assertEqual(swap["status"], "aborted_stale")
@@ -1430,6 +1433,7 @@ class TestExternalAnchorWorkflow(unittest.TestCase):
         os.makedirs(other, exist_ok=True)
         before = sorted(bm.inspect_store_contract(self.delta).days)
         swap = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+                                 unsafe_skip_quiescence=True,
                                  wal_root=self.wal, manifest_root=self.root,
                                  anchor_root=other, compaction_lock_path=self.clock)
         self.assertEqual(swap["status"], "refused")
@@ -1441,6 +1445,7 @@ class TestExternalAnchorWorkflow(unittest.TestCase):
         self._refold()
         plan = self._plan()
         swap = execute_swap_plan(plan, mode="s2", hold_dir=os.path.join(self.tmp, "hold"),
+                                 unsafe_skip_quiescence=True,
                                  wal_root=self.wal, manifest_root=self.root,
                                  compaction_lock_path=self.clock)
         self.assertEqual(swap["status"], "refused")
