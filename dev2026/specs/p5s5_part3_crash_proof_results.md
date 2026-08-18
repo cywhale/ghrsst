@@ -9,13 +9,14 @@ written outside a temp dir.
 
 Branch `dev2026-p5-s5-part3-crash-proof`, stacked on `3c37193` (Part 2, signed off).
 
-- Harness: [`../tests/test_phase2_p5s5_part3.py`](../tests/test_phase2_p5s5_part3.py) — **30/30 green**
+- Harness: [`../tests/test_phase2_p5s5_part3.py`](../tests/test_phase2_p5s5_part3.py) — **43/43 green**
 - Changed: [`../ingest/swap_delta.py`](../ingest/swap_delta.py) — §7.9 quiescence is required, must prove itself, and is recorded
-- Changed: [`p4s10_production_rollout_runbook.md`](p4s10_production_rollout_runbook.md) — the deployed hook, updated to the new contract
+- Changed: [`p4s10_production_rollout_runbook.md`](p4s10_production_rollout_runbook.md) — §1 env + preflight, Step 4a, Step 4b
+- New: [`../ops/quiescence.py`](../ops/quiescence.py) — the drain measurement, importable and therefore testable
 - **Unchanged: [`../store/tiered_cube.py`](../store/tiered_cube.py).** No signed-off P5-S2 behaviour was touched — not even the docstring, which still records R1 as "adjudicated at S5/G10". Amending it to point at this verdict is a one-line follow-up **after** sign-off, not something to slip in alongside the evidence.
-- Full local suite: **803 tests OK** (17 skipped), up from 773
-- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **366 OK**
-- **11 guards mutation-verified**
+- Full local suite: **816 tests OK** (17 skipped), up from 773
+- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **379 OK**
+- **18 guards mutation-verified**
 
 ## The question
 
@@ -105,7 +106,8 @@ needs operational evidence:
 | the dangerous pair exists and is reachable without quiescence | **PROVEN** (`test_the_dangerous_pair_IS_reachable_when_a_refresh_spans_the_swap`) |
 | safety comes from process quiescence, not from `TieredSnapshot` | **PROVEN** |
 | the swap refuses to proceed without a proven drain | **PROVEN** (§7.9, mutation-verified) |
-| the attestation is durable and auditable after the fact | **PROVEN** (recorded on swap and on rollback) |
+| the attestation is durable and auditable after the fact | **PROVEN** (fsync'd per record; on every post-quiesce outcome) |
+| the deployed runbook can execute against the current contract | **PROVEN for arguments** (the runbook's own argument set builds a plan and runs a swap in test) |
 | the deployed hook attests a drain it actually verified | **PARTIAL — deployment prerequisite** |
 
 The last row is the one that keeps this PARTIAL. The runbook hook has been updated to measure
@@ -149,6 +151,49 @@ was supplied without the manifest inheriting an arbitrary caller object. A waive
 `{"attested": false, "waived": true}` rather than nothing, so the audit distinguishes "proven"
 from "not asked".
 
+## Review round 3 — the runbook could still not run, and the drain check was wrong
+
+**1. The runbook was still unexecutable.** Fixing `quiesce()` was not enough: the `prune_delta`
+call passed no `wal_root` / `manifest_root` / `anchor_root`, so it would fail closed the moment
+it dropped a day, and the `execute_swap_plan` call passed no `compaction_lock_path`, so it was
+refused *before `quiesce()` ever ran*. My previous test extracted only the `quiesce()` body and
+could not see any of it. `TestTheProductionRunbookMatchesTheContract` now reads the **argument
+names out of the runbook** and calls the real `prune_delta` and `execute_swap_plan` with exactly
+that set: an argument the runbook forgets is an argument the test does not pass. The §1 env
+block gained the four P5 roots and a preflight that checks them, including the `st_dev`
+comparison between the WAL and the anchor.
+
+**2. "0 online workers" was not a drain.** A worker leaves PM2's `online` set the moment it
+starts stopping, while the OS process is still finishing the request it had already accepted —
+precisely the state `(e2)` must exclude. The check now captures **every** worker pid *before*
+the stop and proves each one is **gone** afterwards via `kill(pid, 0)`, then checks for draining
+statuses, an open port, and any newly listed pid.
+
+That logic now lives in [`../ops/quiescence.py`](../ops/quiescence.py), **imported** by the
+runbook rather than inlined in it. This is the actual lesson of findings 1 and 2: the wrong
+liveness check and the missing executor arguments were both invisible because they were written
+in markdown, and a runbook cannot be tested. `TestQuiescenceAttestation` covers the surviving
+pid, the `stopping` status, a worker that came back, an open port, and `PermissionError` — which
+counts the process as **alive**, since EPERM means it exists and belongs to someone else.
+
+**3. "Durable" was claimed of a buffered write.** `_manifest()` did `write` + `close`, leaving
+the record in the page cache: a VM that died during the swap would lose exactly the evidence
+that the swap was the last thing to happen. It now flushes and `fsync`s per record, and `fsync`s
+the directory when the file is first created, since an unsynced dirent can lose the whole file.
+The runbook's ops-side evidence file does the same.
+
+**4. The two records could not be matched.** The ops file carried `checked_utc`, but
+`normalize_quiescence()` kept extra fields only by **name**, discarding the value — and the ops
+record had no `swap_id`. After a retry the only way to pair them was ordering. There is now a
+required `attestation_id` join key, generated by the hook, recorded on **both** sides; a refused
+attempt records it as `attempted_attestation_id`, because a refused attempt has already written
+its ops-side file. `checked_utc` is validated and its **value** recorded.
+
+**5. The rollback result did not carry what the docs promised.** The rollback *manifest* had
+`quiescence`; the `rolled_back` and `rollback_failed` **return values** did not, while the
+runbook and this document told operators to read `res["quiescence"]`. Every post-quiesce
+outcome now returns it.
+
 ## §7.9 — quiescence is required, and must prove itself
 
 `pre_swap_quiesce_fn` defaulted to `None` and was **silently skipped when omitted**. A caller
@@ -178,8 +223,14 @@ Every refusal is asserted to leave the live delta byte-for-byte as it was.
 
 ## Mutation verification
 
-Eleven guards, each disabled in turn; **all eleven fail** — five from round 1, five
-in the executor from round 2, and the runbook contract itself.
+Eighteen guards, each disabled in turn; **all eighteen fail** — five from round 1, six from
+round 2, and seven from round 3.
+
+One round-3 mutation **survived the first run**: removing the per-record `fsync` left the test
+green, because it asserted only that *something* had been fsync'd and the directory sync alone
+satisfied that. The test now identifies the object by **inode** and asserts both the record file
+and the directory. A guard whose test passes on a neighbouring guard's behaviour is not
+verified, and this is the third time in P5-S5 that shape has appeared.
 
 | guard disabled | result |
 |---|---|
@@ -194,6 +245,13 @@ in the executor from round 2, and the runbook contract itself.
 | the attestation recorded on success (round 2) | FAILED (3) |
 | only validated fields recorded, never the callback object (round 2) | FAILED |
 | the runbook hook reverted to a bare `return` (round 2) | FAILED (5) |
+| `attestation_id` join key not required (round 3) | FAILED (4) |
+| pid liveness filtered to PM2 `online` (round 3) | FAILED |
+| `EPERM` read as "process gone" (round 3) | FAILED |
+| the manifest record not fsync'd (round 3) | FAILED |
+| the rollback result omits `quiescence` (round 3) | FAILED |
+| the runbook drops the compaction reservation (round 3) | FAILED (2) |
+| the runbook drops the P5 roots from the plan (round 3) | FAILED (4) |
 
 The harness's own thread cleanup is verified the same way: a forced failure in the looping-reader
 test leaves **zero** stray thread tracebacks, because a parked reader that outlives a failed

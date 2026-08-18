@@ -43,7 +43,11 @@ class QuiescenceNotProven(RuntimeError):
     `return` produces, so it must not read as success."""
 
 
-QUIESCENCE_CORE_FIELDS = ("drained", "evidence", "observed_inflight")
+QUIESCENCE_CORE_FIELDS = ("drained", "evidence", "observed_inflight", "attestation_id")
+#: Validated and recorded when supplied. `checked_utc` was previously kept only as a NAME, so
+#: the record said a timestamp had been passed without saying what it was (review round 3,
+#: finding 4). Optional because the join key, not the clock, is what matches two records.
+QUIESCENCE_OPTIONAL_FIELDS = ("checked_utc",)
 
 
 def _quiescence_refusal(attestation) -> Optional[str]:
@@ -89,6 +93,15 @@ def _quiescence_refusal(attestation) -> Optional[str]:
     if isinstance(inflight, bool) or not isinstance(inflight, int):
         return (f"observed_inflight must be a raw int, got "
                 f"{type(inflight).__name__} ({inflight!r})")
+    att_id = attestation["attestation_id"]
+    if not isinstance(att_id, str) or not att_id.strip():
+        return ("the quiescence attestation carries no `attestation_id` string. It is the join "
+                "key: the ops-side evidence file and this executor's manifest both record it, "
+                "so two records can be matched after a retry instead of guessed at by order")
+    for opt in QUIESCENCE_OPTIONAL_FIELDS:
+        if opt in attestation and (not isinstance(attestation[opt], str)
+                                   or not attestation[opt].strip()):
+            return f"the quiescence attestation's `{opt}` must be a non-empty string when given"
     if inflight != 0:
         if inflight < 0:
             return (f"observed_inflight is {inflight}: a negative count is not a measurement, "
@@ -104,8 +117,10 @@ def normalize_quiescence(attestation: dict) -> dict:
     The callback's own object is never stored: it is caller-controlled and may hold anything.
     Extra keys are acknowledged by NAME so the record shows what was supplied without the
     manifest inheriting arbitrary payload."""
-    extra = sorted(str(k) for k in attestation if k not in QUIESCENCE_CORE_FIELDS)
+    known = QUIESCENCE_CORE_FIELDS + QUIESCENCE_OPTIONAL_FIELDS
+    extra = sorted(str(k) for k in attestation if k not in known)
     out = {f: attestation[f] for f in QUIESCENCE_CORE_FIELDS}
+    out.update({f: attestation[f] for f in QUIESCENCE_OPTIONAL_FIELDS if f in attestation})
     if extra:
         out["extra_fields"] = extra
     return out
@@ -326,6 +341,7 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
             quiescence = {"attested": False,
                           "waived": bool(unsafe_skip_quiescence and pre_swap_quiesce_fn is None)}
             if pre_swap_quiesce_fn is not None:
+                attestation = None
                 try:
                     attestation = pre_swap_quiesce_fn()
                     why = _quiescence_refusal(attestation)
@@ -339,12 +355,20 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                 except Exception as exc:
                     # SAFE state: no file has been touched. The caller decides app recovery (it may have
                     # half-stopped the serving process) — that is why this is a distinct status.
+                    # Carry the attempted id when there was one: a REFUSED attempt still wrote an
+                    # ops-side evidence file, and matching them is the whole point of the key.
+                    if isinstance(attestation, dict):
+                        aid = attestation.get("attestation_id")
+                        if isinstance(aid, str) and aid.strip():
+                            quiescence = {**quiescence, "attempted_attestation_id": aid}
                     _manifest(hold_dir, {"swap_id": swap_id, "ts": stamp, "op": "swap_quiesce_failed",
                                          "mode": mode, "from": staging, "to": live, "operator": operator,
+                                         "quiescence": quiescence,
                                          "error": f"{type(exc).__name__}: {exc}"})
                     return {"status": "quiesce_failed",
                             "reason": f"pre-swap quiescence failed: {type(exc).__name__}: {exc}",
-                            "swap_id": swap_id, "swap_performed": False, "live_touched": False}
+                            "swap_id": swap_id, "swap_performed": False, "live_touched": False,
+                            "quiescence": quiescence}
 
             # ---- swap ----
             if mode == "s1":
@@ -393,7 +417,8 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                                          "from": staging, "to": live, "backup": backup, "operator": operator,
                                          "reason": failure_reason, "verify": v, "restored_ok": restored})
                     return {"status": "rolled_back", "reason": failure_reason, "verify": v,
-                            "restored_ok": restored, "swap_id": swap_id, "swap_performed": False}
+                            "restored_ok": restored, "swap_id": swap_id, "swap_performed": False,
+                            "quiescence": quiescence}
                 except Exception as rexc:
                     # rollback itself failed — ambiguous on-disk state; record loudly, human required.
                     _manifest(hold_dir, {"swap_id": swap_id, "ts": stamp, "op": "swap_rollback_failed",
@@ -404,6 +429,7 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                     return {"status": "rollback_failed", "reason": failure_reason,
                             "rollback_error": f"{type(rexc).__name__}: {rexc}", "backup": backup,
                             "swap_id": swap_id, "swap_performed": True,
+                            "quiescence": quiescence,
                             "note": "on-disk state ambiguous — manual recovery from backup required"}
 
             # ---- success: hold lifecycle + manifest (§7) ----
@@ -433,6 +459,22 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
             compaction_guard.release()
 
 def _manifest(hold_dir: str, record: dict) -> None:
-    """Append-only JSONL manifest (§7 convention, shared with P4-S7)."""
-    with open(os.path.join(hold_dir, "manifest.jsonl"), "a") as fh:
+    """Append-only JSONL manifest (§7 convention, shared with P4-S7), fsync'd per record.
+
+    A buffered `write` + `close` leaves the record in the page cache: a VM that dies during the
+    swap loses exactly the evidence that swap was the last thing to happen. The directory is
+    fsync'd too on first creation, since an unsynced dirent can lose the whole file. This is
+    what lets the results doc say the attestation is durable -- it said so before this existed
+    (review round 3, finding 3)."""
+    path = os.path.join(hold_dir, "manifest.jsonl")
+    fresh = not os.path.exists(path)
+    with open(path, "a") as fh:
         fh.write(json.dumps(record, sort_keys=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    if fresh:
+        dfd = os.open(hold_dir, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)

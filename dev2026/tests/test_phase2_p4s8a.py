@@ -352,7 +352,8 @@ class TestHoldDirFilesystemPrecheck(_Fixture):
 
 def _attested(**kw):
     """A quiescence attestation for cases that are not about the attestation itself."""
-    return {"drained": True, "evidence": "test harness: no readers", "observed_inflight": 0, **kw}
+    return {"drained": True, "evidence": "test harness: no readers", "observed_inflight": 0,
+            "attestation_id": "p4s8a-att", **kw}
 
 
 class TestPreSwapQuiesce(_Fixture):
@@ -368,8 +369,7 @@ class TestPreSwapQuiesce(_Fixture):
             # at quiesce time the live delta must still be the ORIGINAL (nothing renamed yet)
             live_days_at_quiesce["days"] = sorted(_days_attr(self.live))
             events.append("quiesce")
-            return {"drained": True, "evidence": "test harness: no reader threads started",
-                    "observed_inflight": 0}
+            return _attested(evidence="test harness: no reader threads started")
 
         def start():
             events.append("start")
