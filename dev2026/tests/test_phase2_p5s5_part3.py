@@ -70,6 +70,8 @@ from store.segmented_cube import SegmentedCubeStore  # noqa: E402
 from store.tiered_cube import TieredCube  # noqa: E402
 from store.time_cube import TimeCubeStore  # noqa: E402
 
+_DEV2026 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 ANCHOR = "2026-06-27"
 S = 90
 LON, LAT = 100.0, 0.0
@@ -900,6 +902,101 @@ class TestTheProductionRunbookMatchesTheContract(_Base):
                             "a co-located anchor must STOP the run, not warn and continue")
         self.assertIn("NO-GO", res.stdout + res.stderr)
         self.assertIn("independent domain", res.stdout + res.stderr)
+
+    def _preflight_block(self, header, *, portable_stat=True):
+        block = self.text[self.text.index(header):]
+        block = block[block.index("```bash") + 7:]
+        block = block[:block.index("```")]
+        if portable_stat and sys.platform == "darwin":
+            block = block.replace("stat -c %d", "stat -f %d")   # GNU spelling -> BSD
+        return block
+
+    def test_an_UNDECLARED_anchor_domain_is_a_NO_GO_even_on_its_own_filesystem(self):
+        """Review round 5, finding 1: `anchor_domain_id()` returns None for an undeclared root
+        and the shell only PRINTED it, so python exited 0 and `|| NO-GO` never ran — the check
+        accepted exactly the configuration it was written to reject.
+
+        The same-filesystem arm would mask this, so a stub `stat` on PATH reports the two roots
+        as different devices. That is the only way to reach the domain check on a single-volume
+        test host, and it exercises the real ordering rather than the line in isolation."""
+        bindir = os.path.join(self.tmp, "stubbin")
+        os.makedirs(bindir, exist_ok=True)
+        stub = os.path.join(bindir, "stat")
+        with open(stub, "w") as fh:
+            fh.write("#!/bin/sh\nprintf '%s' \"$(printf '%s' \"$3\" | cksum | cut -d' ' -f1)\"\n")
+        os.chmod(stub, 0o755)
+        undeclared = os.path.join(self.tmp, "undeclared_anchor")
+        os.makedirs(undeclared, exist_ok=True)
+        env = {**os.environ, "PY": sys.executable, "WT": _DEV2026,
+               "PATH": bindir + os.pathsep + os.environ["PATH"],
+               "MANIFEST_ROOT": self.root, "WAL_ROOT": self.wal, "ANCHOR_ROOT": undeclared}
+        res = subprocess.run(["bash", "-c", self._preflight_block(
+            "**Preflight (every check must pass")], env=env, capture_output=True, text=True)
+        out = res.stdout + res.stderr
+        self.assertNotEqual(res.returncode, 0, f"an undeclared anchor was accepted:\n{out}")
+        self.assertIn("NOT declared", out)
+
+    def test_a_DECLARED_anchor_passes_the_same_block(self):
+        """The negative test above must not be passing for an unrelated reason."""
+        bindir = os.path.join(self.tmp, "stubbin2")
+        os.makedirs(bindir, exist_ok=True)
+        stub = os.path.join(bindir, "stat")
+        with open(stub, "w") as fh:
+            fh.write("#!/bin/sh\nprintf '%s' \"$(printf '%s' \"$3\" | cksum | cut -d' ' -f1)\"\n")
+        os.chmod(stub, 0o755)
+        env = {**os.environ, "PY": sys.executable, "WT": _DEV2026,
+               "PATH": bindir + os.pathsep + os.environ["PATH"],
+               "MANIFEST_ROOT": self.root, "WAL_ROOT": self.wal, "ANCHOR_ROOT": self.anchor}
+        res = subprocess.run(["bash", "-c", self._preflight_block(
+            "**Preflight (every check must pass")], env=env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("p5s5p3-runbook-domain", res.stdout)
+
+    def test_the_deployment_gate_demands_an_EXACT_sha_not_a_branch_tip(self):
+        """Review round 5, finding 2: an ancestor check plus a movable branch name is not a pin.
+        A branch tip is not a statement about which implementation ran."""
+        block = self._preflight_block("Record `git rev-parse HEAD", portable_stat=False)
+        repo = os.path.dirname(_DEV2026)
+        base = {**os.environ, "WT": _DEV2026}
+        base.pop("DEPLOY_SHA", None)
+
+        unset = subprocess.run(["bash", "-c", block], env=base, cwd=repo,
+                               capture_output=True, text=True)
+        self.assertNotEqual(unset.returncode, 0, "DEPLOY_SHA must be required")
+
+        wrong = subprocess.run(["bash", "-c", block], env={**base, "DEPLOY_SHA": "3c37193"},
+                               cwd=repo, capture_output=True, text=True)
+        self.assertNotEqual(wrong.returncode, 0, "a non-HEAD SHA must refuse")
+        self.assertIn("not a pin", wrong.stdout + wrong.stderr)
+
+        head = subprocess.run(["bash", "-c", block], env={**base, "DEPLOY_SHA": "HEAD"},
+                              cwd=repo, capture_output=True, text=True)
+        self.assertEqual(head.returncode, 0, head.stdout + head.stderr)
+
+    def test_the_ancestor_floor_is_reachable_and_refuses_a_pre_P5_sha(self):
+        """The floor is checked against $DEPLOY_SHA, not HEAD. Checked against HEAD it was
+        unreachable: HEAD must equal $DEPLOY_SHA by that point, so no input could trip it — a
+        check that reads as a guard without being one."""
+        block = self._preflight_block("Record `git rev-parse HEAD", portable_stat=False)
+        repo = os.path.dirname(_DEV2026)
+        env = {**os.environ, "WT": _DEV2026, "DEPLOY_SHA": "9bc1795"}   # P5-S4 tip: pre-Part 2
+        res = subprocess.run(["bash", "-c", block], env=env, cwd=repo,
+                             capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("predates P5-S5 Part 2", res.stdout + res.stderr)
+
+    def test_the_pin_is_recorded_as_outstanding_until_a_reviewed_sha_is_named(self):
+        """The runbook must not read as fully pinned while the SHA is operator-supplied."""
+        self.assertIn("OUTSTANDING", self.text)
+        self.assertIn("docs-only follow-up", self.text)
+
+    def test_the_path_boundary_names_the_anchor_exception(self):
+        """Finding 3: "all paths under $G, anything else aborts" contradicted the required
+        external anchor."""
+        i = self.text.index("All paths live under")
+        clause = self.text[i:i + 700]
+        self.assertIn("$ANCHOR_ROOT", clause)
+        self.assertIn("outside", clause)
 
     def test_the_runbook_does_not_hand_roll_persistence(self):
         """Finding 3: the evidence file's durability logic lived in markdown and got the

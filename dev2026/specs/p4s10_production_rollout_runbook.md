@@ -24,7 +24,11 @@ cube and the **live** daily staging store.
   hard delete is a later, manual, ops-only action (§9). **S10 itself frees NO disk** — space is
   reclaimed only when ops hard-deletes expired hold entries after `hold_until`.
 - All paths live under `/home/odbadmin/Data/ghrsst` (`$G`) or the runtime worktree; anything else in a
-  command is an abort.
+  command is an abort. **One exception, and only one: `$ANCHOR_ROOT`** (§7.5a-2), which must sit
+  *outside* `$G` — an anchor inside `$G` shares the WAL's rollback domain and cannot witness the
+  rollback it exists to detect. It must be an ops-approved, locally-mounted path in an
+  independent durability domain, and it is **read/attested, never a bulk mutation target**: every
+  path that gets *written* by a prune or swap still lives under `$G`.
 
 Environment (run first):
 ```bash
@@ -60,19 +64,43 @@ test -d "$MANIFEST_ROOT" && test -d "$WAL_ROOT" && test -d "$ANCHOR_ROOT" || \
   { echo "NO-GO: WAL and anchor share a filesystem — a whole-VM rollback restores both, so the"
     echo "       anchor cannot witness it (§7.5a-2). Move ANCHOR_ROOT to an independent domain."
     exit 1; }
+# ASSERT, do not print: `anchor_domain_id()` returns None for an undeclared root and exits 0,
+# so `print(...) || NO-GO` accepted exactly the configuration it was written to reject.
 $PY -c "import sys; sys.path.insert(0,'$WT'); from store import repair_wal as rw; \
-  print('anchor domain:', rw.anchor_domain_id('$ANCHOR_ROOT'))" || \
-  { echo "NO-GO: anchor domain not declared (§7.5a-2)"; exit 1; }
+  d = rw.anchor_domain_id('$ANCHOR_ROOT'); \
+  print('anchor domain:', d); \
+  raise SystemExit(0 if d else 'anchor domain is NOT declared')" || \
+  { echo "NO-GO: anchor domain not declared (§7.5a-2) — declare it before pruning"; exit 1; }
 ```
 Code: **must contain P5-S5 Parts 1–3** — the WAL, the corrected-day gate, the current executor
 contract and `ops/quiescence.py`. `dev2026-p4-s8-swap-design` is **no longer a valid deployment
 branch**: its tip predates all of that, and a worktree checked out from it fails on import.
-Deploy from the signed-off tip of `dev2026-p5-s5-part3-crash-proof`;
-`git merge-base --is-ancestor 3c37193 HEAD` must pass (P5-S5 Part 2, signed off), and the
-capability preflight below is what actually gates execution — a commit pin cannot be written
-inside the commit it names, so the modules are checked directly rather than inferred from a
-hash. Record `git rev-parse HEAD > $ART/git_head.txt`. Checking out the worktree does NOT
-restart the app.
+Deploy from an **exact, operator-supplied SHA** — `$DEPLOY_SHA` — not from a branch tip. A
+branch moves; "the tip of `dev2026-p5-s5-part3-crash-proof`" is not a statement about which
+implementation ran. `git merge-base --is-ancestor 3c37193 HEAD` must also pass (P5-S5 Part 2,
+signed off) as a floor, and the capability preflight checks that the deployed tree really has
+the modules — but neither proves the code was *reviewed*, and only the SHA does.
+
+> **OUTSTANDING — this runbook is not fully pinned until it names one.** `$DEPLOY_SHA` is
+> supplied by the operator today. Once P5-S5 Part 3 is signed off, a **docs-only follow-up
+> commit** records the reviewed SHA (or a signed tag) here as the default. That commit can name
+> the SHA it pins because it is not the commit being pinned — there is no self-reference
+> problem, only an ordering one.
+
+Record `git rev-parse HEAD > $ART/git_head.txt`. Checking out the worktree does NOT restart the
+app.
+
+```bash
+: "${DEPLOY_SHA:?set DEPLOY_SHA to the exact reviewed commit to deploy}"
+# The floor is checked against $DEPLOY_SHA, BEFORE comparing it to HEAD. Checked against HEAD
+# afterwards it was unreachable — HEAD has to equal $DEPLOY_SHA by then, so no input could ever
+# trip it, and it read as a guard without being one.
+cd $WT/.. && git merge-base --is-ancestor 3c37193 "$DEPLOY_SHA" || \
+  { echo "NO-GO: \$DEPLOY_SHA predates P5-S5 Part 2 — it cannot contain this runbook's code"
+    exit 1; }
+git rev-parse HEAD | grep -q "^$(git rev-parse "$DEPLOY_SHA")$" || \
+  { echo "NO-GO: worktree HEAD is not \$DEPLOY_SHA — a branch tip is not a pin"; exit 1; }
+```
 
 **Capability preflight (REQUIRED — the deployed tree must have the code this runbook calls):**
 ```bash

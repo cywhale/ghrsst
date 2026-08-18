@@ -9,15 +9,15 @@ written outside a temp dir.
 
 Branch `dev2026-p5-s5-part3-crash-proof`, stacked on `3c37193` (Part 2, signed off).
 
-- Harness: [`../tests/test_phase2_p5s5_part3.py`](../tests/test_phase2_p5s5_part3.py) — **47/47 green**
+- Harness: [`../tests/test_phase2_p5s5_part3.py`](../tests/test_phase2_p5s5_part3.py) — **53/53 green**
 - Changed: [`../ingest/swap_delta.py`](../ingest/swap_delta.py) — §7.9 quiescence is required, must prove itself, and is recorded
 - Changed: [`p4s10_production_rollout_runbook.md`](p4s10_production_rollout_runbook.md) — §1 env + preflight, Step 4a, Step 4b
 - New: [`../ops/quiescence.py`](../ops/quiescence.py) — the drain measurement, importable and therefore testable
 - New: [`../store/durable_jsonl.py`](../store/durable_jsonl.py) — one durable append-only writer, shared by the executor manifest and the ops evidence file
 - **Unchanged: [`../store/tiered_cube.py`](../store/tiered_cube.py).** No signed-off P5-S2 behaviour was touched — not even the docstring, which still records R1 as "adjudicated at S5/G10". Amending it to point at this verdict is a one-line follow-up **after** sign-off, not something to slip in alongside the evidence.
-- Full local suite: **820 tests OK** (17 skipped), up from 773
-- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **383 OK**
-- **23 guards mutation-verified**
+- Full local suite: **826 tests OK** (17 skipped), up from 773
+- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **389 OK**
+- **29 guards mutation-verified**
 
 ## The question
 
@@ -108,7 +108,8 @@ needs operational evidence:
 | safety comes from process quiescence, not from `TieredSnapshot` | **PROVEN** |
 | the swap refuses to proceed without a proven drain | **PROVEN** (§7.9, mutation-verified) |
 | the attestation is durable and auditable after the fact | **PROVEN** (fsync'd per record; on every post-quiesce outcome) |
-| the deployed runbook can execute against the current contract | **PROVEN for arguments and modules** (its own argument set builds a plan and runs a swap on a real external anchor; its preflight block is executed, not read) |
+| the deployed runbook can execute against the current contract | **PROVEN for arguments and modules** (its own argument set builds a plan and runs a swap on a real external anchor; its preflight blocks are executed, not read) |
+| the runbook is pinned to a reviewed implementation | **PARTIAL — `$DEPLOY_SHA` is operator-supplied; a reviewed SHA is named in a docs-only follow-up after sign-off** |
 | the deployed hook attests a drain it actually verified | **PARTIAL — deployment prerequisite** |
 
 The last row is the one that keeps this PARTIAL. The runbook hook has been updated to measure
@@ -230,6 +231,43 @@ lesson as round 3 and it is worth stating once more: **the copy that lived in ma
 copy that was wrong**, because a document cannot be tested. The runbook now calls
 `qs.write_evidence()`, and a test fails if `os.fsync` reappears anywhere in the runbook text.
 
+## Review round 5 — three checks that did not check
+
+**1. An undeclared anchor domain passed the preflight.** The line ran
+`print(rw.anchor_domain_id(...))`, and `anchor_domain_id()` returns `None` for an undeclared
+root — so Python exited 0 and the `|| NO-GO` branch never ran. The check accepted exactly the
+configuration it was written to reject; only the plan, later, would have failed closed. It now
+`raise SystemExit(...)` on a falsy domain.
+
+Testing it needed care: the **same-filesystem arm fires first** on a single-volume test host, so
+a test that merely ran the block would have passed without ever reaching the domain check. The
+test puts a stub `stat` on `PATH` that reports the two roots as different devices, which is the
+only way to reach the later check — and it asserts on the *domain* message specifically, so it
+cannot pass on the earlier refusal. There is a matching positive case with a declared domain, so
+the negative is not passing for an unrelated reason.
+
+**2. The "pin" was still a movable branch.** An ancestor check plus a branch name is not a
+statement about which implementation ran. The gate now demands an **exact operator-supplied
+`$DEPLOY_SHA`** that must equal the worktree `HEAD`. The runbook records, in the document
+itself, that it is **not fully pinned** until a reviewed SHA is named — a docs-only follow-up
+commit after Part 3 sign-off can name it, since that commit is not the one being pinned.
+
+Two mutations here were instructive:
+
+- Removing `: "${DEPLOY_SHA:?...}"` **survived**, and should have: with it gone the next line
+  still refuses an unset variable. It is a diagnostic, not a guard, and it is not counted as one.
+- The **ancestor floor was unreachable**. Checked against `HEAD`, it sat *after* the line that
+  forces `HEAD == $DEPLOY_SHA`, so no input could ever trip it. It now runs against
+  `$DEPLOY_SHA` and **before** that comparison, and a pre-Part-2 SHA is refused with its own
+  message. A check that reads as a guard without being one is worse than no check, because it
+  is counted as protection.
+
+**3. The path boundary contradicted the anchor.** "All paths under `$G`, anything else aborts"
+could not coexist with an `ANCHOR_ROOT` that must sit outside `$G`. The boundary now names that
+single exception explicitly — an ops-approved, locally-mounted path in an independent durability
+domain, read and attested rather than written — while every path a prune or swap **mutates**
+stays under `$G`.
+
 ## §7.9 — quiescence is required, and must prove itself
 
 `pre_swap_quiesce_fn` defaulted to `None` and was **silently skipped when omitted**. A caller
@@ -259,8 +297,12 @@ Every refusal is asserted to leave the live delta byte-for-byte as it was.
 
 ## Mutation verification
 
-Twenty-three guards, each disabled in turn; **all twenty-three fail** — five from round 1, six
-from round 2, seven from round 3, and five from round 4.
+Twenty-nine guards, each disabled in turn; **all twenty-nine fail** — five from round 1, six
+from round 2, seven from round 3, five from round 4, and six from round 5.
+
+One round-5 mutation survived and is **not** counted: removing `: "${DEPLOY_SHA:?...}"` changes
+nothing, because the next line still refuses an unset variable. It is a diagnostic, not a guard.
+Chasing it into the count would have inflated the number with a line that protects nothing.
 
 One round-3 mutation **survived the first run**: removing the per-record `fsync` left the test
 green, because it asserted only that *something* had been fsync'd and the directory sync alone
@@ -293,6 +335,12 @@ verified, and this is the third time in P5-S5 that shape has appeared.
 | the runbook hand-rolls persistence again (round 4) | FAILED |
 | the shared writer drops the directory `fsync` (round 4) | FAILED |
 | the shared writer drops the file `fsync` (round 4) | FAILED |
+| the anchor-domain check only prints (round 5) | FAILED |
+| the exact-SHA comparison removed (round 5) | FAILED |
+| the ancestor floor removed (round 5) | FAILED |
+| the ancestor floor checked against `HEAD`, unreachable (round 5) | FAILED |
+| the anchor exception dropped from the path boundary (round 5) | FAILED |
+| the outstanding-pin note removed (round 5) | FAILED |
 
 The harness's own thread cleanup is verified the same way: a forced failure in the looping-reader
 test leaves **zero** stray thread tracebacks, because a parked reader that outlives a failed
