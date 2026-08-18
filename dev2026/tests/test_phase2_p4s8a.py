@@ -30,8 +30,33 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 from store.zarr_paths import group_path  # noqa: E402
 from store.time_cube import TimeCubeStore  # noqa: E402
 from ingest.dual_write import append_to_delta  # noqa: E402
-from ingest.prune_delta import prune_delta  # noqa: E402
-from ingest.swap_delta import execute_swap_plan  # noqa: E402
+from ingest.prune_delta import prune_delta as _prune_delta_strict  # noqa: E402
+
+
+def prune_delta(*a, **kw):
+    """Test shim: waive the §7.5a corrected-day gate for cases that are not about it.
+
+    `prune_delta` requires `wal_root` + `manifest_root` whenever it drops days, because base
+    day-membership alone does not show base carries the day's CORRECT value. These tests
+    predate the WAL and exercise the prune mechanics, so they waive it explicitly here -- in
+    ONE named place, rather than each silently passing the flag."""
+    kw.setdefault("corrected_day_gate", False)
+    return _prune_delta_strict(*a, **kw)
+
+from ingest.swap_delta import execute_swap_plan as _execute_swap_plan_strict
+
+
+def execute_swap_plan(*a, **kw):
+    """Test shim: waive the §7.5a corrected-day re-authorization for cases that are not about it.
+
+    `execute_swap_plan` re-runs the gate under the ingest lock before the path switch, because
+    a repair committed between plan and swap does not change the day set and the staleness
+    guard cannot see it. These tests predate the WAL and exercise the swap mechanics, so they
+    waive it explicitly here -- in ONE named place."""
+    kw.setdefault("corrected_day_gate", False)
+    kw.setdefault("unsafe_skip_compaction_lock", True)
+    return _execute_swap_plan_strict(*a, **kw)
+  # noqa: E402
 
 NY, NX = 16, 20
 VARS = ("sst", "sst_anomaly", "sea_ice")

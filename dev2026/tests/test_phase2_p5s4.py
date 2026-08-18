@@ -29,6 +29,13 @@ import p5_fixtures as fx  # noqa: E402
 from ingest import publish_manifest as pub  # noqa: E402
 from store import block_manifest as bm  # noqa: E402
 from store import repair_wal as rw  # noqa: E402
+
+
+def _wal_append(*a, **kw):
+    """Shim: this suite exercises WAL mechanics, not the anchor domain, so it waives the
+    external-anchor requirement in ONE named place."""
+    kw.setdefault("unsafe_allow_colocated_anchor", True)
+    return rw.append(*a, **kw)
 from store import source_provenance as sp  # noqa: E402
 from store.compaction_lock import (  # noqa: E402
     CompactionLock, CompactionLockBusy, CompactionLockError,
@@ -146,12 +153,15 @@ class _Base(unittest.TestCase):
     def _open_repair(self, day, root=None, **kw):
         """Allocate a conforming repair_id. Ids are `<opaque>-<intent seq>`, so tests must not
         invent them any more than production may."""
+        # These tests predate the external-anchor requirement and exercise WAL mechanics, so
+        # they waive it in this one named place.
         rec = rw.open_repair(root or self.tmp, day=day, at_utc=kw.pop("at_utc", "t"),
-                             operator="o", payload=kw.pop("payload", {}))
+                             operator="o", payload=kw.pop("payload", {}),
+                             unsafe_allow_colocated_anchor=True)
         return rec["repair_id"]
 
     def _commit(self, rid, day, fp, root=None, at_utc="t", **payload):
-        return rw.append(root or self.tmp, record=rw.COMMITTED, repair_id=rid, day=day,
+        return _wal_append(root or self.tmp, record=rw.COMMITTED, repair_id=rid, day=day,
                          at_utc=at_utc, operator="o",
                          payload={"fingerprint": fp, **payload})
 
@@ -359,7 +369,7 @@ class TestWalFailsClosed(_Base):
         valid record for a DIFFERENT day must not be usable while an earlier line is corrupt."""
         self._seed()
         r2 = self._open_repair(self.span[5])
-        rw.append(self.tmp, record=rw.ABORTED, repair_id=r2, day=self.span[5],
+        _wal_append(self.tmp, record=rw.ABORTED, repair_id=r2, day=self.span[5],
                   at_utc="t", operator="o", payload={"reason": "did not land"})
         lines = self._lines(self._wal())
         lines[0] = lines[0].replace('"operator":"o"', '"operator":"tampered"')
@@ -375,7 +385,7 @@ class TestWalFailsClosed(_Base):
             fh.write('{"seq": 3, "trunc')
         before = self._read(self._wal())
         with self.assertRaises(rw.WalCorrupt):
-            rw.append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[9],
+            _wal_append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[9],
                       at_utc="t", operator="o", payload={})
         self.assertEqual(self._read(self._wal()), before,
                          "a refused append must leave the WAL byte-unchanged")
@@ -407,7 +417,7 @@ class TestWalStateMachine(_Base):
         self._commit(rid, self.span[0], "fp1")
         r2 = self._open_repair(self.span[5])
         with self.assertRaises(rw.WalError):
-            rw.append(self.tmp, record=rw.ABORTED, repair_id=rid, day=self.span[0],
+            _wal_append(self.tmp, record=rw.ABORTED, repair_id=rid, day=self.span[0],
                       at_utc="t", operator="o", payload={"reason": "x"})
         st = rw.read_wal(self.tmp)
         self.assertEqual(st.repairs[r2].state, "open", "other repairs are unaffected")
@@ -420,7 +430,7 @@ class TestWalStateMachine(_Base):
 
     def test_a_terminal_without_an_intent_is_refused(self):
         with self.assertRaises(rw.WalError) as cm:
-            rw.append(self.tmp, record=rw.COMMITTED, repair_id="ghost-1", day=self.span[0],
+            _wal_append(self.tmp, record=rw.COMMITTED, repair_id="ghost-1", day=self.span[0],
                       at_utc="t", operator="o", payload={"fingerprint": "fp"})
         self.assertIn("no matching repair_intent", str(cm.exception))
 
@@ -431,7 +441,7 @@ class TestWalStateMachine(_Base):
 
     def test_an_aborted_repair_stops_blocking(self):
         rid = self._open_repair(self.span[0])
-        rw.append(self.tmp, record=rw.ABORTED, repair_id=rid, day=self.span[0],
+        _wal_append(self.tmp, record=rw.ABORTED, repair_id=rid, day=self.span[0],
                   at_utc="t", operator="o", payload={"reason": "never landed"})
         st = rw.read_wal(self.tmp)
         self.assertNotIn(self.span[0], st.blocked_days)
@@ -505,8 +515,8 @@ class TestPruneGateIsIdentityBased(_Base):
         clock reading were consulted, this is where it would show."""
         def build(root, when):
             rec = rw.open_repair(root, day=self.span[0], at_utc=when, operator="o",
-                                 payload={})
-            rw.append(root, record=rw.COMMITTED, repair_id=rec["repair_id"],
+                                 payload={}, unsafe_allow_colocated_anchor=True)
+            _wal_append(root, record=rw.COMMITTED, repair_id=rec["repair_id"],
                       day=self.span[0], at_utc=when, operator="o",
                       payload={"fingerprint": "fp1"})
             return rw.read_wal(root), rec["repair_id"]
@@ -629,10 +639,16 @@ class TestPublication(_Base):
         whether a build was running."""
         plan = pub.plan_publication(self.root, self._plan_for_v2(self.delta, self.span[:60]),
                                     now=T0)
-        with self.assertRaises(TypeError):
-            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                                    build_artifact_path=None, now=T0)
+        # `compaction_lock_path` gained a `None` default when publication learned to BORROW a
+        # caller's held lock (P5-S5 Part 2 round 3), so omitting it is now a refusal with a
+        # message rather than a TypeError. Fail-closed either way, and the message is the more
+        # useful of the two.
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
+        with self.assertRaises(pub.PublishRefused) as cm0:
+            pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
+                                    build_artifact_path=None, unsafe_skip_provenance=True,
+                                    now=T0)
+        self.assertIn("compaction_lock_path is required", str(cm0.exception))
         with self.assertRaises(pub.PublishRefused) as cm:
             pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
                                     compaction_lock_path=None, build_artifact_path=None,
@@ -1268,7 +1284,7 @@ class TestLifecycleIsolationAndAtomicity(_Base):
 class TestWalStrictnessRoundTwo(_Base):
     def test_a_hand_made_repair_id_without_the_seq_suffix_is_refused(self):
         with self.assertRaises(rw.WalError) as cm:
-            rw.append(self.tmp, record=rw.INTENT, repair_id="r1", day=self.span[0],
+            _wal_append(self.tmp, record=rw.INTENT, repair_id="r1", day=self.span[0],
                       at_utc="t", operator="o", payload={})
         self.assertIn("must end in", str(cm.exception))
 
@@ -1304,7 +1320,7 @@ class TestWalStrictnessRoundTwo(_Base):
     def test_a_suffix_that_is_not_the_intents_own_seq_is_refused(self):
         self._open_repair(self.span[0])
         with self.assertRaises(rw.WalError):
-            rw.append(self.tmp, record=rw.INTENT, repair_id="x-99", day=self.span[1],
+            _wal_append(self.tmp, record=rw.INTENT, repair_id="x-99", day=self.span[1],
                       at_utc="t", operator="o", payload={})
 
     def test_open_repair_allocates_unique_monotonic_ids(self):
@@ -1485,7 +1501,7 @@ class TestWalWriterDoesNotLaunderPayload(_Base):
         """`dict(payload)` accepts a list of pairs and writes a record that looks well-formed.
         The reader could never tell the writer had passed something else."""
         with self.assertRaises(rw.WalError) as cm:
-            rw.append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
+            _wal_append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
                       at_utc="t", operator="o", payload=[("fingerprint", "fp1")])
         self.assertIn("NOT coerced", str(cm.exception))
         self.assertFalse(os.path.exists(os.path.join(self.tmp, rw.WAL_NAME)))
@@ -1493,7 +1509,7 @@ class TestWalWriterDoesNotLaunderPayload(_Base):
     def test_a_dict_subclass_is_still_accepted(self):
         class D(dict):
             pass
-        rw.append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
+        _wal_append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
                   at_utc="t", operator="o", payload=D(expected_vars=["sst"]))
         self.assertEqual(rw.read_wal(self.tmp).last_seq, 1)
 
@@ -1507,7 +1523,7 @@ class TestWalWriterDoesNotLaunderPayload(_Base):
         payload = Falsey(fingerprint="fp1", expected_vars=["sst"])
         self.assertFalse(payload, "precondition: it really is falsey")
         self.assertTrue(len(payload), "precondition: and really is non-empty")
-        rw.append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
+        _wal_append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
                   at_utc="t", operator="o", payload=payload)
         self.assertEqual(rw.read_wal(self.tmp).records[0]["payload"],
                          {"fingerprint": "fp1", "expected_vars": ["sst"]})
@@ -1521,12 +1537,12 @@ class TestWalWriterDoesNotLaunderPayload(_Base):
         rid = self._open_repair(self.span[0])
         self._commit(rid, self.span[0], "fp1", vars=["sst"])
         with self.assertRaises(rw.WalError):
-            rw.append(self.tmp, record=rw.COMMITTED, repair_id=rid, day=self.span[0],
+            _wal_append(self.tmp, record=rw.COMMITTED, repair_id=rid, day=self.span[0],
                       at_utc="t", operator="o",
                       payload=Falsey(fingerprint="fp1", vars=["sst", "sea_ice"]))
 
     def test_an_absent_payload_is_still_allowed(self):
-        rw.append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
+        _wal_append(self.tmp, record=rw.INTENT, repair_id=None, day=self.span[0],
                   at_utc="t", operator="o")
         self.assertEqual(rw.read_wal(self.tmp).records[0]["payload"], {})
 

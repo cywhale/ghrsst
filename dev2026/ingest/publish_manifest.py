@@ -905,7 +905,8 @@ def _comparable(manifest: dict) -> dict:
 
 
 def execute_publication(plan: dict, *, ingest_lock_path: str,
-                        compaction_lock_path: Optional[str],
+                        compaction_lock_path: Optional[str] = None,
+                        compaction_lock: Optional[CompactionLock] = None,
                         delta_path: Optional[str] = None,
                         build_artifact_path: Optional[str],
                         release_after_s: int = DEFAULT_RELEASE_AFTER_S,
@@ -921,6 +922,33 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
     refusal path -- the archive for `N+1` is written first and is *unreferenced* until the
     replace, which is exactly the §9 "safe" crash state.
     """
+    # The caller-contract half of the reservation, checked FIRST: it is about the arguments,
+    # not about the plan, and discovering it after a plan walk would report the wrong problem.
+    compaction_guard: Optional[CompactionLock] = None
+    borrowed = compaction_lock is not None
+    if borrowed:
+        # A borrowed lock must be bound to the CANONICAL path, not merely be some held lock.
+        # Without the binding, a caller holding an unrelated lock file satisfies "a lock is
+        # held" while the real reservation sits free for a build to take -- the guarantee
+        # reads as satisfied and protects nothing.
+        if not compaction_lock_path:
+            raise PublishRefused(
+                "a borrowed compaction_lock must be accompanied by compaction_lock_path: "
+                "without it there is nothing to bind the lock's identity to, and any held "
+                "lock would do")
+        if os.path.realpath(getattr(compaction_lock, "path", "")) != \
+                os.path.realpath(compaction_lock_path):
+            raise PublishRefused(
+                f"the borrowed compaction_lock is on {getattr(compaction_lock, 'path', None)!r} "
+                f"but the canonical reservation is {compaction_lock_path!r}. Holding some "
+                f"other lock leaves the real one free for a build to take.")
+        if not getattr(compaction_lock, "held", False):
+            raise PublishRefused(
+                "the compaction_lock passed in is not held. Publication borrows a caller's "
+                "reservation; a released one is not a reservation.")
+        compaction_lock.assert_still_held()
+        compaction_guard = compaction_lock
+
     now = now or _utcnow()
     root = plan["root"]
 
@@ -997,13 +1025,21 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
     # block (§7.1b). We take the lock as a RESERVATION and hold it across the whole critical
     # section -- non-blocking, so a build that already holds it makes us refuse rather than wait
     # -- and re-assert the fd/inode fence immediately before the commit.
-    compaction_guard: Optional[CompactionLock] = None
-    if not compaction_lock_path:
+    # A caller that already HOLDS the compaction lock passes it in. Re-acquiring would
+    # deadlock against itself -- `flock` conflicts across distinct open file descriptions even
+    # inside one process -- and, worse, a caller that released and let us re-acquire would have
+    # opened exactly the window the reservation exists to close. So an existing lock is
+    # verified and borrowed: we assert it is still held and we do NOT release it, because we
+    # did not take it.
+    if borrowed:
+        pass
+    elif not compaction_lock_path:
         if not unsafe_skip_compaction_lock:
             raise PublishRefused(
                 "compaction_lock_path is required: publication must not race a build that is "
-                "still writing the block it references (§7.1b). Pass the lock path, or "
-                "unsafe_skip_compaction_lock=True in a test that is not exercising it.")
+                "still writing the block it references (§7.1b). Pass the lock path, a held "
+                "compaction_lock, or unsafe_skip_compaction_lock=True in a test that is not "
+                "exercising it.")
     else:
         try:
             compaction_guard = CompactionLock(
@@ -1139,8 +1175,10 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
     finally:
         # Release the compaction reservation only AFTER the ingest lock is dropped and the
         # commit is done -- the whole point is that no build can start while the block is being
-        # referenced.
-        if compaction_guard is not None:
+        # referenced. A BORROWED lock is never released here: its owner is still using it, and
+        # releasing another component's reservation is how a "held throughout" guarantee turns
+        # into a gap nobody sees.
+        if compaction_guard is not None and not borrowed:
             compaction_guard.release()
 
 

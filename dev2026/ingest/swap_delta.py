@@ -28,7 +28,9 @@ from typing import Callable, List, Optional, Sequence
 import zarr
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from store.compaction_lock import refuse_if_compaction_running  # noqa: E402
+from store.compaction_lock import (  # noqa: E402
+    CompactionLock, CompactionLockBusy,
+)
 
 DEFAULT_HOLD_DAYS = 14
 
@@ -70,12 +72,18 @@ def _atomic_retarget(symlink_path: str, new_target: str) -> None:
 
 
 def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
+                      wal_root: Optional[str] = None, manifest_root: Optional[str] = None,
+                      anchor_root: Optional[str] = None,
+                      unsafe_allow_colocated_anchor: bool = False,
+                      allowed_legacy_paths: Optional[Sequence[str]] = None,
+                      corrected_day_gate: bool = True,
                       lock_path: Optional[str] = None,
                       refresh_fn: Optional[Callable[[], None]] = None,
                       pre_swap_quiesce_fn: Optional[Callable[[], None]] = None,
                       verifier: Optional[Callable[[str, List[str]], dict]] = None,
                       hold_days: int = DEFAULT_HOLD_DAYS,
                       compaction_lock_path: Optional[str] = None,
+                      unsafe_skip_compaction_lock: bool = False,
                       operator: Optional[str] = None) -> dict:
     """Execute a prune_delta swap plan. Returns a result dict; never raises for policy refusals.
 
@@ -94,155 +102,227 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
     """
     # P5-S3 §7.1b: same gate as prune_delta. A swap retargets the delta path, and a block
     # build may be reading it right now; the wrong bytes would become permanent history.
+    # §7.1b: a RESERVATION, not a probe. A probe answers "was a build running a moment ago";
+    # between that answer and the `os.rename` pair below, a build can take the lock and begin
+    # reading the very delta whose path we are about to switch -- the P4-S8a configuration with
+    # a permanent consequence. The reservation is non-blocking (a running build makes us refuse
+    # rather than wait) and is held, in compaction -> ingest order, across the swap AND any
+    # rollback, released only once both are finished.
+    # REQUIRED, not optional. It defaulted to None and only reserved when a path was supplied,
+    # so a caller who simply omitted it swapped the delta path with no reservation at all --
+    # while a build held the real lock and was reading that delta. The waiver is named so it
+    # cannot be typed by accident.
+    compaction_guard = None
+    if not compaction_lock_path and not unsafe_skip_compaction_lock:
+        return {"status": "refused", "swap_performed": False,
+                "reason": ("compaction_lock_path is required: a swap retargets the delta path, "
+                           "and a block build may be reading it right now (§7.1b). Pass the "
+                           "lock path, or unsafe_skip_compaction_lock=True in a test that is "
+                           "not exercising it.")}
     if compaction_lock_path:
-        busy = refuse_if_compaction_running(compaction_lock_path, operation="execute_swap_plan")
-        if busy:
-            return busy
-    if mode not in ("s1", "s2"):
-        raise ValueError(f"mode must be 's1' or 's2', got {mode!r}")
-    if plan.get("status") != "ok":
-        return {"status": "refused", "reason": f"plan status is {plan.get('status')!r}, not 'ok' — "
-                                               "only a validated prune_delta plan is executable"}
-    sp = plan.get("swap_plan") or {}
-    staging, live = sp.get("from"), sp.get("to")
-    if not (staging and live and os.path.isdir(staging)):
-        return {"status": "refused", "reason": "swap_plan.from/to missing or staging path not a directory"}
-    keep_sorted = sorted(plan["keep_days"])
-    dropped = sorted(plan.get("dropped_days", []))
-    expected_live = set(keep_sorted) | set(dropped)
-
-    if mode == "s1" and not os.path.islink(live):
-        return {"status": "refused", "reason": "mode s1 requires the live path to be a symlink "
-                                               "(one-time ops migration; design spec §2)"}
-    if mode == "s2" and os.path.islink(live):
-        return {"status": "refused", "reason": "mode s2 on a symlink live path — use s1"}
-
-    os.makedirs(hold_dir, exist_ok=True)
-    lock_file = lock_path or (live + ".swap.lock")
-    swap_id = _utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + os.urandom(3).hex()
-    stamp = _utcnow().isoformat()
-
-    lk = open(lock_file, "w")
-    try:
-        fcntl.flock(lk, fcntl.LOCK_EX)                # ingest lock: swap and append mutually exclusive
-
-        # ---- staleness guard (§3 step 4): UNIQUE + EXACT set, under the lock ----
-        live_days = _read_live_days(live)
-        if len(live_days) != len(set(live_days)):
-            dups = sorted({d for d in live_days if live_days.count(d) > 1})
-            return {"status": "aborted_stale", "reason": f"live delta has duplicate days: {dups}",
-                    "swap_performed": False}
-        if set(live_days) != expected_live:
-            new_days = sorted(set(live_days) - expected_live)
-            gone = sorted(expected_live - set(live_days))
-            return {"status": "aborted_stale",
-                    "reason": "live delta changed since the plan was built — rebuild the plan",
-                    "unexpected_new_days": new_days, "unexpected_missing_days": gone,
-                    "swap_performed": False}
-
-        # ---- same-filesystem prechecks (os.rename must not cross devices) ----
-        live_parent = os.path.dirname(os.path.abspath(live)) or "."
-        if _st_dev(staging) != _st_dev(live_parent):
-            return {"status": "refused", "reason": "staging and live are on different filesystems "
-                                                   "(os.rename would not be atomic)", "swap_performed": False}
-        if mode == "s2" and _st_dev(hold_dir) != _st_dev(live_parent):
-            # S2 renames live -> hold_dir/<backup>: a cross-device hold_dir would fail MID-swap
-            # (after live was moved) — refuse cleanly BEFORE touching anything (Codex S8a-review #2).
-            return {"status": "refused", "reason": "hold_dir is on a different filesystem than live "
-                                                   "(s2 renames the old live into hold_dir)",
-                    "swap_performed": False}
-
-        # ---- pre-swap quiescence (INSIDE the lock, after staleness+prechecks, BEFORE any rename) ----
-        if pre_swap_quiesce_fn is not None:
-            try:
-                pre_swap_quiesce_fn()
-            except Exception as exc:
-                # SAFE state: no file has been touched. The caller decides app recovery (it may have
-                # half-stopped the serving process) — that is why this is a distinct status.
-                _manifest(hold_dir, {"swap_id": swap_id, "ts": stamp, "op": "swap_quiesce_failed",
-                                     "mode": mode, "from": staging, "to": live, "operator": operator,
-                                     "error": f"{type(exc).__name__}: {exc}"})
-                return {"status": "quiesce_failed",
-                        "reason": f"pre-swap quiescence failed: {type(exc).__name__}: {exc}",
-                        "swap_id": swap_id, "swap_performed": False, "live_touched": False}
-
-        # ---- swap ----
-        if mode == "s1":
-            old_target = os.path.realpath(live)
-            _atomic_retarget(live, os.path.abspath(staging))
-            backup = old_target                        # the old versioned dir IS the backup (record-only)
-        else:
-            backup = os.path.join(hold_dir, os.path.basename(live) + f".pre-prune-{swap_id}")
-            os.rename(live, backup)                    # ← ms-scale ENOENT window starts
-            os.rename(staging, live)                   # ← window ends
-
-        # ---- refresh + verify: ANY exception here is treated as verify failure -> rollback under the
-        # still-held lock. A raising refresh_fn must NOT leave a swapped live delta behind
-        # (Codex S8a-review #1). ----
-        failure_reason = None
-        v: dict = {}
         try:
-            if refresh_fn is not None:                 # step-7 mechanism (tests: cube.refresh)
-                refresh_fn()
-            v = _default_verifier(live, keep_sorted)
-            if v["ok"] and verifier is not None:
-                extra = verifier(live, keep_sorted)
-                v = {**v, "extra": extra, "ok": bool(v["ok"] and extra.get("ok"))}
-            if not v["ok"]:
-                failure_reason = "post-swap verification failed"
-        except Exception as exc:
-            failure_reason = f"refresh/verify raised: {type(exc).__name__}: {exc}"
-            v = {"ok": False, "exception": failure_reason}
+            compaction_guard = CompactionLock(
+                compaction_lock_path, holder="p5-execute-swap-plan").acquire()
+        except CompactionLockBusy:
+            return {"status": "refused", "reason": "compaction_lock_held",
+                    "operation": "execute_swap_plan", "lock_path": compaction_lock_path,
+                    "swap_performed": False,
+                    "hint": ("a block build holds the compaction lock and may be reading this "
+                             "delta; retargeting the path now would freeze wrong bytes into an "
+                             "immutable block. Reschedule after the build completes.")}
+    try:
+        if mode not in ("s1", "s2"):
+            raise ValueError(f"mode must be 's1' or 's2', got {mode!r}")
+        if plan.get("status") != "ok":
+            return {"status": "refused", "reason": f"plan status is {plan.get('status')!r}, not 'ok' — "
+                                                   "only a validated prune_delta plan is executable"}
+        sp = plan.get("swap_plan") or {}
+        staging, live = sp.get("from"), sp.get("to")
+        if not (staging and live and os.path.isdir(staging)):
+            return {"status": "refused", "reason": "swap_plan.from/to missing or staging path not a directory"}
+        keep_sorted = sorted(plan["keep_days"])
+        dropped = sorted(plan.get("dropped_days", []))
+        expected_live = set(keep_sorted) | set(dropped)
 
-        if failure_reason:
-            # ---- rollback under the still-held lock (§5) ----
-            try:
-                if mode == "s1":
-                    _atomic_retarget(live, backup)
-                else:
-                    os.rename(live, staging)           # put the new delta back at its staging path
-                    os.rename(backup, live)            # restore the original live delta
+        if mode == "s1" and not os.path.islink(live):
+            return {"status": "refused", "reason": "mode s1 requires the live path to be a symlink "
+                                                   "(one-time ops migration; design spec §2)"}
+        if mode == "s2" and os.path.islink(live):
+            return {"status": "refused", "reason": "mode s2 on a symlink live path — use s1"}
+
+        os.makedirs(hold_dir, exist_ok=True)
+        lock_file = lock_path or (live + ".swap.lock")
+        swap_id = _utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + os.urandom(3).hex()
+        stamp = _utcnow().isoformat()
+
+        lk = open(lock_file, "w")
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX)                # ingest lock: swap and append mutually exclusive
+
+            # ---- staleness guard (§3 step 4): UNIQUE + EXACT set, under the lock ----
+            live_days = _read_live_days(live)
+            if len(live_days) != len(set(live_days)):
+                dups = sorted({d for d in live_days if live_days.count(d) > 1})
+                return {"status": "aborted_stale", "reason": f"live delta has duplicate days: {dups}",
+                        "swap_performed": False}
+            if set(live_days) != expected_live:
+                new_days = sorted(set(live_days) - expected_live)
+                gone = sorted(expected_live - set(live_days))
+                return {"status": "aborted_stale",
+                        "reason": "live delta changed since the plan was built — rebuild the plan",
+                        "unexpected_new_days": new_days, "unexpected_missing_days": gone,
+                        "swap_performed": False}
+
+            # ---- §7.5a corrected-day re-authorization, UNDER THE LOCK, BEFORE the path switch.
+            # The staleness guard above compares the live delta's DAY SET against the plan's. A
+            # repair committed between plan and swap does not change the day set at all: the day is
+            # still there, still the same date, and the guard sees nothing. Re-running the gate here
+            # is the only thing standing between "a newer correction landed" and "that correction
+            # was dropped". The plan's authorization is minutes or hours old; this one is current.
+            if dropped and corrected_day_gate:
+                if not (wal_root and manifest_root):
+                    return {"status": "refused", "swap_performed": False,
+                            "reason": ("wal_root and manifest_root are REQUIRED to swap away days: "
+                                       "without them the §7.5a gate cannot be re-run under the "
+                                       "lock, and the plan's authorization is not current")}
                 try:
-                    if refresh_fn is not None:
-                        refresh_fn()                   # best-effort; the re-read below is authoritative
-                except Exception:
-                    pass
-                restored = sorted(_read_live_days(live)) == sorted(expected_live)
-                _manifest(hold_dir, {"swap_id": swap_id, "ts": stamp, "op": "swap_rollback", "mode": mode,
-                                     "from": staging, "to": live, "backup": backup, "operator": operator,
-                                     "reason": failure_reason, "verify": v, "restored_ok": restored})
-                return {"status": "rolled_back", "reason": failure_reason, "verify": v,
-                        "restored_ok": restored, "swap_id": swap_id, "swap_performed": False}
-            except Exception as rexc:
-                # rollback itself failed — ambiguous on-disk state; record loudly, human required.
-                _manifest(hold_dir, {"swap_id": swap_id, "ts": stamp, "op": "swap_rollback_failed",
-                                     "mode": mode, "from": staging, "to": live, "backup": backup,
-                                     "operator": operator, "reason": failure_reason,
-                                     "rollback_error": f"{type(rexc).__name__}: {rexc}"})
-                return {"status": "rollback_failed", "reason": failure_reason,
-                        "rollback_error": f"{type(rexc).__name__}: {rexc}", "backup": backup,
-                        "swap_id": swap_id, "swap_performed": True,
-                        "note": "on-disk state ambiguous — manual recovery from backup required"}
+                    from ingest import corrected_day as _cd
+                    # The plan recorded which anchor domain authorized it. Re-authorizing against a
+                    # different one would mean the two stages rest on different evidence -- and the
+                    # weaker of the two is the one that decides.
+                    planned_anchor = plan.get("anchor_root")
+                    here = (os.path.realpath(anchor_root) if anchor_root else None)
+                    if planned_anchor != here:
+                        return {"status": "refused", "swap_performed": False,
+                                "reason": (f"the plan was authorized against anchor domain "
+                                           f"{planned_anchor!r} but the swap is using {here!r}; "
+                                           f"switching anchor domain between plan and swap means the "
+                                           f"two stages rest on different evidence")}
+                    gate = _cd.prune_eligibility(
+                        dropped, manifest_root=manifest_root, delta_path=live, wal_root=wal_root,
+                        anchor_root=anchor_root, allowed_legacy_paths=allowed_legacy_paths,
+                        unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
+                except Exception as exc:                  # unreadable WAL/manifest -> fail closed
+                    return {"status": "refused", "swap_performed": False,
+                            "reason": (f"the corrected-day gate could not be re-run under the lock "
+                                       f"({exc}); refusing rather than switching the path on a "
+                                       f"stale authorization")}
+                if gate["refused"]:
+                    first = sorted(gate["refused"])[0]
+                    return {"status": "aborted_stale", "swap_performed": False,
+                            "reason": (f"{len(gate['refused'])} day(s) are no longer authorized to "
+                                       f"leave delta (first {first}: {gate['refused'][first]}). The "
+                                       f"day set is unchanged, so the staleness guard cannot see "
+                                       f"this -- a repair landed after the plan was built."),
+                            "corrected_day_refused": sorted(gate["refused"])}
 
-        # ---- success: hold lifecycle + manifest (§7) ----
-        hold_until = (_utcnow() + timedelta(days=hold_days)).isoformat()
-        if mode == "s2":
-            hold_entry = backup                        # already renamed into hold_dir
-        else:
-            hold_entry = backup                        # record-only: old target stays put until ops deletes
-        record = {"swap_id": swap_id, "ts": stamp, "op": "delta_prune_swap", "mode": mode,
-                  "from": staging, "to": live, "backup": hold_entry, "hold_until": hold_until,
-                  "keep_day_count": len(keep_sorted), "keep_latest": keep_sorted[-1],
-                  "dropped_days": dropped, "operator": operator, "verify": v,
-                  "hard_delete": "ops-only after hold_until (never automated in S7/S8)"}
-        _manifest(hold_dir, record)
-        return {"status": "swapped", "swap_id": swap_id, "mode": mode, "backup": hold_entry,
-                "hold_until": hold_until, "verify": v, "manifest": record, "swap_performed": True,
-                "production_mutation": False}          # caller supplies paths; this phase = staging/shadow
+            # ---- same-filesystem prechecks (os.rename must not cross devices) ----
+            live_parent = os.path.dirname(os.path.abspath(live)) or "."
+            if _st_dev(staging) != _st_dev(live_parent):
+                return {"status": "refused", "reason": "staging and live are on different filesystems "
+                                                       "(os.rename would not be atomic)", "swap_performed": False}
+            if mode == "s2" and _st_dev(hold_dir) != _st_dev(live_parent):
+                # S2 renames live -> hold_dir/<backup>: a cross-device hold_dir would fail MID-swap
+                # (after live was moved) — refuse cleanly BEFORE touching anything (Codex S8a-review #2).
+                return {"status": "refused", "reason": "hold_dir is on a different filesystem than live "
+                                                       "(s2 renames the old live into hold_dir)",
+                        "swap_performed": False}
+
+            # ---- pre-swap quiescence (INSIDE the lock, after staleness+prechecks, BEFORE any rename) ----
+            if pre_swap_quiesce_fn is not None:
+                try:
+                    pre_swap_quiesce_fn()
+                except Exception as exc:
+                    # SAFE state: no file has been touched. The caller decides app recovery (it may have
+                    # half-stopped the serving process) — that is why this is a distinct status.
+                    _manifest(hold_dir, {"swap_id": swap_id, "ts": stamp, "op": "swap_quiesce_failed",
+                                         "mode": mode, "from": staging, "to": live, "operator": operator,
+                                         "error": f"{type(exc).__name__}: {exc}"})
+                    return {"status": "quiesce_failed",
+                            "reason": f"pre-swap quiescence failed: {type(exc).__name__}: {exc}",
+                            "swap_id": swap_id, "swap_performed": False, "live_touched": False}
+
+            # ---- swap ----
+            if mode == "s1":
+                old_target = os.path.realpath(live)
+                _atomic_retarget(live, os.path.abspath(staging))
+                backup = old_target                        # the old versioned dir IS the backup (record-only)
+            else:
+                backup = os.path.join(hold_dir, os.path.basename(live) + f".pre-prune-{swap_id}")
+                os.rename(live, backup)                    # ← ms-scale ENOENT window starts
+                os.rename(staging, live)                   # ← window ends
+
+            # ---- refresh + verify: ANY exception here is treated as verify failure -> rollback under the
+            # still-held lock. A raising refresh_fn must NOT leave a swapped live delta behind
+            # (Codex S8a-review #1). ----
+            failure_reason = None
+            v: dict = {}
+            try:
+                if refresh_fn is not None:                 # step-7 mechanism (tests: cube.refresh)
+                    refresh_fn()
+                v = _default_verifier(live, keep_sorted)
+                if v["ok"] and verifier is not None:
+                    extra = verifier(live, keep_sorted)
+                    v = {**v, "extra": extra, "ok": bool(v["ok"] and extra.get("ok"))}
+                if not v["ok"]:
+                    failure_reason = "post-swap verification failed"
+            except Exception as exc:
+                failure_reason = f"refresh/verify raised: {type(exc).__name__}: {exc}"
+                v = {"ok": False, "exception": failure_reason}
+
+            if failure_reason:
+                # ---- rollback under the still-held lock (§5) ----
+                try:
+                    if mode == "s1":
+                        _atomic_retarget(live, backup)
+                    else:
+                        os.rename(live, staging)           # put the new delta back at its staging path
+                        os.rename(backup, live)            # restore the original live delta
+                    try:
+                        if refresh_fn is not None:
+                            refresh_fn()                   # best-effort; the re-read below is authoritative
+                    except Exception:
+                        pass
+                    restored = sorted(_read_live_days(live)) == sorted(expected_live)
+                    _manifest(hold_dir, {"swap_id": swap_id, "ts": stamp, "op": "swap_rollback", "mode": mode,
+                                         "from": staging, "to": live, "backup": backup, "operator": operator,
+                                         "reason": failure_reason, "verify": v, "restored_ok": restored})
+                    return {"status": "rolled_back", "reason": failure_reason, "verify": v,
+                            "restored_ok": restored, "swap_id": swap_id, "swap_performed": False}
+                except Exception as rexc:
+                    # rollback itself failed — ambiguous on-disk state; record loudly, human required.
+                    _manifest(hold_dir, {"swap_id": swap_id, "ts": stamp, "op": "swap_rollback_failed",
+                                         "mode": mode, "from": staging, "to": live, "backup": backup,
+                                         "operator": operator, "reason": failure_reason,
+                                         "rollback_error": f"{type(rexc).__name__}: {rexc}"})
+                    return {"status": "rollback_failed", "reason": failure_reason,
+                            "rollback_error": f"{type(rexc).__name__}: {rexc}", "backup": backup,
+                            "swap_id": swap_id, "swap_performed": True,
+                            "note": "on-disk state ambiguous — manual recovery from backup required"}
+
+            # ---- success: hold lifecycle + manifest (§7) ----
+            hold_until = (_utcnow() + timedelta(days=hold_days)).isoformat()
+            if mode == "s2":
+                hold_entry = backup                        # already renamed into hold_dir
+            else:
+                hold_entry = backup                        # record-only: old target stays put until ops deletes
+            record = {"swap_id": swap_id, "ts": stamp, "op": "delta_prune_swap", "mode": mode,
+                      "from": staging, "to": live, "backup": hold_entry, "hold_until": hold_until,
+                      "keep_day_count": len(keep_sorted), "keep_latest": keep_sorted[-1],
+                      "dropped_days": dropped, "operator": operator, "verify": v,
+                      "hard_delete": "ops-only after hold_until (never automated in S7/S8)"}
+            _manifest(hold_dir, record)
+            return {"status": "swapped", "swap_id": swap_id, "mode": mode, "backup": hold_entry,
+                    "hold_until": hold_until, "verify": v, "manifest": record, "swap_performed": True,
+                    "production_mutation": False}          # caller supplies paths; this phase = staging/shadow
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+            lk.close()
+
+
     finally:
-        fcntl.flock(lk, fcntl.LOCK_UN)
-        lk.close()
-
+        if compaction_guard is not None:
+            compaction_guard.release()
 
 def _manifest(hold_dir: str, record: dict) -> None:
     """Append-only JSONL manifest (§7 convention, shared with P4-S7)."""

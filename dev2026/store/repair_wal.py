@@ -34,14 +34,50 @@ import uuid
 from typing import Dict, List, NamedTuple, Optional, Sequence
 
 WAL_NAME = "p5_repairs.jsonl"
+#: A durable high-water mark for the log, updated inside the WAL lock on every append and
+#: fsync'd separately. Pass `anchor_root` to place it in a **different rollback domain** from
+#: the log itself.
+#:
+#: **What co-locating it does and does not prove.** In the same directory it detects
+#: single-file truncation or substitution of `p5_repairs.jsonl` -- and nothing more. A VM
+#: snapshot rollback restores the log AND the anchor together, and the restored pair is
+#: perfectly self-consistent. Defending against that requires the anchor to live somewhere the
+#: rollback does not reach, or to be cross-checked against a second independent durable
+#: authority. A same-directory sidecar cannot make that claim and this module does not make it.
+#:
+#: It exists because a **valid prefix is still a valid log**: restore
+#: `p5_repairs.jsonl` from an older backup, or truncate it to an earlier record, and every
+#: integrity rule still passes -- checksums chain, `seq` is gap-free, the state machine is
+#: coherent. The days repaired in the lost tail simply read as never-repaired, and the gate
+#: authorizes dropping them. Nothing in a self-describing log can detect its own truncation;
+#: the detection has to come from outside it.
+ANCHOR_NAME = "p5_repairs.anchor.json"
+#: Identity of the anchor's **rollback domain**, written once into the anchor root.
+#:
+#: Three things are routinely confused and are not the same:
+#:
+#: * **a different path** — two directories. Says nothing about durability.
+#: * **a different filesystem** — different `st_dev`. Still usually the same VM, the same
+#:   hypervisor snapshot, and the same backup set.
+#: * **a different ROLLBACK DOMAIN** — storage that a restore of the WAL's host does not
+#:   revert: another machine, an object store, an NFS/iSCSI volume ops has confirmed is
+#:   outside the VM's snapshot scope.
+#:
+#: Only the third defends against a whole-VM snapshot rollback, and **no check inside this
+#: process can establish it** — a path on a snapshotted volume is indistinguishable from one on
+#: an independent volume. So this file records an auditable `domain_id` an operator sets
+#: deliberately, the WAL binds to that id rather than to a local path, and the guarantee itself
+#: remains a deployment prerequisite that ops must verify.
+ANCHOR_DOMAIN_NAME = "p5_anchor_domain.json"
 LOCK_NAME = "p5_repairs.lock"
 
+WAL_INITIALIZED = "wal_initialized"
 INTENT = "repair_intent"
 COMMITTED = "repair_committed"
 ABORTED = "repair_aborted"
 LOG_TAIL_REPAIRED = "log_tail_repaired"
 
-RECORD_TYPES = (INTENT, COMMITTED, ABORTED, LOG_TAIL_REPAIRED)
+RECORD_TYPES = (WAL_INITIALIZED, INTENT, COMMITTED, ABORTED, LOG_TAIL_REPAIRED)
 TERMINAL = (COMMITTED, ABORTED)
 
 #: every record carries exactly these keys -- no more, no less. An unknown key is a different
@@ -93,6 +129,191 @@ class RepairState(NamedTuple):
     terminal_payload: Optional[str]             # canonical payload of the terminal record
 
 
+class WalRolledBack(WalError):
+    """The log is a valid earlier PREFIX of itself. Valid, and not current."""
+
+
+class WalNotInitialized(WalError):
+    """The WAL was never initialized, or belongs to a different deployment.
+
+    An **absent** log is not an empty one. A missing or uninitialized WAL read as "no repairs"
+    means every day looks never-repaired and every prune is authorized -- the failure mode is
+    silent, total, and indistinguishable from a healthy deployment that has genuinely had no
+    repairs. So the log must say, in its own first record, which manifest authority it belongs
+    to, and the gate refuses until it does."""
+
+
+def anchor_domain_id(anchor_root: str) -> Optional[str]:
+    """The declared rollback-domain identity of an anchor root, or None if undeclared."""
+    doc = _anchor_domain_doc(anchor_root)
+    return None if doc is None else doc["domain_id"]
+
+
+def _anchor_domain_doc(anchor_root: str) -> Optional[dict]:
+    path = os.path.join(anchor_root, ANCHOR_DOMAIN_NAME)
+    if not os.path.isfile(path):
+        return None
+    with open(path) as fh:
+        doc = json.load(fh)
+    if not isinstance(doc, dict):
+        raise WalCorrupt(f"{path}: anchor domain declaration is not an object")
+    missing = [k for k in _DOMAIN_FIELDS if k not in doc]
+    extra = [k for k in doc if k not in _DOMAIN_FIELDS]
+    if missing or extra:
+        raise WalCorrupt(f"{path}: declaration has the wrong field set (missing={missing}, "
+                         f"unexpected={extra})")
+    for name in ("domain_id", "declared_utc", "operator", "note"):
+        if not isinstance(doc[name], str):
+            raise WalCorrupt(f"{path}: {name} must be a string, got "
+                             f"{type(doc[name]).__name__}")
+    if not doc["domain_id"]:
+        raise WalCorrupt(f"{path}: domain_id is empty")
+    if type(doc["allow_same_filesystem"]) is not bool:
+        raise WalCorrupt(f"{path}: allow_same_filesystem must be a raw bool, got "
+                         f"{type(doc['allow_same_filesystem']).__name__}")
+    return doc
+
+
+_DOMAIN_FIELDS = ("domain_id", "declared_utc", "operator", "note", "allow_same_filesystem")
+
+
+def declare_anchor_domain(anchor_root: str, *, domain_id: str, at_utc: str,
+                          operator: str, note: str = "",
+                          allow_same_filesystem: bool = False) -> dict:
+    """Record who this anchor root belongs to. Written once; a different id is refused.
+
+    The id is chosen by an operator, deliberately, and is the thing the WAL binds to — not a
+    local path, which changes on every mount and proves nothing about durability."""
+    if not isinstance(domain_id, str) or not domain_id.strip():
+        raise WalError("domain_id must be a non-empty string")
+    # `bool(x)` would turn the string "false" into True -- a typo in a deployment script
+    # silently granting the waiver it was trying to withhold.
+    if type(allow_same_filesystem) is not bool:
+        raise WalError(
+            f"allow_same_filesystem must be a raw bool, got "
+            f"{type(allow_same_filesystem).__name__} {allow_same_filesystem!r}; it is not "
+            f"coerced, because bool('false') is True and this field grants a waiver")
+    for name, value in (("at_utc", at_utc), ("operator", operator), ("note", note)):
+        if not isinstance(value, str):
+            raise WalError(f"{name} must be a string, got {type(value).__name__}")
+    os.makedirs(anchor_root, exist_ok=True)
+    doc = {"domain_id": domain_id, "declared_utc": at_utc, "operator": operator, "note": note,
+           "allow_same_filesystem": allow_same_filesystem}
+    existing = _anchor_domain_doc(anchor_root)
+    if existing is not None:
+        if existing == doc:
+            return {"status": "already_declared", "domain_id": domain_id}
+        if existing["domain_id"] != domain_id:
+            raise WalError(
+                f"{anchor_root} already declares domain {existing['domain_id']!r}; "
+                f"re-declaring it as {domain_id!r} would silently move every log bound to "
+                f"the old id")
+        # Same id, different content. The declaration is IMMUTABLE: it is the record ops
+        # audited. Returning "already_declared" while ignoring the new fields made the
+        # documented "re-declare with allow_same_filesystem=True" a no-op that looked like it
+        # worked -- the worst kind of waiver, one you believe you have.
+        differing = sorted(k for k in _DOMAIN_FIELDS if existing.get(k) != doc.get(k))
+        raise WalError(
+            f"{anchor_root} already declares domain {domain_id!r} with different content "
+            f"({differing}). The declaration is immutable -- it is what an auditor read. To "
+            f"change it, replace {ANCHOR_DOMAIN_NAME} administratively and record why.")
+    path = os.path.join(anchor_root, ANCHOR_DOMAIN_NAME)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(canonical(doc))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(anchor_root)
+    return {"status": "declared", "domain_id": domain_id}
+
+
+def resolve_anchor_root(wal_root: str, anchor_root: Optional[str], *,
+                        unsafe_allow_colocated_anchor: bool = False) -> str:
+    """The one place that decides where the high-water mark lives. Fail-closed by default.
+
+    **What this can and cannot check.** It refuses a missing anchor, one that resolves to the
+    WAL root, and — as a minimum preflight — one on the same `st_dev`. None of that establishes
+    a different *rollback domain*: two directories on different filesystems of the same VM are
+    still restored together by one hypervisor snapshot. No check inside this process can tell
+    the difference, so the real guarantee is a **deployment prerequisite** (see
+    `ANCHOR_DOMAIN_NAME`), and what this function enforces is that an operator has *declared*
+    one, not that the declaration is true."""
+    if anchor_root is None:
+        if unsafe_allow_colocated_anchor:
+            return os.path.realpath(wal_root)
+        raise WalNotInitialized(
+            "anchor_root is required: an anchor beside the WAL cannot detect a rollback of "
+            "that root, because the rollback restores both and the restored pair is "
+            "self-consistent. Point it at a declared separate rollback domain, or pass "
+            "unsafe_allow_colocated_anchor=True in a test that is not exercising it.")
+    resolved = os.path.realpath(anchor_root)
+    if unsafe_allow_colocated_anchor:
+        return resolved
+    if not os.path.isdir(resolved):
+        raise WalNotInitialized(f"anchor_root {anchor_root!r} is not an existing directory")
+    if resolved == os.path.realpath(wal_root):
+        raise WalNotInitialized(
+            f"anchor_root {anchor_root!r} resolves to the WAL root itself, which is the one "
+            f"placement that certainly cannot detect a rollback of that root")
+    if anchor_domain_id(resolved) is None:
+        raise WalNotInitialized(
+            f"{anchor_root} declares no rollback domain. A different path is not a different "
+            f"rollback domain, and neither is a different filesystem: both are restored "
+            f"together by one VM snapshot. Run declare_anchor_domain() against storage ops "
+            f"have confirmed is outside the WAL host's snapshot scope.")
+    try:
+        same_dev = os.stat(resolved).st_dev == os.stat(wal_root).st_dev
+    except OSError as exc:
+        # Not "different device". A missing WAL root -- the ordinary state when initializing a
+        # new deployment -- made `stat` fail, which was read as "different filesystem" and
+        # waved a same-filesystem anchor through with no acknowledgement. An unanswerable
+        # question is not a passing answer.
+        raise WalNotInitialized(
+            f"cannot compare filesystems for {wal_root!r} and {resolved!r} ({exc}). Both roots "
+            f"must exist before the anchor preflight can mean anything; initialize_wal() "
+            f"creates the WAL root for you.") from exc
+    if same_dev and not (_anchor_domain_doc(resolved) or {}).get("allow_same_filesystem"):
+        raise WalNotInitialized(
+            f"{anchor_root} is on the same filesystem as the WAL root. This is only a minimum "
+            f"preflight -- a different st_dev would still not prove a different backup domain "
+            f"-- but the same one rules it out. If the storage really is independent (a bind "
+            f"mount, a remote volume reporting the host device), re-declare the domain with "
+            f"allow_same_filesystem=True so the acknowledgement is auditable.")
+    return resolved
+
+
+def manifest_authority(manifest_root: str, anchor_root: Optional[str] = None) -> dict:
+    """The identity a WAL is bound to. Stable across generations, distinct across deployments.
+
+    `generation_id` changes on every publish and cannot be it. The grid, the block calendar and
+    the resolved root do not change for the life of a store, and together they are what makes
+    one repair log belong to one base."""
+    live = _bm().load_live(manifest_root)
+    out = {"manifest_root": os.path.realpath(manifest_root),
+           "format": live["format"], "version": live["version"],
+           "grid": live["grid"], "block_grid": live["block_grid"]}
+    if anchor_root is not None:
+        # Bound to BOTH the canonical path and the declared domain id, deliberately. The
+        # domain id is the durable claim -- it is what an operator asserted about where this
+        # storage lives, and it survives a remount. The path is the narrower, stricter check:
+        # it catches a second anchor root that happens to carry the same declaration. Keeping
+        # both means a relocation needs a deliberate re-initialization, which is the safer
+        # default when the alternative is silently accepting a different directory.
+        out["anchor_root"] = os.path.realpath(anchor_root)
+        out["anchor_domain_id"] = anchor_domain_id(os.path.realpath(anchor_root))
+    return out
+
+
+def authority_digest(authority: dict) -> str:
+    return hashlib.sha256(canonical(authority).encode()).hexdigest()
+
+
+def _bm():
+    from store import block_manifest as bm      # local: block_manifest does not import us
+    return bm
+
+
 class WalState(NamedTuple):
     records: tuple
     last_seq: int
@@ -102,6 +323,75 @@ class WalState(NamedTuple):
     #: days whose evidence is individually untrustworthy (conflicting terminals, orphan
     #: terminal). Distinct from a whole-log failure, which raises instead.
     poisoned_days: frozenset
+    #: the `wal_initialized` payload, or None when the log has never been initialized
+    authority: Optional[dict]
+    #: the durable high-water mark, or None when no anchor has ever been written
+    anchor: Optional[dict]
+
+    def assert_fresh(self) -> None:
+        """Refuse a log that has been rolled back to a valid earlier prefix.
+
+        The anchor names a `(seq, record_checksum)` the log is known to have reached. A log
+        shorter than that, or one whose record at that seq is a different record, is a
+        truncated or substituted history -- and its missing tail is exactly the set of repairs
+        whose days would otherwise read as never-repaired."""
+        if self.anchor is None:
+            if self.last_seq == 0:
+                return                            # never written; nothing to be stale against
+            raise WalNotInitialized(
+                "the repair WAL has records but no durable anchor. A valid PREFIX of a log is "
+                "still a valid log, so without an external high-water mark a truncated history "
+                "is undetectable from the inside.")
+        want_seq, want_sum = int(self.anchor["seq"]), self.anchor["record_checksum"]
+        # One check, not two. A log shorter than the anchor has no record at `want_seq` at all,
+        # so a separate `last_seq < want_seq` branch could never fire -- an unreachable arm that
+        # reads as a guard. The message covers both shapes because both are the same fact: the
+        # log is not the log the anchor was written against.
+        # The anchor must name the log's LAST record, not merely some record in it. An anchor
+        # that lags means either the log grew without the anchor advancing -- a crash between
+        # the two writes -- or the anchor was restored from an older copy. Both leave the tail
+        # unattested, and an unattested tail is exactly what a rollback produces.
+        if want_seq != self.last_seq:
+            raise WalRolledBack(
+                f"the durable anchor names seq {want_seq} but the log's head is "
+                f"{self.last_seq}. The anchor must equal the head: anything else leaves the "
+                f"tail unattested, which is indistinguishable from a rollback. This needs "
+                f"manual recovery, not a heuristic.")
+        at = next((r for r in self.records if r["seq"] == want_seq), None)
+        if at is None or at["record_checksum"] != want_sum:
+            raise WalRolledBack(
+                f"the repair WAL does not contain the record the durable anchor names (seq "
+                f"{want_seq}); it ends at seq {self.last_seq}. The log was truncated or "
+                f"replaced rather than extended, and the days repaired in the missing tail "
+                f"would read as never-repaired -- precisely the authorization this refuses.")
+
+    def assert_bound_to(self, manifest_root: str, anchor_root: Optional[str] = None) -> None:
+        """Refuse unless this log was initialized for THIS manifest authority AND this anchor
+        domain. Switching anchor domain between stages is refused, not silently accepted."""
+        if self.authority is None:
+            raise WalNotInitialized(
+                "the repair WAL has no wal_initialized record. An absent log is not an empty "
+                "one: read as 'no repairs' it authorizes every prune, and that failure is "
+                "silent and total. Run initialize_wal() against the manifest this delta "
+                "belongs to.")
+        want = manifest_authority(manifest_root, anchor_root)
+        if anchor_root is not None and "anchor_root" not in self.authority:
+            raise WalNotInitialized(
+                "this WAL was initialized without an anchor domain, so it cannot be trusted "
+                "with one now: its earlier records were never attested outside the WAL root. "
+                "Re-initialize a fresh log against the external anchor.")
+        if anchor_root is None and "anchor_root" in self.authority:
+            raise WalNotInitialized(
+                f"this WAL is bound to the anchor domain "
+                f"{self.authority['anchor_root']!r} but is being read without one; dropping "
+                f"the external anchor mid-workflow removes the rollback protection the log "
+                f"was initialized with")
+        if self.authority != want:
+            raise WalNotInitialized(
+                f"the repair WAL is bound to a different deployment "
+                f"(log: {self.authority.get('manifest_root')!r}, asked about: "
+                f"{want['manifest_root']!r}). A log from another base cannot say whether THIS "
+                f"base carries a day's correction.")
 
     def latest_committed(self, day: str) -> Optional[RepairState]:
         """The highest-`seq` committed repair for `day`, or None if it was never repaired."""
@@ -155,7 +445,8 @@ def _check_types(rec: dict, n: int, path: str) -> None:
         _fail(f"{path}: line {n} has unknown record type {rec['record']!r}.")
     if not rec["repair_id"]:
         _fail(f"{path}: line {n} has an empty repair_id.")
-    if rec["record"] != LOG_TAIL_REPAIRED and repair_id_seq(rec["repair_id"]) is None:
+    if rec["record"] not in (LOG_TAIL_REPAIRED, WAL_INITIALIZED) \
+            and repair_id_seq(rec["repair_id"]) is None:
         _fail(f"{path}: line {n} repair_id {rec['repair_id']!r} does not end in "
               f"'-<seq>'. The suffix is what makes repair ids verifiably unique and "
               f"monotonic; an opaque id cannot be ordered at all. All prune is refused.")
@@ -165,20 +456,25 @@ def _fail(msg, **kw):
     raise WalCorrupt(msg, **kw)
 
 
-def parse_wal(path: str) -> WalState:
+def parse_wal(path: str, *, anchor_root: Optional[str] = None) -> WalState:
     """Strict, whole-file, fail-closed. Never skips a record.
 
     Reading is done under a SHARED flock by `read_wal()`, so a benign in-progress append is
     never mistaken for a crash tear. This function is the pure parser and does no locking, so
     it can also be called on a copy during administrative recovery."""
     if not os.path.isfile(path):
-        return WalState((), 0, None, {}, frozenset(), frozenset())
+        # An absent file is a valid *parse* -- there is nothing malformed about it -- and an
+        # invalid *authority*. The distinction matters: callers that only append see a fresh
+        # log, and callers that authorize see `authority is None` and refuse.
+        return WalState((), 0, None, {}, frozenset(), frozenset(), None,
+                        _read_anchor(anchor_root or os.path.dirname(path)))
     with open(path, "r") as fh:
         raw = fh.read()
-    return parse_text(raw, path=path)
+    return parse_text(raw, path=path, anchor_root=anchor_root)
 
 
-def parse_text(raw: str, *, path: str = "<wal>") -> WalState:
+def parse_text(raw: str, *, path: str = "<wal>",
+               anchor_root: Optional[str] = None) -> WalState:
     lines = raw.split("\n")
     if lines and lines[-1] == "":
         lines.pop()                              # the trailing newline of a complete record
@@ -231,8 +527,20 @@ def parse_text(raw: str, *, path: str = "<wal>") -> WalState:
 
     repairs, poisoned = _replay(records, path)
     blocked = frozenset(r.day for r in repairs.values() if r.state == "open")
+    authority = None
+    if records:
+        first = records[0]
+        if first["record"] == WAL_INITIALIZED:
+            authority = first["payload"].get("authority")
+            if not isinstance(authority, dict) or not authority:
+                _fail(f"{path}: the wal_initialized record carries no authority payload")
+        for rec in records[1:]:
+            if rec["record"] == WAL_INITIALIZED:
+                _fail(f"{path}: a wal_initialized record appears at seq {rec['seq']}; it is "
+                      f"the first record of a log or it is not one at all")
     return WalState(tuple(records), prev_seq, prev_checksum, repairs, blocked,
-                    frozenset(poisoned))
+                    frozenset(poisoned), authority,
+                    _read_anchor(anchor_root or os.path.dirname(path)))
 
 
 def _replay(records: Sequence[dict], path: str):
@@ -282,18 +590,18 @@ def _replay(records: Sequence[dict], path: str):
     return repairs, poisoned
 
 
-def read_wal(root: str) -> WalState:
+def read_wal(root: str, *, anchor_root: Optional[str] = None) -> WalState:
     """Parse under a SHARED lock, so an in-progress append is never read as a crash tear."""
     path = os.path.join(root, WAL_NAME)
     lock = os.path.join(root, LOCK_NAME)
     if not os.path.isfile(path):
-        return parse_wal(path)
+        return parse_wal(path, anchor_root=anchor_root)
     os.makedirs(root, exist_ok=True)
     fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_SH)
         try:
-            return parse_wal(path)
+            return parse_wal(path, anchor_root=anchor_root)
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
@@ -302,7 +610,9 @@ def read_wal(root: str) -> WalState:
 
 # --------------------------------------------------------------------------- append
 def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc: str,
-           operator: str, payload: Optional[dict] = None) -> dict:
+           operator: str, payload: Optional[dict] = None,
+           anchor_root: Optional[str] = None,
+           unsafe_allow_colocated_anchor: bool = False) -> dict:
     """Validate the ENTIRE existing log, then append exactly one fsync'd record.
 
     There is no write-only fast path. If the log does not fully validate the append is refused
@@ -318,6 +628,14 @@ def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc
     # into a well-formed record -- the reader would then see a clean dict and have no way to
     # know the writer had passed something else. The parser is strict about types; the writer
     # must be too, or the strictness only applies to files nobody wrote through this function.
+    # The anchor goes through the same decision point as every reader. It used to accept
+    # `anchor_root=None` and quietly write a co-located sidecar -- which is what the terminal
+    # writers used, so a `repair_committed` could succeed while leaving the real external
+    # anchor behind. Nothing was lost, but every later prune and refold then failed closed and
+    # the deployment needed manual recovery: a write that reports success and strands the
+    # workflow is worse than one that refuses.
+    resolved_anchor = resolve_anchor_root(
+        root, anchor_root, unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
     if payload is not None and not isinstance(payload, dict):
         raise WalError(
             f"payload must be a dict, got {type(payload).__name__}. It is NOT coerced: "
@@ -334,7 +652,40 @@ def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc
     fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)           # blocking: held only for the append itself
-        state = parse_wal(path)                  # <- refuses the append if anything is wrong
+        state = parse_wal(path, anchor_root=resolved_anchor)  # refuses the append on any fault
+        # The anchor this append would advance must be the one the log is BOUND to -- BOTH
+        # halves of the binding, not just the domain id. A second root can declare the same
+        # `domain_id` and carry a copy of the current sidecar; checking the id alone let a
+        # terminal write succeed there, advancing the WAL and the twin while the canonical
+        # anchor fell behind. That is the previous bypass one level down: same domain,
+        # different path. Checked before a byte is written, so a mismatched call leaves the
+        # WAL and both anchors byte-identical rather than half-advanced.
+        auth = state.authority or {}
+        bound_path = auth.get("anchor_root")
+        # `resolve_anchor_root()` already returns a realpath and `manifest_authority()` stores
+        # one; re-resolving here keeps the comparison correct if either ever stops doing that.
+        if bound_path is not None and os.path.realpath(resolved_anchor) != bound_path:
+            raise WalNotInitialized(
+                f"this WAL is bound to the anchor at {bound_path!r} but the append supplies "
+                f"{resolved_anchor!r}. A second root declaring the same domain is still a "
+                f"different anchor: advancing it would leave the bound one behind and strand "
+                f"every later prune and refold in fail-closed recovery.")
+        bound = auth.get("anchor_domain_id")
+        if bound is not None:
+            here = anchor_domain_id(resolved_anchor)
+            if here != bound:
+                raise WalNotInitialized(
+                    f"this WAL is bound to anchor domain {bound!r} but the append supplies "
+                    f"{here!r}. Advancing a different anchor would leave the bound one behind "
+                    f"and strand every later prune and refold in fail-closed recovery.")
+        # Freshness BEFORE any seq is allocated -- after the domain check, which gives the
+        # more specific diagnosis when the caller simply passed the wrong anchor. Without
+        # this, a rollback that left an older WAL beside an intact external anchor let the
+        # next writer re-use the missing seq and report success. The prune and refold still
+        # failed closed, so nothing was wrongly dropped -- but the rollback evidence was
+        # overwritten and recovery got harder. A writer that cannot be trusted to read the log
+        # must not be trusted to extend it.
+        state.assert_fresh()
         seq = state.last_seq + 1
         # NOT `payload or {}`: a dict subclass whose __bool__ is False would be silently
         # replaced by an empty payload, which is the same laundering the type check above
@@ -363,6 +714,10 @@ def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc
             # A brand-new file can be lost entirely on a crash even after its own fsync,
             # because the directory entry is a separate write.
             _fsync_dir(root)
+        # The anchor advances AFTER the record is durable. The other order would name a record
+        # that a crash could leave unwritten, and a log "missing" a record it never had is
+        # indistinguishable from one that lost it.
+        _write_anchor(resolved_anchor, rec)
         return rec
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -370,7 +725,8 @@ def append(root: str, *, record: str, repair_id: Optional[str], day: str, at_utc
 
 
 def open_repair(root: str, *, day: str, at_utc: str, operator: str,
-                payload: Optional[dict] = None) -> dict:
+                payload: Optional[dict] = None, anchor_root: Optional[str] = None,
+                unsafe_allow_colocated_anchor: bool = False) -> dict:
     """Open a repair, allocating a conforming `repair_id` **in the same lock hold** as the
     append.
 
@@ -381,13 +737,83 @@ def open_repair(root: str, *, day: str, at_utc: str, operator: str,
     repair ids; they ask for one. `record["repair_id"]` is what the terminal records and the
     block's `materialized_repairs` must carry."""
     return append(root, record=INTENT, repair_id=None, day=day, at_utc=at_utc,
-                  operator=operator, payload=payload)
+                  operator=operator, payload=payload, anchor_root=anchor_root,
+                  unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
+
+
+def initialize_wal(root: str, *, manifest_root: str, at_utc: str, operator: str,
+                   anchor_root: Optional[str] = None,
+                   unsafe_allow_colocated_anchor: bool = False) -> dict:
+    """Write the `wal_initialized` record that binds this log to one manifest authority.
+
+    Idempotent for an identical binding -- re-running deployment tooling must not be a hazard --
+    and a refusal for a different one, because rebinding a log that already carries repair
+    history would silently transfer those authorizations to another base."""
+    # The WAL root is created FIRST, so the filesystem preflight has two real paths to
+    # compare. Initializing a new deployment is exactly when it does not exist yet.
+    os.makedirs(root, exist_ok=True)
+    resolved = resolve_anchor_root(
+        root, anchor_root, unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
+    bound_anchor = None if (anchor_root is None and unsafe_allow_colocated_anchor) else resolved
+    state = read_wal(root, anchor_root=resolved)
+    if state.authority is not None:
+        want = manifest_authority(manifest_root, bound_anchor)
+        if state.authority == want:
+            return {"status": "already_initialized", "authority": state.authority}
+        raise WalError(
+            f"this WAL is already bound to {state.authority.get('manifest_root')!r}; rebinding "
+            f"a log that carries repair history would transfer its authorizations to another "
+            f"base. Start a new log.")
+    if state.last_seq != 0:
+        raise WalError(
+            "this WAL has records but no wal_initialized first record; it cannot be "
+            "retroactively bound. Administrative recovery, not initialization.")
+    rec = append(root, record=WAL_INITIALIZED, repair_id="wal-0", day="",
+                 at_utc=at_utc, operator=operator, anchor_root=anchor_root,
+                 unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor,
+                 payload={"authority": manifest_authority(manifest_root, bound_anchor)})
+    return {"status": "initialized", "authority": rec["payload"]["authority"]}
+
+
+def commit_repair(root: str, *, repair_id: str, day: str, fingerprint: str, at_utc: str,
+                  operator: str, anchor_root: Optional[str] = None,
+                  extra: Optional[dict] = None,
+                  unsafe_allow_colocated_anchor: bool = False) -> dict:
+    """Close a repair as COMMITTED. The terminal writer the workflow should use.
+
+    `append()` is the primitive and takes an optional anchor; these wrappers exist so the
+    workflow does not have to remember. A terminal record written against the wrong anchor
+    strands the deployment, so the choice belongs in one place rather than at every call."""
+    payload = {"fingerprint": fingerprint}
+    if extra:
+        payload.update(extra)
+    return append(root, record=COMMITTED, repair_id=repair_id, day=day, at_utc=at_utc,
+                  operator=operator, payload=payload, anchor_root=anchor_root,
+                  unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
+
+
+def abort_repair(root: str, *, repair_id: str, day: str, reason: str, at_utc: str,
+                 operator: str, anchor_root: Optional[str] = None,
+                 unsafe_allow_colocated_anchor: bool = False) -> dict:
+    """Close a repair as ABORTED, after establishing it did not land."""
+    return append(root, record=ABORTED, repair_id=repair_id, day=day, at_utc=at_utc,
+                  operator=operator, payload={"reason": reason}, anchor_root=anchor_root,
+                  unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
 
 
 def _check_transition(state: WalState, *, record: str, repair_id: str, day: str, payload: dict,
                       next_seq: int):
+    if record == WAL_INITIALIZED:
+        if next_seq != 1:
+            raise WalError("wal_initialized must be the first record of the log")
+        return
     if record == LOG_TAIL_REPAIRED:
         return
+    # Appending to an UNBOUND log is allowed, deliberately. Such a log can never be bound
+    # retroactively (`initialize_wal` refuses a log that already has records), so its records
+    # can never authorize anything -- the fail-closed property lives at authorization time,
+    # where the reviewer asked for it. Refusing appends as well would add no safety and would
+    # make an already-signed-off suite churn for a rule that changes no outcome.
     if record == INTENT and repair_id_seq(repair_id) != next_seq:
         raise WalError(
             f"repair_id {repair_id!r} must end in '-{next_seq}' (the seq this intent will "
@@ -415,6 +841,42 @@ def _check_transition(state: WalState, *, record: str, repair_id: str, day: str,
         f"repair {repair_id!r} is already {cur.state!r}; a conflicting terminal record is "
         f"invalid. Exactly one terminal state per intent, and only a byte-identical replay of "
         f"the same terminal is a no-op.")
+
+
+def _read_anchor(root: str) -> Optional[dict]:
+    path = os.path.join(root or ".", ANCHOR_NAME)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as fh:
+            doc = json.load(fh)
+    except ValueError as exc:
+        raise WalCorrupt(f"{path}: the durable anchor is not valid JSON ({exc})") from exc
+    if not isinstance(doc, dict) or set(doc) != {"seq", "record_checksum", "at_utc"}:
+        raise WalCorrupt(f"{path}: the durable anchor has the wrong field set")
+    if isinstance(doc["seq"], bool) or not isinstance(doc["seq"], int) or doc["seq"] < 1:
+        raise WalCorrupt(f"{path}: anchor seq {doc['seq']!r} must be a positive int")
+    if not isinstance(doc["record_checksum"], str) or not doc["record_checksum"]:
+        raise WalCorrupt(f"{path}: anchor record_checksum missing")
+    return doc
+
+
+def _write_anchor(root: str, rec: dict) -> None:
+    """Advance the high-water mark. Monotonic: it never moves backwards, so a stale write
+    cannot un-anchor a log that has already gone further."""
+    path = os.path.join(root, ANCHOR_NAME)
+    current = _read_anchor(root)
+    if current is not None and int(current["seq"]) >= int(rec["seq"]):
+        return
+    doc = {"seq": int(rec["seq"]), "record_checksum": rec["record_checksum"],
+           "at_utc": rec["at_utc"]}
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(canonical(doc))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(root)
 
 
 def _fsync_dir(dirpath: str):

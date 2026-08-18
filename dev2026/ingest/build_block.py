@@ -56,6 +56,7 @@ import zarr
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from store import block_manifest as bm  # noqa: E402
+from store import repair_wal as rw  # noqa: E402
 from store import source_provenance as sp  # noqa: E402
 from store.compaction_lock import CompactionLock  # noqa: E402
 
@@ -391,6 +392,8 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
                 artifacts_dir: Optional[str] = None,
                 tile: int = 256, resume: bool = False,
                 sealed: Optional[bool] = None,
+                wal_root: Optional[str] = None, anchor_root: Optional[str] = None,
+                unsafe_allow_colocated_anchor: bool = False,
                 unsafe_skip_isolation: bool = False) -> dict:
     """Build one immutable block into `out_path` and return a publish plan.
 
@@ -422,6 +425,8 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
             spatial_window_days=spatial_window_days, window_latest_day=window_latest_day,
             lock=lock, journal=journal, artifacts_dir=artifacts_dir, tile=tile,
             resume=resume, hard_reserve_bytes=hard_reserve_bytes, sealed=sealed,
+            wal_root=wal_root, anchor_root=anchor_root,
+            unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor,
             unsafe_skip_isolation=unsafe_skip_isolation)
     except BuildRefused as exc:
         journal.event(event="refused", reason=str(exc))
@@ -435,7 +440,8 @@ def build_block(out_path: str, *, start_day: str, end_day: str,
 def _build_block(out_path, *, start_day, end_day, classification_target, predecessor_present,
                  delta_path, predecessor_path, daily_root, hold_root, confirmed_missing,
                  spatial_window_days, window_latest_day, lock, journal, artifacts_dir,
-                 tile, resume, hard_reserve_bytes, sealed, unsafe_skip_isolation) -> dict:
+                 tile, resume, hard_reserve_bytes, sealed, wal_root, anchor_root,
+                 unsafe_allow_colocated_anchor, unsafe_skip_isolation) -> dict:
     # ---- isolation is MANDATORY unless explicitly, loudly waived
     if not unsafe_skip_isolation:
         if lock is None or not getattr(lock, "held", False):
@@ -614,6 +620,41 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
     if is_sealed and unknown:
         raise BuildRefused(f"cannot seal: {len(unknown)} day(s) still unknown")
 
+    # §7.5a / §7.8: what repairs did this fold actually consume? DERIVED, never accepted -- the
+    # caller does not get to say which correction a block carries. For every day this build read
+    # FROM DELTA that has a committed repair in the WAL, record the repair id and the
+    # fingerprint of the bytes we actually read. A day sourced from the predecessor block
+    # carries the predecessor's claim forward and is not re-attested here: the fold did not read
+    # the repair, so it must not say it did.
+    materialized_repairs = {}
+    if wal_root:
+        from ingest.corrected_day import date_slot          # local: avoids an import cycle
+        # The refold reads the WAL through the SAME anchor domain the prune gate will use.
+        # Attesting a repair from a log the gate would refuse is a block that can never be
+        # authorized -- work done to produce evidence nothing will accept.
+        _anchor = rw.resolve_anchor_root(
+            wal_root, anchor_root,
+            unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
+        state = rw.read_wal(wal_root, anchor_root=_anchor)   # WalCorrupt -> the build refuses
+        state.assert_fresh()
+        for t_idx, day in enumerate(rebuild_source_set):
+            latest = state.latest_committed(day)
+            if latest is None or smap[day]["source_kind"] != "delta":
+                continue
+            slot = date_slot(day)
+            i0, i1, j0, j1 = sp.sample_window(ny, nx, seed=sp.SAMPLE_SEED, day_index=slot)
+            tiles, valid = {}, {}
+            for v in VARS:
+                has = bool(present_flags[v][t_idx]) and v in keep_vars
+                valid[v] = has
+                tiles[v] = reader.read_tile(smap[day], v, i0, i1, j0, j1) if has else None
+            materialized_repairs[day] = {
+                "repair_id": latest.repair_id, "source_kind": "delta",
+                "source_fingerprint": sp.window_fingerprint(
+                    tiles, seed=sp.SAMPLE_SEED, day_index=slot, var_valid=valid),
+            }
+        journal.event(event="materialized_repairs", days=sorted(materialized_repairs))
+
     source_records = {d: source_map_record(d, smap[d]) for d in rebuild_source_set}
     segment = {
         "segment_id": os.path.basename(out_path.rstrip("/")),
@@ -631,7 +672,7 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
         "precedence": 0, "sealed": is_sealed, "supersedes": None,
         "build_provenance": {
             "source_map_digest": source_map_digest(source_records),
-            "materialized_repairs": {},
+            "materialized_repairs": materialized_repairs,
             "sources": source_records,
         },
     }

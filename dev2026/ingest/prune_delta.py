@@ -43,6 +43,7 @@ import zarr
 
 from ingest.dual_write import DELTA_SPATIAL_CHUNK, DELTA_SHARD_SPATIAL, append_to_delta
 from store.compaction_lock import refuse_if_compaction_running  # noqa: E402
+from ingest import corrected_day as cd  # noqa: E402
 from store.zarr_paths import group_exists, group_path
 
 _CK_NAME = "_bulk_prune_ck.jsonl"                    # append-only checkpoint inside out_path
@@ -361,6 +362,11 @@ def _bulk_build(orig: dict, out_path: str, keep_sorted: List[str], *,
 # --------------------------------------------------------------------------- the helper
 def prune_delta(delta_path: str, out_path: str, keep_days: Sequence[str], *,
                 compaction_lock_path: Optional[str] = None,
+                wal_root: Optional[str] = None, manifest_root: Optional[str] = None,
+                anchor_root: Optional[str] = None,
+                unsafe_allow_colocated_anchor: bool = False,
+                allowed_legacy_paths: Optional[Sequence[str]] = None,
+                corrected_day_gate: bool = True,
                 source_daily: Optional[str] = None, source_delta: Optional[str] = None,
                 base_days: Optional[Sequence[str]] = None,
                 spatial_window_days: int = 31,
@@ -387,6 +393,10 @@ def prune_delta(delta_path: str, out_path: str, keep_days: Sequence[str], *,
       ``missing_from_keep_window``.
     - **base coverage is MANDATORY whenever anything is dropped**: ``base_days=None`` is allowed ONLY for a
       pure rebuild/reorder (``dropped_days`` empty); any uncovered dropped day -> refuse.
+    - **§7.5a corrected-day gate (P5-S5 Part 2)**: base day-membership is NOT sufficient. Every dropped day
+      that was ever repaired must pass **E1 repair identity** and **§7.8a Phase A base-only verification**,
+      both. ``wal_root`` and ``manifest_root`` are required whenever anything is dropped;
+      ``corrected_day_gate=False`` is the single named waiver for tests that are not exercising it.
     """
     if engine not in ("bulk", "perday"):
         raise ValueError(f"engine must be 'bulk' or 'perday', got {engine!r}")
@@ -458,6 +468,48 @@ def prune_delta(delta_path: str, out_path: str, keep_days: Sequence[str], *,
                 return _refuse("dropped days not covered by base (compaction must run first): "
                                f"{uncovered}", base_uncovered=uncovered)
 
+            # §7.5a: DAY MEMBERSHIP IN BASE IS NOT SUFFICIENT. The gate above proves base has
+            # the day; it says nothing about whether base has the day's CORRECT value. A day
+            # repaired into delta after its block was sealed passes coverage and, dropped here,
+            # loses the correction permanently and silently.
+            #
+            # So: E1 repair identity AND §7.8a Phase A base-only verification, both, for every
+            # dropped day that was ever repaired. Either refusing refuses the prune.
+            if corrected_day_gate:
+                if not (wal_root and manifest_root):
+                    return _refuse(
+                        "wal_root and manifest_root are REQUIRED to drop days: without them "
+                        "the §7.5a corrected-day gate cannot run, and base day-membership "
+                        "alone would authorize dropping a day whose correction base does not "
+                        "carry. Pass both, or corrected_day_gate=False in a test that is not "
+                        "exercising it.")
+                # The gate must examine the delta that will actually be SWAPPED, not a
+                # separate read source. `source_delta` may point at a different store; the day
+                # whose correction we are authorizing away lives in `delta_path`, and checking
+                # some other copy of it authorizes the wrong bytes.
+                if os.path.realpath(source_delta) != os.path.realpath(delta_path):
+                    return _refuse(
+                        f"source_delta ({source_delta}) differs from the live delta being "
+                        f"swapped ({delta_path}); the corrected-day gate has no way to bind "
+                        f"the two, and authorizing against one while swapping the other is "
+                        f"exactly the substitution it exists to prevent")
+                try:
+                    gate = cd.prune_eligibility(
+                        dropped, manifest_root=manifest_root, delta_path=delta_path,
+                        wal_root=wal_root, anchor_root=anchor_root,
+                        allowed_legacy_paths=allowed_legacy_paths,
+                        unsafe_allow_colocated_anchor=unsafe_allow_colocated_anchor)
+                except Exception as exc:            # unreadable manifest/WAL -> fail closed
+                    return _refuse(f"the corrected-day gate could not run ({exc}); refusing "
+                                   f"rather than dropping days on an unchecked basis")
+                if gate["refused"]:
+                    first = sorted(gate["refused"])[0]
+                    return _refuse(
+                        f"{len(gate['refused'])} dropped day(s) are not authorized to leave "
+                        f"delta (first {first}: {gate['refused'][first]})",
+                        corrected_day_refused=sorted(gate["refused"]))
+                journal.event(event="corrected_day_gate", authorized=len(gate["authorized"]))
+
         journal.event(event="gates_passed", engine=engine, keep=len(keep_sorted),
                       dropped=dropped, window=[rw["window_start"], rw["window_end"]])
 
@@ -499,6 +551,7 @@ def prune_delta(delta_path: str, out_path: str, keep_days: Sequence[str], *,
             "source": ("+".join(sorted(src_used)) if src_used else None),
             "keep_days": keep_sorted,
             "dropped_days": dropped,
+            "anchor_root": (os.path.realpath(anchor_root) if anchor_root else None),
             "recent_window": rw,
             "validation": validation,
             "swap_plan": {
