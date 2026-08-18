@@ -40,6 +40,7 @@ distinguish a drained process from one it never looked at.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -57,6 +58,7 @@ import p5_fixtures as fx  # noqa: E402
 from ingest import corrected_day as cd  # noqa: E402
 from ingest.build_block import build_block  # noqa: E402
 from ingest.prune_delta import prune_delta  # noqa: E402
+from ingest import swap_delta as sd  # noqa: E402
 from ingest.swap_delta import execute_swap_plan  # noqa: E402
 from store import block_manifest as bm  # noqa: E402
 from store import repair_wal as rw  # noqa: E402
@@ -73,6 +75,12 @@ def _attested(**kw):
     """A quiescence attestation for the cases that are not about the attestation itself."""
     return {"drained": True, "evidence": "harness: reader threads joined",
             "observed_inflight": 0, **kw}
+
+
+def _counted(alive):
+    """What a real hook returns: the count it measured, whatever it turns out to be."""
+    return {"drained": alive == 0, "evidence": "harness: enumerated reader threads",
+            "observed_inflight": alive}
 
 
 class _PausableBase(SegmentedCubeStore):
@@ -327,9 +335,7 @@ class TestReachability(_Base):
         self._refold()
 
         def quiesce_counts_readers():
-            alive = 1 if reader.is_alive() else 0
-            return {"drained": alive == 0, "evidence": "harness: enumerated reader threads",
-                    "observed_inflight": alive}
+            return _counted(1 if reader.is_alive() else 0)
 
         before = sorted(bm.inspect_store_contract(self.live).days)
         refused = self._swap(self._plan(), pre_swap_quiesce_fn=quiesce_counts_readers)
@@ -387,9 +393,7 @@ class TestReachability(_Base):
         def quiesce_joins_the_reader():
             stop.set()
             reader.join(timeout=30)
-            alive = 1 if reader.is_alive() else 0
-            return {"drained": alive == 0, "evidence": "harness: stop flag set, reader joined",
-                    "observed_inflight": alive}
+            return _counted(1 if reader.is_alive() else 0)
 
         self.assertEqual(self._swap(self._plan(),
                                     pre_swap_quiesce_fn=quiesce_joins_the_reader)["status"],
@@ -441,7 +445,8 @@ class TestQuiescenceIsFailClosed(_Base):
         self.assertIn("no attestation", res["reason"])
 
     def test_a_hook_that_reports_not_drained_is_refused(self):
-        res = self._attempt(pre_swap_quiesce_fn=lambda: {"drained": False, "evidence": "x"})
+        res = self._attempt(pre_swap_quiesce_fn=lambda: {"drained": False, "evidence": "x",
+                                                         "observed_inflight": 0})
         self.assertEqual(res["status"], "quiesce_failed")
         self.assertIn("drained=False", res["reason"])
 
@@ -450,24 +455,57 @@ class TestQuiescenceIsFailClosed(_Base):
         in Part 2 round 7. `drained` must be exactly `True`."""
         for bad in ("false", "true", 1, [1]):
             with self.subTest(repr(bad)):
-                res = self._attempt(
-                    pre_swap_quiesce_fn=lambda b=bad: {"drained": b, "evidence": "x"})
+                res = self._attempt(pre_swap_quiesce_fn=lambda b=bad: {
+                    "drained": b, "evidence": "x", "observed_inflight": 0})
                 self.assertEqual(res["status"], "quiesce_failed")
                 self.assertIn("must be exactly True", res["reason"])
 
     def test_an_attestation_without_evidence_is_refused(self):
-        for bad in ({}, {"evidence": ""}, {"evidence": "   "}, {"evidence": 7}):
+        for bad in ({"evidence": None}, {"evidence": ""}, {"evidence": "   "}, {"evidence": 7}):
             with self.subTest(repr(bad)):
-                res = self._attempt(
-                    pre_swap_quiesce_fn=lambda b=bad: {"drained": True, **b})
+                res = self._attempt(pre_swap_quiesce_fn=lambda b=bad: {
+                    "drained": True, "observed_inflight": 0, **b})
                 self.assertEqual(res["status"], "quiesce_failed")
                 self.assertIn("no `evidence` string", res["reason"])
 
     def test_a_positive_in_flight_count_is_refused_even_when_drained_is_claimed(self):
         res = self._attempt(pre_swap_quiesce_fn=lambda: {
             "drained": True, "evidence": "pm2 stop returned 0", "observed_inflight": 2})
+        self.assertIn("2 in-flight", res["reason"])
         self.assertEqual(res["status"], "quiesce_failed")
         self.assertIn("2 in-flight", res["reason"])
+
+    def test_observed_inflight_is_REQUIRED_not_merely_checked_when_present(self):
+        """Review round 2, finding 2. `{"drained": True, "evidence": "trust me"}` was accepted:
+        the one load-bearing gate taking an answer it never asked for."""
+        res = self._attempt(pre_swap_quiesce_fn=lambda: {"drained": True,
+                                                         "evidence": "trust me"})
+        self.assertEqual(res["status"], "quiesce_failed")
+        self.assertIn("missing required field(s) observed_inflight", res["reason"])
+
+    def test_every_core_field_is_required(self):
+        full = {"drained": True, "evidence": "e", "observed_inflight": 0}
+        for drop in ("drained", "evidence", "observed_inflight"):
+            with self.subTest(drop):
+                att = {k: v for k, v in full.items() if k != drop}
+                res = self._attempt(pre_swap_quiesce_fn=lambda a=att: dict(a))
+                self.assertEqual(res["status"], "quiesce_failed")
+                self.assertIn(f"missing required field(s) {drop}", res["reason"])
+
+    def test_a_negative_inflight_count_is_not_fewer_than_none(self):
+        res = self._attempt(pre_swap_quiesce_fn=lambda: {
+            "drained": True, "evidence": "e", "observed_inflight": -1})
+        self.assertEqual(res["status"], "quiesce_failed")
+        self.assertIn("not a measurement", res["reason"])
+
+    def test_the_inflight_count_must_be_a_raw_int(self):
+        """`isinstance(True, int)` is True, so a bool would otherwise read as a proven zero."""
+        for bad in (False, True, "0", 0.0, None):
+            with self.subTest(repr(bad)):
+                res = self._attempt(pre_swap_quiesce_fn=lambda b=bad: {
+                    "drained": True, "evidence": "e", "observed_inflight": b})
+                self.assertEqual(res["status"], "quiesce_failed")
+                self.assertIn("must be a raw int", res["reason"])
 
     def test_a_hook_that_raises_still_reports_the_safe_state(self):
         def boom():
@@ -484,6 +522,67 @@ class TestQuiescenceIsFailClosed(_Base):
                                 pre_swap_quiesce_fn=_attested)
         self.assertEqual(res["status"], "swapped", res.get("reason"))
 
+    def test_the_attestation_is_RECORDED_on_a_successful_swap(self):
+        """Review round 2, finding 3. `evidence` is mandatory at the gate and was then thrown
+        away, so the audit trail could not answer what quiescence actually verified."""
+        res = execute_swap_plan(self._plan(), mode="s1", hold_dir=self.hold,
+                                wal_root=self.wal, manifest_root=self.root,
+                                unsafe_allow_colocated_anchor=True,
+                                compaction_lock_path=self.clock,
+                                pre_swap_quiesce_fn=lambda: _attested(
+                                    evidence="pm2 stop ghrsst; :8035 closed; 0 worker pids"))
+        self.assertEqual(res["status"], "swapped", res.get("reason"))
+        for where in (res["quiescence"], res["manifest"]["quiescence"]):
+            self.assertTrue(where["attested"])
+            self.assertFalse(where["waived"])
+            self.assertEqual(where["observed_inflight"], 0)
+            self.assertIn(":8035 closed", where["evidence"])
+
+        with open(os.path.join(self.hold, "manifest.jsonl")) as fh:
+            lines = [json.loads(x) for x in fh if x.strip()]
+        swap_rec = [r for r in lines if r["op"] == "delta_prune_swap"][-1]
+        self.assertIn(":8035 closed", swap_rec["quiescence"]["evidence"])
+
+    def test_only_validated_fields_are_recorded_never_the_callback_object(self):
+        """The callback's object is caller-controlled. Extra keys are acknowledged by NAME so
+        the record shows what was supplied without inheriting arbitrary payload."""
+        res = execute_swap_plan(self._plan(), mode="s1", hold_dir=self.hold,
+                                wal_root=self.wal, manifest_root=self.root,
+                                unsafe_allow_colocated_anchor=True,
+                                compaction_lock_path=self.clock,
+                                pre_swap_quiesce_fn=lambda: _attested(
+                                    pm2_dump=object(), pids=[1, 2]))
+        self.assertEqual(res["status"], "swapped", res.get("reason"))
+        q = res["quiescence"]
+        self.assertEqual(q["extra_fields"], ["pids", "pm2_dump"])
+        self.assertNotIn("pm2_dump", q)
+        json.dumps(res["manifest"])                 # the record must stay serializable
+
+    def test_a_waived_swap_is_recorded_as_waived(self):
+        res = execute_swap_plan(self._plan(), mode="s1", hold_dir=self.hold,
+                                wal_root=self.wal, manifest_root=self.root,
+                                unsafe_allow_colocated_anchor=True,
+                                compaction_lock_path=self.clock,
+                                unsafe_skip_quiescence=True)
+        self.assertEqual(res["status"], "swapped", res.get("reason"))
+        self.assertEqual(res["quiescence"], {"attested": False, "waived": True})
+
+    def test_a_rollback_records_the_attestation_too(self):
+        """A swap that rolls back is exactly when the question gets asked."""
+        def bad_verifier(live, keep):
+            return {"ok": False, "why": "forced"}
+        res = execute_swap_plan(self._plan(), mode="s1", hold_dir=self.hold,
+                                wal_root=self.wal, manifest_root=self.root,
+                                unsafe_allow_colocated_anchor=True,
+                                compaction_lock_path=self.clock,
+                                pre_swap_quiesce_fn=lambda: _attested(evidence="rollback case"),
+                                verifier=bad_verifier)
+        self.assertEqual(res["status"], "rolled_back", res.get("reason"))
+        with open(os.path.join(self.hold, "manifest.jsonl")) as fh:
+            lines = [json.loads(x) for x in fh if x.strip()]
+        rb = [r for r in lines if r["op"] == "swap_rollback"][-1]
+        self.assertEqual(rb["quiescence"]["evidence"], "rollback case")
+
     def test_the_waiver_has_to_be_typed(self):
         """`unsafe_skip_quiescence` exists for suites that predate §7.9. It is named so it
         cannot be reached by omission, which is how the old default behaved."""
@@ -493,6 +592,51 @@ class TestQuiescenceIsFailClosed(_Base):
                                 compaction_lock_path=self.clock,
                                 unsafe_skip_quiescence=True)
         self.assertEqual(res["status"], "swapped", res.get("reason"))
+
+
+class TestTheProductionRunbookMatchesTheContract(unittest.TestCase):
+    """Review round 2, finding 1: the one production runbook was broken by this API change.
+
+    Its `quiesce()` ended in a bare `return`, so under the new executor it would stop pm2, close
+    the port, return None, and be refused — the swap never running while the app was down. A
+    contract that only the tests satisfy is not a contract, so the runbook is checked here."""
+
+    RUNBOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "specs", "p4s10_production_rollout_runbook.md")
+
+    def setUp(self):
+        with open(self.RUNBOOK) as fh:
+            text = fh.read()
+        start = text.index("def quiesce():")
+        self.body = text[start:text.index("\ndef ", start + 1)]
+
+    def test_the_runbook_hook_returns_an_attestation_not_a_bare_return(self):
+        self.assertNotIn("; return\n", self.body,
+                         "a bare `return` is exactly what the executor now refuses")
+        self.assertIn("return att", self.body)
+
+    def test_the_runbook_hook_supplies_every_required_core_field(self):
+        """If a core field is ever added, this fails until the runbook is updated too — which is
+        the drift that produced this finding."""
+        for field in sd.QUIESCENCE_CORE_FIELDS:
+            with self.subTest(field):
+                self.assertIn(f'"{field}"', self.body)
+
+    def test_the_attestation_the_runbook_builds_is_ACCEPTED_by_the_executor(self):
+        """The shape itself, run through the real validator rather than eyeballed."""
+        att = {"drained": True,
+               "evidence": ("pm2 stop ghrsst -> exit 0; GET /healthz on :8035 refused; "
+                            "pm2 jlist shows 0 online workers for ghrsst"),
+               "observed_inflight": 0,
+               "checked_utc": "2027-01-01T00:00:00+00:00"}
+        self.assertIsNone(sd._quiescence_refusal(att))
+        self.assertEqual(sd.normalize_quiescence(att)["extra_fields"], ["checked_utc"])
+
+    def test_the_runbook_measures_the_worker_count_rather_than_inferring_it(self):
+        """A closed port says new connections are refused; it does not say the worker finished
+        the request it was already serving."""
+        self.assertIn("pm2", self.body)
+        self.assertIn("worker_pids()", self.body)
 
 
 if __name__ == "__main__":

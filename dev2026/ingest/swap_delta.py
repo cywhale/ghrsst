@@ -43,6 +43,9 @@ class QuiescenceNotProven(RuntimeError):
     `return` produces, so it must not read as success."""
 
 
+QUIESCENCE_CORE_FIELDS = ("drained", "evidence", "observed_inflight")
+
+
 def _quiescence_refusal(attestation) -> Optional[str]:
     """None when the attestation PROVES drain; otherwise why it does not.
 
@@ -50,33 +53,62 @@ def _quiescence_refusal(attestation) -> Optional[str]:
     evidence the port is closed and the workers are gone -- and "no reader was observed" is not
     "no reader exists", which is the assumption the (e2) analysis is not allowed to make.
 
-    `drained` must be a raw `True`. Truthiness would accept the string ``"false"``, which is
-    what a shell-scripted hook produces when it interpolates a variable it never set -- the
-    same laundering that made `allow_same_filesystem` grant a waiver it was refusing (P5-S5
-    Part 2 round 7)."""
+    All three core fields are REQUIRED. `observed_inflight` was previously checked only when
+    present and only against `> 0`, so `{"drained": True, "evidence": "trust me"}` passed, and
+    so did a count of -1: the one load-bearing gate accepting the answer it never asked for.
+    Extra keys are allowed as supplementary evidence, but only the core fields are validated,
+    and only they are recorded (`normalize_quiescence`).
+
+    `drained` must be a raw `True` and `observed_inflight` a raw `int`. Truthiness would accept
+    the string ``"false"``, which is what a shell-scripted hook produces when it interpolates a
+    variable it never set -- the same laundering that made `allow_same_filesystem` grant a
+    waiver it was refusing (P5-S5 Part 2 round 7). `bool` is excluded explicitly because
+    `isinstance(True, int)` is True in Python, so `observed_inflight=False` would otherwise read
+    as a proven zero."""
     if attestation is None:
         return ("the quiescence hook returned no attestation. A hook that merely does not raise "
                 "proves nothing: it cannot distinguish a drained process from one it never "
                 "looked at")
     if not isinstance(attestation, dict):
-        return (f"the quiescence attestation must be a dict, got {type(attestation).__name__}")
-    drained = attestation.get("drained")
+        return f"the quiescence attestation must be a dict, got {type(attestation).__name__}"
+    missing = [f for f in QUIESCENCE_CORE_FIELDS if f not in attestation]
+    if missing:
+        return (f"the quiescence attestation is missing required field(s) "
+                f"{', '.join(missing)}. All of {', '.join(QUIESCENCE_CORE_FIELDS)} must be "
+                f"supplied: an absent field is an unanswered question, not a passing answer")
+    drained = attestation["drained"]
     if drained is not True:
         return (f"the quiescence attestation reports drained={drained!r}; it must be exactly "
                 f"True. Readers are not proven gone")
-    evidence = attestation.get("evidence")
+    evidence = attestation["evidence"]
     if not isinstance(evidence, str) or not evidence.strip():
         return ("the quiescence attestation carries no `evidence` string. Record WHAT was "
                 "checked (process stopped, port closed, in-flight count read), so a swap that "
                 "later loses a day can be traced to what quiescence actually verified")
-    inflight = attestation.get("observed_inflight")
-    if inflight is not None:
-        if not isinstance(inflight, int) or isinstance(inflight, bool):
-            return (f"observed_inflight must be an int, got {type(inflight).__name__}")
-        if inflight > 0:
-            return (f"the quiescence attestation reports {inflight} in-flight request(s) still "
-                    f"alive. A reader alive across the swap is the (e2) combination itself")
+    inflight = attestation["observed_inflight"]
+    if isinstance(inflight, bool) or not isinstance(inflight, int):
+        return (f"observed_inflight must be a raw int, got "
+                f"{type(inflight).__name__} ({inflight!r})")
+    if inflight != 0:
+        if inflight < 0:
+            return (f"observed_inflight is {inflight}: a negative count is not a measurement, "
+                    f"and it must not read as 'fewer than none'")
+        return (f"the quiescence attestation reports {inflight} in-flight request(s) still "
+                f"alive. A reader alive across the swap is the (e2) combination itself")
     return None
+
+
+def normalize_quiescence(attestation: dict) -> dict:
+    """The validated core, and nothing else, for the audit record.
+
+    The callback's own object is never stored: it is caller-controlled and may hold anything.
+    Extra keys are acknowledged by NAME so the record shows what was supplied without the
+    manifest inheriting arbitrary payload."""
+    extra = sorted(str(k) for k in attestation if k not in QUIESCENCE_CORE_FIELDS)
+    out = {f: attestation[f] for f in QUIESCENCE_CORE_FIELDS}
+    if extra:
+        out["extra_fields"] = extra
+    return out
 
 
 def _st_dev(path: str) -> int:
@@ -291,11 +323,19 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                         "swap_performed": False}
 
             # ---- pre-swap quiescence (INSIDE the lock, after staleness+prechecks, BEFORE any rename) ----
+            quiescence = {"attested": False,
+                          "waived": bool(unsafe_skip_quiescence and pre_swap_quiesce_fn is None)}
             if pre_swap_quiesce_fn is not None:
                 try:
-                    why = _quiescence_refusal(pre_swap_quiesce_fn())
+                    attestation = pre_swap_quiesce_fn()
+                    why = _quiescence_refusal(attestation)
                     if why is not None:
                         raise QuiescenceNotProven(why)
+                    # Kept for the audit record: an `evidence` string that is mandatory at the
+                    # gate and then discarded cannot answer "what did quiescence actually
+                    # verify?" the day a swap is suspected of losing one.
+                    quiescence = {"attested": True, "waived": False,
+                                  **normalize_quiescence(attestation)}
                 except Exception as exc:
                     # SAFE state: no file has been touched. The caller decides app recovery (it may have
                     # half-stopped the serving process) — that is why this is a distinct status.
@@ -349,6 +389,7 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                         pass
                     restored = sorted(_read_live_days(live)) == sorted(expected_live)
                     _manifest(hold_dir, {"swap_id": swap_id, "ts": stamp, "op": "swap_rollback", "mode": mode,
+                                         "quiescence": quiescence,
                                          "from": staging, "to": live, "backup": backup, "operator": operator,
                                          "reason": failure_reason, "verify": v, "restored_ok": restored})
                     return {"status": "rolled_back", "reason": failure_reason, "verify": v,
@@ -357,6 +398,7 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                     # rollback itself failed — ambiguous on-disk state; record loudly, human required.
                     _manifest(hold_dir, {"swap_id": swap_id, "ts": stamp, "op": "swap_rollback_failed",
                                          "mode": mode, "from": staging, "to": live, "backup": backup,
+                                         "quiescence": quiescence,
                                          "operator": operator, "reason": failure_reason,
                                          "rollback_error": f"{type(rexc).__name__}: {rexc}"})
                     return {"status": "rollback_failed", "reason": failure_reason,
@@ -374,10 +416,12 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                       "from": staging, "to": live, "backup": hold_entry, "hold_until": hold_until,
                       "keep_day_count": len(keep_sorted), "keep_latest": keep_sorted[-1],
                       "dropped_days": dropped, "operator": operator, "verify": v,
+                      "quiescence": quiescence,
                       "hard_delete": "ops-only after hold_until (never automated in S7/S8)"}
             _manifest(hold_dir, record)
             return {"status": "swapped", "swap_id": swap_id, "mode": mode, "backup": hold_entry,
-                    "hold_until": hold_until, "verify": v, "manifest": record, "swap_performed": True,
+                    "hold_until": hold_until, "verify": v, "manifest": record,
+                    "quiescence": quiescence, "swap_performed": True,
                     "production_mutation": False}          # caller supplies paths; this phase = staging/shadow
         finally:
             fcntl.flock(lk, fcntl.LOCK_UN)

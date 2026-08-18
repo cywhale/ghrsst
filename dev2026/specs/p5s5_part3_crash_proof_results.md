@@ -1,19 +1,21 @@
 # P5-S5 Part 3 — the `(e2)` cross-tier question: RESULTS
 
-Status: **PARTIAL.** The `(e2)` reachability question is answered and closed as a
-**protocol-enforced invariant**; the crash-boundary matrix is **NOT YET DELIVERED**, and
-**G10 / H4 / G17 are still NOT claimed.**
+Status: **PARTIAL.** `(e2)` **protocol design and mechanism are proven**; **production closure
+is PARTIAL**, pending ops evidence that the deployed quiescence hook attests a drain it actually
+verified. The crash-boundary matrix is **NOT YET DELIVERED**, and **G10 / H4 / G17 are still NOT
+claimed.**
 `[MUT-STG]`: staging/synthetic only. No VM24 path, no `GHRSST_*` store, no cron, nothing
 written outside a temp dir.
 
 Branch `dev2026-p5-s5-part3-crash-proof`, stacked on `3c37193` (Part 2, signed off).
 
-- Harness: [`../tests/test_phase2_p5s5_part3.py`](../tests/test_phase2_p5s5_part3.py) — **18/18 green**
-- Changed: [`../ingest/swap_delta.py`](../ingest/swap_delta.py) — §7.9 quiescence is required and must prove itself
+- Harness: [`../tests/test_phase2_p5s5_part3.py`](../tests/test_phase2_p5s5_part3.py) — **30/30 green**
+- Changed: [`../ingest/swap_delta.py`](../ingest/swap_delta.py) — §7.9 quiescence is required, must prove itself, and is recorded
+- Changed: [`p4s10_production_rollout_runbook.md`](p4s10_production_rollout_runbook.md) — the deployed hook, updated to the new contract
 - **Unchanged: [`../store/tiered_cube.py`](../store/tiered_cube.py).** No signed-off P5-S2 behaviour was touched — not even the docstring, which still records R1 as "adjudicated at S5/G10". Amending it to point at this verdict is a one-line follow-up **after** sign-off, not something to slip in alongside the evidence.
-- Full local suite: **791 tests OK** (17 skipped), up from 773
-- `-W error::ResourceWarning` over S4 + S5 Parts 1–3: **335 OK**
-- **5 new guards mutation-verified**
+- Full local suite: **803 tests OK** (17 skipped), up from 773
+- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **366 OK**
+- **11 guards mutation-verified**
 
 ## The question
 
@@ -85,16 +87,67 @@ Point 2 is the one that decides the verdict. With a reader parked mid-refresh, t
 hook counts it, cannot attest a drain, and the swap **refuses with the live delta untouched**.
 The reader then completes on new base + old delta — safe — and the swap succeeds on the retry.
 
-## Verdict: `(e2)` closes as a protocol-enforced invariant
+## Verdict: mechanism proven; production closure still PARTIAL
 
-The dangerous pair is unreachable in production **because the process is stopped across the
-swap**, so no refresh is in flight to be caught mid-way. No composite generation/epoch fence is
-needed, and `tiered_cube.py` is unchanged.
+The dangerous pair is unreachable **when the process is genuinely stopped across the swap**, so
+no refresh is in flight to be caught mid-way. That is a real result: no composite
+generation/epoch fence is needed for it, and `tiered_cube.py` is unchanged.
 
-This verdict is **conditional, and the conditions are now enforced in code**:
+It is **not** the same as `(e2)` being closed, and this document does not say it is. What the
+executor can check is that the attestation is **present, well-formed and internally consistent**.
+It cannot check that the attestation is **true** — a hook that reports `drained: True` without
+looking is accepted, by construction, because there is nothing on this side of the boundary that
+could contradict it. The closure therefore rests on an operational fact, and an operational fact
+needs operational evidence:
 
-1. the swap must not proceed without quiescence, and
-2. quiescence must be **proven**, not assumed.
+| | status |
+|---|---|
+| the dangerous pair exists and is reachable without quiescence | **PROVEN** (`test_the_dangerous_pair_IS_reachable_when_a_refresh_spans_the_swap`) |
+| safety comes from process quiescence, not from `TieredSnapshot` | **PROVEN** |
+| the swap refuses to proceed without a proven drain | **PROVEN** (§7.9, mutation-verified) |
+| the attestation is durable and auditable after the fact | **PROVEN** (recorded on swap and on rollback) |
+| the deployed hook attests a drain it actually verified | **PARTIAL — deployment prerequisite** |
+
+The last row is the one that keeps this PARTIAL. The runbook hook has been updated to measure
+the worker count and record what it checked (below), but it has not been run: VM24 is off
+limits for this work, so no real execution of it exists to point at.
+
+Nothing here requires changing `TieredCube` or building the composite fence.
+
+## Review round 2 — the production runbook, and a schema that was not enforced
+
+**The one production runbook was broken by this API change.** `p4s10_production_rollout_runbook`
+`quiesce()` ended in a bare `return`, so under the new executor it would stop pm2, close the
+port, return `None`, be refused, and leave the swap unrun with the app down. A contract that
+only the tests satisfy is not a contract. The hook now enumerates PM2 workers — a closed port
+says new connections are refused, not that the worker finished the request it was already
+serving — returns a real attestation, and writes an ops-side `quiescence_evidence.jsonl` before
+the swap so it can be compared with what the executor recorded.
+`TestTheProductionRunbookMatchesTheContract` reads the runbook and fails if it drifts again,
+including if a core field is ever added.
+
+**`observed_inflight` was documented as required and was not.** It was checked only when
+present, and only against `> 0`, so both of these were accepted by the one load-bearing gate:
+
+```
+{"drained": True, "evidence": "trust me"}
+{"drained": True, "evidence": "trust me", "observed_inflight": -1}
+```
+
+All three core fields are now required; `observed_inflight` must be a **raw `int`** equal to
+`0`. `bool` is excluded explicitly, because `isinstance(True, int)` is True in Python and
+`observed_inflight=False` would otherwise read as a proven zero. A negative count is refused as
+"not a measurement" rather than treated as fewer than none. Extra keys remain allowed as
+supplementary evidence and are **not** validated.
+
+**The attestation was validated and then discarded.** Requiring `evidence` and throwing it away
+made this document's own claim — that a swap suspected of losing a day can be traced to what
+quiescence verified — untrue. The validated core is now recorded in `hold_dir/manifest.jsonl` on
+the successful swap **and** on a rollback, and returned as `res["quiescence"]`. Only the fixed
+validated fields are stored; extra keys are acknowledged by **name** so the record shows what
+was supplied without the manifest inheriting an arbitrary caller object. A waived swap records
+`{"attested": false, "waived": true}` rather than nothing, so the audit distinguishes "proven"
+from "not asked".
 
 ## §7.9 — quiescence is required, and must prove itself
 
@@ -125,7 +178,8 @@ Every refusal is asserted to leave the live delta byte-for-byte as it was.
 
 ## Mutation verification
 
-Five new guards, each disabled in turn; **all five fail**.
+Eleven guards, each disabled in turn; **all eleven fail** — five from round 1, five
+in the executor from round 2, and the runbook contract itself.
 
 | guard disabled | result |
 |---|---|
@@ -134,6 +188,12 @@ Five new guards, each disabled in turn; **all five fail**.
 | `drained` truthiness instead of raw `True` | FAILED (4) |
 | `evidence` not required | FAILED (4) |
 | in-flight readers ignored | FAILED |
+| every core field required (round 2) | FAILED (4) |
+| `observed_inflight` must be a raw int (round 2) | FAILED (5) |
+| a negative `observed_inflight` refused (round 2) | FAILED |
+| the attestation recorded on success (round 2) | FAILED (3) |
+| only validated fields recorded, never the callback object (round 2) | FAILED |
+| the runbook hook reverted to a bare `return` (round 2) | FAILED (5) |
 
 The harness's own thread cleanup is verified the same way: a forced failure in the looping-reader
 test leaves **zero** stray thread tracebacks, because a parked reader that outlives a failed
@@ -156,6 +216,6 @@ Stated plainly, because the verdict is conditional:
 1. a second refresh path in the serving layer that refreshes **one** tier;
 2. a swap performed without quiescence (now refused, waiver aside);
 3. a quiescence hook that attests a drain it did not verify — the code can check that the
-   attestation is *present and well-formed*, never that it is *true*. That last one is an
-   operational responsibility, and it is the reason `evidence` is mandatory: so a swap that
-   later loses a day can be traced to what quiescence actually checked.
+   attestation is *present and well-formed*, never that it is *true*. That is an operational
+   responsibility, it is why `evidence` is mandatory and now durable, and it is the reason
+   production closure is recorded above as PARTIAL rather than done.

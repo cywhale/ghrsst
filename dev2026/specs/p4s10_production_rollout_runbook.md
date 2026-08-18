@@ -166,6 +166,7 @@ tail -3 $ART/prune_step.log
 ```bash
 cd $WT && $PY - <<'EOF' > $ART/swap_step.log 2>&1
 import json, os, subprocess, sys, time, urllib.request
+from datetime import datetime, timezone
 sys.path.insert(0, os.environ["WT"])
 from ingest.swap_delta import execute_swap_plan
 ART, HOLD, LOCK = os.environ["ART"], os.environ["HOLD"], os.environ["LOCK"]
@@ -196,13 +197,36 @@ def healthz_verifier(live_path, keep_sorted):      # extra verifier: the SERVED 
     return {"ok": ok, "healthz": {k: hz.get(k) for k in
             ("delta_latest", "delta_day_count", "spatial_window", "cube_latest_in_sync")}}
 
+def worker_pids():                                 # the count the attestation has to carry
+    """PM2 worker pids for the app — the in-flight measurement, not an inference from the port.
+
+    A closed port says new connections are refused; it does not say the worker finished the
+    request it was already serving. `pm2 jlist` is the process-level answer."""
+    out = subprocess.run(["pm2", "jlist"], capture_output=True, text=True, check=True).stdout
+    procs = [p for p in json.loads(out) if p.get("name") == "ghrsst"]
+    return [p["pid"] for p in procs
+            if p.get("pm2_env", {}).get("status") == "online" and p.get("pid")]
+
 def quiesce():                                     # pre_swap_quiesce_fn: runs INSIDE the executor lock,
     subprocess.run(["pm2", "stop", "ghrsst"], check=True)   # after staleness guard, BEFORE any rename
     for _ in range(30):
         time.sleep(1)
-        if not serving():
-            print("quiesced: port 8035 down, no worker serving"); return
-    raise RuntimeError("app still serving after pm2 stop")  # -> executor returns quiesce_failed,
+        pids = worker_pids()
+        if not serving() and not pids:
+            # P5-S5 Part 3 §7.9: the executor REQUIRES an attestation. A bare `return` — which
+            # is what this hook used to do — now reads as "you told me nothing" and refuses the
+            # swap. Report what was actually checked, and measure the count rather than infer
+            # it from the closed port.
+            att = {"drained": True,
+                   "evidence": ("pm2 stop ghrsst -> exit 0; GET /healthz on :8035 refused; "
+                                "pm2 jlist shows 0 online workers for ghrsst"),
+                   "observed_inflight": 0,
+                   "checked_utc": datetime.now(timezone.utc).isoformat()}
+            with open(os.path.join(HOLD, "quiescence_evidence.jsonl"), "a") as fh:
+                fh.write(json.dumps(att, sort_keys=True) + "\n")   # ops-side artifact; the
+            return att                                             # executor records its own
+    raise RuntimeError(f"app still serving after pm2 stop (pids={worker_pids()})")
+                                                            # -> executor returns quiesce_failed,
                                                             #    NOTHING touched
 
 def ensure_serving():
@@ -215,6 +239,14 @@ def ensure_serving():
             return True
     return False
 
+# §7.9 (P5-S5 Part 3): `pre_swap_quiesce_fn` is REQUIRED and must PROVE the drain. Omitting it
+# is refused outright; returning None, a non-dict, `drained` anything but a raw True, blank
+# `evidence`, or an `observed_inflight` that is missing, negative, a bool or non-zero all refuse
+# with NOTHING touched. The executor records the validated core of the attestation into
+# hold_dir/manifest.jsonl on the successful swap AND on a rollback, and returns it as
+# `res["quiescence"]`; `quiescence_evidence.jsonl` above is the ops-side copy, written before
+# the swap, so the two can be compared if a day is ever suspected missing.
+#
 # The quiescence + swap share ONE critical section: the executor's own lock (an external pm2-stop
 # before this call would sit OUTSIDE the lock, and wrapping our own flock would deadlock its nested
 # acquire). Order inside: lock -> staleness -> prechecks -> quiesce() -> swap -> start_and_wait() ->
