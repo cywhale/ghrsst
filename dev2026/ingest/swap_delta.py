@@ -28,6 +28,7 @@ from typing import Callable, List, Optional, Sequence
 import zarr
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from store import durable_jsonl  # noqa: E402
 from store.compaction_lock import (  # noqa: E402
     CompactionLock, CompactionLockBusy,
 )
@@ -459,22 +460,10 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
             compaction_guard.release()
 
 def _manifest(hold_dir: str, record: dict) -> None:
-    """Append-only JSONL manifest (§7 convention, shared with P4-S7), fsync'd per record.
+    """Append-only JSONL manifest (§7 convention, shared with P4-S7), durably.
 
-    A buffered `write` + `close` leaves the record in the page cache: a VM that dies during the
-    swap loses exactly the evidence that swap was the last thing to happen. The directory is
-    fsync'd too on first creation, since an unsynced dirent can lose the whole file. This is
-    what lets the results doc say the attestation is durable -- it said so before this existed
-    (review round 3, finding 3)."""
-    path = os.path.join(hold_dir, "manifest.jsonl")
-    fresh = not os.path.exists(path)
-    with open(path, "a") as fh:
-        fh.write(json.dumps(record, sort_keys=True) + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
-    if fresh:
-        dfd = os.open(hold_dir, os.O_RDONLY | os.O_CLOEXEC)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+    The file AND, on first create, the directory are fsync'd -- see `store.durable_jsonl`, the
+    single implementation both this and the ops-side evidence file use. There used to be a
+    second copy of this logic in the runbook's markdown, and that copy got the directory sync
+    wrong, because a copy in a document cannot be tested (review round 4, finding 3)."""
+    durable_jsonl.append(os.path.join(hold_dir, "manifest.jsonl"), record, dir_fd_path=hold_dir)

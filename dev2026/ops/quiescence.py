@@ -21,7 +21,11 @@ as in-flight, and the attestation is refused.
 from __future__ import annotations
 
 import os
+import sys
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from store import durable_jsonl  # noqa: E402
 
 #: PM2 statuses that mean "this worker is winding down but the process may still be serving".
 DRAINING_STATUSES = ("stopping", "launching", "one-launch-status")
@@ -107,3 +111,20 @@ def attest_drain(*, app: str, before_pids: Iterable[int], jlist_after: Sequence[
                      f"port refused" + (f"; {extra_evidence}" if extra_evidence else "")),
         "checked_utc": checked_utc,
     }
+
+
+def write_evidence(hold_dir: str, attestation: Dict[str, object], *,
+                   run_id: Optional[str] = None) -> str:
+    """Record the ops-side copy of the attestation, durably, BEFORE the swap proceeds.
+
+    Uses the same writer as the executor's manifest (`store.durable_jsonl`) so both get the file
+    fsync AND the first-create directory fsync. The runbook's own version of this had the file
+    sync and not the directory one: a machine dying between the evidence write and the
+    executor's first manifest record could come back with the record durable and its dirent
+    gone. The two records are joined by `attestation_id`, not by their order."""
+    path = os.path.join(hold_dir, "quiescence_evidence.jsonl")
+    record = dict(attestation)
+    if run_id is not None:
+        record["swap_run_id"] = run_id
+    durable_jsonl.append(path, record, dir_fd_path=hold_dir)
+    return path

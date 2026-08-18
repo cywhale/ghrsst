@@ -41,22 +41,56 @@ export LOCK=$G/mur_delta.ingest.lock                                   # shared 
 # REQUIRED whenever a day is dropped; a plan or swap without these fails closed, by design.
 export MANIFEST_ROOT=$G/p5_blocks                                      # generation manifests
 export WAL_ROOT=$G/p5_repairs                                          # repair WAL (§7.5a-1)
-export ANCHOR_ROOT=$G/p5_anchor                                        # WAL freshness anchor --
-                                                                       # MUST be a different
-                                                                       # rollback domain (§7.5a-2)
 export CLOCK=$G/p5_compaction.lock                                     # compaction reservation
+# ANCHOR_ROOT is NOT under $G, and that is the whole point: the WAL freshness anchor exists to
+# survive a rollback of the WAL's own host. VM24 has had two whole-VM snapshot rollbacks; an
+# anchor restored alongside the WAL it is meant to check proves nothing. The operator supplies
+# a path in a genuinely independent durability domain (separate mount / host / object store).
+export ANCHOR_ROOT=${ANCHOR_ROOT:?set ANCHOR_ROOT to an INDEPENDENT rollback domain (§7.5a-2)}
 ```
-**Preflight (all four must pass, or §4 does not start):**
+**Preflight (every check must pass, or §4 does not start):**
 ```bash
 test -d "$MANIFEST_ROOT" && test -d "$WAL_ROOT" && test -d "$ANCHOR_ROOT" || \
-  { echo "P5 roots missing — prune would fail closed"; exit 1; }
+  { echo "NO-GO: P5 roots missing — prune would fail closed"; exit 1; }
+# NO-GO, not a warning. `resolve_anchor_root()` refuses a same-filesystem anchor unless the
+# domain declaration explicitly waives it, so a shared filesystem here does not degrade the
+# guarantee quietly — it stops the run. Fix the deployment, do not waive it: an anchor that
+# a whole-VM rollback restores together with the WAL cannot detect that rollback.
 [ "$(stat -c %d "$WAL_ROOT")" != "$(stat -c %d "$ANCHOR_ROOT")" ] || \
-  echo "WARNING: WAL and anchor share a filesystem — a whole-VM rollback restores both (§7.5a-2)"
+  { echo "NO-GO: WAL and anchor share a filesystem — a whole-VM rollback restores both, so the"
+    echo "       anchor cannot witness it (§7.5a-2). Move ANCHOR_ROOT to an independent domain."
+    exit 1; }
 $PY -c "import sys; sys.path.insert(0,'$WT'); from store import repair_wal as rw; \
-  print('anchor domain:', rw.anchor_domain_id('$ANCHOR_ROOT'))" || exit 1
+  print('anchor domain:', rw.anchor_domain_id('$ANCHOR_ROOT'))" || \
+  { echo "NO-GO: anchor domain not declared (§7.5a-2)"; exit 1; }
 ```
-Code: branch `dev2026-p4-s8-swap-design` tip; `git merge-base --is-ancestor 2fa8b43 HEAD` must pass;
-record `git rev-parse HEAD > $ART/git_head.txt`. Checking out the worktree does NOT restart the app.
+Code: **must contain P5-S5 Parts 1–3** — the WAL, the corrected-day gate, the current executor
+contract and `ops/quiescence.py`. `dev2026-p4-s8-swap-design` is **no longer a valid deployment
+branch**: its tip predates all of that, and a worktree checked out from it fails on import.
+Deploy from the signed-off tip of `dev2026-p5-s5-part3-crash-proof`;
+`git merge-base --is-ancestor 3c37193 HEAD` must pass (P5-S5 Part 2, signed off), and the
+capability preflight below is what actually gates execution — a commit pin cannot be written
+inside the commit it names, so the modules are checked directly rather than inferred from a
+hash. Record `git rev-parse HEAD > $ART/git_head.txt`. Checking out the worktree does NOT
+restart the app.
+
+**Capability preflight (REQUIRED — the deployed tree must have the code this runbook calls):**
+```bash
+cd $WT && $PY - <<'EOF' || { echo "NO-GO: deployed tree predates P5-S5"; exit 1; }
+import inspect, sys
+sys.path.insert(0, ".")
+from ingest.swap_delta import execute_swap_plan, QUIESCENCE_CORE_FIELDS
+from ops.quiescence import attest_drain, worker_pids           # P5-S5 Part 3
+from store import repair_wal, durable_jsonl                    # P5-S4 / P5-S5
+sig = set(inspect.signature(execute_swap_plan).parameters)
+need = {"compaction_lock_path", "wal_root", "manifest_root", "anchor_root",
+        "pre_swap_quiesce_fn"}
+assert need <= sig, f"executor is missing {sorted(need - sig)}"
+assert set(QUIESCENCE_CORE_FIELDS) == {"drained", "evidence", "observed_inflight",
+                                       "attestation_id"}, QUIESCENCE_CORE_FIELDS
+print("capability preflight OK")
+EOF
+```
 
 ## 2. Fresh-audit precondition (**[RO]** — the gate for everything below)
 
@@ -245,10 +279,10 @@ def quiesce():                                     # pre_swap_quiesce_fn: runs I
         except qs.NotQuiesced as exc:                  # not yet -- keep waiting
             last = exc
             continue
-        with open(os.path.join(HOLD, "quiescence_evidence.jsonl"), "a") as fh:
-            fh.write(json.dumps({**att, "swap_run_id": os.environ["RUN_ID"]},
-                                sort_keys=True) + "\n")
-            fh.flush(); os.fsync(fh.fileno())          # the evidence must survive the swap
+        # Durability is NOT hand-rolled here: `write_evidence` uses the same writer as the
+        # executor's manifest, so the file AND (on first create) the directory are fsync'd.
+        # The version this document used to carry had the file sync and not the directory one.
+        qs.write_evidence(HOLD, att, run_id=os.environ["RUN_ID"])
         return att
     raise RuntimeError(f"app did not drain after pm2 stop: {last}")
                                                        # -> executor returns quiesce_failed,

@@ -44,6 +44,7 @@ import json
 import os
 import shutil
 import sys
+import subprocess
 import tempfile
 import re
 import threading
@@ -113,6 +114,10 @@ class _Base(unittest.TestCase):
     production (mode s1: atomic retarget). Two days are set up to be lost in different ways.
     """
 
+    #: subclasses set this to use a real separate anchor root threaded through every call,
+    #: instead of the `unsafe_allow_colocated_anchor` waiver.
+    EXTERNAL_ANCHOR = False
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
@@ -148,10 +153,30 @@ class _Base(unittest.TestCase):
                          hard_reserve_bytes=0, unsafe_skip_isolation=True)
         self.v1_id = v1["segment"]["segment_id"]
         self._publish(v1["segment"], generation=1)
+        if self.EXTERNAL_ANCHOR:
+            # A real anchor root, declared, and threaded through plan and swap. It is on the
+            # same filesystem as the WAL -- unavoidable under `mkdtemp` -- so the declaration
+            # waives THAT check explicitly. A separate rollback DOMAIN remains a deployment
+            # prerequisite; see the results doc. What this proves is the wiring: no
+            # `unsafe_allow_colocated_anchor` anywhere in this class's path.
+            self.anchor = os.path.join(self.tmp, "anchor_domain")
+            os.makedirs(self.anchor, exist_ok=True)
+            rw.declare_anchor_domain(self.anchor, domain_id="p5s5p3-runbook-domain",
+                                     at_utc="t", operator="tests",
+                                     allow_same_filesystem=True,
+                                     note="unit-test domain; NOT a real rollback domain")
+        else:
+            self.anchor = None
         rw.initialize_wal(self.wal, manifest_root=self.root, at_utc="t", operator="ops",
-                          unsafe_allow_colocated_anchor=True)
+                          **self._anchor_kw())
 
         self.stale_value = self._base_value(self.repaired)      # what gen 1 serves for it
+
+    def _anchor_kw(self):
+        """The external anchor when there is one; the named waiver when there is not."""
+        if self.EXTERNAL_ANCHOR:
+            return {"anchor_root": self.anchor}
+        return {"unsafe_allow_colocated_anchor": True}
 
     # ---- fixture helpers -------------------------------------------------
     def _publish(self, segment, *, generation):
@@ -175,15 +200,14 @@ class _Base(unittest.TestCase):
     def _repair(self):
         """Correct the day in delta and commit it to the WAL, as a repair_overwrite would."""
         rec = rw.open_repair(self.wal, day=self.repaired, at_utc="t", operator="ops",
-                             payload={"expected_vars": list(fx.VARS)},
-                             unsafe_allow_colocated_anchor=True)
+                             payload={"expected_vars": list(fx.VARS)}, **self._anchor_kw())
         idx = list(bm.inspect_store_contract(self.live).days).index(self.repaired)
         g = zarr.open_group(self.live, mode="a")
         g["sst"][idx] = np.asarray(g["sst"][idx]) + 21.0
         fp, _v, _t = cd.fingerprint_day(self.live, self.repaired, physical_index=idx)
         rw.append(self.wal, record=rw.COMMITTED, repair_id=rec["repair_id"],
                   day=self.repaired, at_utc="t", operator="ops",
-                  payload={"fingerprint": fp}, unsafe_allow_colocated_anchor=True)
+                  payload={"fingerprint": fp}, **self._anchor_kw())
         self.corrected_value = self._delta_value(self.repaired)
         return rec["repair_id"]
 
@@ -196,7 +220,7 @@ class _Base(unittest.TestCase):
         the delta-only day."""
         return cd.corrective_refold(
             day=self.repaired, manifest_root=self.root, delta_path=self.live,
-            wal_root=self.wal, unsafe_allow_colocated_anchor=True,
+            wal_root=self.wal, **self._anchor_kw(),
             new_block_path=os.path.join(self.root, "b_v2.zarr"),
             artifacts_dir=self.artifacts, start_day=self.s0, end_day=self.e0,
             classification_target=list(self.days), predecessor_segment_id=self.v1_id,
@@ -210,15 +234,14 @@ class _Base(unittest.TestCase):
         staging = os.path.join(self.tmp, f"staging{type(self)._stage_n}.zarr")
         return prune_delta(self.live, staging, list(self.keep_days),
                            base_days=self.days, spatial_window_days=1,
-                           wal_root=self.wal, manifest_root=self.root,
-                           unsafe_allow_colocated_anchor=True)
+                           wal_root=self.wal, manifest_root=self.root, **self._anchor_kw())
 
     def _swap(self, plan, **kw):
         kw.setdefault("pre_swap_quiesce_fn", _attested)
         return execute_swap_plan(plan, mode="s1", hold_dir=self.hold,
                                  wal_root=self.wal, manifest_root=self.root,
-                                 unsafe_allow_colocated_anchor=True,
-                                 compaction_lock_path=self.clock, **kw)
+                                 compaction_lock_path=self.clock,
+                                 **self._anchor_kw(), **kw)
 
     def _cube(self, base=None):
         return TieredCube(base or SegmentedCubeStore(self.root), TimeCubeStore(self.live))
@@ -741,6 +764,7 @@ class TestQuiescenceAttestation(unittest.TestCase):
 
 
 class TestTheProductionRunbookMatchesTheContract(_Base):
+    EXTERNAL_ANCHOR = True                       # review round 4, finding 2: no waiver here
     """Review round 3, finding 1: the runbook's `prune_delta` call omitted the P5 roots and its
     `execute_swap_plan` call omitted the compaction reservation, so it would have refused before
     `quiesce()` ever ran. The previous test extracted only the `quiesce()` body and could not
@@ -791,26 +815,30 @@ class TestTheProductionRunbookMatchesTheContract(_Base):
         self._repair()
         self._refold()
         pnames = self._kwargs_of("plan = prune_delta")
-        # This suite's WAL uses a co-located anchor (`_Base`), so `anchor_root` is supplied by
-        # the named waiver rather than a separate root — the runbook's own `anchor_root` is
-        # asserted by name in the test above, and exercised for real in the Part 2 suite.
         # Argument NAMES come from the runbook; values are the fixture's, since production
         # window sizes mean nothing at a six-day fixture scale. What is under test is whether
         # the runbook passes enough arguments, not what it passes for the tuning knobs.
-        supply = {"wal_root": self.wal, "manifest_root": self.root}
+        # `anchor_root` is a REAL separate root here (EXTERNAL_ANCHOR), not the waiver: a test
+        # that waives the anchor cannot show the production configuration executes.
+        supply = {"wal_root": self.wal, "manifest_root": self.root, "anchor_root": self.anchor}
         plan = prune_delta(self.live, os.path.join(self.tmp, "runbook_staging.zarr"),
                            list(self.keep_days), base_days=self.days, spatial_window_days=1,
-                           **{k: v for k, v in supply.items() if k in pnames},
-                           unsafe_allow_colocated_anchor=True)
+                           **{k: v for k, v in supply.items() if k in pnames})
         self.assertEqual(plan["status"], "ok", plan.get("reason"))
 
         snames = self._kwargs_of("res = execute_swap_plan")
         skw = {"compaction_lock_path": self.clock, "wal_root": self.wal,
-               "manifest_root": self.root, "pre_swap_quiesce_fn": _attested}
+               "manifest_root": self.root, "anchor_root": self.anchor,
+               "pre_swap_quiesce_fn": _attested}
         res = execute_swap_plan(plan, mode="s1", hold_dir=self.hold,
-                                unsafe_allow_colocated_anchor=True,
                                 **{k: v for k, v in skw.items() if k in snames})
         self.assertEqual(res["status"], "swapped", res.get("reason"))
+        self.assertEqual(plan["anchor_root"], os.path.realpath(self.anchor))
+        # nothing in this path may have leaned on the waiver
+        state = rw.read_wal(self.wal, anchor_root=self.anchor)
+        self.assertEqual(state.anchor["seq"], state.last_seq)
+        self.assertFalse(os.path.isfile(os.path.join(self.wal, rw.ANCHOR_NAME)),
+                         "a co-located sidecar would mean the external anchor was bypassed")
 
     def test_the_runbook_captures_pids_BEFORE_the_stop(self):
         """Capturing them afterwards measures nothing: the survivors are already unlisted."""
@@ -821,6 +849,64 @@ class TestTheProductionRunbookMatchesTheContract(_Base):
         self.assertLess(body.index("qs.worker_pids"), body.index('"pm2", "stop"'),
                         "the pid capture must precede the stop")
         self.assertNotIn("; return\n", body, "a bare `return` is what the executor refuses")
+
+    def test_the_deployment_pin_names_a_tree_that_HAS_this_code(self):
+        """Review round 4, finding 1: the runbook pinned `dev2026-p4-s8-swap-design`, whose tip
+        predates the WAL, the current executor contract and `ops/quiescence.py`. A worktree
+        checked out from it fails on import."""
+        self.assertNotIn("branch `dev2026-p4-s8-swap-design` tip", self.text,
+                         "that branch cannot run this runbook")
+        pin = re.search(r"git merge-base --is-ancestor ([0-9a-f]{7,40}) HEAD", self.text)
+        self.assertIsNotNone(pin, "the runbook must pin a minimum ancestor commit")
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        exists = subprocess.run(["git", "cat-file", "-e", pin.group(1) + "^{commit}"],
+                                cwd=repo, capture_output=True)
+        self.assertEqual(exists.returncode, 0, f"pinned commit {pin.group(1)} does not exist")
+        anc = subprocess.run(["git", "merge-base", "--is-ancestor", pin.group(1), "HEAD"],
+                             cwd=repo, capture_output=True)
+        self.assertEqual(anc.returncode, 0,
+                         f"{pin.group(1)} is not an ancestor of HEAD — the pin is wrong")
+
+    def test_the_capability_preflight_names_modules_that_actually_exist(self):
+        """The pin cannot name the commit it lives in, so the runbook checks the code directly.
+        This asserts those checks are real: every module and symbol it imports must resolve."""
+        block = self.text[self.text.index("**Capability preflight"):]
+        block = block[block.index("```bash") + 7:]
+        block = block[:block.index("```")]
+        for mod, syms in re.findall(r"from ([\w.]+) import ([^\n#]+)", block):
+            with self.subTest(mod):
+                imported = __import__(mod, fromlist=["_"])
+                for sym in [x.strip() for x in syms.split(",") if x.strip()]:
+                    self.assertTrue(hasattr(imported, sym), f"{mod}.{sym} is missing")
+        self.assertIn("ops.quiescence", block)
+        self.assertIn("QUIESCENCE_CORE_FIELDS", block)
+
+    def test_the_anchor_preflight_is_a_NO_GO_not_a_warning(self):
+        """Review round 4, finding 2: a shared filesystem only printed a WARNING and continued.
+        The runbook's own shell is executed here, not read: same-filesystem must EXIT NON-ZERO.
+        """
+        block = self.text[self.text.index("**Preflight (every check must pass"):]
+        block = block[block.index("```bash") + 7:]
+        block = block[:block.index("```")]
+        env = {**os.environ, "PY": sys.executable,
+               "MANIFEST_ROOT": self.root, "WAL_ROOT": self.wal,
+               "ANCHOR_ROOT": os.path.join(self.tmp, "same_fs_anchor")}
+        os.makedirs(env["ANCHOR_ROOT"], exist_ok=True)      # same mkdtemp => same st_dev
+        # `stat -c` is GNU; on this host use the BSD spelling so the check runs at all.
+        if sys.platform == "darwin":
+            block = block.replace("stat -c %d", "stat -f %d")
+        res = subprocess.run(["bash", "-c", block], env=env, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0,
+                            "a co-located anchor must STOP the run, not warn and continue")
+        self.assertIn("NO-GO", res.stdout + res.stderr)
+        self.assertIn("independent domain", res.stdout + res.stderr)
+
+    def test_the_runbook_does_not_hand_roll_persistence(self):
+        """Finding 3: the evidence file's durability logic lived in markdown and got the
+        directory fsync wrong. It must call the shared, tested writer."""
+        self.assertIn("qs.write_evidence(", self.text)
+        self.assertNotIn('os.fsync(fh.fileno())', self.text,
+                         "durability belongs in store.durable_jsonl, not in this document")
 
     def test_the_runbook_delegates_to_the_TESTED_module(self):
         """If the hook is ever inlined back into markdown, this fails: unimportable logic is

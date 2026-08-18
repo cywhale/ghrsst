@@ -9,14 +9,15 @@ written outside a temp dir.
 
 Branch `dev2026-p5-s5-part3-crash-proof`, stacked on `3c37193` (Part 2, signed off).
 
-- Harness: [`../tests/test_phase2_p5s5_part3.py`](../tests/test_phase2_p5s5_part3.py) — **43/43 green**
+- Harness: [`../tests/test_phase2_p5s5_part3.py`](../tests/test_phase2_p5s5_part3.py) — **47/47 green**
 - Changed: [`../ingest/swap_delta.py`](../ingest/swap_delta.py) — §7.9 quiescence is required, must prove itself, and is recorded
 - Changed: [`p4s10_production_rollout_runbook.md`](p4s10_production_rollout_runbook.md) — §1 env + preflight, Step 4a, Step 4b
 - New: [`../ops/quiescence.py`](../ops/quiescence.py) — the drain measurement, importable and therefore testable
+- New: [`../store/durable_jsonl.py`](../store/durable_jsonl.py) — one durable append-only writer, shared by the executor manifest and the ops evidence file
 - **Unchanged: [`../store/tiered_cube.py`](../store/tiered_cube.py).** No signed-off P5-S2 behaviour was touched — not even the docstring, which still records R1 as "adjudicated at S5/G10". Amending it to point at this verdict is a one-line follow-up **after** sign-off, not something to slip in alongside the evidence.
-- Full local suite: **816 tests OK** (17 skipped), up from 773
-- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **379 OK**
-- **18 guards mutation-verified**
+- Full local suite: **820 tests OK** (17 skipped), up from 773
+- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **383 OK**
+- **23 guards mutation-verified**
 
 ## The question
 
@@ -107,7 +108,7 @@ needs operational evidence:
 | safety comes from process quiescence, not from `TieredSnapshot` | **PROVEN** |
 | the swap refuses to proceed without a proven drain | **PROVEN** (§7.9, mutation-verified) |
 | the attestation is durable and auditable after the fact | **PROVEN** (fsync'd per record; on every post-quiesce outcome) |
-| the deployed runbook can execute against the current contract | **PROVEN for arguments** (the runbook's own argument set builds a plan and runs a swap in test) |
+| the deployed runbook can execute against the current contract | **PROVEN for arguments and modules** (its own argument set builds a plan and runs a swap on a real external anchor; its preflight block is executed, not read) |
 | the deployed hook attests a drain it actually verified | **PARTIAL — deployment prerequisite** |
 
 The last row is the one that keeps this PARTIAL. The runbook hook has been updated to measure
@@ -194,6 +195,41 @@ its ops-side file. `checked_utc` is validated and its **value** recorded.
 runbook and this document told operators to read `res["quiescence"]`. Every post-quiesce
 outcome now returns it.
 
+## Review round 4 — the deployment pin, the anchor posture, and one writer
+
+**1. The pinned deployment branch did not contain this code.** The runbook still said
+`dev2026-p4-s8-swap-design`, whose tip predates the WAL, the current executor contract and
+`ops/quiescence.py`: a worktree checked out from it fails on import. The pin is now the
+signed-off tip of the Part 3 branch, with `3c37193` (Part 2) as the minimum ancestor, plus a
+**capability preflight** — because a commit pin cannot be written inside the commit it names,
+so the modules and `execute_swap_plan`'s signature are checked **directly** rather than inferred
+from a hash. The test asserts the pinned commit exists and is an ancestor of `HEAD`, and that
+every module and symbol the preflight imports actually resolves.
+
+**2. The default anchor configuration contradicted the anchor's purpose.** `ANCHOR_ROOT` was
+`$G/p5_anchor` — same filesystem as the WAL, same rollback domain — and the preflight only
+printed a warning. The freshness anchor exists to survive a rollback of the WAL's own host;
+VM24 has had two whole-VM rollbacks, and an anchor restored alongside the WAL it checks proves
+nothing. `ANCHOR_ROOT` is now a **required operator-supplied path** outside `$G`, and a shared
+filesystem is a **NO-GO with a non-zero exit**, not a warning. The test **executes the
+runbook's own preflight block** against a co-located anchor and asserts it stops the run —
+reading the text would not have shown whether it exits.
+
+The integration test now runs on a **real declared external anchor** with no
+`unsafe_allow_colocated_anchor` anywhere in its path, threaded through `initialize_wal`,
+`open_repair`, the commit append, the refold, the plan and the swap, and it asserts no
+co-located sidecar exists afterwards. The anchor is still on the same filesystem as the WAL —
+unavoidable under `mkdtemp`, and waived by the *declaration* rather than the unsafe flag — so a
+separate rollback **domain** remains a deployment prerequisite, unchanged.
+
+**3. The ops-side evidence file still hand-rolled durability.** It had the file `fsync` and not
+the first-create directory `fsync`, so a machine dying between the evidence write and the
+executor's first manifest record could come back with the record durable and its dirent gone.
+Both writers now call [`../store/durable_jsonl.py`](../store/durable_jsonl.py). This is the same
+lesson as round 3 and it is worth stating once more: **the copy that lived in markdown was the
+copy that was wrong**, because a document cannot be tested. The runbook now calls
+`qs.write_evidence()`, and a test fails if `os.fsync` reappears anywhere in the runbook text.
+
 ## §7.9 — quiescence is required, and must prove itself
 
 `pre_swap_quiesce_fn` defaulted to `None` and was **silently skipped when omitted**. A caller
@@ -223,8 +259,8 @@ Every refusal is asserted to leave the live delta byte-for-byte as it was.
 
 ## Mutation verification
 
-Eighteen guards, each disabled in turn; **all eighteen fail** — five from round 1, six from
-round 2, and seven from round 3.
+Twenty-three guards, each disabled in turn; **all twenty-three fail** — five from round 1, six
+from round 2, seven from round 3, and five from round 4.
 
 One round-3 mutation **survived the first run**: removing the per-record `fsync` left the test
 green, because it asserted only that *something* had been fsync'd and the directory sync alone
@@ -252,6 +288,11 @@ verified, and this is the third time in P5-S5 that shape has appeared.
 | the rollback result omits `quiescence` (round 3) | FAILED |
 | the runbook drops the compaction reservation (round 3) | FAILED (2) |
 | the runbook drops the P5 roots from the plan (round 3) | FAILED (4) |
+| the deployment pin names a code-less branch (round 4) | FAILED |
+| a co-located anchor warns instead of stopping (round 4) | FAILED |
+| the runbook hand-rolls persistence again (round 4) | FAILED |
+| the shared writer drops the directory `fsync` (round 4) | FAILED |
+| the shared writer drops the file `fsync` (round 4) | FAILED |
 
 The harness's own thread cleanup is verified the same way: a forced failure in the looping-reader
 test leaves **zero** stray thread tracebacks, because a parked reader that outlives a failed
