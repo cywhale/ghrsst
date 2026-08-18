@@ -675,6 +675,26 @@ class TestReconcilerTakesTheIngestLock(_CrashCase):
             holder.kill()
             holder.communicate()
 
+    def test_a_MISSING_root_remains_absent(self):
+        """Review round 9. `apply` used to `os.makedirs(root)` before taking the lock, so a
+        mistyped path left an empty directory behind and only then failed closed -- a write
+        outside the very lock the apply path promises to work inside."""
+        missing = os.path.join(self.tmp, "no_such_root")
+        r = pub.reconcile_publication(missing, operator="ops", apply=True,
+                                      ingest_lock_path=self.lock,
+                                      confirm_orphan_generation=2)
+        self.assertEqual(r["verdict"], pub.RECOVERY_FAIL_CLOSED)
+        self.assertFalse(r["applied"])
+        self.assertIn("does not create one", " ".join(r["reasons"]))
+        self.assertFalse(os.path.exists(missing),
+                         "recovery reconciles a deployment; it must not establish one")
+
+    def test_a_missing_root_is_also_absent_after_a_report_only_call(self):
+        missing = os.path.join(self.tmp, "no_such_root_ro")
+        r = pub.reconcile_publication(missing)
+        self.assertEqual(r["verdict"], pub.RECOVERY_FAIL_CLOSED)
+        self.assertFalse(os.path.exists(missing))
+
     def test_and_it_DOES_apply_once_the_lock_is_free(self):
         """The companion the blocking test needs: otherwise 'it did not apply' would also pass
         for a reconciler that never applies at all."""

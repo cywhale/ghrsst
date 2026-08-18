@@ -10,16 +10,16 @@ written outside a temp dir.
 Branch `dev2026-p5-s5-part3-crash-proof`, stacked on `3c37193` (Part 2, signed off).
 
 - Harness: [`../tests/test_phase2_p5s5_part3.py`](../tests/test_phase2_p5s5_part3.py) — **53/53 green**
-- Crash / snapshot / G17: [`../tests/test_phase2_p5s5_part3_crash.py`](../tests/test_phase2_p5s5_part3_crash.py) — **48/48 green**
+- Crash / snapshot / G17: [`../tests/test_phase2_p5s5_part3_crash.py`](../tests/test_phase2_p5s5_part3_crash.py) — **50/50 green**
 - New: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py) `reconcile_publication()` — the §9.4 authority and recovery rule
 - Changed: [`../ingest/swap_delta.py`](../ingest/swap_delta.py) — §7.9 quiescence is required, must prove itself, and is recorded
 - Changed: [`p4s10_production_rollout_runbook.md`](p4s10_production_rollout_runbook.md) — §1 env + preflight, Step 4a, Step 4b
 - New: [`../ops/quiescence.py`](../ops/quiescence.py) — the drain measurement, importable and therefore testable
 - New: [`../store/durable_jsonl.py`](../store/durable_jsonl.py) — one durable append-only writer, shared by the executor manifest and the ops evidence file
 - **Unchanged: [`../store/tiered_cube.py`](../store/tiered_cube.py).** No signed-off P5-S2 behaviour was touched — not even the docstring, which still records R1 as "adjudicated at S5/G10". Amending it to point at this verdict is a one-line follow-up **after** sign-off, not something to slip in alongside the evidence.
-- Full local suite: **874 tests OK** (17 skipped), up from 773
-- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **437 OK** (also clean under `PYTHONWARNINGS=error::ResourceWarning`, the reviewer's invocation)
-- **44 guards mutation-verified**
+- Full local suite: **876 tests OK** (17 skipped), up from 773
+- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **439 OK** (also clean under `PYTHONWARNINGS=error::ResourceWarning`, the reviewer's invocation)
+- **45 guards mutation-verified**
 
 ## Delivered / not delivered
 
@@ -438,9 +438,9 @@ Every refusal is asserted to leave the live delta byte-for-byte as it was.
 
 ## Mutation verification
 
-Forty-four guards, each disabled in turn; **all forty-four fail** — five from round 1, six from
+Forty-five guards, each disabled in turn; **all forty-five fail** — five from round 1, six from
 round 2, seven from round 3, five from round 4, six from round 5, five from round 6, eight from
-the crash/recovery work, and two from round 8.
+the crash/recovery work, two from round 8, and one from round 9.
 
 Two mutations survived across rounds 5 and 6 and are **not** counted, because neither changes
 behaviour: removing `: "${DEPLOY_SHA:?...}"` (the next line still refuses an unset variable) and
@@ -489,6 +489,7 @@ verified, and this is the third time in P5-S5 that shape has appeared.
 | reconstructed lines not marked as such (round 7) | FAILED |
 | the reconciler applies without the ingest lock (round 8) | FAILED |
 | an orphan is completed without confirmation (round 8) | FAILED |
+| the reconciler creates the manifest root (round 9) | FAILED |
 | the anchor-domain check only prints (round 5) | FAILED |
 | the exact-SHA comparison removed (round 5) | FAILED |
 | the ancestor floor removed (round 5) | FAILED |
@@ -564,6 +565,18 @@ the table at the top; a results artifact that argues with itself cannot support 
 zombies and unclosed pipes — and a `SIGSTOP`ped child ignores `SIGKILL` until it is continued, so
 the teardown has to `SIGCONT` first or the reap never returns. One `_reap` helper now continues,
 kills, waits and closes all three pipes.
+
+## Review round 9 — one write outside the lock
+
+**[Low] The reconciler created the manifest root.** `apply=True` ran
+`os.makedirs(root, exist_ok=True)` *before* taking the ingest lock, so a mistyped path left an
+empty directory behind and only then failed closed — and the recovery path touched the
+filesystem outside the very lock it promises to do all of its work inside. It served nothing
+different, but it contradicted the contract.
+
+Recovery **reconciles** a deployment; it does not establish one. A root that is not a directory
+is now refused before anything is opened, and two tests assert the path is still absent
+afterwards — for the applying call and for the report-only one.
 
 ## Residual risks and stop conditions
 

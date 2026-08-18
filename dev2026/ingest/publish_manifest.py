@@ -1558,7 +1558,15 @@ def reconcile_publication(root: str, *, operator: str = "", now: Optional[dateti
                 "reasons": ["ingest_lock_path is required to apply: a verdict computed outside "
                             "the lock describes a moment that has passed, and acting on it can "
                             "overwrite a publication or rollback that landed in between"]}
-    os.makedirs(root, exist_ok=True)
+    # The reconciler does NOT create the root. It used to `os.makedirs(root, exist_ok=True)`
+    # here -- before the lock -- so a typo'd path left an empty directory behind and only then
+    # failed closed, and the recovery path touched the filesystem outside the lock it promises
+    # to do all of its work inside. Recovery reads a deployment; it does not establish one.
+    if not os.path.isdir(root):
+        return {"root": root, "verdict": RECOVERY_FAIL_CLOSED, "applied": False, "actions": [],
+                "reasons": [f"{root} is not a directory. Recovery reconciles an existing "
+                            f"manifest root; it does not create one, and a mistyped path must "
+                            f"not leave anything behind."]}
     lk = open(ingest_lock_path, "w")
     try:
         fcntl.flock(lk, fcntl.LOCK_EX)
