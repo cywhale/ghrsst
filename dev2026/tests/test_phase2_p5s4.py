@@ -19,6 +19,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import zarr
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,6 +29,7 @@ import p5_fixtures as fx  # noqa: E402
 from ingest import publish_manifest as pub  # noqa: E402
 from store import block_manifest as bm  # noqa: E402
 from store import repair_wal as rw  # noqa: E402
+from store import source_provenance as sp  # noqa: E402
 from store.compaction_lock import (  # noqa: E402
     CompactionLock, CompactionLockBusy, CompactionLockError,
 )
@@ -41,6 +43,8 @@ def _execute(plan, **kw):
     `TestCompactionLockIsMandatory` calls `pub.execute_publication` directly."""
     kw.setdefault("compaction_lock_path", None)
     kw.setdefault("unsafe_skip_compaction_lock", True)
+    kw.setdefault("build_artifact_path", None)
+    kw.setdefault("unsafe_skip_provenance", True)
     return pub.execute_publication(plan, **kw)
 
 
@@ -104,6 +108,39 @@ class _Base(unittest.TestCase):
     def _write(path, text):
         with open(path, "w") as fh:
             fh.write(text)
+
+    def _artifact_for(self, block_path, segment_id, smap, *, out=None):
+        seed = sp.SAMPLE_SEED
+        """A genuine artifact for a fixture block, sampled from the block itself.
+
+        These tests build blocks with the fixture rather than through `build_block`, so the
+        block's own bytes stand in for the source's. Hand-written fingerprints would make the
+        byte check pass or fail for reasons unrelated to it."""
+        insp = bm.inspect_store_contract(block_path)
+        g = zarr.open_group(block_path, mode="r")
+        valid_map = {v: list(f) for v, f in insp.var_valid}
+        days = {}
+        for t_idx, day in enumerate(insp.days):
+            i0, i1, j0, j1 = sp.sample_window(insp.ny, insp.nx, seed=seed, day_index=t_idx)
+            tiles, valid = {}, {}
+            for var in fx.VARS:                 # the canonical domain, as the builder uses
+                flags = valid_map.get(var, [])
+                present = bool(flags) and t_idx < len(flags) and flags[t_idx] is True
+                valid[var] = present
+                tiles[var] = (np.asarray(g[var][t_idx, i0:i1, j0:j1]) if present else None)
+            rec = smap[day]
+            days[day] = {
+                "source_kind": rec["source_kind"], "source_path": rec["source_path"],
+                "source_day_index": rec["source_day_index"], "day_index": t_idx,
+                "source_fingerprint": sp.window_fingerprint(
+                    tiles, seed=seed, day_index=t_idx, var_valid=valid),
+                "var_valid": valid,
+            }
+        doc = sp.build_artifact(segment_id=segment_id, block_path=block_path,
+                                ny=insp.ny, nx=insp.nx, days=days)
+        path = out or os.path.join(self.tmp, sp.ARTIFACT_NAME)
+        sp.write_artifact(path, doc)
+        return path, doc
 
     # ---- WAL helpers -----------------------------------------------------
     def _open_repair(self, day, root=None, **kw):
@@ -581,7 +618,9 @@ class TestPublication(_Base):
         with CompactionLock(clock):
             out = pub.execute_publication(plan, ingest_lock_path=self.lock,
                                           delta_path=self.delta,
-                                          compaction_lock_path=clock, now=T0)
+                                          compaction_lock_path=clock,
+                                          build_artifact_path=None,
+                                          unsafe_skip_provenance=True, now=T0)
         self.assertEqual(out["reason"], "compaction_lock_held")
         self.assertFalse(out["published"])
 
@@ -592,11 +631,12 @@ class TestPublication(_Base):
                                     now=T0)
         with self.assertRaises(TypeError):
             pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                                    now=T0)
+                                    build_artifact_path=None, now=T0)
         before = self._read(os.path.join(self.root, bm.LIVE_NAME))
         with self.assertRaises(pub.PublishRefused) as cm:
             pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                                    compaction_lock_path=None, now=T0)
+                                    compaction_lock_path=None, build_artifact_path=None,
+                                    unsafe_skip_provenance=True, now=T0)
         self.assertIn("compaction_lock_path is required", str(cm.exception))
         self.assertEqual(self._read(os.path.join(self.root, bm.LIVE_NAME)), before)
 
@@ -607,7 +647,8 @@ class TestPublication(_Base):
         with CompactionLock(clock):
             pass                                            # created, then released
         out = pub.execute_publication(plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                                      compaction_lock_path=clock, now=T0)
+                                      compaction_lock_path=clock, build_artifact_path=None,
+                                      unsafe_skip_provenance=True, now=T0)
         self.assertEqual(out["status"], "published")
 
     def test_the_compaction_lock_is_held_through_publication_not_merely_probed(self):
@@ -647,7 +688,8 @@ class TestPublication(_Base):
                 try:
                     result["out"] = pub.execute_publication(
                         plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                        compaction_lock_path=clock, now=T0)
+                        compaction_lock_path=clock, build_artifact_path=None,
+                        unsafe_skip_provenance=True, now=T0)
                 except BaseException as exc:        # noqa: BLE001 -- surfaced to the test
                     result["exc"] = exc
                 finally:
@@ -700,7 +742,8 @@ class TestPublication(_Base):
                 try:
                     result["out"] = pub.execute_publication(
                         plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                        compaction_lock_path=clock, now=T0)
+                        compaction_lock_path=clock, build_artifact_path=None,
+                        unsafe_skip_provenance=True, now=T0)
                 except BaseException as exc:        # noqa: BLE001
                     result["exc"] = exc
                 finally:
@@ -749,7 +792,9 @@ class TestPublication(_Base):
         try:
             out = pub.execute_publication(plan, ingest_lock_path=self.lock,
                                           delta_path=self.delta,
-                                          compaction_lock_path=clock, now=T0)
+                                          compaction_lock_path=clock,
+                                          build_artifact_path=None,
+                                          unsafe_skip_provenance=True, now=T0)
         finally:
             bm.publish = real_publish
         self.assertEqual(out["status"], "published")
@@ -1581,6 +1626,12 @@ class TestSourceMapIsStrictlyValidated(_Base):
 
 
 class TestProvenanceIsBoundToTheBlock(_Base):
+    """These exercise the artifact's LOCATOR agreement and segment identity.
+
+    They pass `unsafe_skip_source_recheck=True`: the fixture builds the block and the delta independently,
+    so the block is not actually derived from its declared source and a byte comparison against
+    that source would (correctly) refuse. The end-to-end source-byte check, where the builder
+    really does read the delta, is exercised in the P5-S5 suite."""
     def setUp(self):
         super().setUp()
         self._live_gen1()
@@ -1614,44 +1665,44 @@ class TestProvenanceIsBoundToTheBlock(_Base):
                                       now=T0)
         self.assertEqual(out["status"], "published")
 
-    def test_a_build_artifact_that_disagrees_is_refused(self):
-        """The builder's own p5_block_plan.json is the only record outside the manifest of
-        what was actually read, so when it exists it wins."""
+    def test_a_build_artifact_that_disagrees_on_a_LOCATOR_is_refused(self):
+        """The builder's own record is the only evidence outside the manifest of what was
+        read, so when it exists it wins."""
         src = self._plan_for_v2(self.delta, self.span[:60])
-        artifact = os.path.join(self.tmp, "p5_block_plan.json")
-        other = self._smap(self.delta, self.span[:60])
-        other[self.span[0]] = dict(other[self.span[0]], source_day_index=41)
-        with open(artifact, "w") as fh:
-            json.dump({"segment": {"segment_id": "b_v2",
-                                   "build_provenance": {"sources": other}}}, fh)
+        path, doc = self._artifact_for(src["out_path"], "b_v2", src["source_map"])
+        doc["days"][self.span[0]]["source_day_index"] = 41
+        doc["artifact_checksum"] = sp.artifact_checksum(doc)
+        sp.write_artifact(path, doc)
         plan = pub.plan_publication(self.root, src, now=T0)
         with self.assertRaises(pub.PublishRefused) as cm:
             _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                                    build_artifact_path=artifact, now=T0)
-        self.assertIn("builder's own record", str(cm.exception))
+                     build_artifact_path=path, unsafe_skip_provenance=False,
+                     unsafe_skip_source_recheck=True, now=T0)
+        self.assertIn("source_day_index", str(cm.exception))
 
     def test_a_build_artifact_for_another_segment_is_refused(self):
         src = self._plan_for_v2(self.delta, self.span[:60])
-        artifact = os.path.join(self.tmp, "p5_block_plan.json")
-        with open(artifact, "w") as fh:
-            json.dump({"segment": {"segment_id": "someone_else",
-                                   "build_provenance": {"sources": src["source_map"]}}}, fh)
+        path, _ = self._artifact_for(src["out_path"], "someone_else", src["source_map"])
         plan = pub.plan_publication(self.root, src, now=T0)
         with self.assertRaises(pub.PublishRefused) as cm:
             _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                                    build_artifact_path=artifact, now=T0)
+                     build_artifact_path=path, unsafe_skip_provenance=False,
+                     unsafe_skip_source_recheck=True, now=T0)
         self.assertIn("describes segment", str(cm.exception))
 
     def test_an_agreeing_build_artifact_publishes(self):
         src = self._plan_for_v2(self.delta, self.span[:60])
-        artifact = os.path.join(self.tmp, "p5_block_plan.json")
-        with open(artifact, "w") as fh:
-            json.dump({"segment": {"segment_id": "b_v2",
-                                   "build_provenance": {"sources": src["source_map"]}}}, fh)
+        path, _ = self._artifact_for(src["out_path"], "b_v2", src["source_map"])
         plan = pub.plan_publication(self.root, src, now=T0)
         out = _execute(plan, ingest_lock_path=self.lock, delta_path=self.delta,
-                                      build_artifact_path=artifact, now=T0)
+                       build_artifact_path=path, unsafe_skip_provenance=False,
+                       unsafe_skip_source_recheck=True, now=T0)
         self.assertEqual(out["status"], "published")
+        self.assertFalse(out["provenance"]["verified"],
+                         "the source recheck was waived, so this is not a verified publication")
+        self.assertEqual(out["provenance"]["source_recheck"], "waived")
+        self.assertIn("does NOT hold", out["provenance"]["reason"])
+        self.assertEqual(out["provenance"]["days"], 60)
 
 
 # ============================ review round 5: full block binding + kind-specific source checks

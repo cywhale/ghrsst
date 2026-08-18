@@ -82,24 +82,29 @@ def build_block(path: str, days: Sequence[str], ny: int = 32, nx: int = 32, *,
 
 
 def build_delta(path: str, days: Sequence[str], ny: int = 32, nx: int = 32,
-                seed: int = 900) -> str:
+                seed: int = 900, *, absent_vars: Sequence[str] = ()) -> str:
     """F3 -- an append-optimized delta (t1/s256-shaped, clipped to the fixture grid).
 
-    Present so tests can prove the segmented store NEVER touches it."""
+    Present so tests can prove the segmented store NEVER touches it.
+    `absent_vars` are omitted entirely (P1 omit semantics, `var_valid` False), so a test can
+    build a partial source and then backfill it."""
     days = list(days)
     T = len(days)
+    keep = [v for v in VARS if v not in set(absent_vars)]
     g = zarr.open_group(path, mode="w", zarr_format=3)
     g.create_array("lon", shape=(nx,), dtype="float32", chunks=(nx,))
     g["lon"][:] = np.linspace(100.0, 100.0 + nx - 1, nx, dtype=np.float32)
     g.create_array("lat", shape=(ny,), dtype="float32", chunks=(ny,))
     g["lat"][:] = np.linspace(0.0, ny - 1.0, ny, dtype=np.float32)
     for i, v in enumerate(VARS):
+        if v not in keep:
+            continue
         g.create_array(v, shape=(T, ny, nx), dtype="float32",
                        chunks=(1, ny, nx), shards=(1, ny, nx), fill_value=float("nan"))
         g[v][:] = _field(T, ny, nx, seed=seed + i * 7) + 1000.0   # distinguishable values
     g.attrs["days"] = days
-    g.attrs["vars"] = list(VARS)
-    g.attrs["var_valid"] = {v: [True] * T for v in VARS}
+    g.attrs["vars"] = list(keep)
+    g.attrs["var_valid"] = {v: [True] * T for v in keep}
     g.attrs["layout"] = "time_lat_lon"
     return path
 

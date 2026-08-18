@@ -56,6 +56,7 @@ import zarr
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from store import block_manifest as bm  # noqa: E402
+from store import source_provenance as sp  # noqa: E402
 from store.compaction_lock import CompactionLock  # noqa: E402
 
 VARS = ("sst", "sst_anomaly", "sea_ice")
@@ -559,6 +560,33 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
             journal.event(event="var_done", day=day, var=v,
                           source=smap[day]["source_kind"], target_index=t)
 
+    # ---- §7.5a source-BYTE provenance, read from the SOURCE, not from what we wrote.
+    # The locator map records where each day came from; this records what came out. One
+    # tile-sized window per (day, var), through the same cached handle the fill used -- so it
+    # is bounded I/O and it is the source's own bytes, not a re-read of our output (which would
+    # only prove we can read back what we just wrote).
+    prov_days = {}
+    for t_idx, day in enumerate(rebuild_source_set):
+        i0, i1, j0, j1 = sp.sample_window(ny, nx, seed=sp.SAMPLE_SEED, day_index=t_idx)
+        # The variable domain is the canonical VARS, not `keep_vars`. A variable absent from
+        # the whole block still has to appear as False: the verifier compares against the
+        # source's real availability over VARS, and two sides digesting different key sets
+        # disagree on every day for a reason that is not a difference.
+        tiles, valid = {}, {}
+        for v in VARS:
+            has = bool(present_flags[v][t_idx]) and v in keep_vars
+            valid[v] = has
+            tiles[v] = reader.read_tile(smap[day], v, i0, i1, j0, j1) if has else None
+        rec = source_map_record(day, smap[day])
+        prov_days[day] = {
+            "source_kind": rec["source_kind"], "source_path": rec["source_path"],
+            "source_day_index": rec["source_day_index"], "day_index": t_idx,
+            "source_fingerprint": sp.window_fingerprint(
+                tiles, seed=sp.SAMPLE_SEED, day_index=t_idx, var_valid=valid),
+            "var_valid": valid,
+        }
+    journal.event(event="source_fingerprints", days=len(prov_days), seed=sp.SAMPLE_SEED)
+
     # ---- finalize attrs LAST (a partial build is never a valid store)
     g.attrs["days"] = list(rebuild_source_set)
     g.attrs["vars"] = list(keep_vars)
@@ -607,8 +635,24 @@ def _build_block(out_path, *, start_day, end_day, classification_target, predece
             "sources": source_records,
         },
     }
+    # The artifact's grid comes from the INSPECTION of the block that was written, not from the
+    # source probe that seeded the fill -- the block is the authority a verifier will re-read.
+    # A divergence between the two would mean every fingerprint describes cells a verifier does
+    # not read, and it cannot reach here: `inspect_store_contract` above already refuses a block
+    # whose `region` does not match its own grid, so the build fails before a plan exists. An
+    # explicit check here would be unreachable code that reads as a guard.
+    provenance = sp.build_artifact(segment_id=segment["segment_id"], block_path=out_path,
+                                   ny=int(insp.ny), nx=int(insp.nx), days=prov_days)
+    provenance_path = None
+    if artifacts_dir:
+        provenance_path = sp.write_artifact(
+            os.path.join(artifacts_dir, sp.ARTIFACT_NAME), provenance)
+        journal.event(event="provenance_written", path=provenance_path,
+                      days=len(prov_days))
+
     plan = {"status": "ok", "out_path": out_path, "segment": segment,
             "source_map": source_records,
+            "provenance": provenance, "provenance_path": provenance_path,
             "rebuild_source_set": rebuild_source_set,
             "classification_target": sorted(classification_target),
             "disk": disk, "build_s": build_s, "performed_publish": False,
