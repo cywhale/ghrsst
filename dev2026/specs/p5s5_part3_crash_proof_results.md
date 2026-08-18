@@ -1,23 +1,124 @@
 # P5-S5 Part 3 — the `(e2)` cross-tier question: RESULTS
 
-Status: **PARTIAL.** `(e2)` **protocol design and mechanism are proven**; **production closure
-is PARTIAL**, pending ops evidence that the deployed quiescence hook attests a drain it actually
-verified. The crash-boundary matrix is **NOT YET DELIVERED**, and **G10 / H4 / G17 are still NOT
-claimed.**
+Status: **PARTIAL.** `(e2)` protocol mechanism proven; **production closure PARTIAL**.
+The crash-boundary matrix, the committed-but-unlogged recovery rule, and snapshot cases
+(a)(b)(c)(e) are **DELIVERED** in this round. **H4: PASS. G17: PASS. G10: PARTIAL** — one clause
+of it has a demonstrated counterexample that the read path does not close (below).
 `[MUT-STG]`: staging/synthetic only. No VM24 path, no `GHRSST_*` store, no cron, nothing
 written outside a temp dir.
 
 Branch `dev2026-p5-s5-part3-crash-proof`, stacked on `3c37193` (Part 2, signed off).
 
 - Harness: [`../tests/test_phase2_p5s5_part3.py`](../tests/test_phase2_p5s5_part3.py) — **53/53 green**
+- Crash / snapshot / G17: [`../tests/test_phase2_p5s5_part3_crash.py`](../tests/test_phase2_p5s5_part3_crash.py) — **42/42 green**
+- New: [`../ingest/publish_manifest.py`](../ingest/publish_manifest.py) `reconcile_publication()` — the §9.4 authority and recovery rule
 - Changed: [`../ingest/swap_delta.py`](../ingest/swap_delta.py) — §7.9 quiescence is required, must prove itself, and is recorded
 - Changed: [`p4s10_production_rollout_runbook.md`](p4s10_production_rollout_runbook.md) — §1 env + preflight, Step 4a, Step 4b
 - New: [`../ops/quiescence.py`](../ops/quiescence.py) — the drain measurement, importable and therefore testable
 - New: [`../store/durable_jsonl.py`](../store/durable_jsonl.py) — one durable append-only writer, shared by the executor manifest and the ops evidence file
 - **Unchanged: [`../store/tiered_cube.py`](../store/tiered_cube.py).** No signed-off P5-S2 behaviour was touched — not even the docstring, which still records R1 as "adjudicated at S5/G10". Amending it to point at this verdict is a one-line follow-up **after** sign-off, not something to slip in alongside the evidence.
-- Full local suite: **826 tests OK** (17 skipped), up from 773
-- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **389 OK**
+- Full local suite: **868 tests OK** (17 skipped), up from 773
+- `-W error::ResourceWarning` over S4 + S5 Parts 1–3 + P4-S8a: **431 OK**
 - **29 guards mutation-verified**
+
+## Delivered / not delivered
+
+| spec item | verdict | evidence |
+|---|---|---|
+| (a) stable-old across a publish, **value-asserted** | **PASS** | `TestCaseA_StableOldAcrossAPublish` |
+| (b) shrinking day set — the S8a silent-`None` variant | **PASS** | `TestCaseB_ShrinkingDaySet` |
+| (c) superseded block deleted early → snapshot build fails closed | **PASS** | `TestCaseC_SupersededBlockDeletedTooEarly` |
+| (c′) the same deletion under an **already-open** snapshot | **KNOWN GAP — not closed by the read path** | `test_KNOWN_GAP_reads_through_a_retained_snapshot_go_silently_None` |
+| (d) every §9 crash boundary, injected | **PASS** | `test_phase2_p5s5_part3_crash.py`, 8 boundaries |
+| (e) concurrent refresh + reads, no torn snapshot | **PASS** | `TestCaseE_ConcurrentRefreshUnderLoad` |
+| (e2) composite base+delta | **PASS (mechanism)**, production closure PARTIAL | round 1, unchanged |
+| (f) G17 build isolation: kill / `SIGSTOP` / replaced inode | **PASS** | `TestG17BuildIsolationFencing` |
+| committed-but-unlogged + retry / recovery | **PASS** | `reconcile_publication`, `TestCommittedButUnlogged`, `TestOrphanArchiveRetrySafety` |
+| **H4** (immutable versioned paths ⇒ stable-old across a generation change) | **PASS** | (a) + (b) + (e), value-asserted |
+| **G17** | **PASS** | (f) |
+| **G10** | **PARTIAL** | see below |
+| whole-VM snapshot rollback | **PARTIAL — deployment prerequisite** | unchanged (Part 2) |
+| `(e2)` production closure | **PARTIAL** | unchanged |
+| runbook pinned to a *reviewed* implementation | **PARTIAL — external approval record** | unchanged (round 6) |
+
+### Why G10 is PARTIAL and H4 is PASS
+
+They are different claims, and only one of them survives intact.
+
+**H4** is about a *manifest generation change*: a reader holding generation `N` must keep
+reading generation-`N` bytes while `N+1` is published. That is proven, on values, including when
+`N+1` **shrinks** the day set — the S8a silent-`None` variant — and under a concurrent
+refresh/rollback loop where **every** observation is checked to be wholly one generation.
+
+**G10** says more: *"never a fabricated `None`"*, without qualification. There is a demonstrated
+counterexample. If a block the live manifest still references is **deleted** while a snapshot is
+open, reads through that snapshot return `None` for days they previously served. Zarr opens
+lazily per read, so retaining the snapshot *object* is not retaining the *data*. The snapshot
+**build** fails closed, as (c) requires; this arrives by a route (c) does not cover.
+
+Nothing in the read path closes it. What prevents it is **§8.5's lifecycle** — a superseded
+block stays `referenced` until `release_after_utc`, only then moves to hold, and hard deletion is
+ops-only after `hold_until`. So the guarantee is operational, exactly like `(e2)`'s. It is
+recorded here as a residual risk rather than counted as a pass, and it is **not** a reason to
+change `tiered_cube.py` or `segmented_cube.py`: closing it in the read path would mean holding
+every segment's file handles open for the life of a snapshot, which is a real cost against a
+hazard the lifecycle already prevents. **That is a decision for review, not one taken here.**
+
+## §9 crash boundaries — what is durable, what is safe, what must stop
+
+Each boundary is reached by running the **real** §7.8 refold (hence the real §7.4 publication) in
+a child process killed with `os._exit(9)`. No cleanup runs, no buffer flushes, no `finally`
+unwinds: what the parent finds is what a power cut would have left. No `sleep`, no race — and if
+a boundary is never reached the harness fails rather than passing quietly.
+
+| boundary | durable afterwards | served | verdict | resolution |
+|---|---|---|---|---|
+| before publish | nothing new | `N` | `clean` | re-run the publication |
+| after archive `fsync`, before pointer | `manifest.gen<N+1>.json`, unreferenced | `N` | `orphan_archive` | complete the replace, or GC by hand |
+| after temp pointer, before `os.replace` | archive + `.manifest.json.tmp-<N+1>` | `N` | `orphan_archive` | as above; the temp is not a generation |
+| after `os.replace` | pointer at `N+1`; no dir `fsync`, no log | **`N+1`** | `committed_unlogged` | reconstruct the log line |
+| after publish, before the log line | pointer at `N+1` | **`N+1`** | `committed_unlogged` | reconstruct the log line |
+| after the log line | everything | `N+1` | `clean` | nothing |
+| rollback: after the verified temp copy | temp copy; both archives | `N+1` | `clean` | re-run the rollback |
+| rollback: after `os.replace`, before its log line | pointer back at `N`; **both** archives | `N` | `clean` | nothing (see below) |
+
+The live pointer is asserted **whole** at every boundary — it parses, it checksums, and it names
+exactly one generation. `os.replace` is atomic, and this is the evidence rather than the
+assumption.
+
+## The authority rule for committed-but-unlogged
+
+> **The manifest generation and its archive are authoritative. The audit log is derived.**
+
+A publication commits at exactly one instant: the `os.replace`. Everything after it is
+bookkeeping about a fact already true on disk. So a generation that is **live and archived**
+happened whether or not the log says so, and its log line may be **reconstructed**; a generation
+the **log claims** but the manifest does not carry did **not** happen, and the log may never
+authorize it into existence. The log can be rebuilt from the manifest, never the reverse.
+
+Reconstructed lines carry `reconstructed: true` and the evidence they were derived from, so an
+auditor can always tell a record of an observation from a record of an inference.
+
+**Retry safety, asserted:** completing an interrupted publication does not consume the archive
+(§9.3's copy-don't-rename rule, applied forwards); the predecessor archive and
+`predecessor_generation` both survive; repairing twice is byte-identical to repairing once;
+republishing the same generation is **refused** rather than repeated, because the archive is
+immutable and rewriting it would erase the only record of what was actually published. The
+`referenced → releasable → held` lifecycle reaches a fixed point: retries after it do not move a
+held block again.
+
+**Fail-closed states, enumerated rather than inferred** — a log claiming a generation that is
+neither live nor archived; an unparsable log line (a torn tail is an expected crash artifact, and
+it is triaged by a human because the reconciler *reasons from* the log); a live generation with
+no archive; an unreadable or checksum-invalid live manifest; an ahead archive that does not
+validate, skips a generation, or references a block that is not on disk. In every one, nothing
+is written and nothing is served differently.
+
+**One defect this round's own tests caught.** The first version of the reconciler classified a
+**deliberate rollback** as an interrupted publication: generation `N+1` is archived and ahead of
+live, which looks identical to a crash between archive and pointer. `apply=True` would have
+**silently undone the operator's rollback**. The log is what separates them — it records `N+1` as
+published — so an ahead generation the log knows about is never an orphan.
 
 ## The question
 
@@ -337,8 +438,9 @@ Every refusal is asserted to leave the live delta byte-for-byte as it was.
 
 ## Mutation verification
 
-Thirty-four guards, each disabled in turn; **all thirty-four fail** — five from round 1, six
-from round 2, seven from round 3, five from round 4, six from round 5, and five from round 6.
+Forty-two guards, each disabled in turn; **all forty-two fail** — five from round 1, six from
+round 2, seven from round 3, five from round 4, six from round 5, five from round 6, and eight
+from the crash/recovery work.
 
 Two mutations survived across rounds 5 and 6 and are **not** counted, because neither changes
 behaviour: removing `: "${DEPLOY_SHA:?...}"` (the next line still refuses an unset variable) and
@@ -377,6 +479,14 @@ verified, and this is the third time in P5-S5 that shape has appeared.
 | the runbook hand-rolls persistence again (round 4) | FAILED |
 | the shared writer drops the directory `fsync` (round 4) | FAILED |
 | the shared writer drops the file `fsync` (round 4) | FAILED |
+| the log may authorize a publication (round 7) | FAILED |
+| an unparsable log line is skipped (round 7) | FAILED |
+| a live generation with no archive tolerated (round 7) | FAILED |
+| a deliberate rollback treated as an orphan (round 7) | FAILED |
+| the orphan's predecessor not checked (round 7) | FAILED |
+| the orphan's segments not checked on disk (round 7) | FAILED |
+| the orphan archive not validated (round 7) | FAILED |
+| reconstructed lines not marked as such (round 7) | FAILED |
 | the anchor-domain check only prints (round 5) | FAILED |
 | the exact-SHA comparison removed (round 5) | FAILED |
 | the ancestor floor removed (round 5) | FAILED |
@@ -413,3 +523,30 @@ Stated plainly, because the verdict is conditional:
    attestation is *present and well-formed*, never that it is *true*. That is an operational
    responsibility, it is why `evidence` is mandatory and now durable, and it is the reason
    production closure is recorded above as PARTIAL rather than done.
+
+
+## Residual risks and stop conditions
+
+Stated so they are decided rather than discovered.
+
+1. **Early deletion of a referenced block produces a silent `None`** for reads through an
+   already-open snapshot (G10's PARTIAL, above). Prevented operationally by §8.5, not by the
+   read path. **Stop condition:** if ops ever hard-deletes inside `release_after_utc`, or if a
+   process is observed serving `None` for a day the manifest lists, G10's clause is breached and
+   the read path must hold segment handles for the life of a snapshot.
+2. **`(e2)` production closure** depends on a quiescence hook attesting a drain it actually
+   performed. The executor can check the attestation is present and well-formed, never that it
+   is true.
+3. **Whole-VM snapshot rollback** still needs an anchor root in an independent durability
+   domain. Unchanged from Part 2, and unprovable here.
+4. **The runbook has never been executed.** Its arguments, modules and preflight blocks are
+   tested; the thing itself has not run, because VM24 is off limits for this work.
+5. **Crash coverage is of the publication and rollback paths**, not of the block *build*. §9's
+   first two rows (during build, after build before validation) are resume/discard cases owned
+   by `build_block`'s progress journal, and they are **not** injected here.
+
+## Still NOT delivered
+
+- crash injection inside `build_block` (§9 rows 1–2);
+- the `(e2)` composite fence itself — deliberately not built, per the round-1 verdict;
+- any VM24, production, cron or `GHRSST_*` execution of any of this.

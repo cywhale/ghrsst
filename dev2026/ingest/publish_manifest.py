@@ -1457,3 +1457,206 @@ def prune_outlook(root: str, days: Sequence[str], *, wal_root: str,
         return {**rw.refuse_all_reason(exc), "authorized": [], "refused":
                 {d: "the repair WAL does not validate; no day can be authorized" for d in days}}
     return rw.prune_authorization(state, days, materialized_repairs=materialized_repairs)
+
+
+# --------------------------------------------------------------------------- §9.4 recovery
+#: Recovery verdicts. `apply=True` acts only on the two that say a safe action exists.
+RECOVERY_CLEAN = "clean"
+RECOVERY_COMMITTED_UNLOGGED = "committed_unlogged"
+RECOVERY_ORPHAN_ARCHIVE = "orphan_archive"
+RECOVERY_FAIL_CLOSED = "fail_closed"
+
+
+def _read_log(root: str, name: str) -> List[dict]:
+    """Every parsable line, and a marker for any that is not.
+
+    A corrupt tail is expected after a crash -- the last line may be a partial write -- but it
+    is REPORTED, never skipped silently, because "the log does not mention it" is a premise the
+    reconciler reasons from."""
+    path = os.path.join(root, name)
+    out: List[dict] = []
+    if not os.path.isfile(path):
+        return out
+    with open(path) as fh:
+        for i, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                out.append({"op": "__unparsable__", "line_no": i})
+    return out
+
+
+def reconcile_publication(root: str, *, operator: str = "", now: Optional[datetime] = None,
+                          apply: bool = False) -> dict:
+    """Classify the on-disk state after a crash, and repair only what is provably safe (§9.4).
+
+    ## The authority rule
+
+    **The manifest generation and its archive are authoritative. The audit log is derived.**
+
+    A publication commits at exactly one instant: the `os.replace` that makes `manifest.json`
+    point at generation `N+1`. Everything after that -- the log line, the returned dict, the
+    operator's terminal -- is bookkeeping about a fact already true on disk. So:
+
+    - a generation that is **live and archived** happened, whether or not the log says so, and
+      its log line may be **reconstructed** from the manifest;
+    - a generation the **log claims** but the manifest does not carry did **not** happen, and the
+      log may never authorize it into existence. That direction is the one that would let a
+      crash-truncated or hand-edited log invent a publication.
+
+    This asymmetry is the whole rule: the log can be rebuilt from the manifest, never the
+    reverse. Reconstructed lines are marked `reconstructed: true` with the evidence they were
+    derived from, so an auditor can always tell a record of an observation from a record of an
+    inference.
+
+    ## Verdicts
+
+    - `clean` -- live generation is archived and logged. Nothing to do.
+    - `committed_unlogged` -- live generation is archived but has no log line: the crash landed
+      between the `os.replace` and the log append. **Safe to repair**: append the reconstructed
+      line. The served state is already correct and is not touched.
+    - `orphan_archive` -- an archive exists for a generation ahead of live, and it is fully
+      verifiable (valid, checksummed, its predecessor is the live generation, every segment it
+      references is present on disk). The crash landed between the archive write and the
+      `os.replace`; nothing was ever referenced. §9 allows either garbage-collecting the orphan
+      or re-attempting the replace. `apply=True` **re-attempts the replace** via
+      `bm.rollback_to`, which copies rather than consumes the archive; it never deletes, since
+      hard deletion is ops-only in this design.
+    - `fail_closed` -- anything else. Enumerated, never inferred: an unreadable or invalid live
+      manifest, a live generation with no archive, a log claiming a generation that is neither
+      live nor archived, an unparsable log line, or an ahead archive that does not verify.
+      **No automatic action.** An ambiguous state must never resolve itself into success.
+    """
+    now = now or datetime.now(timezone.utc)
+    report: dict = {"root": root, "verdict": RECOVERY_FAIL_CLOSED, "applied": False,
+                    "actions": [], "reasons": []}
+
+    live_path = os.path.join(root, bm.LIVE_NAME)
+    if not os.path.isfile(live_path):
+        report["reasons"].append("no live manifest.json: nothing has ever been published here, "
+                                 "or the pointer was lost. A human must establish which.")
+        return report
+    try:
+        live = bm.load_live(root)
+        bm.validate_manifest(live)
+    except Exception as exc:                       # unreadable / invalid -> §9.4 fail closed
+        report["reasons"].append(f"live manifest is unusable ({type(exc).__name__}: {exc}); the "
+                                 f"serving process keeps its current snapshot and alarms (§9.4)")
+        return report
+
+    live_gen = int(live["generation"])
+    report["live_generation"] = live_gen
+
+    entries = _read_log(root, MANIFEST_LOG)
+    if any(e.get("op") == "__unparsable__" for e in entries):
+        bad = [e["line_no"] for e in entries if e.get("op") == "__unparsable__"]
+        report["reasons"].append(f"{MANIFEST_LOG} has unparsable line(s) {bad}. A truncated tail "
+                                 f"is an expected crash artifact, but it is triaged by a human: "
+                                 f"reconciling around it would reason from a log we cannot read.")
+        return report
+
+    archives = {}
+    for name in os.listdir(root):
+        if name.startswith("manifest.gen") and name.endswith(".json"):
+            try:
+                archives[int(name[len("manifest.gen"):-len(".json")])] = os.path.join(root, name)
+            except ValueError:
+                continue
+    report["archived_generations"] = sorted(archives)
+
+    if live_gen not in archives:
+        report["reasons"].append(
+            f"live generation {live_gen} has no archive. Rollback and audit both need it; this "
+            f"is not something recovery may fabricate.")
+        return report
+
+    logged = {int(e["to_generation"]) for e in entries
+              if e.get("op") in ("manifest_publish", "manifest_rollback")
+              and isinstance(e.get("to_generation"), int)}
+    report["logged_generations"] = sorted(logged)
+
+    ahead = sorted(g for g in logged if g > live_gen and g not in archives)
+    if ahead:
+        report["reasons"].append(
+            f"{MANIFEST_LOG} claims generation(s) {ahead} that are neither live nor archived. "
+            f"The log does not authorize a publication into existence -- the manifest is the "
+            f"authority -- so this is a human triage, not a repair.")
+        return report
+
+    # An ahead generation that the log records as PUBLISHED is not an orphan: it was published
+    # and then deliberately rolled back (§9.3 leaves the archive in place precisely so a
+    # roll-forward stays possible). Completing it would silently undo an operator's rollback --
+    # the reconciler acting on an intention it does not have. Only an ahead generation the log
+    # never recorded can be an interrupted publication.
+    orphans = sorted(g for g in archives if g > live_gen and g not in logged)
+    rolled_back_ahead = sorted(g for g in archives if g > live_gen and g in logged)
+    if rolled_back_ahead:
+        report["rolled_back_generations"] = rolled_back_ahead
+    if orphans:
+        target = orphans[-1]
+        ok, why = _orphan_is_completable(root, archives[target], target, live_gen)
+        report["orphan_generations"] = orphans
+        if not ok:
+            report["reasons"].append(f"archive for generation {target} is ahead of live but "
+                                     f"cannot be completed: {why}")
+            return report
+        report["verdict"] = RECOVERY_ORPHAN_ARCHIVE
+        report["completable_generation"] = target
+        if apply:
+            bm.rollback_to(root, target)           # copy -> verify -> fsync -> replace
+            _append_log(root, MANIFEST_LOG, {
+                "op": "manifest_publish", "at_utc": _iso(now), "operator": operator,
+                "from_generation": live_gen, "to_generation": target,
+                "new_segment": None, "superseded": None,
+                "reconstructed": True,
+                "evidence": f"orphan archive {os.path.basename(archives[target])} completed by "
+                            f"reconcile_publication; the commit had not happened before"})
+            report["applied"] = True
+            report["actions"].append(f"completed the interrupted publication of generation "
+                                     f"{target}")
+        return report
+
+    if live_gen not in logged:
+        report["verdict"] = RECOVERY_COMMITTED_UNLOGGED
+        if apply:
+            _append_log(root, MANIFEST_LOG, {
+                "op": "manifest_publish", "at_utc": _iso(now), "operator": operator,
+                "from_generation": live.get("predecessor_generation"),
+                "to_generation": live_gen,
+                "new_segment": None, "superseded": None,
+                "reconstructed": True,
+                "evidence": f"derived from live manifest.json (generation {live_gen}, checksum "
+                            f"{live['manifest_checksum'][:16]}...) and its archive; the "
+                            f"publication had already committed"})
+            report["applied"] = True
+            report["actions"].append(f"reconstructed the missing log line for generation "
+                                     f"{live_gen}")
+        return report
+
+    report["verdict"] = RECOVERY_CLEAN
+    return report
+
+
+def _orphan_is_completable(root: str, path: str, generation: int, live_gen: int):
+    """Can this ahead-of-live archive be made live? Every condition, or nothing."""
+    try:
+        with open(path) as fh:
+            cand = json.load(fh)
+        bm.validate_manifest(cand)
+    except Exception as exc:
+        return False, f"it does not parse or validate ({type(exc).__name__}: {exc})"
+    if int(cand["generation"]) != generation:
+        return False, (f"it declares generation {cand['generation']} but is named for "
+                       f"{generation}")
+    if cand.get("predecessor_generation") != live_gen:
+        return False, (f"its predecessor is {cand.get('predecessor_generation')}, not the live "
+                       f"generation {live_gen}: completing it would skip a generation")
+    for seg in cand.get("segments", []):
+        p = _seg_path(root, seg)
+        if not os.path.isdir(p):
+            return False, (f"segment {seg.get('segment_id')} is not on disk at {p}; publishing "
+                           f"it would make every snapshot build fail closed")
+    return True, ""
