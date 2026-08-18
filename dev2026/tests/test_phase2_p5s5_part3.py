@@ -964,14 +964,40 @@ class TestTheProductionRunbookMatchesTheContract(_Base):
                                capture_output=True, text=True)
         self.assertNotEqual(unset.returncode, 0, "DEPLOY_SHA must be required")
 
-        wrong = subprocess.run(["bash", "-c", block], env={**base, "DEPLOY_SHA": "3c37193"},
-                               cwd=repo, capture_output=True, text=True)
-        self.assertNotEqual(wrong.returncode, 0, "a non-HEAD SHA must refuse")
-        self.assertIn("not a pin", wrong.stdout + wrong.stderr)
+        full = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                              capture_output=True, text=True).stdout.strip()
+        branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo,
+                                capture_output=True, text=True).stdout.strip()
 
-        head = subprocess.run(["bash", "-c", block], env={**base, "DEPLOY_SHA": "HEAD"},
-                              cwd=repo, capture_output=True, text=True)
-        self.assertEqual(head.returncode, 0, head.stdout + head.stderr)
+        # Every MOVABLE way of naming the same commit must be refused. `git rev-parse` resolves
+        # all of them, so comparing its OUTPUT to HEAD accepted exactly what the gate exists to
+        # reject -- including `HEAD` itself, which an earlier version of this test used as its
+        # success case.
+        part2_full = subprocess.run(["git", "rev-parse", "3c37193"], cwd=repo,
+                                    capture_output=True, text=True).stdout.strip()
+
+        # Each case asserts WHICH guard fired, not merely that something did. The three checks
+        # are deliberately redundant -- any one of them rejects most bad input -- so a test that
+        # only looked at the exit code proved nothing about any individual check, and three
+        # mutations survived on exactly that.
+        for value, expected in (
+            ("HEAD", "full immutable commit SHA"),        # a ref: caught by canonical equality
+            (branch, "full immutable commit SHA"),        # a branch: same
+            (full[:7], "full immutable commit SHA"),      # an abbreviation: same
+            ("f" * 40, "does not name a commit"),         # unknown: caught by --verify
+            (part2_full, "worktree HEAD is not"),         # real, immutable, but NOT this tree
+        ):
+            with self.subTest(value):
+                res = subprocess.run(["bash", "-c", block],
+                                     env={**base, "DEPLOY_SHA": value},
+                                     cwd=repo, capture_output=True, text=True)
+                out = res.stdout + res.stderr
+                self.assertNotEqual(res.returncode, 0, f"{value!r} is not an immutable pin")
+                self.assertIn(expected, out, f"{value!r} was refused by the wrong check:\n{out}")
+
+        exact = subprocess.run(["bash", "-c", block], env={**base, "DEPLOY_SHA": full},
+                               cwd=repo, capture_output=True, text=True)
+        self.assertEqual(exact.returncode, 0, exact.stdout + exact.stderr)
 
     def test_the_ancestor_floor_is_reachable_and_refuses_a_pre_P5_sha(self):
         """The floor is checked against $DEPLOY_SHA, not HEAD. Checked against HEAD it was
@@ -979,7 +1005,10 @@ class TestTheProductionRunbookMatchesTheContract(_Base):
         check that reads as a guard without being one."""
         block = self._preflight_block("Record `git rev-parse HEAD", portable_stat=False)
         repo = os.path.dirname(_DEV2026)
-        env = {**os.environ, "WT": _DEV2026, "DEPLOY_SHA": "9bc1795"}   # P5-S4 tip: pre-Part 2
+        # the FULL sha, so the canonical check passes and the floor is the guard under test
+        old_full = subprocess.run(["git", "rev-parse", "9bc1795"], cwd=repo,
+                                  capture_output=True, text=True).stdout.strip()
+        env = {**os.environ, "WT": _DEV2026, "DEPLOY_SHA": old_full}   # P5-S4 tip: pre-Part 2
         res = subprocess.run(["bash", "-c", block], env=env, cwd=repo,
                              capture_output=True, text=True)
         self.assertNotEqual(res.returncode, 0)
@@ -988,7 +1017,10 @@ class TestTheProductionRunbookMatchesTheContract(_Base):
     def test_the_pin_is_recorded_as_outstanding_until_a_reviewed_sha_is_named(self):
         """The runbook must not read as fully pinned while the SHA is operator-supplied."""
         self.assertIn("OUTSTANDING", self.text)
-        self.assertIn("docs-only follow-up", self.text)
+        self.assertIn("external approval record", self.text)
+        # The document cannot hold its own pin: a commit recording SHA X changes HEAD to
+        # something other than X, so the pin it just wrote can never equal HEAD.
+        self.assertNotIn("docs-only follow-up", self.text)
 
     def test_the_path_boundary_names_the_anchor_exception(self):
         """Finding 3: "all paths under $G, anything else aborts" contradicted the required

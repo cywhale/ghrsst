@@ -109,7 +109,7 @@ needs operational evidence:
 | the swap refuses to proceed without a proven drain | **PROVEN** (§7.9, mutation-verified) |
 | the attestation is durable and auditable after the fact | **PROVEN** (fsync'd per record; on every post-quiesce outcome) |
 | the deployed runbook can execute against the current contract | **PROVEN for arguments and modules** (its own argument set builds a plan and runs a swap on a real external anchor; its preflight blocks are executed, not read) |
-| the runbook is pinned to a reviewed implementation | **PARTIAL — `$DEPLOY_SHA` is operator-supplied; a reviewed SHA is named in a docs-only follow-up after sign-off** |
+| the runbook is pinned to a reviewed implementation | **PARTIAL — the gate now accepts only a full immutable SHA; which SHA is *reviewed* comes from an external approval record, not from this document** |
 | the deployed hook attests a drain it actually verified | **PARTIAL — deployment prerequisite** |
 
 The last row is the one that keeps this PARTIAL. The runbook hook has been updated to measure
@@ -268,6 +268,46 @@ single exception explicitly — an ops-approved, locally-mounted path in an inde
 domain, read and attested rather than written — while every path a prune or swap **mutates**
 stays under `$G`.
 
+## Review round 6 — the pin accepted every movable ref, and the fix was self-contradictory
+
+**`$DEPLOY_SHA` was not an exact SHA.** The gate compared `git rev-parse "$DEPLOY_SHA"` to
+`HEAD`, and `rev-parse` resolves `HEAD`, a branch, a tag and an abbreviation alike — so every
+movable ref passed the check written to reject them. My own test used `DEPLOY_SHA=HEAD` as its
+**success** case, which is as clear a statement as possible that the test agreed with the bug.
+
+The gate now canonicalizes with `--verify` and requires the operator's **original input** to
+equal the canonical form, so only a full 40-character commit SHA survives.
+
+**The proposed fix for pinning could not work.** The previous note said a docs-only follow-up
+commit would record the reviewed SHA in this runbook. It cannot: a commit that records SHA *X*
+**changes `HEAD` to something other than *X***, so the pin it just wrote can never satisfy
+`HEAD == $DEPLOY_SHA`. The document cannot hold its own pin. The reviewed SHA now comes from an
+**external approval record** — the Part 3 sign-off note, or a signed tag — and the runbook says
+so.
+
+**Ordering.** The ancestor floor ran first and answered "predates P5-S5 Part 2" for a SHA that
+does not exist at all — a true refusal for the wrong reason, which sends a wrong pin to be
+debugged in the wrong place. Existence and form are established first, then ancestry, then the
+`HEAD` comparison.
+
+**What the mutations forced me to fix in the tests.** Three of them survived the first run: the
+five checks are deliberately redundant, so any one of them refuses most bad input, and a test
+that asserted only the **exit code** proved nothing about any individual check. Each case now
+asserts **which** guard fired, by its message:
+
+| input | must be refused by |
+|---|---|
+| `HEAD`, a branch name, an abbreviation | canonical-form equality |
+| a 40-char SHA that is not a commit | `--verify` |
+| the full SHA of a pre-Part-2 commit | the ancestor floor |
+| the full SHA of another real commit | the `HEAD` comparison |
+
+One mutation still survives and is **not counted**: rewriting the final comparison as
+`[ "$(git rev-parse HEAD)" = "$(git rev-parse "$DEPLOY_SHA")" ]`. After canonicalization
+`$DEPLOY_SHA` is already a full SHA, so `rev-parse` returns it unchanged — the rewrite is
+equivalent, not a weakened guard. The literal form is kept because it does not depend on an
+upstream check to be correct.
+
 ## §7.9 — quiescence is required, and must prove itself
 
 `pre_swap_quiesce_fn` defaulted to `None` and was **silently skipped when omitted**. A caller
@@ -297,12 +337,14 @@ Every refusal is asserted to leave the live delta byte-for-byte as it was.
 
 ## Mutation verification
 
-Twenty-nine guards, each disabled in turn; **all twenty-nine fail** — five from round 1, six
-from round 2, seven from round 3, five from round 4, and six from round 5.
+Thirty-four guards, each disabled in turn; **all thirty-four fail** — five from round 1, six
+from round 2, seven from round 3, five from round 4, six from round 5, and five from round 6.
 
-One round-5 mutation survived and is **not** counted: removing `: "${DEPLOY_SHA:?...}"` changes
-nothing, because the next line still refuses an unset variable. It is a diagnostic, not a guard.
-Chasing it into the count would have inflated the number with a line that protects nothing.
+Two mutations survived across rounds 5 and 6 and are **not** counted, because neither changes
+behaviour: removing `: "${DEPLOY_SHA:?...}"` (the next line still refuses an unset variable) and
+rewriting the final SHA comparison to re-`rev-parse` an already-canonical value. Both are
+diagnostics or equivalent formulations. Counting them would have inflated the number with lines
+that protect nothing — which is the same error as counting an unreachable check.
 
 One round-3 mutation **survived the first run**: removing the per-record `fsync` left the test
 green, because it asserted only that *something* had been fsync'd and the directory sync alone
@@ -341,6 +383,11 @@ verified, and this is the third time in P5-S5 that shape has appeared.
 | the ancestor floor checked against `HEAD`, unreachable (round 5) | FAILED |
 | the anchor exception dropped from the path boundary (round 5) | FAILED |
 | the outstanding-pin note removed (round 5) | FAILED |
+| canonical-form equality removed (round 6) | FAILED (3) |
+| `--verify` dropped, a non-commit SHA accepted (round 6) | FAILED (4) |
+| the ancestor floor removed (round 6, after reorder) | FAILED |
+| the `HEAD` equality removed (round 6) | FAILED |
+| the self-referential docs pin proposed again (round 6) | FAILED |
 
 The harness's own thread cleanup is verified the same way: a forced failure in the looping-reader
 test leaves **zero** stray thread tracebacks, because a parked reader that outlives a failed

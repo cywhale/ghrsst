@@ -81,25 +81,40 @@ implementation ran. `git merge-base --is-ancestor 3c37193 HEAD` must also pass (
 signed off) as a floor, and the capability preflight checks that the deployed tree really has
 the modules — but neither proves the code was *reviewed*, and only the SHA does.
 
-> **OUTSTANDING — this runbook is not fully pinned until it names one.** `$DEPLOY_SHA` is
-> supplied by the operator today. Once P5-S5 Part 3 is signed off, a **docs-only follow-up
-> commit** records the reviewed SHA (or a signed tag) here as the default. That commit can name
-> the SHA it pins because it is not the commit being pinned — there is no self-reference
-> problem, only an ordering one.
+> **OUTSTANDING — the reviewed SHA comes from OUTSIDE this document.** `$DEPLOY_SHA` is supplied
+> by the operator, who must take it from the **external approval record**: the sign-off note for
+> P5-S5 Part 3, or a signed tag (`git verify-tag`) pointing at the reviewed commit.
+>
+> Writing the reviewed SHA into this runbook does **not** work, and an earlier revision of this
+> note proposed exactly that. A commit that records SHA *X* here **changes `HEAD` to something
+> other than *X*** — so the pin it just wrote can never satisfy `HEAD == $DEPLOY_SHA`. The
+> document cannot hold its own pin; only an external record can.
 
 Record `git rev-parse HEAD > $ART/git_head.txt`. Checking out the worktree does NOT restart the
 app.
 
 ```bash
 : "${DEPLOY_SHA:?set DEPLOY_SHA to the exact reviewed commit to deploy}"
-# The floor is checked against $DEPLOY_SHA, BEFORE comparing it to HEAD. Checked against HEAD
-# afterwards it was unreachable — HEAD has to equal $DEPLOY_SHA by then, so no input could ever
-# trip it, and it read as a guard without being one.
-cd $WT/.. && git merge-base --is-ancestor 3c37193 "$DEPLOY_SHA" || \
+# Order matters: establish that $DEPLOY_SHA is a real, immutable commit BEFORE asking anything
+# about it. Asked first, the ancestor floor answered "predates P5-S5" for a SHA that does not
+# exist at all -- a true refusal for the wrong reason, which is how a wrong pin gets debugged in
+# the wrong place.
+#
+# `git rev-parse` happily resolves HEAD, a branch, a tag or an abbreviation, so comparing its
+# OUTPUT to HEAD accepted every movable ref -- the thing this gate exists to reject. Canonicalize
+# first, then require the operator's ORIGINAL input to equal the canonical form: only a full
+# 40-char commit SHA survives that.
+cd $WT/..
+CANONICAL=$(git rev-parse --verify "$DEPLOY_SHA^{commit}" 2>/dev/null) || \
+  { echo "NO-GO: \$DEPLOY_SHA does not name a commit in this repository"; exit 1; }
+[ "$DEPLOY_SHA" = "$CANONICAL" ] || \
+  { echo "NO-GO: \$DEPLOY_SHA must be the full immutable commit SHA, not a ref or abbreviation"
+    echo "       (got '$DEPLOY_SHA', canonical is '$CANONICAL')"; exit 1; }
+git merge-base --is-ancestor 3c37193 "$DEPLOY_SHA" || \
   { echo "NO-GO: \$DEPLOY_SHA predates P5-S5 Part 2 — it cannot contain this runbook's code"
     exit 1; }
-git rev-parse HEAD | grep -q "^$(git rev-parse "$DEPLOY_SHA")$" || \
-  { echo "NO-GO: worktree HEAD is not \$DEPLOY_SHA — a branch tip is not a pin"; exit 1; }
+[ "$(git rev-parse HEAD)" = "$DEPLOY_SHA" ] || \
+  { echo "NO-GO: worktree HEAD is not \$DEPLOY_SHA"; exit 1; }
 ```
 
 **Capability preflight (REQUIRED — the deployed tree must have the code this runbook calls):**
