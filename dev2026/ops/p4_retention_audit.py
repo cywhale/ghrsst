@@ -231,11 +231,27 @@ def delta_prune(base: dict, delta: dict, window_days: int, delta_buffer: int, *,
         "keep_window_days": window_days + delta_buffer,
         "delta_buffer_days": delta_buffer,
         "keep_day_count": len(keep_days),
+        # Four DIFFERENT sets. They were easy to confuse, and the 2026-08 rehearsal showed
+        # what the confusion costs: 22 calendar candidates, only 4 of them base-covered.
+        #
+        #   drop_candidates_by_calendar   -- older than the keep window. Says nothing about base.
+        #   delta_prune_candidates        -- of those, the ones base COVERS. The only set a prune
+        #                                    may drop.
+        #   blocked_need_compaction_first -- of those, the ones base does NOT cover. Never
+        #                                    droppable until they are compacted in.
+        #   base_uncovered_approved_candidates -- days an operator approved that base does not
+        #                                    cover. Always empty here by construction; present so
+        #                                    a consumer can assert on it rather than infer it.
         "drop_candidates_by_calendar": drop_candidates,
+        # NOT "base covers the days we are about to drop" -- that is true of
+        # `delta_prune_candidates` by construction. It means "base covers EVERY calendar drop
+        # candidate, so nothing is blocked". False whenever any day is blocked, even when there
+        # are eligible candidates to drop: the rehearsal's 4-of-22 case reports False.
         "base_covers_all_drop_candidates": (not blocked and bool(drop_candidates)),
-        "delta_prune_candidates": eligible,          # eligible ONLY after base coverage — dry-run
+        "delta_prune_candidates": eligible,          # eligible ONLY after base coverage -- dry-run
         "delta_prune_candidate_count": len(eligible),
         "blocked_need_compaction_first": blocked,
+        "base_uncovered_approved_candidates": [],
         "reason": reason,
         "dry_run": True,
     }

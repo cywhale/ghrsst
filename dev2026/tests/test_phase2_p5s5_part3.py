@@ -890,7 +890,7 @@ class TestTheProductionRunbookMatchesTheContract(_Base):
         block = self.text[self.text.index("**Preflight (every check must pass"):]
         block = block[block.index("```bash") + 7:]
         block = block[:block.index("```")]
-        env = {**os.environ, "PY": sys.executable,
+        env = {**os.environ, "PYTHON": sys.executable, "CODE_ROOT": _DEV2026,
                "MANIFEST_ROOT": self.root, "WAL_ROOT": self.wal,
                "ANCHOR_ROOT": os.path.join(self.tmp, "same_fs_anchor")}
         os.makedirs(env["ANCHOR_ROOT"], exist_ok=True)      # same mkdtemp => same st_dev
@@ -927,7 +927,7 @@ class TestTheProductionRunbookMatchesTheContract(_Base):
         os.chmod(stub, 0o755)
         undeclared = os.path.join(self.tmp, "undeclared_anchor")
         os.makedirs(undeclared, exist_ok=True)
-        env = {**os.environ, "PY": sys.executable, "WT": _DEV2026,
+        env = {**os.environ, "PYTHON": sys.executable, "CODE_ROOT": _DEV2026,
                "PATH": bindir + os.pathsep + os.environ["PATH"],
                "MANIFEST_ROOT": self.root, "WAL_ROOT": self.wal, "ANCHOR_ROOT": undeclared}
         res = subprocess.run(["bash", "-c", self._preflight_block(
@@ -944,7 +944,7 @@ class TestTheProductionRunbookMatchesTheContract(_Base):
         with open(stub, "w") as fh:
             fh.write("#!/bin/sh\nprintf '%s' \"$(printf '%s' \"$3\" | cksum | cut -d' ' -f1)\"\n")
         os.chmod(stub, 0o755)
-        env = {**os.environ, "PY": sys.executable, "WT": _DEV2026,
+        env = {**os.environ, "PYTHON": sys.executable, "CODE_ROOT": _DEV2026,
                "PATH": bindir + os.pathsep + os.environ["PATH"],
                "MANIFEST_ROOT": self.root, "WAL_ROOT": self.wal, "ANCHOR_ROOT": self.anchor}
         res = subprocess.run(["bash", "-c", self._preflight_block(
@@ -957,7 +957,7 @@ class TestTheProductionRunbookMatchesTheContract(_Base):
         A branch tip is not a statement about which implementation ran."""
         block = self._preflight_block("Record `git rev-parse HEAD", portable_stat=False)
         repo = os.path.dirname(_DEV2026)
-        base = {**os.environ, "WT": _DEV2026}
+        base = {**os.environ, "CODE_ROOT": _DEV2026, "PYTHON": sys.executable}
         base.pop("DEPLOY_SHA", None)
 
         unset = subprocess.run(["bash", "-c", block], env=base, cwd=repo,
@@ -1008,7 +1008,8 @@ class TestTheProductionRunbookMatchesTheContract(_Base):
         # the FULL sha, so the canonical check passes and the floor is the guard under test
         old_full = subprocess.run(["git", "rev-parse", "9bc1795"], cwd=repo,
                                   capture_output=True, text=True).stdout.strip()
-        env = {**os.environ, "WT": _DEV2026, "DEPLOY_SHA": old_full}   # P5-S4 tip: pre-Part 2
+        env = {**os.environ, "CODE_ROOT": _DEV2026, "PYTHON": sys.executable,
+               "DEPLOY_SHA": old_full}   # P5-S4 tip: pre-Part 2
         res = subprocess.run(["bash", "-c", block], env=env, cwd=repo,
                              capture_output=True, text=True)
         self.assertNotEqual(res.returncode, 0)

@@ -33,8 +33,12 @@ cube and the **live** daily staging store.
 Environment (run first):
 ```bash
 export G=/home/odbadmin/Data/ghrsst
-export WT=/home/odbadmin/python/ghrsst-dev2026-phase2/dev2026
-export PY=$WT/.venv/bin/python
+# The P4 code and the interpreter live in DIFFERENT trees. They were one variable, and the
+# rehearsal found the consequence: the O4 cron pointed at `ops/p4_retention_audit.py` under the
+# phase2 worktree, where that file does not exist, so a cron that reads correctly never ran.
+export CODE_ROOT=/home/odbadmin/python/ghrsst-p4s10/dev2026          # the P4-S10 code
+export PYTHON=/home/odbadmin/python/ghrsst-dev2026-phase2/dev2026/.venv/bin/python  # the venv
+export PYTHONPATH=$CODE_ROOT                                          # imports resolve to CODE_ROOT
 export RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
 export ART=$G/logs/p4s10_$RUN_ID; mkdir -p "$ART"
 export HOLD=$G/hold; mkdir -p "$HOLD"
@@ -54,6 +58,16 @@ export ANCHOR_ROOT=${ANCHOR_ROOT:?set ANCHOR_ROOT to an INDEPENDENT rollback dom
 ```
 **Preflight (every check must pass, or §4 does not start):**
 ```bash
+# The interpreter and the code are in different trees; check BOTH, and check that the modules
+# this runbook calls actually import from CODE_ROOT. A runbook that reads correctly and cannot
+# import is the failure the rehearsal hit.
+test -x "$PYTHON" || { echo "NO-GO: \$PYTHON is not executable: $PYTHON"; exit 1; }
+test -f "$CODE_ROOT/ops/p4_retention_audit.py" || \
+  { echo "NO-GO: \$CODE_ROOT does not contain ops/p4_retention_audit.py: $CODE_ROOT"; exit 1; }
+PYTHONPATH=$CODE_ROOT "$PYTHON" -c "
+import ingest.prune_delta, ingest.swap_delta, ingest.prune_staging
+import ops.p4_retention_audit, ops.degraded_prune
+print('import preflight OK')" || { echo "NO-GO: P4 modules do not import"; exit 1; }
 test -d "$MANIFEST_ROOT" && test -d "$WAL_ROOT" && test -d "$ANCHOR_ROOT" || \
   { echo "NO-GO: P5 roots missing — prune would fail closed"; exit 1; }
 # NO-GO, not a warning. `resolve_anchor_root()` refuses a same-filesystem anchor unless the
@@ -66,7 +80,7 @@ test -d "$MANIFEST_ROOT" && test -d "$WAL_ROOT" && test -d "$ANCHOR_ROOT" || \
     exit 1; }
 # ASSERT, do not print: `anchor_domain_id()` returns None for an undeclared root and exits 0,
 # so `print(...) || NO-GO` accepted exactly the configuration it was written to reject.
-$PY -c "import sys; sys.path.insert(0,'$WT'); from store import repair_wal as rw; \
+$PYTHON -c "import sys; sys.path.insert(0,'$CODE_ROOT'); from store import repair_wal as rw; \
   d = rw.anchor_domain_id('$ANCHOR_ROOT'); \
   print('anchor domain:', d); \
   raise SystemExit(0 if d else 'anchor domain is NOT declared')" || \
@@ -104,7 +118,7 @@ app.
 # OUTPUT to HEAD accepted every movable ref -- the thing this gate exists to reject. Canonicalize
 # first, then require the operator's ORIGINAL input to equal the canonical form: only a full
 # 40-char commit SHA survives that.
-cd $WT/..
+cd $CODE_ROOT/..
 CANONICAL=$(git rev-parse --verify "$DEPLOY_SHA^{commit}" 2>/dev/null) || \
   { echo "NO-GO: \$DEPLOY_SHA does not name a commit in this repository"; exit 1; }
 [ "$DEPLOY_SHA" = "$CANONICAL" ] || \
@@ -119,7 +133,7 @@ git merge-base --is-ancestor 3c37193 "$DEPLOY_SHA" || \
 
 **Capability preflight (REQUIRED — the deployed tree must have the code this runbook calls):**
 ```bash
-cd $WT && $PY - <<'EOF' || { echo "NO-GO: deployed tree predates P5-S5"; exit 1; }
+cd $CODE_ROOT && $PYTHON - <<'EOF' || { echo "NO-GO: deployed tree predates P5-S5"; exit 1; }
 import inspect, sys
 sys.path.insert(0, ".")
 from ingest.swap_delta import execute_swap_plan, QUIESCENCE_CORE_FIELDS
@@ -140,10 +154,10 @@ EOF
 **Never reuse S9 (or any earlier) day sets** — the compact-free window and the staging keep-set both
 erode daily. Immediately before execution:
 ```bash
-cd $WT
+cd $CODE_ROOT
 curl -fsS http://127.0.0.1:8035/healthz > "$ART/healthz_before.json"
 set +e
-$PY ops/p4_retention_audit.py \
+$PYTHON ops/p4_retention_audit.py \
   --daily $G/mur.zarr --base $G/mur_timecube_s8_t90_sh128.zarr --delta $LIVE_DELTA \
   --healthz-url http://127.0.0.1:8035 \
   --alarm --strict --json-out "$ART/audit.json"
@@ -154,7 +168,8 @@ AUDIT_RC=$?; set -e; echo "$AUDIT_RC" > "$ART/audit.exit"; echo "audit rc=$AUDIT
 | rc=2 (recent window NOT contiguous / duplicate days / **API metadata stale**) | **NO-GO — stop everything** |
 | rc=3 with a **free-disk** reason | **NO-GO** (below margin) |
 | rc=3 with only a delta-span reason | operator decision, recorded; §4 may still proceed |
-| `delta_prune.blocked_need_compaction_first` **non-empty** | **delta prune/swap (§4) is NO-GO or degraded**: only the days in `delta_prune.delta_prune_candidates` may be dropped; if that list is empty, **skip §4 entirely** and (if approved) run only §5 staging prune |
+| `delta_prune.blocked_need_compaction_first` **non-empty** | **NO-GO for §4 by default.** Degraded *candidate-only* mode is possible but requires a **recorded operator approval** naming exactly the days in `delta_prune.delta_prune_candidates` (§4a). Without that approval, skip §4 entirely and (if approved separately) run only §5. If the candidate list is empty there is no degraded mode at all |
+| degraded mode approved, `delta_prune_candidates` non-empty | proceed to §4a in candidate-only mode; the dropped set is **exactly** that list, and every blocked day **stays in delta** |
 | `staging_keep.blocked_by_recent_window*` true | §5 is NO-GO too |
 | rc=0, candidates present | proceed |
 
@@ -225,19 +240,37 @@ with `df -h $G; du -sh $LIVE_DELTA` → `$ART/disk_before.txt`.
 
 ### 4a. Build the plan to a STAGING path (**[MUT-STG]**; live untouched)
 ```bash
-cd $WT && $PY - <<'EOF' > $ART/prune_step.log 2>&1
+cd $CODE_ROOT && $PYTHON - <<'EOF' > $ART/prune_step.log 2>&1
 import os, sys
-sys.path.insert(0, os.environ["WT"])
+sys.path.insert(0, os.environ["CODE_ROOT"])
 import zarr, json
 from ingest.prune_delta import prune_delta
 G, ART = os.environ["G"], os.environ["ART"]
 live, new = os.environ["LIVE_DELTA"], os.environ["NEW_DELTA"]
 with open(os.path.join(ART, "audit.json")) as fh:
     audit = json.load(fh)
-dp = audit["delta_prune"]
-keep_start = dp["keep_window_start"]                       # FRESH audit is the only day-set source
+# The day sets come from `ops.degraded_prune`, NOT from arithmetic written here. The
+# previous version computed a keep set as "every day newer than the keep window", which
+# drops EVERY older day -- including the `blocked_need_compaction_first` days that base
+# does not cover. In the 2026-08 rehearsal that was 22 days offered instead of 4.
+# `prune_delta`'s base-coverage gate refused the plan, so nothing was lost; the arithmetic
+# still had to move somewhere it is tested (tests/test_phase2_p4s10_degraded.py).
+#
+# NORMAL RUN: leave APPROVAL as None. If any day is blocked this REFUSES -- that is the
+# intended NO-GO. Degraded candidate-only mode: set APPROVAL to the recorded approval,
+# whose `approved_candidates` must equal the audit's `delta_prune_candidates` exactly.
+from ops.degraded_prune import partition_delta_days
+APPROVAL = None
+# APPROVAL = {"approved_by": "<operator>", "approval_ref": "<approval record id>",
+#             "approved_candidates": audit["delta_prune"]["delta_prune_candidates"]}
 dd = sorted(zarr.open_group(live, mode="r").attrs["days"])
-keep = [d for d in dd if d >= keep_start]
+part = partition_delta_days(live_delta_days=dd, audit=audit, approval=APPROVAL)
+keep = part["keep_days"]
+print("mode:", part["mode"], "| dropping:", len(part["dropped_days"]),
+      "| blocked retained:", len(part["blocked_retained"]),
+      "| approval:", part["approval_ref"])
+with open(os.path.join(ART, "degraded_partition.json"), "w") as fh:
+    json.dump(part, fh, indent=2, sort_keys=True)
 base_days = list(zarr.open_group(os.path.join(G, "mur_timecube_s8_t90_sh128.zarr"), mode="r").attrs["days"])
 # P5-S5: wal_root/manifest_root/anchor_root are REQUIRED whenever days are dropped. Without
 # them the plan refuses -- correctly, since no day may leave delta unless E1 identity
@@ -258,15 +291,21 @@ tail -3 $ART/prune_step.log
 - Monitor: `tail -f $ART/prune_delta_progress.jsonl`. If the process dies: **resume is only valid under
   the SAME code version** — rerun with `resume=True`. **After any code fix, never resume**: delete only
   `$NEW_DELTA` and rebuild (the 2026-07-09 lesson).
-- Plan `refused` (e.g. base-coverage) → §4 is over (degradation per §2 table); continue at §5 if
-  approved.
+- Plan `refused` (e.g. base-coverage) → §4 is over (per the §2 table); continue at §5 if approved.
+- `partition_delta_days` raising `DegradedPruneRefused` is the **normal NO-GO** when days
+  are blocked and no approval was supplied. It is not an error to work around: dropping
+  those days is exactly what must not happen. Record the refusal and stop §4.
+- The `prune_delta` base-coverage gate is **not** relaxed in degraded mode. The partition
+  decides which days are *offered*; that gate still decides whether they may go.
+- `$ART/degraded_partition.json` records mode, approval reference, dropped candidates and
+  retained blocked days for this run.
 
 ### 4b. Quiesce (pm2 stop) → swap → pm2 start, under the lock (**[MUT-SWAP] + [MUT-LIVE]**) → verify → hold
 ```bash
-cd $WT && $PY - <<'EOF' > $ART/swap_step.log 2>&1
+cd $CODE_ROOT && $PYTHON - <<'EOF' > $ART/swap_step.log 2>&1
 import json, os, subprocess, sys, time, urllib.request, uuid
 from datetime import datetime, timezone
-sys.path.insert(0, os.environ["WT"])
+sys.path.insert(0, os.environ["CODE_ROOT"])
 from ingest.swap_delta import execute_swap_plan
 from ops import quiescence as qs                   # tested; see tests/test_phase2_p5s5_part3.py
 ART, HOLD, LOCK = os.environ["ART"], os.environ["HOLD"], os.environ["LOCK"]
@@ -414,6 +453,9 @@ probes.
 | `swap_result.status` | app | action |
 |---|---|---|
 | `swapped` + `verify.ok` | auto-started | continue to §7 probes |
+| `DegradedPruneRefused` at §4a (blocked days, no approval) | never started; live untouched | **NORMAL NO-GO.** Record the blocked day count and stop §4. Do NOT widen the keep window to "make it work": those days are exactly the ones base cannot serve |
+| `DegradedPruneRefused` at §4a (approval does not match the audit) | never started; live untouched | NO-GO. Re-run the audit and re-approve against the fresh candidate list; never edit the approval to match |
+| degraded mode ran and swapped | live delta = keep set; blocked days **retained** | not an abort. Record in the summary: degraded approval reference, dropped candidates, retained blocked days |
 | `quiesce_failed` | auto-start attempted (nothing touched) | NO-GO for this window; check PM2 state (`pm2 ls`), fix, retry in a new window |
 | `aborted_stale` | never stopped (quiesce not reached) | nothing touched; NO-GO for this window; rebuild plan from a fresh audit |
 | `rolled_back` + `restored_ok: true` | auto-started (safe: restore verified) | NO-GO; investigate with the artifacts; confirm `/healthz` stable fields match `healthz_before.json` |
@@ -424,9 +466,9 @@ probes.
 
 Conservative mode, **dry-run first, always**; real run only if the dry-run is clean and reviewed.
 ```bash
-cd $WT && $PY - <<'EOF' > $ART/staging_step.log 2>&1
+cd $CODE_ROOT && $PYTHON - <<'EOF' > $ART/staging_step.log 2>&1
 import json, os, sys
-sys.path.insert(0, os.environ["WT"])
+sys.path.insert(0, os.environ["CODE_ROOT"])
 from ingest.prune_staging import prune_daily_staging
 G, ART, HOLD = os.environ["G"], os.environ["ART"], os.environ["HOLD"]
 res = prune_daily_staging(os.path.join(G, "mur.zarr"), HOLD,
@@ -458,8 +500,12 @@ tail -2 $ART/staging_step.log
 
 ```cron
 # O4 alarm (P4-S8b): daily, OUTSIDE ingest windows (Asia/Taipei). Exit 3 == alarm.
-40 09 * * * /home/odbadmin/python/ghrsst-dev2026-phase2/dev2026/.venv/bin/python \
-  /home/odbadmin/python/ghrsst-dev2026-phase2/dev2026/ops/p4_retention_audit.py \
+# The interpreter comes from the phase2 venv; the SCRIPT comes from the P4 code root. They
+# are not the same tree, and the previous line took both from phase2, where the script does
+# not exist -- a cron that reads correctly and never ran.
+40 09 * * * PYTHONPATH=/home/odbadmin/python/ghrsst-p4s10/dev2026 \
+  /home/odbadmin/python/ghrsst-dev2026-phase2/dev2026/.venv/bin/python \
+  /home/odbadmin/python/ghrsst-p4s10/dev2026/ops/p4_retention_audit.py \
   --daily /home/odbadmin/Data/ghrsst/mur.zarr \
   --base  /home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.zarr \
   --delta /home/odbadmin/Data/ghrsst/mur_timecube_s8_t90_sh128.delta.zarr \
@@ -469,6 +515,9 @@ tail -2 $ART/staging_step.log
 - **Exit-code policy:** 0 = quiet; **3 = alarm fired** → the `|| <ops alerting hook>` (mail/notify —
   ops' existing mechanism) MUST page a human; 2 cannot occur without `--strict` (do not add it here —
   the alarm cron is a monitor, not a gate).
+- **Before installing the line, verify both paths resolve** (the check that would have
+  caught the previous version): `test -x <interpreter> && test -f <script>`, then run it
+  once by hand.
 - **The alarm NEVER prunes/compacts/mutates** — it only notifies. Response to an alarm is a human
   decision (provision disk → unlock O1/O3, fund the O2 §6.1 design, or schedule another S10-style
   prune run).
@@ -513,6 +562,9 @@ curl -fsS http://127.0.0.1:8035/healthz
 ```
 P4-S10 SUMMARY — RUN_ID: ............  operator: ............  approval ref: ............
 step 2 fresh audit: rc=.. / window contiguous Y/N / blocked_need_compaction_first: [..] / decision: ..
+step 4a mode: normal | degraded_candidate_only (approval ref: ................)
+             dropped candidates (exactly audit delta_prune_candidates): [..] (n=..)
+             blocked days RETAINED in delta: [..] (n=..)
 step 4a plan: status .. / keep .. days / dropped [..] / (or SKIPPED because ..)
 step 4b swap: status .. / verify.ok .. / posture: stop-swap-start (REQUIRED; restart-after-swap is rejected) / backup: ..
 step 3 cron guard: flock-in-wrapper | cron-disabled(+re-enabled Y/N) | schedule-separation-OVERRIDE(justification: ..)
@@ -525,10 +577,21 @@ VERDICT: PASS / NO-GO (which condition fired: ..............................)
 ## 9. Rollback / abort (consolidated)
 
 **Abort conditions** (any → stop; record which): audit rc=2; free-disk alarm; recent-window hole;
-`blocked_need_compaction_first` non-empty (for §4); append log without completion marker; inside a cron
-window; `aborted_stale`; plan `refused`/`invalid`/`error`; `rolled_back`; **`rollback_failed`
+**`blocked_need_compaction_first` non-empty (for §4) — NO-GO by default**, and the ONLY way past it
+is the recorded operator approval for degraded candidate-only mode described in §2 and executed in
+§4a; a degraded run whose dropped set is not exactly `delta_prune.delta_prune_candidates`; append log
+without completion marker; inside a cron window; `aborted_stale`; plan `refused`/`invalid`/`error`; `rolled_back`; **`rollback_failed`
 (ambiguous — hard stop, manual recovery)**; any §7 hard gate failing; any command targeting a path
 outside `$G`/worktree.
+
+**Degraded candidate-only mode (§2 / §4a) — what it is and is not.** It is an approved, narrower
+prune: the dropped set is exactly the audit's `delta_prune_candidates`, and every
+`blocked_need_compaction_first` day **stays in delta** because base cannot serve it. It is **not** a
+relaxation of any gate — `prune_delta`'s base-coverage check still runs and still refuses. A degraded
+run that completes is a **success**, not an abort, and the operator summary must record the approval
+reference, the dropped candidates and the retained blocked days. Widening the keep window to "make
+the numbers work" is the one response that is never allowed: those days are precisely the ones the
+base cannot answer for.
 
 **Recovery ladder:**
 1. `rolled_back` — live already restored + re-verified by the executor; nothing further to recover.
