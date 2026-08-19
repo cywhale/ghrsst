@@ -750,64 +750,106 @@ def capacity_gate(*, free_now_gb: float, s: int = DEFAULT_S,
 
 
 # ------------------------------------------------- hold / lifecycle audit (read-only)
-HOLD_CLASSES = ("referenced", "blocked_unique_copy", "repair_or_refold_pending",
-                "releasable_after_approval", "inconsistent_or_unknown")
+HOLD_CLASSES = ("referenced", "blocked_unique_copy", "repair_state_unknown_pre_p5",
+                "recovery_policy_pending", "releasable_after_approval",
+                "inconsistent_or_unknown")
 
 
 def classify_hold_entry(*, entry: dict, now_utc: str, base_days: set,
                         spatial_window: Sequence[str],
+                        base_value_parity_verified: bool = False,
+                        recovery_source_verified: bool = False,
+                        p5_roots_present: bool = False,
                         wal_repairs_pending: Optional[set] = None,
+                        referenced_by_rollback: bool = False,
+                        in_active_serving_path: bool = False,
                         tracked_in_manifest: bool = True) -> dict:
-    """Classify ONE hold entry. Read-only reasoning; deletes nothing, ever.
+    """Classify ONE hold entry, read-only. Deletes nothing and authorizes nothing.
 
-    Fail-closed by construction: the releasable verdict is the LAST branch, reachable only when
-    every prior objection has been positively cleared. Anything unverifiable lands in
-    `inconsistent_or_unknown`, never in `releasable_after_approval`.
+    ## What each piece of evidence does and does NOT establish
 
-    The order matters and is the S5 lifecycle's, not a convenience: an entry that is still
-    referenced, or is the only copy of a day base cannot serve, or has repair work outstanding,
-    is not releasable no matter what its `hold_until` says."""
+    The first version of this collapsed several different questions into one verdict, and got
+    the answer wrong. They are separate fields now because they are separate facts:
+
+    - `base_membership_covered` -- base's day SET contains the day. Says nothing about values.
+    - `base_value_parity_verified` -- base's BYTES for the day match the held copy. This is what
+      would make base a substitute; membership alone never was.
+    - `bbox_spatially_unneeded` -- the day is outside the enforced spatial window, so bbox does
+      not need it. **This alone can never authorize a release**: it says nothing about
+      point/time-range, about a base rebuild, or about recovery.
+    - `recovery_source_verified` -- some OTHER retrievable copy exists (NetCDF on disk, or a
+      recorded external manifest with a usable download window). Without it, deleting a daily
+      hold removes the local rebuild source for that day.
+    - `release_authorized` -- true only when base can substitute for the day AND a recovery path
+      survives the deletion.
+
+    ## Pre-P5 hosts
+
+    When the P5 roots are absent there is no repair WAL to read, so "no pending repair" is
+    **not a finding**. It is `repair_state_unknown_pre_p5`: unchecked, not clear.
+    """
     days = list(entry.get("days") or ([entry["day"]] if entry.get("day") else []))
-    reasons = []
+    ev = {"base_membership_covered": None, "base_value_parity_verified": False,
+          "bbox_spatially_unneeded": None, "recovery_source_verified": False,
+          "release_authorized": False}
+
+    def out(klass, reason):
+        return {"klass": klass, "days": days, "evidence": ev, "reason": reason}
 
     if not tracked_in_manifest:
-        return {"klass": "inconsistent_or_unknown", "days": days,
-                "reason": ("present on disk but not recorded in the hold manifest, so no "
-                           "lifecycle state exists for it. Not releasable: an untracked path "
-                           "is exactly what a manual `rm` would have left behind.")}
+        return out("inconsistent_or_unknown",
+                   "present on disk but absent from the hold manifest, so no lifecycle state "
+                   "exists for it; an untracked path is what a manual cleanup leaves behind")
     if not days:
-        return {"klass": "inconsistent_or_unknown", "days": [],
-                "reason": "the hold record names no day; its coverage cannot be established"}
-    hold_until = entry.get("hold_until")
-    if not hold_until:
-        return {"klass": "inconsistent_or_unknown", "days": days,
-                "reason": "no hold_until in the record; the retention window is unknown"}
+        return out("inconsistent_or_unknown", "the record names no day")
+    if not entry.get("hold_until"):
+        return out("inconsistent_or_unknown", "no hold_until; the retention window is unknown")
 
-    pending = set(wal_repairs_pending or ())
-    overlap = sorted(set(days) & pending)
-    if overlap:
-        return {"klass": "repair_or_refold_pending", "days": days,
-                "reason": f"repair/refold outstanding for {overlap[:3]}"}
+    if in_active_serving_path:
+        return out("referenced", "still on the active serving path")
+    if referenced_by_rollback:
+        return out("referenced", "named as a rollback/reverse-swap target")
 
-    uncovered = sorted(d for d in days if d not in base_days)
-    if uncovered:
-        return {"klass": "blocked_unique_copy", "days": days,
-                "reason": (f"{len(uncovered)} day(s) are not in base, first {uncovered[0]}: "
-                           f"this hold is the only local copy and releasing it loses the day")}
+    ev["base_membership_covered"] = all(d in base_days for d in days)
+    ev["bbox_spatially_unneeded"] = not (
+        spatial_window and any(spatial_window[0] <= d <= spatial_window[1] for d in days))
+    ev["base_value_parity_verified"] = bool(base_value_parity_verified)
+    ev["recovery_source_verified"] = bool(recovery_source_verified)
 
-    if spatial_window and any(spatial_window[0] <= d <= spatial_window[1] for d in days):
-        return {"klass": "referenced", "days": days,
-                "reason": (f"day(s) fall inside the enforced spatial window "
-                           f"{spatial_window[0]}..{spatial_window[1]} and are still served")}
+    if not ev["base_membership_covered"]:
+        missing = sorted(d for d in days if d not in base_days)
+        return out("blocked_unique_copy",
+                   f"{len(missing)} day(s) are not in base, first {missing[0]}: this is the "
+                   f"only local copy and releasing it loses the day")
 
-    if hold_until > now_utc:
-        return {"klass": "referenced", "days": days,
-                "reason": f"hold_until {hold_until} has not passed (now {now_utc})"}
+    if not ev["bbox_spatially_unneeded"]:
+        return out("referenced", "day(s) fall inside the enforced spatial window")
 
-    return {"klass": "releasable_after_approval", "days": days,
-            "reason": ("base covers every day, none fall inside the spatial window, no repair "
-                       "is outstanding, and hold_until has passed. RELEASE STILL REQUIRES "
-                       "HUMAN APPROVAL: this classification authorizes nothing.")}
+    if not p5_roots_present:
+        return out("repair_state_unknown_pre_p5",
+                   "the P5 roots are absent, so no repair WAL exists to consult. Repair state "
+                   "is UNCHECKED, not clear, and an unchecked precondition cannot authorize a "
+                   "release")
+    if set(days) & set(wal_repairs_pending or ()):
+        return out("repair_state_unknown_pre_p5", "repair/refold outstanding for day(s) held")
+
+    if entry["hold_until"] > now_utc:
+        return out("referenced", f"hold_until {entry['hold_until']} has not passed")
+
+    # Everything above is necessary. NONE of it is sufficient: membership is not parity, and an
+    # expired window is not a recovery plan.
+    if not (ev["base_value_parity_verified"] or ev["recovery_source_verified"]):
+        return out("recovery_policy_pending",
+                   "base covers the day SET and the retention window has passed, but base/hold "
+                   "VALUE parity is unverified and no recovery source is confirmed. Deleting "
+                   "this removes the local rebuild source for those days. Needs an operator "
+                   "policy decision, not a classifier's verdict")
+
+    ev["release_authorized"] = True
+    return out("releasable_after_approval",
+               "base substitutes for the day (membership plus verified parity or a confirmed "
+               "recovery source), the window has passed, and nothing references it. RELEASE "
+               "STILL REQUIRES HUMAN APPROVAL: this authorizes nothing on its own")
 
 
 # --------------------------------------------------------------------------- deferred

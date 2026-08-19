@@ -45,7 +45,7 @@
       "verdict": "NOT_ADJUDICATED"
     },
     "G18_capacity": {
-      "audit_note": "A hold audit finds ~2288 GiB releasable after approval, which would clear the 136.3 GiB shortfall. G18 remains BLOCKED: audit_only, no deletion performed.",
+      "audit_note": "Round 2: safely reclaimable is ~96 GiB, not ~2288 GiB. Still ~40 GiB short of 403.3 GiB. The 2192 GiB of daily holds await an operator decision on the local rebuild source. audit_only, no deletion performed, G18 BLOCKED.",
       "reason": "projected_free_after 113.7 GB < HARD_RESERVE 250 GB; shortfall 136.3 GB. 403.3 GB free would be needed. Blocked even with temp and growth set to zero.",
       "verdict": "BLOCKED"
     },
@@ -109,65 +109,89 @@
     },
     "candidates": [
       {
-        "basis": "every day is inside base's gapless 2023-01-01..2026-06-26 range, so base serves point/range for all of them; the newest held day 2026-06-20 is before the enforced spatial window starts (2026-06-27), so none is needed for bbox; hold_until has passed",
         "bytes": 2353299279803,
         "day_range": [
           "2023-01-01",
           "2026-06-20"
         ],
+        "evidence": {
+          "base_membership_covered": true,
+          "base_value_parity_verified": false,
+          "bbox_spatially_unneeded": true,
+          "recovery_source_verified": false,
+          "release_authorized": false
+        },
         "gib": 2191.7,
         "hold_until": "2026-08-13T03:19:41Z (PASSED)",
-        "klass": "releasable_after_approval",
-        "path_glob": "hold/mur.zarr.day-<date>.pre-prune-20260730T031941Z-5fbaa5",
-        "safe_to_release": "yes, SUBJECT TO HUMAN APPROVAL",
-        "what": "daily staging holds, 1267 day directories"
+        "klass": "recovery_policy_pending",
+        "operator_decision_required": "EITHER verify base/hold value parity (var_valid and NaN semantics included) for the range, OR record an external recovery manifest with a usable download window, OR accept in writing that the local daily rebuild source is given up.",
+        "safe_to_release": "NOT ON THIS EVIDENCE",
+        "what": "daily staging holds, 1267 day directories",
+        "why_not_releasable": "base covers the day SET gaplessly and the retention window has passed -- both necessary, neither sufficient. Base/hold VALUE parity was not verified, and no recovery source covers these days (local NetCDF starts 2026-07-12). Deleting them removes the only local rebuild source for 2023-01-01..2026-06-20."
       },
       {
-        "basis": "superseded by two later prune swaps; their days are covered by base (<=2026-06-26) or by the live delta (2026-06-27..2026-08-17)",
+        "basis": "day sets read from each backup's own attributes; every day is covered by base (<=2026-06-26, gapless) or by the LIVE delta (2026-06-27..2026-08-17), which is the recovery source. Not on the serving path -- serving reads the live delta path, these sit under hold/. Not the rollback target: the 2026-08-18 backup is, and two later verified swaps supersede these. Expiry alone was treated as necessary, not sufficient.",
         "bytes": 103423011956,
+        "caveat": "value parity was not byte-verified; the basis is set coverage plus supersession",
+        "day_ranges": [
+          [
+            "2026-05-30",
+            "2026-07-08"
+          ],
+          [
+            "2026-06-05",
+            "2026-07-26"
+          ]
+        ],
+        "evidence": {
+          "base_membership_covered": true,
+          "base_value_parity_verified": false,
+          "bbox_spatially_unneeded": true,
+          "recovery_source_verified": true,
+          "release_authorized": true
+        },
         "gib": 96.3,
         "hold_until": "2026-07-23 and 2026-08-11 (both PASSED)",
         "klass": "releasable_after_approval",
-        "path_glob": "hold/mur_timecube_s8_t90_sh128.delta.zarr.pre-prune-{20260709,20260728}*",
         "safe_to_release": "yes, SUBJECT TO HUMAN APPROVAL",
         "what": "expired delta pre-prune backups (2026-07-09, 2026-07-28)"
       },
       {
-        "basis": "inside its retention window; it is the reverse-swap target for the most recent prune",
+        "basis": "inside its retention window and the reverse-swap target for the latest prune",
         "bytes": 63614571775,
         "gib": 59.2,
         "hold_until": "2026-09-01T13:27:27Z (NOT passed)",
         "klass": "referenced",
-        "path": "hold/mur_timecube_s8_t90_sh128.delta.zarr.pre-prune-20260818T132723Z-7c3b72",
         "safe_to_release": "NO",
         "what": "newest delta pre-prune backup (2026-08-18)"
       },
       {
-        "basis": "present on disk but NOT recorded in hold/manifest.jsonl, so no lifecycle state exists for them. Excluded from the reclaimable total by policy: an untracked path is what a manual cleanup would have left behind, and it is not this audit's to authorize",
+        "basis": "on disk with no hold record, so no lifecycle state exists for them",
+        "gib": 41.0,
         "klass": "inconsistent_or_unknown",
         "paths": [
-          "mur_timecube_s8_t90_sh128.delta.zarr.p4build.20260727T021310Z (~38 GB)",
-          "mur_timecube_s8_t90_sh128.delta.zarr.pre-gapfix.20260625T133355 (~3 GB)"
+          "mur_timecube_s8_t90_sh128.delta.zarr.p4build.20260727T021310Z (~38 GiB)",
+          "mur_timecube_s8_t90_sh128.delta.zarr.pre-gapfix.20260625T133355 (~3 GiB)"
         ],
-        "safe_to_release": "NOT DETERMINABLE without an ops decision",
+        "safe_to_release": "NO -- unchanged from round 1; needs an ops decision, not this audit's",
         "what": "two delta copies outside the hold manifest"
       }
     ],
     "capacity": {
-      "currently_reclaimable_bytes": 2456722291759,
-      "currently_reclaimable_gib": 2288.0,
-      "disk_expansion_required": false,
-      "excluded_from_reclaimable_gib": {
-        "referenced_newest_delta_backup": 59.2,
-        "untracked_paths": 41.0
-      },
-      "free_after_hypothetical_reclaim_gib": 2555.0,
+      "currently_reclaimable_bytes": 103423011956,
+      "currently_reclaimable_gib": 96.3,
+      "disk_expansion_or_policy_decision_required": true,
+      "excluded_referenced_gib": 59.2,
+      "excluded_untracked_gib": 41.0,
+      "free_after_hypothetical_reclaim_gib": 363.3,
       "free_now_gib": 267.0,
-      "remaining_shortfall_gib": 0.0,
+      "note": "ONLY the two expired delta backups. Round 1 counted the 1267 daily holds here; they are now recovery_policy_pending and are excluded.",
+      "remaining_shortfall_gib": 40.0,
       "required_free_before_build_gib": 403.3,
-      "unblocks_G18_if_executed": true
+      "unblocks_G18_if_executed": false,
+      "withheld_pending_operator_decision_gib": 2191.7
     },
-    "conclusion": "~2288 GiB is theoretically reclaimable against a 136.3 GiB shortfall -- roughly 17x what G18 needs. DISK EXPANSION IS NOT REQUIRED. But nothing was deleted, theoretical reclaim is not reclaimed capacity, and G18 stays BLOCKED until a human approves the release and it actually happens.",
+    "conclusion": "Safely reclaimable on the evidence available: ~96 GiB (two expired delta backups). That leaves ~40 GiB short of the 403.3 GiB the build needs. The 2192 GiB of daily holds could close it many times over, but ONLY after an operator decision about the local rebuild source -- which this audit does not make. G18 remains BLOCKED; nothing was deleted.",
     "deletion_performed": false,
     "enforced_spatial_window": [
       "2026-06-27",
@@ -179,12 +203,27 @@
       "unparsable": 0
     },
     "label": "VM24_PRODUCTION_READ_ONLY",
-    "measured_utc": "2026-08-19T07:20:00Z",
+    "measured_utc": "2026-08-19T07:40:00Z",
     "measurement_note": "`du --block-size=1G` per directory summed to 2534 GiB against a 2347 GiB total, because it rounds each of 1267 entries UP. All figures here are `du -sb` bytes; the daily and backup totals sum to the measured hold total, which is the check that caught it.",
     "method": "hold/manifest.jsonl read + du -sb; no path was modified",
     "mode": "audit_only",
-    "p5_roots_note": "p5_blocks / p5_repairs / p5_anchor / base_blocks are all ABSENT, so no repair WAL, Phase A state or segmented manifest exists on this host. `repair_or_refold_pending` is therefore empty by construction rather than by inspection, and that distinction is recorded rather than hidden.",
-    "p5_roots_present": false
+    "p5_roots_note": "p5_blocks / p5_repairs / p5_anchor / base_blocks are ABSENT, so there is no repair WAL to read. Repair state is therefore UNCHECKED, not clear. Round 1 reported these categories as 'empty', which read as a finding; the class is now `repair_state_unknown_pre_p5`.",
+    "p5_roots_present": false,
+    "recovery_sources": {
+      "consequence": "for the 1267 held daily days, the hold IS the only local rebuild source. Base can serve those days for point/range, but base is not a source you can rebuild base FROM.",
+      "covers_daily_hold_range": false,
+      "finding": "the only local NetCDF holding is 32 files covering 2026-07-12..2026-08-17. It does NOT cover the daily hold range 2023-01-01..2026-06-20 -- not one day of it. There is no recorded external recovery manifest, download window or rebuild procedure on this host either.",
+      "label": "VM24_PRODUCTION_READ_ONLY",
+      "local_netcdf_bytes": 23625668015,
+      "local_netcdf_coverage": [
+        "2026-07-12",
+        "2026-08-17"
+      ],
+      "local_netcdf_dir": "src/",
+      "local_netcdf_files": 32
+    },
+    "revision": 2,
+    "revision_note": "Round 1 classified the 1267 daily holds as releasable from base MEMBERSHIP plus 'outside the spatial window'. Both were withdrawn: membership is not value parity, and 'bbox does not need it' is not 'nothing needs it'. That verdict is superseded below."
   },
   "host": "odb24",
   "measured_local": "2026-08-19T15:12:51+08:00",

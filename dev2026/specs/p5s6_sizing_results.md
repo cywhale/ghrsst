@@ -350,6 +350,201 @@ What remains true: a 2 TB monolith rebuild is far further out of reach than one 
 which is the constraint O2 exists to remove. But **O2 cannot run on VM24 at today's free
 space**, and no local result changes that.
 
+### Hold / lifecycle audit — **AUDIT ONLY, NO DELETION PERFORMED** (revision 2)
+
+> **Revision 1 is withdrawn.** It classified the 1267 daily holds as releasable on base
+> **membership** plus "outside the spatial window". Neither authorizes a release: membership is
+> not **value parity**, and "bbox does not need it" is not "nothing needs it". The corrected
+> verdict is below, and the reclaimable figure drops from ~2288 GiB to **~96 GiB**.
+
+Read-only: `hold/manifest.jsonl`, store attributes, `healthz`, `du -sb`. Nothing deleted, moved
+or modified. This classification **authorizes nothing**.
+
+#### The finding that changes the answer
+
+The only local NetCDF holding is **32 files covering `2026-07-12`..`2026-08-17`** (~22 GiB). It
+does **not cover one day** of the daily hold range `2023-01-01`..`2026-06-20`, and there is no
+recorded external recovery manifest or download window on the host.
+
+So for those 1267 days **the hold is the only local rebuild source**. Base can *serve* them for
+point/range — but base is not something you can rebuild base *from*.
+
+#### Classification
+
+| class | what | size | releasable? |
+|---|---|---|---|
+| `recovery_policy_pending` | 1267 daily holds, `2023-01-01`..`2026-06-20` | ~2192 GiB | **not on this evidence** |
+| `releasable_after_approval` | 2 expired delta backups (07-09, 07-28) | ~96 GiB | yes, with approval |
+| `referenced` | newest delta backup (08-18), `hold_until` 2026-09-01 | ~59 GiB | no |
+| `inconsistent_or_unknown` | 2 delta copies not in the hold manifest | ~41 GiB | no |
+
+Evidence is recorded per entry as five **separate** fields — `base_membership_covered`,
+`base_value_parity_verified`, `bbox_spatially_unneeded`, `recovery_source_verified`,
+`release_authorized` — because they are separate facts and collapsing them is what produced the
+wrong answer. `bbox_spatially_unneeded` can never authorize a release on its own, and a test
+enforces that.
+
+The two expired delta backups do qualify: their day sets (read from each backup's own
+attributes) are covered by base or by the **live delta**, which is the recovery source; they are
+not on the serving path; and the rollback target is the 2026-08-18 backup, not these. Expiry was
+treated as necessary, not sufficient. Value parity was not byte-verified — the basis is set
+coverage plus supersession, and that is stated in the artifact.
+
+**P5 repair state is `repair_state_unknown_pre_p5`, not "empty".** `p5_blocks` / `p5_repairs` /
+`p5_anchor` / `base_blocks` are absent, so there is no WAL to read: **unchecked, not clear**.
+Revision 1 reported "empty", which read as a finding.
+
+#### Does it clear G18?
+
+| | GiB |
+|---|---|
+| `currently_reclaimable` (expired delta backups only) | **96.3** |
+| `free_now` | 267.0 |
+| `free_after_hypothetical_reclaim` | 363.3 |
+| `required_free_before_build` | 403.3 |
+| **`remaining_shortfall`** | **40.0** |
+| withheld pending operator decision | 2192.0 |
+
+**No.** Safe reclamation leaves the build ~40 GiB short. The daily holds would close it many
+times over, but only after an operator decision this audit does not make.
+
+**G18 remains BLOCKED.** Theoretical reclaim is not reclaimed capacity; nothing was deleted, and
+only an actual deletion followed by a fresh `df` can change the gate.
+
+#### The operator decision required
+
+To release the 1267 daily holds, **one** of these must exist:
+
+1. verified base/hold **value parity** across `2023-01-01`..`2026-06-20`, including `var_valid`
+   and NaN semantics — not membership;
+2. a recorded **external recovery manifest** with a usable download window and a rebuild
+   procedure;
+3. a written acceptance that the **local daily rebuild source is given up**.
+
+Otherwise the alternative is **expanding the data volume** by at least the 40 GiB shortfall,
+with margin.
+
+## H5 — crossing latency through a real `TieredCube` (item 3, DELIVERED)
+
+`measure_h5_span()` builds a published base **and** a delta from **one oracle**: the delta days
+are the same days the base tail holds, then stamped with a distinct per-day value so precedence
+is observable. Two independently generated fixtures would make any disagreement meaningless —
+it would not be a bug, just two different datasets.
+
+Each span measures **base-only**, **crossing** and **delta-only** requests through
+`TieredCube.point_series()`, recording p50/p95, requested vs returned day counts, and
+`day_source` per day. Spans: **31 / 45 / 64 / 90 / 124** in the full run; the first two in
+`quick`.
+
+Asserted, not assumed:
+
+- the crossing request really spans **both** tiers (`day_source` contains base *and* delta) —
+  otherwise "crossing" is a base read with a longer name;
+- **delta wins** for days both tiers hold, checked on the **timed rows themselves**. Base holds
+  the same days, so a timed loop reading base alone returns the right *count* — a mutation doing
+  exactly that survived until the values were checked;
+- a **negative control** makes the precedence check fail on demand, so `ok: True` is falsifiable.
+
+Timings are in the artifact under `H5.by_span`, not reproduced here. **LOCAL_SYNTHETIC: it does
+not adjudicate G3, which is a VM24 measurement.**
+
+## Provisional design target
+
+**S=90 / C=30**, an operator decision recorded here, held as `DEFAULT_S` / `DEFAULT_C`
+**configuration** in the harness and never hardcoded at a call site. Production adjudication
+still waits on VM24's G3 / H7 / G16.
+
+## Item 4 — NOT STARTED
+
+**O2 tail carry-forward.** One finding that changes its shape: the carry-forward contract
+**already exists** in S3's `build_block` — `predecessor_path`, `predecessor_present`,
+`resolve_source_map()` with authority order delta → block → daily → hold, delta-wins for late
+corrections, `rebuild_source_set = predecessor_present ∪ newly_present`, and a refusal for any
+day whose source cannot be resolved *before* anything is written. So O2 is **exercising and
+measuring that path**, not building a second source-map or provenance truth beside it.
+
+Not started here, and `measure_tail_rebuild` remains DEFERRED and publishes no numbers.
+
+## VM24 — read-only measurement TAKEN
+
+**Artifact: `bench/results/p5s6_vm24_readonly.json`, provenance `VM24_PRODUCTION_READ_ONLY`.**
+Kept in its own file: no VM24 number appears in the LOCAL_SYNTHETIC artifacts and none of the
+synthetic numbers appear here. Host stable throughout (up 5 days, load 0.10) — no measurement
+was marked BLOCKED.
+
+Read-only only: `df`, `df -i`, `free`, `findmnt`, `/healthz`, `pm2 jlist`, `/proc/<pid>` and
+`du -sh`, plus **21 serial point-range GETs** at concurrency 1, 0.3 s apart. No prune, swap,
+compaction, repair, hold deletion, cron/PM2/systemd change, or write of any kind.
+
+### The model was close — checked against the real stores for the first time
+
+| | measured | modelled (§10.3) |
+|---|---|---|
+| delta GB/day | 1.12 | 1.09 |
+| base GB/day | 1.62 | 1.57 |
+
+Both within ~3 %. The §10.3 volume table, and the peak-temp-disk figures derived from it, rest on
+numbers that now have production evidence behind them.
+
+### The H5 finding, and it inverts a natural assumption
+
+**Delta-only is the slowest window**, despite returning *fewer* days than base-only:
+
+| window | days returned | p50 | p95 |
+|---|---|---|---|
+| base-only | 51 | fastest | |
+| crossing | 31 | middle | |
+| delta-only | 41 | **slowest** | |
+
+(Values in the artifact; not reproduced here, per the timing-drift guard.) Delta is
+**t1/s256** — one chunk per day — so a 41-day delta read touches ~41 chunks per variable, while
+base's `(90,8,8)` chunking serves 51 days from far fewer. This is §10.1's claim that **cadence,
+not block size, governs the read cost of the delta tail** — measured on production rather than
+modelled.
+
+It is a direct argument for the **small C** in the provisional S=90 / C=30 target: C drives the
+delta span, and the delta span is what this measurement shows dominating read latency.
+
+### Gates, from VM24 evidence
+
+| gate | verdict | why |
+|---|---|---|
+| **G3** | **NOT_ADJUDICATED** | 1-concurrency samples at one coordinate over 3 windows. They inform G3; they do not decide it. |
+| **H7 inode headroom** | **PASS_EVIDENCE_AVAILABLE** | 225,490,340 free inodes against a ~4.9 M +10 y projection — ~46× headroom. The adjudication is the reviewer's. |
+| **H7 fd/RSS** | **NOT_ADJUDICATED** | 22 fds, 78 MB RSS at rest; H7 asks for C=8/16 under sustained load, which is not a read-only measurement. |
+| **G16** | **NOT_ADJUDICATED** | metadata scan / snapshot-open on the production tree were not measured; walking a 5.4 T store is not a low-rate probe. |
+
+### Capacity gate (§7.1c / G18) — **BLOCKED**
+
+**The earlier claim in this document that "141 GB fits with margin" was wrong, and is
+withdrawn.** It compared the block size alone against free space. The gate is
+`projected_free_after ≥ HARD_RESERVE`, and `additional` is never the block alone:
+
+| term | value | source |
+|---|---|---|
+| `free_now` | 267 GB | `df` avail, measured |
+| `new_block` (S=90 × 1.62 GB/day) | 145.8 GB | measured base rate |
+| `temp` / checkpoint / artifacts | 2 GB | estimate |
+| `growth_during_build` (2.74 GB/day × 2 d) | 5.5 GB | measured ingest rate, **assumed** duration |
+| **`additional`** | **153.3 GB** | |
+| **`projected_free_after`** | **113.7 GB** | `free_now − additional` |
+| `HARD_RESERVE` | **250 GB** | §7.1c / P4-S4 §6 |
+
+**113.7 GB < 250 GB → BLOCKED.** Shortfall **136.3 GB**; the build would need **403.3 GB** free.
+
+It stays blocked with `temp` and `growth` set to **zero** — the block alone breaches the
+reserve — so the verdict does not depend on how the soft terms are estimated, and the assumed
+2-day build duration does not change it either.
+
+`HARD_RESERVE` is **not** adjusted here. Lowering a reserve to make a gate pass is an ops policy
+decision raised separately, never an implementation detail; a test pins it at 250 GB. The
+arithmetic is cross-checked against the shipped `build_block.disk_precheck` on identical inputs,
+so this is production's formula rather than a second one.
+
+What remains true: a 2 TB monolith rebuild is far further out of reach than one 90-day block,
+which is the constraint O2 exists to remove. But **O2 cannot run on VM24 at today's free
+space**, and no local result changes that.
+
 ### Hold / lifecycle audit — **AUDIT ONLY, NO DELETION PERFORMED**
 
 Read-only: `hold/manifest.jsonl` plus `du -sb`. Nothing was deleted, moved or modified, and this

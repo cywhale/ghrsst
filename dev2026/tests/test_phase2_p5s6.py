@@ -758,71 +758,106 @@ class TestCapacityGate(unittest.TestCase):
 
 
 class TestHoldLifecycleClassification(unittest.TestCase):
-    """Read-only classification. It authorizes nothing; the tests exist so that the one verdict
-    that could lose data is the hardest to reach."""
+    """Round 2. The first version authorized a release from membership + spatial window alone.
+    Membership is not parity, and "bbox does not need it" is not "nothing needs it"."""
 
     NOW = "2026-08-19T07:12:51+00:00"
     WINDOW = ("2026-06-27", "2026-08-17")
     BASE = {f"2026-06-{d:02d}" for d in range(1, 27)} | {"2026-01-01"}
+    EXPIRED = {"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"}
 
-    def _c(self, entry, **kw):
+    def _c(self, entry=None, **kw):
         kw.setdefault("base_days", self.BASE)
         kw.setdefault("spatial_window", self.WINDOW)
-        return sizing.classify_hold_entry(entry=entry, now_utc=self.NOW, **kw)
+        kw.setdefault("p5_roots_present", True)
+        return sizing.classify_hold_entry(entry=entry or dict(self.EXPIRED),
+                                          now_utc=self.NOW, **kw)
 
-    def test_a_clean_expired_hold_is_releasable(self):
-        out = self._c({"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"})
+    # ---- the defect this round exists to fix -------------------------------
+    def test_being_outside_the_spatial_window_ALONE_never_authorizes(self):
+        out = self._c()
+        self.assertTrue(out["evidence"]["bbox_spatially_unneeded"])
+        self.assertTrue(out["evidence"]["base_membership_covered"])
+        self.assertNotEqual(out["klass"], "releasable_after_approval")
+        self.assertFalse(out["evidence"]["release_authorized"])
+
+    def test_membership_without_parity_or_recovery_is_recovery_policy_pending(self):
+        out = self._c()
+        self.assertEqual(out["klass"], "recovery_policy_pending")
+        self.assertIn("removes the local rebuild source", out["reason"])
+        self.assertFalse(out["evidence"]["base_value_parity_verified"])
+        self.assertFalse(out["evidence"]["recovery_source_verified"])
+
+    def test_verified_parity_authorizes(self):
+        out = self._c(base_value_parity_verified=True)
         self.assertEqual(out["klass"], "releasable_after_approval")
+        self.assertTrue(out["evidence"]["release_authorized"])
         self.assertIn("REQUIRES HUMAN APPROVAL", out["reason"])
 
-    def test_a_day_base_does_NOT_cover_is_a_unique_copy(self):
-        out = self._c({"day": "2026-06-30", "hold_until": "2026-01-01T00:00:00+00:00"})
-        self.assertEqual(out["klass"], "blocked_unique_copy")
-        self.assertIn("only local copy", out["reason"])
+    def test_a_verified_recovery_source_authorizes(self):
+        out = self._c(recovery_source_verified=True)
+        self.assertEqual(out["klass"], "releasable_after_approval")
 
-    def test_a_day_inside_the_spatial_window_is_still_referenced(self):
-        out = self._c({"day": "2026-07-01", "hold_until": "2026-01-01T00:00:00+00:00"},
-                      base_days=self.BASE | {"2026-07-01"})
+    # ---- pre-P5 semantics --------------------------------------------------
+    def test_absent_P5_roots_are_UNCHECKED_not_clear(self):
+        out = self._c(p5_roots_present=False, recovery_source_verified=True)
+        self.assertEqual(out["klass"], "repair_state_unknown_pre_p5")
+        self.assertIn("UNCHECKED, not clear", out["reason"])
+        self.assertNotEqual(out["klass"], "releasable_after_approval")
+
+    def test_a_pending_repair_blocks_release(self):
+        out = self._c(wal_repairs_pending={"2026-01-01"}, recovery_source_verified=True)
+        self.assertEqual(out["klass"], "repair_state_unknown_pre_p5")
+
+    # ---- reference / uniqueness -------------------------------------------
+    def test_a_day_base_does_NOT_cover_is_a_unique_copy(self):
+        out = self._c({"day": "2026-06-30", "hold_until": "2026-01-01T00:00:00+00:00"},
+                      recovery_source_verified=True)
+        self.assertEqual(out["klass"], "blocked_unique_copy")
+
+    def test_a_rollback_referenced_backup_is_not_releasable(self):
+        out = self._c(referenced_by_rollback=True, recovery_source_verified=True)
+        self.assertEqual(out["klass"], "referenced")
+        self.assertIn("rollback", out["reason"])
+
+    def test_an_entry_on_the_active_serving_path_is_not_releasable(self):
+        out = self._c(in_active_serving_path=True, recovery_source_verified=True)
         self.assertEqual(out["klass"], "referenced")
 
     def test_an_unexpired_hold_is_referenced(self):
-        out = self._c({"day": "2026-01-01", "hold_until": "2026-09-01T00:00:00+00:00"})
+        out = self._c({"day": "2026-01-01", "hold_until": "2026-09-01T00:00:00+00:00"},
+                      recovery_source_verified=True)
         self.assertEqual(out["klass"], "referenced")
-        self.assertIn("has not passed", out["reason"])
 
-    def test_a_pending_repair_blocks_release(self):
-        out = self._c({"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"},
-                      wal_repairs_pending={"2026-01-01"})
-        self.assertEqual(out["klass"], "repair_or_refold_pending")
-
-    def test_an_untracked_path_fails_closed(self):
-        out = self._c({"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"},
-                      tracked_in_manifest=False)
+    def test_an_untracked_path_is_NEVER_releasable(self):
+        out = self._c(tracked_in_manifest=False, recovery_source_verified=True,
+                      base_value_parity_verified=True)
         self.assertEqual(out["klass"], "inconsistent_or_unknown")
-        self.assertIn("not recorded in the hold manifest", out["reason"])
 
     def test_missing_metadata_fails_closed(self):
         for entry in ({"day": "2026-01-01"}, {"hold_until": "2026-08-13T00:00:00+00:00"}):
             with self.subTest(sorted(entry)):
-                self.assertEqual(self._c(entry)["klass"], "inconsistent_or_unknown")
+                self.assertEqual(self._c(entry, recovery_source_verified=True)["klass"],
+                                 "inconsistent_or_unknown")
 
-    def test_repair_outranks_expiry_and_coverage(self):
-        """Ordering: a pending repair must win even when everything else looks releasable."""
-        out = self._c({"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"},
-                      wal_repairs_pending={"2026-01-01"})
-        self.assertNotEqual(out["klass"], "releasable_after_approval")
-
-    def test_only_one_class_can_ever_authorize_a_release(self):
-        self.assertIn("releasable_after_approval", sizing.HOLD_CLASSES)
-        for entry, kw in (({"day": "2026-06-30", "hold_until": "2026-01-01T00:00:00+00:00"}, {}),
-                          ({"day": "2026-01-01", "hold_until": "2026-09-01T00:00:00+00:00"}, {}),
-                          ({"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"},
-                           {"wal_repairs_pending": {"2026-01-01"}}),
-                          ({"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"},
-                           {"tracked_in_manifest": False})):
-            with self.subTest(str(entry)[:40]):
-                self.assertNotEqual(self._c(entry, **kw)["klass"],
-                                    "releasable_after_approval")
+    def test_no_objection_can_be_overridden_by_recovery_evidence(self):
+        """Every blocker, each with parity AND recovery supplied: none may reach releasable."""
+        cases = [
+            ("unique copy", {"entry": {"day": "2026-06-30",
+                                       "hold_until": "2026-01-01T00:00:00+00:00"}}),
+            ("rollback", {"referenced_by_rollback": True}),
+            ("serving", {"in_active_serving_path": True}),
+            ("unexpired", {"entry": {"day": "2026-01-01",
+                                     "hold_until": "2026-09-01T00:00:00+00:00"}}),
+            ("untracked", {"tracked_in_manifest": False}),
+            ("pre-p5", {"p5_roots_present": False}),
+        ]
+        for name, kw in cases:
+            with self.subTest(name):
+                out = self._c(base_value_parity_verified=True,
+                              recovery_source_verified=True, **kw)
+                self.assertNotEqual(out["klass"], "releasable_after_approval")
+                self.assertFalse(out["evidence"]["release_authorized"])
 
 
 if __name__ == "__main__":
