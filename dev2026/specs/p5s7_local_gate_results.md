@@ -18,7 +18,7 @@ Branch `dev2026-p5-s6-o2-local`, based on `5f8450c`.
   disk gate) and
   [`../tests/test_phase2_p5s7_wiring.py`](../tests/test_phase2_p5s7_wiring.py) (base-tier
   authority), committed **failing first**; consistency guards in
-  [`../tests/test_phase2_p5s7_report.py`](../tests/test_phase2_p5s7_report.py) — **55/55** across
+  [`../tests/test_phase2_p5s7_report.py`](../tests/test_phase2_p5s7_report.py) — **57/57** across
   the four modules, **12 mutations killed**, no survivors
 - Artifact: `../bench/results/p5s7_local_gate.json`
 
@@ -153,6 +153,22 @@ What is **not** measured is G7's actual threshold: the temp disk a real producti
 consumes ("≈ one block + margin; never a second full base"). The gate's arithmetic is verified;
 the quantity it gates is not. Local free space also says nothing about VM24, where **G18 remains
 BLOCKED (267 GiB available against a 403.3 GiB minimum)**.
+
+## A green run is not a clean run
+
+`ResourceWarning` is raised from a **finalizer**, where it is printed rather than propagated. So
+`-W error::ResourceWarning` still exits 0 and the suite still reports `OK` while stderr fills
+with leaked-handle warnings — which is exactly what happened here: two unmanaged handles
+(`open(...).read()` for the archive bytes, and `stream=open(os.devnull, "w")` passed to
+`TextTestRunner` once per gate) survived a run this document would otherwise have called clean,
+because the check was on exit status and the warnings were never on that channel.
+
+Both are context-managed now — the runner stream is an `io.StringIO`, which needs no closing at
+all — and the verification reads **stderr**, not the return code. A structural guard asserts no
+S7 module calls `open()` outside a `with`, and proves itself by detecting both reported shapes;
+a re-run under warning filters could not be the guard, since the only reliable runtime check is
+a subprocess whose stderr is inspected, and that would re-run the whole suite to catch one class
+of defect that is plainly visible in the source.
 
 ## Mutation verification
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import io
 import json
 import os
 import statistics
@@ -380,7 +381,10 @@ def run_gate_tests() -> dict:
                 out[gate] = {"verdict": "NOT_ADJUDICATED",
                              "reason": "the mapped tests matched nothing"}
                 continue
-            res = unittest.TextTestRunner(stream=open(os.devnull, "w"), verbosity=0).run(suite)
+            # `io.StringIO` rather than `open(os.devnull, "w")`: this runs once per gate, so an
+            # unclosed devnull handle leaked on every call and each one surfaced a
+            # ResourceWarning from its finalizer. An in-memory stream needs no closing at all.
+            res = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
             passed = res.wasSuccessful()
             out[gate] = {
                 "verdict": "PASS" if passed else "FAIL",

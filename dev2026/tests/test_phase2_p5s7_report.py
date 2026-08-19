@@ -119,6 +119,57 @@ class TestTheArtifactIsSelfConsistent(unittest.TestCase):
         self.assertEqual(self.a["measured"]["concurrency"]["errors"], [])
 
 
+class TestNoUnmanagedFileHandles(unittest.TestCase):
+    """Every `open()` in S7 code must be context-managed.
+
+    `open(...).read()` and `stream=open(os.devnull, "w")` both leave the handle to the garbage
+    collector, which emits its ResourceWarning from a **finalizer** — where it is printed, not
+    raised. So `-W error::ResourceWarning` still exits 0 and the suite still reports OK while
+    stderr fills up. Two such leaks were reported after exactly that reading of a green run:
+    the check was on exit status, and the warnings were never on that channel.
+
+    This guard is structural rather than a re-run under warning filters, because the only
+    reliable runtime check is a subprocess whose *stderr* is inspected — and that would re-run
+    the whole suite to protect against one class of defect. The defect is visible in the source.
+    """
+
+    FILES = ("tests/test_phase2_p5s7_http.py", "tests/test_phase2_p5s7_load.py",
+             "tests/test_phase2_p5s7_wiring.py", "tests/test_phase2_p5s7_report.py",
+             "bench/bench_p5s7_local_gate.py")
+
+    @staticmethod
+    def _unmanaged(source: str):
+        """`open(...)` calls that are not the context expression of a `with` item."""
+        import ast
+        tree = ast.parse(source)
+        managed = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    managed.add(id(item.context_expr))
+        out = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "open" and id(node) not in managed):
+                out.append(node.lineno)
+        return out
+
+    def test_no_S7_module_opens_a_file_outside_a_context_manager(self):
+        for rel in self.FILES:
+            with self.subTest(rel):
+                with open(os.path.join(_DEV, rel)) as fh:
+                    lines = self._unmanaged(fh.read())
+                self.assertEqual(lines, [], f"unmanaged open() at {rel}:{lines}")
+
+    def test_the_guard_detects_both_reported_shapes(self):
+        """Without this the check above passes just as happily on a parser that finds nothing."""
+        bad = ("d = {n: open(n, 'rb').read() for n in names}\n"
+               "r = Runner(stream=open(os.devnull, 'w'))\n")
+        self.assertEqual(len(self._unmanaged(bad)), 2)
+        good = "with open(p, 'rb') as fh:\n    data = fh.read()\n"
+        self.assertEqual(self._unmanaged(good), [])
+
+
 class TestTheCommittedArtifactMatchesTheGenerator(unittest.TestCase):
     """Regenerating must reproduce every non-volatile CLAIM, not merely the labels."""
 

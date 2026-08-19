@@ -51,6 +51,14 @@ CONCURRENCY_LEVELS = (1, 4, 8, 16)
 GATE_RESERVE_BYTES = 256 * 1024 * 1024
 
 
+def _read_bytes(path: str) -> bytes:
+    """Context-managed read. `open(...).read()` leaves the handle to the garbage collector,
+    which emits a ResourceWarning from a finalizer — where it is *printed* rather than raised,
+    so the run still reports OK while stderr is dirty."""
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
 def _open_fds() -> int:
     """Open descriptors for THIS process. `/dev/fd` on macOS, `/proc/self/fd` on Linux."""
     for d in ("/proc/self/fd", "/dev/fd"):
@@ -355,7 +363,7 @@ class TestPostPublicationRollback(_LoadCase):
         days = f.base_days[-BLOCK_DAYS:]
         gen1 = f.generation
         before = self._served(days)
-        archives_before = {n: open(os.path.join(f.root, n), "rb").read()
+        archives_before = {n: _read_bytes(os.path.join(f.root, n))
                            for n in os.listdir(f.root) if n.startswith("manifest.gen")}
 
         p = fx.build_block(os.path.join(f.root, "rb_v2.zarr"), days, ny=NY, nx=NX, seed=4242)
