@@ -30,8 +30,10 @@ APPROVED = ["2026-06-23", "2026-06-24", "2026-06-25", "2026-06-26"]
 LIVE = sorted(BLOCKED + APPROVED + [f"2026-06-{d:02d}" for d in range(27, 31)])
 
 
-def _audit(candidates=APPROVED, blocked=BLOCKED):
+def _audit(candidates=APPROVED, blocked=BLOCKED, calendar=None):
+    cal = list(candidates) + list(blocked) if calendar is None else list(calendar)
     return {"delta_prune": {"available": True, "keep_window_start": "2026-06-27",
+                            "drop_candidates_by_calendar": cal,
                             "delta_prune_candidates": list(candidates),
                             "blocked_need_compaction_first": list(blocked)}}
 
@@ -119,6 +121,153 @@ class TestApprovalIsRequired(unittest.TestCase):
         self.assertIn("rehearsal note", out["approval_ref"])
 
 
+class TestNothingIsCoerced(unittest.TestCase):
+    """Round-3 finding 1. `list("2026-06-01")` is a list of characters and passes every later
+    check; `str(True)` is 'True' and reads like an approver. Input that has to be converted
+    before it can be checked was never the input the checker was written for."""
+
+    def test_a_STRING_is_not_accepted_as_a_day_list(self):
+        with self.assertRaises(DegradedPruneRefused) as cm:
+            partition_delta_days(live_delta_days="2026-06-23", audit=_audit(),
+                                 approval=_approval())
+        self.assertIn("must be a list", str(cm.exception))
+
+    def test_other_iterables_are_not_accepted_either(self):
+        for value in (tuple(APPROVED), set(APPROVED), iter(APPROVED), None, 7):
+            with self.subTest(type(value).__name__):
+                with self.assertRaises(DegradedPruneRefused):
+                    partition_delta_days(live_delta_days=value, audit=_audit(),
+                                         approval=_approval())
+
+    def test_a_non_date_entry_is_refused(self):
+        for bad in ("a", "2026-13-01", "2026-06-31", "20260601", "", 20260601, None, True):
+            with self.subTest(repr(bad)):
+                with self.assertRaises(DegradedPruneRefused) as cm:
+                    partition_delta_days(live_delta_days=LIVE + [bad], audit=_audit(),
+                                         approval=_approval())
+                self.assertIn("live_delta_days", str(cm.exception))
+
+    def test_the_reviewers_reproduction_no_longer_returns_a_result(self):
+        """Reported as: dropped_days = ['a', 'b', ...] with approval_ref = 123."""
+        with self.assertRaises(DegradedPruneRefused):
+            partition_delta_days(
+                live_delta_days="abcdef",
+                audit={"delta_prune": {"available": True,
+                                       "drop_candidates_by_calendar": "abc",
+                                       "delta_prune_candidates": "abc",
+                                       "blocked_need_compaction_first": []}},
+                approval={"approved_by": True, "approval_ref": 123,
+                          "approved_candidates": "abc"})
+
+    def test_a_BOOL_approver_or_numeric_reference_is_refused(self):
+        for field, value in (("approved_by", True), ("approved_by", 1),
+                             ("approval_ref", 123), ("approval_ref", None),
+                             ("approved_by", ["ops"])):
+            with self.subTest(f"{field}={value!r}"):
+                with self.assertRaises(DegradedPruneRefused) as cm:
+                    partition_delta_days(live_delta_days=LIVE, audit=_audit(),
+                                         approval={**_approval(), field: value})
+                self.assertIn(field, str(cm.exception))
+
+    def test_the_audits_own_lists_are_type_checked_too(self):
+        for field in ("delta_prune_candidates", "blocked_need_compaction_first",
+                      "drop_candidates_by_calendar"):
+            with self.subTest(field):
+                audit = _audit()
+                audit["delta_prune"][field] = "2026-06-23"
+                with self.assertRaises(DegradedPruneRefused) as cm:
+                    partition_delta_days(live_delta_days=LIVE, audit=audit,
+                                         approval=_approval())
+                self.assertIn("must be a list", str(cm.exception))
+
+
+class TestTheAuditSetsMustPartition(unittest.TestCase):
+    """Round-3 finding 3. Disjointness is not enough: the two sets must EQUAL the calendar
+    candidates, or a day nobody's keep-window arithmetic considered can become droppable."""
+
+    def test_the_calendar_set_is_REQUIRED(self):
+        audit = _audit()
+        del audit["delta_prune"]["drop_candidates_by_calendar"]
+        with self.assertRaises(DegradedPruneRefused) as cm:
+            partition_delta_days(live_delta_days=LIVE, audit=audit, approval=_approval())
+        self.assertIn("drop_candidates_by_calendar", str(cm.exception))
+
+    def test_a_TAMPERED_audit_cannot_smuggle_in_a_non_calendar_day(self):
+        """The attack: add a base-covered day that was never a calendar candidate. It is
+        eligible, it is not blocked, and an approval naming it would drop it."""
+        smuggled = "2026-06-29"                      # in the live delta, NOT a calendar candidate
+        self.assertIn(smuggled, LIVE)
+        audit = _audit(candidates=APPROVED + [smuggled])
+        audit["delta_prune"]["drop_candidates_by_calendar"] = APPROVED + BLOCKED
+        with self.assertRaises(DegradedPruneRefused) as cm:
+            partition_delta_days(live_delta_days=LIVE, audit=audit,
+                                 approval=_approval(APPROVED + [smuggled]))
+        self.assertIn("never a calendar candidate", str(cm.exception))
+        self.assertIn(smuggled, str(cm.exception))
+
+    def test_a_calendar_day_classified_as_NEITHER_is_refused(self):
+        audit = _audit()
+        audit["delta_prune"]["drop_candidates_by_calendar"] = APPROVED + BLOCKED + ["2026-06-04"]
+        with self.assertRaises(DegradedPruneRefused) as cm:
+            partition_delta_days(live_delta_days=LIVE, audit=audit, approval=_approval())
+        self.assertIn("classified as neither", str(cm.exception))
+
+    def test_a_duplicated_calendar_candidate_is_refused(self):
+        audit = _audit()
+        audit["delta_prune"]["drop_candidates_by_calendar"] = APPROVED + BLOCKED + [APPROVED[0]]
+        with self.assertRaises(DegradedPruneRefused) as cm:
+            partition_delta_days(live_delta_days=LIVE, audit=audit, approval=_approval())
+        self.assertIn("more than once", str(cm.exception))
+
+    def test_the_real_audits_output_satisfies_the_partition_it_is_checked_against(self):
+        """The production audit and this checker must agree, or the check is unusable."""
+        from ops import p4_retention_audit as audit
+        base = sorted([f"2026-06-{d:02d}" for d in range(1, 5)] + APPROVED)
+        out = audit.delta_prune({"present": True, "physical_days": base},
+                                {"present": True, "physical_days": LIVE},
+                                window_days=3, delta_buffer=1)
+        part = partition_delta_days(live_delta_days=LIVE, audit={"delta_prune": out},
+                                    approval=_approval(out["delta_prune_candidates"]))
+        self.assertEqual(sorted(part["dropped_days"]), sorted(APPROVED))
+
+
+class TestTheAuditCoreRefusesADuplicatedStore(unittest.TestCase):
+    """Round-3 finding 2. `_dayset()` returns a set, so a store listing a day twice arrived
+    already collapsed and every candidate looked legal."""
+
+    BASE = sorted([f"2026-06-{d:02d}" for d in range(1, 5)] + APPROVED)
+
+    def _out(self, delta_days, base_days=None):
+        from ops import p4_retention_audit as audit
+        return audit.delta_prune({"present": True, "physical_days": list(base_days or self.BASE)},
+                                 {"present": True, "physical_days": list(delta_days)},
+                                 window_days=3, delta_buffer=1)
+
+    def test_a_duplicated_DELTA_day_makes_the_block_unavailable(self):
+        out = self._out(LIVE + [LIVE[0]])
+        self.assertFalse(out["available"])
+        self.assertIn("more than once", out["reason"])
+        self.assertNotIn("delta_prune_candidates", out)
+
+    def test_a_duplicated_BASE_day_makes_the_block_unavailable(self):
+        out = self._out(LIVE, base_days=self.BASE + [self.BASE[0]])
+        self.assertFalse(out["available"])
+        self.assertIn("base", out["reason"])
+
+    def test_the_clean_store_still_produces_candidates(self):
+        """Otherwise "always unavailable" would pass the two tests above."""
+        out = self._out(LIVE)
+        self.assertTrue(out["available"])
+        self.assertEqual(len(out["delta_prune_candidates"]), 4)
+
+    def test_an_unavailable_audit_stops_the_partition_too(self):
+        """End to end: a malformed store cannot reach a day set through either half."""
+        with self.assertRaises(DegradedPruneRefused):
+            partition_delta_days(live_delta_days=LIVE,
+                                 audit={"delta_prune": self._out(LIVE + [LIVE[0]])},
+                                 approval=_approval())
+
+
 class TestDuplicatesAreRefusedNotDeduplicated(unittest.TestCase):
     """Finding 1. `dict.fromkeys()` silently collapsed repeats, laundering a malformed store
     into a legal-looking day set."""
@@ -162,10 +311,14 @@ class TestDuplicatesAreRefusedNotDeduplicated(unittest.TestCase):
 class TestTheAuditMustBeConsistentAndFresh(unittest.TestCase):
 
     def test_a_day_listed_as_BOTH_eligible_and_blocked_is_refused(self):
+        """The calendar list is given explicitly and without repeats, so the duplicate check
+        cannot answer first -- the overlap guard is the one under test."""
         with self.assertRaises(DegradedPruneRefused) as cm:
-            partition_delta_days(live_delta_days=LIVE,
-                                 audit=_audit(candidates=APPROVED + [BLOCKED[0]]),
-                                 approval=_approval(APPROVED + [BLOCKED[0]]))
+            partition_delta_days(
+                live_delta_days=LIVE,
+                audit=_audit(candidates=APPROVED + [BLOCKED[0]],
+                             calendar=APPROVED + BLOCKED),
+                approval=_approval(APPROVED + [BLOCKED[0]]))
         self.assertIn("BOTH", str(cm.exception))
 
     def test_a_candidate_missing_from_the_live_delta_means_a_stale_audit(self):

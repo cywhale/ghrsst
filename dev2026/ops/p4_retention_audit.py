@@ -206,6 +206,17 @@ def delta_prune(base: dict, delta: dict, window_days: int, delta_buffer: int, *,
     GLOBAL PRECONDITION (P4-S4 §4.1): if the recent spatial window is not confirmed contiguous
     (``window_ok`` False), NO delta prune candidate is emitted — even for older days base already covers —
     repair the window hole first."""
+    # `_dayset()` returns a SET, so a store listing a day twice arrives here already collapsed
+    # and every downstream candidate looks legal. `--strict` would flag it later via
+    # `_collect_failures()`, but this function must not emit a usable answer from a malformed
+    # store in the first place: the runbook reads THIS block to choose the day sets.
+    for label, info in (("delta", delta), ("base", base)):
+        raw = list(info.get("physical_days") or []) if info.get("present") else []
+        repeats = sorted({d for d in raw if raw.count(d) > 1})
+        if repeats:
+            return {"available": False,
+                    "reason": (f"{label} lists day(s) {repeats} more than once; the store is "
+                               f"malformed and no prune candidate may be derived from it")}
     dd = sorted(_dayset(delta))
     if not dd:
         return {"available": False, "reason": "no delta days"}
