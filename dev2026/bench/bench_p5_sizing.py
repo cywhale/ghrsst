@@ -368,23 +368,168 @@ def _tail_rebuild_probe(*, s: int, c: int, touch_without_changing: bool = False)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def measure_tail_rebuild(*, s: int, c: int) -> dict:
-    """DEFERRED — and therefore carrying NO numbers. Runs nothing.
+def _publish_predecessor(root: str, segment: dict, *, ny: int, nx: int, anchor: str,
+                         s: int) -> dict:
+    """Publish the predecessor block, so the successor reads a real published block."""
+    from store import block_manifest as bm
+    m = {"format": bm.MANIFEST_FORMAT, "version": bm.SCHEMA_VERSION,
+         "generation": 1, "generation_id": "gen000001-o2-bench",
+         "created_utc": "2027-01-01T00:00:00Z", "created_by": "bench_p5_sizing",
+         "predecessor_generation": None, "predecessor_manifest": None,
+         "grid": {"ny": ny, "nx": nx, "region": [0, ny, 0, nx]},
+         "variables": list(_fixture_vars()),
+         "block_grid": {"anchor_day": anchor, "block_days": s},
+         "segments": [dict(segment)], "superseded": [], "manifest_checksum": ""}
+    m["manifest_checksum"] = bm.compute_checksum(m)
+    bm.publish(root, m)
+    return m
 
-    It used to accept `touch_without_changing` and ignore it, which is worse than not accepting
-    it: a caller could pass the flag and believe a probe had run. The content-digest guard lives
-    in `_tail_rebuild_probe()`, which does run the fixture work — a file whose mtime moved and
-    whose bytes did not is not a rewrite — but whose timings are deliberately not published
-    here, because a `rebuild_wall_ms` in a DEFERRED row reads as evidence it is not."""
-    return {
-        "label": "DEFERRED", "s": s, "c": c,
-        "reason": ("no carry-forward was measured: v2 is rebuilt from fixtures, never read from "
-                   "the predecessor block, and there is no source map. Real carry-forward needs "
-                   "the O2 materialization strategy, which does not exist yet. The probe's "
-                   "timings are deliberately NOT published here -- a wall-clock number in a "
-                   "DEFERRED row reads as evidence it is not."),
-        "rewrite_evidence": "sha256-content-digest (probe only)",
-    }
+
+def _fixture_vars():
+    import p5_fixtures as fx
+    return fx.VARS
+
+
+def _tail_fold_unproven(*, carried: Sequence[str], pred_days: Sequence[str],
+                        from_delta: Sequence[str], new_days: Sequence[str],
+                        present: Sequence[str], smap: Dict[str, dict],
+                        provenance_path: Optional[str],
+                        digest_before: dict, digest_after: dict) -> List[str]:
+    """Why this fold may NOT publish numbers. Empty means every claim was established.
+
+    Separated from the measurement so each condition can be driven directly. Inline, these
+    branches only execute when something is broken, so nothing in a passing run ever reaches
+    them and a mutation deleting one survives untouched."""
+    why: List[str] = []
+    if sorted(carried) != sorted(pred_days):
+        why.append("not every predecessor day resolved to the published block")
+    if sorted(from_delta) != sorted(new_days):
+        why.append("not every newly aged day resolved to the delta")
+    if any(d not in smap for d in present):
+        why.append("a present day has no source-map entry")
+    if not provenance_path or not os.path.exists(provenance_path):
+        why.append("no provenance was written")
+    if digest_after != digest_before:
+        why.append("the predecessor block was mutated by the successor build")
+    return why
+
+
+def measure_tail_rebuild(*, s: int, c: int, fill_days: Optional[int] = None,
+                         ny: int = 24, nx: int = 24) -> dict:
+    """LOCAL_SYNTHETIC — the O2 tail fold through `ingest.build_block`'s real path.
+
+    A predecessor block is built and **published**, its days are pruned from the delta (which
+    is what makes them carry-forward days at all), and the successor is built with
+    `predecessor_path`/`predecessor_present`. The numbers therefore describe a real
+    predecessor read, a real source map, real provenance, and a real plan.
+
+    The row publishes numbers **only if the returned plan proves the carry-forward happened**:
+    every predecessor day resolved to `block`, provenance was written, and the source map
+    covers every present day. If any of that fails the row degrades to DEFERRED and carries no
+    numbers — a wall-clock in an unproven row reads as evidence it is not. `carried_forward_days`
+    is counted from the source map (read evidence), never from arithmetic on `s` and `c`.
+
+    Not a capacity result: `hard_reserve_bytes=0` deliberately bypasses the disk gate so a
+    temp-dir fixture can run at all."""
+    import zarr
+    import p5_fixtures as fx
+    from ingest.build_block import build_block
+    from store import block_manifest as bm
+
+    tmp = tempfile.mkdtemp(prefix="p5s6-o2-tail-")
+    try:
+        # `fill_days` is the fold POSITION: how many days the predecessor already holds. A
+        # tail block is folded at fill = C, 2C, ... until it seals at S, and the amplification
+        # of each fold differs. Measuring only the default position would make
+        # `carried_forward_days` numerically equal to `min(c, s)` in every row, so a harness
+        # that computed it arithmetically would be indistinguishable from one that counted it.
+        first = min(c, s) if fill_days is None else fill_days
+        total = min(first + c, s)
+        assert_fixture_bounds(ny=ny, nx=nx, days=total)
+        root = os.path.join(tmp, "root")
+        os.makedirs(root, exist_ok=True)
+        s0, e0 = bm.block_bounds(FIXTURE_ANCHOR_DAY, s, 0)
+        span = fx.calendar_span(s0, e0)
+        pred_days, new_days = span[:first], span[first:total]
+        if not new_days or not pred_days:
+            # Degenerate: with s == c the block is already full and nothing ages into it, so
+            # there is no fold to measure. Refused rather than reported -- dividing by an empty
+            # `newly_aged_days` would have yielded a large, publishable-looking amplification
+            # for a build that carried everything and folded nothing.
+            return {"label": "DEFERRED", "s": s, "c": c, "fill_days": first,
+                    "reason": (f"no tail fold exists at s={s}, c={c}, fill={first}: "
+                               f"{len(pred_days)} predecessor day(s) and {len(new_days)} newly "
+                               "aged day(s). An amplification ratio here would divide by an "
+                               "empty numerator's counterpart, not measure a rebuild."),
+                    "rewrite_evidence": "sha256-content-digest"}
+
+        delta_v1 = os.path.join(tmp, "delta_v1.zarr")
+        fx.build_delta(delta_v1, pred_days, ny=ny, nx=nx)
+        v1 = os.path.join(root, "tail_v1.zarr")
+        p1 = build_block(v1, start_day=s0, end_day=e0, classification_target=list(pred_days),
+                         delta_path=delta_v1, lock=None, hard_reserve_bytes=0,
+                         unsafe_skip_isolation=True)
+        _publish_predecessor(root, p1["segment"], ny=ny, nx=nx, anchor=FIXTURE_ANCHOR_DAY, s=s)
+        before = _digest_tree(v1)
+
+        # The prune: v1's days now live only in the block.
+        delta_v2 = os.path.join(tmp, "delta_v2.zarr")
+        fx.build_delta(delta_v2, new_days, ny=ny, nx=nx, seed=1500)
+
+        v2 = os.path.join(root, "tail_v2.zarr")
+        t0 = time.perf_counter()
+        p2 = build_block(v2, start_day=s0, end_day=e0, classification_target=list(new_days),
+                         predecessor_present=list(pred_days), predecessor_path=v1,
+                         delta_path=delta_v2, artifacts_dir=os.path.join(tmp, "artifacts"),
+                         lock=None, hard_reserve_bytes=0, unsafe_skip_isolation=True)
+        wall_ms = (time.perf_counter() - t0) * 1000.0
+
+        smap = p2["source_map"]
+        carried = sorted(d for d, r in smap.items() if r["source_kind"] == "block")
+        from_delta = sorted(d for d, r in smap.items() if r["source_kind"] == "delta")
+        present = list(zarr.open_group(v2, mode="r").attrs["days"])
+        after_pred = _digest_tree(v1)
+        unproven = _tail_fold_unproven(
+            carried=carried, pred_days=pred_days, from_delta=from_delta, new_days=new_days,
+            present=present, smap=smap, provenance_path=p2.get("provenance_path"),
+            digest_before=before, digest_after=after_pred)
+
+        if unproven:
+            return {"label": "DEFERRED", "s": s, "c": c, "fill_days": first,
+                    "reason": ("the carry-forward path ran but could not prove itself, so no "
+                               "numbers are published: " + "; ".join(unproven)),
+                    "rewrite_evidence": "sha256-content-digest"}
+
+        return {
+            "label": "LOCAL_SYNTHETIC", "s": s, "c": c, "fill_days": first,
+            "reason": ("real path: a published predecessor block was read through "
+                       "build_block's source map, its days pruned from the delta beforehand. "
+                       "Fixture extent, not production geometry, and not a capacity result. "
+                       "`write_amplification` is ONE fold at one fill level, not the §10 "
+                       "lifecycle mean (S/C+1)/2, which averages every fold from empty to "
+                       "full; the two happen to agree at s=90/c=30 and disagree elsewhere, so "
+                       "this row does not corroborate the model."),
+            "amplification_scope": "single-fold",
+            "predecessor_fill_days": len(pred_days),
+            "rewrite_evidence": "sha256-content-digest",
+            "carried_forward_days": len(carried),      # counted from the source map, not from s/c
+            "newly_aged_days": len(from_delta),
+            "days_in_new_tail": len(present),
+            # Derived from the evidence, never written as literal `True`. These are only
+            # reached when `unproven` is empty, so a literal would be correct-by-construction
+            # today and silently wrong the moment the checks above are reordered or relaxed.
+            "predecessor_published": bm.load_live(root)["segments"][0]["path"] == \
+                os.path.basename(v1),
+            "predecessor_unchanged": after_pred == before,
+            "source_map_complete": all(d in smap for d in present),
+            # No `max(1, ...)` guard: an empty `from_delta` is refused above, so a division by
+            # zero here would be a real fault and must not be laundered into a number.
+            "write_amplification": round(len(present) / len(from_delta), 3),
+            "rebuild_wall_ms": round(wall_ms, 3),
+            "source_group_opens": p2["source_group_opens"],
+        }
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ------------------------------------------------- items 1 & 2: the REAL O2 read path
@@ -1109,7 +1254,12 @@ def build_report(*, quick: bool = False) -> dict:
             "segment_calls": [measure_segment_calls(s=s, days=days) for s in s_grid],
             "snapshot_open": [measure_snapshot_open(segments=n) for n in horizons],
             "metadata_scan": [measure_metadata_scan(segments=n) for n in horizons],
-            "tail_rebuild": [measure_tail_rebuild(s=s, c=30) for s in s_grid],
+            # Every fold position a block passes through, not just the first: fill = C, 2C, ...
+            # up to S. The amplification of a fold depends on how full the block already is,
+            # so a single position would describe one moment of the block's life as if it were
+            # the whole of it.
+            "tail_rebuild": [measure_tail_rebuild(s=s, c=30, fill_days=fill)
+                             for s in s_grid for fill in range(30, s + 1, 30)],
             # The two real-path measurements belong in the ARTIFACT, not only in the prose.
             # They were described in the results doc and absent from the JSON, so the
             # consistency tests could not see the omission.

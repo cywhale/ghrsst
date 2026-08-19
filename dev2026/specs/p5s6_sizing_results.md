@@ -1,30 +1,33 @@
 # P5-S6 — block-size / cadence sizing: RESULTS
 
-Status: **MODEL DELIVERED. THE THREE "MEASUREMENTS" DO NOT USE THE O2 READ PATH AND ARE
-WITHDRAWN AS EVIDENCE.** No production gate adjudicated.
+Status: **MODEL DELIVERED. THE FOUR ROUND-2 WITHDRAWALS ARE NOW DISCHARGED** — each measurement
+was rebuilt against the code it claims to measure. Still **fixture extent, local and synthetic**:
+no production gate is adjudicated, and nothing here is capacity evidence.
 
-> **Review round 2 correction — read this before any table below.** Three measurements went
-> around the code they claimed to measure, and the fourth measured arithmetic:
+> **Review round 2 correction — kept as the record of what was wrong, and what closed it.**
+> Three measurements went around the code they claimed to measure, and the fourth measured
+> arithmetic:
 >
-> | claimed | actually measured | now |
+> | claimed | actually measured, at round 2 | now |
 > |---|---|---|
-> | segment calls on the grouped read path | stores *this harness* opened in a loop — no manifest, no `SegmentedCubeStore`, no `point_series()` | **not production-path evidence** |
-> | O2 snapshot-open cost | raw `zarr.open_group()` — no manifest validation, segment inspection, metadata binding or snapshot build | **raw group-open cost, relabelled** |
-> | H5 crossing latency vs delta span | nothing; the table is volume arithmetic | **DEFERRED** |
-> | tail rebuild carry-forward | `v2` rebuilt from fixtures, never read from the predecessor; `carried_forward_days` is a computed number | **DEFERRED** |
+> | segment calls on the grouped read path | stores *this harness* opened in a loop — no manifest, no `SegmentedCubeStore`, no `point_series()` | **discharged** — real `point_series()` against a published manifest, spied in the implementation's own namespace |
+> | O2 snapshot-open cost | raw `zarr.open_group()` — no manifest validation, segment inspection, metadata binding or snapshot build | **discharged** — real constructor; the raw figure is retained separately and labelled as raw |
+> | H5 crossing latency vs delta span | nothing; the table is volume arithmetic | **discharged** — real `TieredCube` |
+> | tail rebuild carry-forward | `v2` rebuilt from fixtures, never read from the predecessor; `carried_forward_days` is a computed number | **discharged (O2)** — a published predecessor read through `build_block`'s source map; the count comes out of that map |
 >
-> `open_only_first` is an artificial restriction of the harness's own loop, not a real request,
-> so it does not rescue the first row. Rebuilding these against `SegmentedCubeStore` /
-> `TieredCube` — the path `bench_p5_segmented_read.py` already exercises — is the next step and
-> is **not done here**.
+> `open_only_first` was an artificial restriction of the harness's own loop, not a real request,
+> so it never rescued the first row; what rescued it was a request that lands inside one segment,
+> where `observed` and `reported` **must** differ.
 `[MUT-STG]` — local and synthetic only. No VM24, SSH, `GHRSST_*` store, cron, PM2 or production
 path is touched anywhere in this step.
 
 Branch `dev2026-p5-s6-o2-local`, based on the merged tip `7902b61`.
 
 - Harness: [`../bench/bench_p5_sizing.py`](../bench/bench_p5_sizing.py)
-- Tests: [`../tests/test_phase2_p5s6.py`](../tests/test_phase2_p5s6.py) — **33/33**, committed
-  **failing first**; **11 guards mutation-verified**
+- Tests: [`../tests/test_phase2_p5s6.py`](../tests/test_phase2_p5s6.py) — **107/107**, committed
+  **failing first**; and [`../tests/test_phase2_p5s6_o2.py`](../tests/test_phase2_p5s6_o2.py) —
+  **17/17**, the O2 carry-forward path. **23 guards mutation-verified**, each mutation run
+  serially from a git-clean tree.
 - Artifacts: `../bench/results/p5s6_sizing_quick.json`, `p5s6_sizing_full.json`
 
 ## How to read every number here
@@ -168,20 +171,61 @@ where the two *must* differ: `open_only_first` reads a window landing inside one
 tally still says three, and the test asserts `observed = 1`, `reported = 3`. Both mutations now
 fail. A counter that agrees with itself under every input the tests supply is not verified.
 
-## Tail rebuild — DEFERRED, and therefore no numbers
+## Tail rebuild — LOCAL_SYNTHETIC, through the real carry-forward path
 
-No carry-forward was measured. `v2` is rebuilt from fixtures, never read from the predecessor
-block, and there is no source map — so `carried_forward_days` was arithmetic wearing the label
-of read evidence. The earlier table of rebuild wall times has been **removed rather than
-relabelled**: a millisecond figure sitting under a `DEFERRED` heading reads as performance
-evidence no matter what the heading says.
+**This withdrawal is discharged.** The previous revision said carry-forward could not be
+measured because `v2` was rebuilt from fixtures, never read from the predecessor, and had no
+source map — `carried_forward_days` was arithmetic wearing the label of read evidence. O2 closed
+that: `measure_tail_rebuild()` now builds and **publishes** a predecessor block, prunes its days
+out of the delta, and builds the successor through `ingest.build_block` with
+`predecessor_path` / `predecessor_present`. `carried_forward_days` is counted out of the
+returned source map.
 
-A probe (`_tail_rebuild_probe`) still runs the fixture work, because the guard it exercises is
-worth keeping under test: rewrite evidence is a **sha256 content digest**, and a companion test
-moves every mtime forward without changing a byte and asserts **0** files are counted as
-rewritten. The probe's timings are not published.
+The O2 work needed almost no new code, which is the main finding. `build_block` already
+implemented the contract — resolution order delta → block → daily → hold, so a post-prune
+repair beats the block's stale copy; `rebuild_source_set = predecessor_present ∪ newly_present`;
+and a refusal for any unresolved day *before* a byte is written. O2 exercises that path instead
+of building a second source-map truth beside it.
 
-Real carry-forward needs the O2 materialization strategy, which does not exist yet.
+The row publishes numbers **only if the returned plan proves the fold happened**: every
+predecessor day resolved to `block`, every newly aged day to `delta`, every present day has a
+source-map entry, provenance was written, and the predecessor's digest is unchanged. Any failure
+degrades the row to `DEFERRED` with no numbers. This is not decorative — the first run of the
+rewired function returned `DEFERRED` because the harness had not passed `artifacts_dir` and no
+provenance was written.
+
+A block is folded at fill = C, 2C, … until it seals at S, and each position amplifies
+differently, so every position is measured rather than just the first (S=90, C=30, fixture
+extent):
+
+| fill (days already in the block) | carried forward | newly aged | days out | single-fold ratio |
+|---|---|---|---|---|
+| 30 | 30 | 30 | 60 | 2.0 |
+| 60 | 60 | 30 | 90 | 3.0 |
+| 90 | — | — | — | `DEFERRED`: sealed, nothing ages in |
+
+Measuring only the first position would have hidden a second problem: there
+`carried_forward_days` numerically equals `min(C, S)`, so a harness that computed it
+arithmetically would be indistinguishable from one that counted it out of the source map. At
+fill=60 the two separate, and a test asserts they do.
+
+The refused positions are refused on purpose. With `S == C`, or at fill = S, the block is
+already full and there is no fold. An earlier draft returned `write_amplification: 30.0` for
+that case, because a `max(1, ...)` guard turned a division by an empty count into a
+publishable-looking number.
+
+**The measured ratio is one fold, not the model.** `write_amplification` here is
+`days_in_new_tail / newly_aged_days` at a single fill level — the artifact rows carry
+`amplification_scope: single-fold` for exactly this reason. §10.2's `(S/C+1)/2` is a different
+quantity: the **lifecycle mean** over every fold from empty to sealed. At S=90/C=30 both are
+**2.0** — a coincidence of this configuration, not agreement — and they diverge
+at S=45/C=30 (measured 3.0, model 1.25). A test asserts that divergence, so this section cannot
+quietly become a claim that the measurement corroborates the model. It does not.
+
+Rewrite evidence remains a **sha256 content digest**: `_tail_rebuild_probe` still runs, and a
+companion test moves every mtime forward without changing a byte and asserts **0** files count
+as rewritten. Timings live in the artifacts, not in this prose, and remain fixture-extent —
+not production geometry, and not a capacity result.
 
 ## DEFERRED — five metrics, no numbers
 
@@ -574,7 +618,9 @@ space**, and no local result changes that.
 
 ## Not delivered in this pass
 
-- **O2 materialization strategy, source-map extension, disk gate, manifest/provenance/rollback
-  lifecycle, API parity and snapshot-safety tests.** The instruction was to implement the sizing
-  harness *first*; this document covers that and nothing beyond it.
+- **O2 tail carry-forward** is now exercised and measured (see the tail-rebuild section) at
+  fixture extent. Still not delivered: **API parity and snapshot-safety tests, and the
+  manifest/provenance/rollback lifecycle at production geometry.** The disk gate exists in
+  `build_block` but the tail measurement deliberately bypasses it (`hard_reserve_bytes=0`) so a
+  temp-dir fixture can run, so nothing here is capacity evidence.
 - **S7 integration and any production deployment work** — explicitly out of scope.

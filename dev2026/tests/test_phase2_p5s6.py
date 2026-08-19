@@ -218,25 +218,111 @@ class TestRewriteEvidenceIsContentNotMtime(unittest.TestCase):
 
 class TestDeferredIsNeverAPass(unittest.TestCase):
 
+    BANNED_IN_DEFERRED = ("rebuild_wall_ms", "rewritten_files", "rewritten_files_touched_only",
+                          "carried_forward_days", "newly_aged_days", "days_in_new_tail",
+                          "write_amplification", "modelled_amplification", "source_group_opens")
+
     def test_a_DEFERRED_tail_rebuild_publishes_no_numbers(self):
-        """A `rebuild_wall_ms` in a DEFERRED row reads as performance evidence."""
-        out = sizing.measure_tail_rebuild(s=30, c=30)
+        """A `rebuild_wall_ms` in a DEFERRED row reads as performance evidence.
+
+        The invariant is per-label, not per-metric: now that the real O2 path can produce a
+        measured row, asserting "tail_rebuild is always DEFERRED" would have to be deleted the
+        moment it started measuring, taking the no-numbers rule out with it."""
+        out = sizing.measure_tail_rebuild(s=30, c=30)     # s == c: no day ages in, so no fold
         self.assertEqual(out["label"], "DEFERRED")
-        for banned in ("rebuild_wall_ms", "rewritten_files", "carried_forward_days",
-                       "days_in_new_tail", "rewritten_files_touched_only",
-                       "modelled_amplification"):
+        for banned in self.BANNED_IN_DEFERRED:
             self.assertNotIn(banned, out)
-        banned = ("rebuild_wall_ms", "rewritten_files", "rewritten_files_touched_only",
-                  "carried_forward_days", "days_in_new_tail", "modelled_amplification")
+
+        seen_deferred = False
         for stamp in ("quick", "full"):
             path = os.path.join(_DEV2026, "bench", "results", f"p5s6_sizing_{stamp}.json")
             with open(path) as fh:
                 rows = json.load(fh)["measured"]["tail_rebuild"]
             self.assertTrue(rows)
             for row in rows:
-                for key in banned:              # the whole set, on every row, in both artifacts
-                    with self.subTest(stamp=stamp, key=key):
+                if row["label"] != "DEFERRED":
+                    continue
+                seen_deferred = True
+                for key in self.BANNED_IN_DEFERRED:
+                    with self.subTest(stamp=stamp, s=row["s"], key=key):
                         self.assertNotIn(key, row)
+        self.assertTrue(seen_deferred,
+                        "no DEFERRED row remains in either artifact, so this test checked "
+                        "nothing; re-point it at whatever is still deferred")
+
+    def test_a_measured_tail_rebuild_carries_its_proof_fields(self):
+        """Numbers are only publishable alongside the evidence that earned them."""
+        out = sizing.measure_tail_rebuild(s=90, c=30)
+        self.assertEqual(out["label"], "LOCAL_SYNTHETIC")
+        for proof in ("predecessor_published", "predecessor_unchanged", "source_map_complete"):
+            self.assertIs(out[proof], True)
+        self.assertEqual(out["rewrite_evidence"], "sha256-content-digest")
+
+    def test_carried_forward_days_are_COUNTED_not_derived_from_s_and_c(self):
+        """`carried_forward_days` must come from the source map. Arithmetic on s and c would
+        report a carry-forward that never happened."""
+        out = sizing.measure_tail_rebuild(s=90, c=30)
+        self.assertEqual(out["carried_forward_days"] + out["newly_aged_days"],
+                         out["days_in_new_tail"])
+        self.assertEqual(out["write_amplification"],
+                         round(out["days_in_new_tail"] / out["newly_aged_days"], 3))
+        self.assertGreater(out["newly_aged_days"], 0, "a fold with nothing new is not a fold")
+
+    def _fold_facts(self, **over):
+        facts = {"carried": ["d1", "d2"], "pred_days": ["d1", "d2"],
+                 "from_delta": ["d3"], "new_days": ["d3"],
+                 "present": ["d1", "d2", "d3"],
+                 "smap": {"d1": {}, "d2": {}, "d3": {}},
+                 "provenance_path": __file__,            # an existing file
+                 "digest_before": {"a": "1"}, "digest_after": {"a": "1"}}
+        facts.update(over)
+        return facts
+
+    def test_each_fold_proof_condition_actually_refuses(self):
+        """Inline, these branches only run when something is broken, so a passing measurement
+        never reaches them and a mutation deleting one survives. Driven directly instead."""
+        self.assertEqual(sizing._tail_fold_unproven(**self._fold_facts()), [])
+        for over, expected in (
+                ({"carried": ["d1"]}, "predecessor day"),
+                ({"from_delta": []}, "newly aged day"),
+                ({"smap": {"d1": {}, "d2": {}}}, "no source-map entry"),
+                ({"provenance_path": None}, "no provenance"),
+                ({"provenance_path": "/nonexistent/prov.json"}, "no provenance"),
+                ({"digest_after": {"a": "2"}}, "mutated by the successor build")):
+            with self.subTest(**over):
+                why = sizing._tail_fold_unproven(**self._fold_facts(**over))
+                self.assertTrue(any(expected in w for w in why),
+                                f"{over} was accepted; got {why}")
+
+    def test_an_unproven_fold_publishes_no_numbers_even_if_the_run_succeeded(self):
+        """The wiring between the proof and the decision to publish. Without this, deleting
+        `if unproven:` changes nothing in a healthy run and no test notices."""
+        from unittest import mock
+        with mock.patch.object(sizing, "_tail_fold_unproven", return_value=["forced"]):
+            out = sizing.measure_tail_rebuild(s=90, c=30)
+        self.assertEqual(out["label"], "DEFERRED")
+        self.assertIn("forced", out["reason"])
+        for banned in self.BANNED_IN_DEFERRED:
+            self.assertNotIn(banned, out)
+
+    def test_carried_forward_days_track_the_FOLD_POSITION(self):
+        """At the default position `carried_forward_days` equals `min(c, s)`, so counting and
+        arithmetic are indistinguishable there. A later fold separates them."""
+        second = sizing.measure_tail_rebuild(s=90, c=30, fill_days=60)
+        self.assertEqual(second["carried_forward_days"], 60)
+        self.assertNotEqual(second["carried_forward_days"], min(30, 90))
+        self.assertEqual(second["write_amplification"], 3.0)   # 90 days out, 30 newly aged
+
+    def test_the_measured_amplification_is_not_presented_as_the_MODEL(self):
+        """At s=90/c=30 the single-fold ratio equals the §10 lifecycle mean by coincidence. The
+        row must say which quantity it is, or it reads as corroborating the model it isn't."""
+        out = sizing.measure_tail_rebuild(s=90, c=30)
+        self.assertEqual(out["amplification_scope"], "single-fold")
+        self.assertEqual(out["write_amplification"], sizing.model_write_amplification(s=90, c=30)["amplification"],
+                         "if these ever diverge the coincidence note below is what matters")
+        self.assertIn("lifecycle mean", out["reason"])
+        skew = sizing.measure_tail_rebuild(s=45, c=30)     # where they genuinely disagree
+        self.assertNotEqual(skew["write_amplification"], sizing.model_write_amplification(s=45, c=30)["amplification"])
 
     def test_production_scale_metrics_are_marked_DEFERRED_with_a_reason(self):
         deferred = sizing.deferred_metrics()
@@ -342,7 +428,10 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
     #: test that was introduced to stop exactly that. Excluding an observation from the
     #: comparison is indistinguishable from not observing it.
     VOLATILE = ("wall_ms", "ms_per_segment", "ms_per_1k_files", "read_ms",
-                "p50_ms", "p95_ms")
+                "p50_ms", "p95_ms", "rebuild_wall_ms")
+    # `write_amplification`, `carried_forward_days` and `newly_aged_days` are deliberately NOT
+    # volatile: they are day counts read out of the source map, so they must reproduce exactly.
+    # Excluding them would let a carry-forward regression pass as clock noise.
 
     def _claims(self, node, out=None, trail=""):
         """Every non-volatile leaf, keyed by path: the report's claims minus its timings."""
@@ -390,9 +479,21 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
                 # replaced rather than deleted, so the artifact still has to say which.
                 self.assertEqual(a["H5"]["label"], "LOCAL_SYNTHETIC")
                 self.assertTrue(a["H5"]["measured"])
+                # tail_rebuild was DEFERRED because "the O2 materialization strategy does not
+                # exist yet". O2 discharged that: the rows now read a published predecessor
+                # through build_block's source map. As with H5 the assertion is replaced, not
+                # deleted, so the artifact still has to say which state it is in -- and the
+                # stale wording must be gone, or a discharged withdrawal keeps being claimed.
+                measured = [r for r in a["measured"]["tail_rebuild"]
+                            if r["label"] == "LOCAL_SYNTHETIC"]
+                self.assertTrue(measured, "no tail fold was measured")
                 for row in a["measured"]["tail_rebuild"]:
-                    self.assertEqual(row["label"], "DEFERRED")
-                    self.assertIn("materialization strategy", row["reason"])
+                    self.assertNotIn("materialization strategy", row["reason"])
+                    self.assertIn(row["label"], ("LOCAL_SYNTHETIC", "DEFERRED"))
+                for row in measured:
+                    self.assertIs(row["predecessor_published"], True)
+                    self.assertIs(row["predecessor_unchanged"], True)
+                    self.assertEqual(row["amplification_scope"], "single-fold")
                 for row in a["measured"]["segment_calls"]:
                     self.assertIn("NOT the grouped read path", row["measures"])
                 for row in a["measured"]["snapshot_open"]:
@@ -410,15 +511,23 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
         for gate in ("G3", "H7", "G16"):
             self.assertEqual(art["gates"][gate]["verdict"], "NOT_ADJUDICATED")
             self.assertIn("NOT_ADJUDICATED", doc)
-        # the withdrawals must be visible in the prose, not only in the JSON
-        for phrase in ("WITHDRAWN AS EVIDENCE", "raw group-open", "DEFERRED"):
+        # The round-2 record must survive its own resolution: a discharged withdrawal is
+        # marked discharged, not deleted, so the doc still shows what was wrong and why it is
+        # no longer wrong. "DEFERRED" must remain, because metrics still are.
+        for phrase in ("Review round 2 correction", "discharged", "raw group-open", "DEFERRED"):
             self.assertIn(phrase, doc)
         # the doc must carry the artifact's OWN withdrawal wording, not a paraphrase that can
         # drift away from it
         flat = " ".join(doc.split())
-        self.assertIn("materialization strategy", flat)
-        self.assertIn("materialization strategy",
-                      " ".join(art["measured"]["tail_rebuild"][0]["reason"].split()))
+        self.assertNotIn("materialization strategy", flat,
+                         "O2 discharged this withdrawal; the doc still claims it")
+        # The measured fold's own caveat -- that it is one fold, not the §10 lifecycle mean --
+        # must appear in the prose too. At s=90/c=30 the two numbers coincide, so a doc that
+        # omits this reads as if the measurement corroborated the model.
+        row = next(r for r in art["measured"]["tail_rebuild"] if r["label"] == "LOCAL_SYNTHETIC")
+        self.assertIn("lifecycle mean", " ".join(row["reason"].split()))
+        self.assertIn("lifecycle mean", flat)
+        self.assertIn("single-fold", flat)
         self.assertIn("NOT O2 snapshot-open cost", art["measured"]["snapshot_open"][0]["measures"])
         self.assertIn("not O2 snapshot-open", flat)
         # and the pre-withdrawal headings must be gone
@@ -454,11 +563,17 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
                          + re.findall(r"\b\d+\s*(?:ms|s)\b", body))
                 self.assertEqual(stray, [],
                                  f"hand-typed timings in the {name} section: {stray}")
-        # a DEFERRED section may not carry a wall-clock number
+        # The tail section may not hand-carry a wall-clock number. It legitimately quotes
+        # amplification RATIOS now -- day counts out of the source map, and the whole point of
+        # the single-fold-vs-model caveat -- so pinning the old "removed rather than relabelled"
+        # wording would have blocked the correction instead of the drift. Test the invariant
+        # the phrase stood for: timings live in the artifacts, never in this prose.
         tail = doc[doc.index("## Tail rebuild"):doc.index("## DEFERRED — five metrics")]
         self.assertNotIn("rebuild (ms)", tail)
-        # normalized: the doc hard-wraps, so a contiguous match is a test about line breaks
-        self.assertIn("removed rather than relabelled", " ".join(tail.split()))
+        timings = re.findall(r"\b\d+(?:\.\d+)?\s*(?:ms|s)\b", re.sub(r"§\d+(\.\d+)*[a-z]?",
+                                                                     "", tail))
+        self.assertEqual(timings, [], f"hand-typed timings in the tail section: {timings}")
+        self.assertIn("Timings live in the artifacts", " ".join(tail.split()))
 
     def test_no_artifact_claims_a_production_gate_PASS(self):
         for stamp in ("quick", "full"):

@@ -74,8 +74,8 @@
               "2026-09-24": "base"
             },
             "delta_owned_days_in_response": 0,
-            "p50_ms": 0.84,
-            "p95_ms": 0.86,
+            "p50_ms": 0.878,
+            "p95_ms": 1.137,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -94,8 +94,8 @@
               "2027-01-21": "delta"
             },
             "delta_owned_days_in_response": 5,
-            "p50_ms": 2.747,
-            "p95_ms": 3.158,
+            "p50_ms": 3.01,
+            "p95_ms": 3.247,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -114,8 +114,8 @@
               "2027-01-26": "delta"
             },
             "delta_owned_days_in_response": 10,
-            "p50_ms": 3.31,
-            "p95_ms": 3.663,
+            "p50_ms": 3.526,
+            "p95_ms": 3.945,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -154,8 +154,8 @@
               "2026-09-24": "base"
             },
             "delta_owned_days_in_response": 0,
-            "p50_ms": 0.843,
-            "p95_ms": 0.877,
+            "p50_ms": 0.894,
+            "p95_ms": 1.074,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -174,8 +174,8 @@
               "2026-10-20": "delta"
             },
             "delta_owned_days_in_response": 5,
-            "p50_ms": 2.534,
-            "p95_ms": 3.071,
+            "p50_ms": 2.926,
+            "p95_ms": 3.194,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -194,8 +194,8 @@
               "2026-10-25": "delta"
             },
             "delta_owned_days_in_response": 10,
-            "p50_ms": 3.524,
-            "p95_ms": 3.955,
+            "p50_ms": 3.55,
+            "p95_ms": 3.823,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -235,7 +235,7 @@
             },
             "delta_owned_days_in_response": 0,
             "p50_ms": 0.807,
-            "p95_ms": 0.824,
+            "p95_ms": 1.122,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -254,8 +254,8 @@
               "2026-11-03": "delta"
             },
             "delta_owned_days_in_response": 5,
-            "p50_ms": 3.045,
-            "p95_ms": 3.201,
+            "p50_ms": 2.87,
+            "p95_ms": 3.148,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -274,8 +274,8 @@
               "2026-11-08": "delta"
             },
             "delta_owned_days_in_response": 10,
-            "p50_ms": 3.093,
-            "p95_ms": 3.893,
+            "p50_ms": 3.586,
+            "p95_ms": 3.764,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -314,8 +314,8 @@
               "2026-09-24": "base"
             },
             "delta_owned_days_in_response": 0,
-            "p50_ms": 0.816,
-            "p95_ms": 0.929,
+            "p50_ms": 0.898,
+            "p95_ms": 0.985,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -334,8 +334,8 @@
               "2026-11-22": "delta"
             },
             "delta_owned_days_in_response": 5,
-            "p50_ms": 2.975,
-            "p95_ms": 3.405,
+            "p50_ms": 2.864,
+            "p95_ms": 3.17,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -354,8 +354,8 @@
               "2026-11-27": "delta"
             },
             "delta_owned_days_in_response": 10,
-            "p50_ms": 3.159,
-            "p95_ms": 3.714,
+            "p50_ms": 3.728,
+            "p95_ms": 3.979,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -394,8 +394,8 @@
               "2026-09-24": "base"
             },
             "delta_owned_days_in_response": 0,
-            "p50_ms": 0.903,
-            "p95_ms": 1.127,
+            "p50_ms": 0.853,
+            "p95_ms": 1.189,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -414,8 +414,8 @@
               "2026-12-18": "delta"
             },
             "delta_owned_days_in_response": 5,
-            "p50_ms": 2.689,
-            "p95_ms": 3.087,
+            "p50_ms": 3.015,
+            "p95_ms": 3.356,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -434,8 +434,8 @@
               "2026-12-23": "delta"
             },
             "delta_owned_days_in_response": 10,
-            "p50_ms": 3.777,
-            "p95_ms": 3.97,
+            "p50_ms": 3.424,
+            "p95_ms": 3.713,
             "requested_days": 10,
             "returned_days": 10,
             "timed_rows_served_delta_values": true
@@ -551,7 +551,7 @@
         "raw_cell_canary_ok": true,
         "raw_cell_canary_oracle": "a sentinel written directly into the block's raw cells via zarr BEFORE the measured read, then checked on that request's own returned row",
         "raw_cell_canary_scope": "ONE probe day, ONE variable (sst), ONE cell. It shows the measured request serves real bytes; it is NOT parity over all returned rows or all variables.",
-        "read_ms": 10.083,
+        "read_ms": 10.221,
         "read_path": "SegmentedCubeStore.point_series",
         "requested_days": 40,
         "returned_days": 40,
@@ -582,7 +582,7 @@
         "raw_cell_canary_ok": true,
         "raw_cell_canary_oracle": "a sentinel written directly into the block's raw cells via zarr BEFORE the measured read, then checked on that request's own returned row",
         "raw_cell_canary_scope": "ONE probe day, ONE variable (sst), ONE cell. It shows the measured request serves real bytes; it is NOT parity over all returned rows or all variables.",
-        "read_ms": 4.935,
+        "read_ms": 5.399,
         "read_path": "SegmentedCubeStore.point_series",
         "requested_days": 20,
         "returned_days": 20,
@@ -613,7 +613,7 @@
         "raw_cell_canary_ok": true,
         "raw_cell_canary_oracle": "a sentinel written directly into the block's raw cells via zarr BEFORE the measured read, then checked on that request's own returned row",
         "raw_cell_canary_scope": "ONE probe day, ONE variable (sst), ONE cell. It shows the measured request serves real bytes; it is NOT parity over all returned rows or all variables.",
-        "read_ms": 2.919,
+        "read_ms": 2.573,
         "read_path": "SegmentedCubeStore.point_series",
         "requested_days": 5,
         "returned_days": 5,
@@ -629,37 +629,37 @@
       {
         "files": 55,
         "label": "LOCAL",
-        "ms_per_1k_files": 39.0106,
+        "ms_per_1k_files": 45.8045,
         "segments": 5,
-        "wall_ms": 2.146
+        "wall_ms": 2.519
       },
       {
         "files": 143,
         "label": "LOCAL",
-        "ms_per_1k_files": 36.4024,
+        "ms_per_1k_files": 38.9333,
         "segments": 13,
-        "wall_ms": 5.206
+        "wall_ms": 5.567
       },
       {
         "files": 451,
         "label": "LOCAL",
-        "ms_per_1k_files": 38.8308,
+        "ms_per_1k_files": 39.4964,
         "segments": 41,
-        "wall_ms": 17.513
+        "wall_ms": 17.813
       },
       {
         "files": 902,
         "label": "LOCAL",
-        "ms_per_1k_files": 37.4928,
+        "ms_per_1k_files": 39.6873,
         "segments": 82,
-        "wall_ms": 33.819
+        "wall_ms": 35.798
       },
       {
         "files": 1342,
         "label": "LOCAL",
-        "ms_per_1k_files": 37.7246,
+        "ms_per_1k_files": 39.9997,
         "segments": 122,
-        "wall_ms": 50.626
+        "wall_ms": 53.68
       }
     ],
     "segment_calls": [
@@ -743,8 +743,8 @@
         "label": "LOCAL_SYNTHETIC",
         "measures": "SegmentedCubeStore(manifest_dir) construction",
         "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
-        "p50_ms": 36.858,
-        "p95_ms": 38.019,
+        "p50_ms": 37.814,
+        "p95_ms": 40.017,
         "segments": 5
       },
       {
@@ -765,8 +765,8 @@
         "label": "LOCAL_SYNTHETIC",
         "measures": "SegmentedCubeStore(manifest_dir) construction",
         "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
-        "p50_ms": 95.171,
-        "p95_ms": 97.588,
+        "p50_ms": 100.745,
+        "p95_ms": 107.791,
         "segments": 13
       },
       {
@@ -787,8 +787,8 @@
         "label": "LOCAL_SYNTHETIC",
         "measures": "SegmentedCubeStore(manifest_dir) construction",
         "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
-        "p50_ms": 303.886,
-        "p95_ms": 305.493,
+        "p50_ms": 310.78,
+        "p95_ms": 315.52,
         "segments": 41
       },
       {
@@ -809,8 +809,8 @@
         "label": "LOCAL_SYNTHETIC",
         "measures": "SegmentedCubeStore(manifest_dir) construction",
         "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
-        "p50_ms": 594.573,
-        "p95_ms": 615.07,
+        "p50_ms": 627.782,
+        "p95_ms": 637.878,
         "segments": 82
       },
       {
@@ -831,8 +831,8 @@
         "label": "LOCAL_SYNTHETIC",
         "measures": "SegmentedCubeStore(manifest_dir) construction",
         "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
-        "p50_ms": 890.039,
-        "p95_ms": 896.441,
+        "p50_ms": 974.601,
+        "p95_ms": 999.142,
         "segments": 122
       }
     ],
@@ -840,69 +840,121 @@
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.3994,
+        "ms_per_segment": 0.4056,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 5,
         "segments": 5,
-        "wall_ms": 1.997
+        "wall_ms": 2.028
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.3342,
+        "ms_per_segment": 0.433,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 13,
         "segments": 13,
-        "wall_ms": 4.345
+        "wall_ms": 5.629
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.3739,
+        "ms_per_segment": 0.3692,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 41,
         "segments": 41,
-        "wall_ms": 15.331
+        "wall_ms": 15.137
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.4326,
+        "ms_per_segment": 0.3945,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 82,
         "segments": 82,
-        "wall_ms": 35.47
+        "wall_ms": 32.348
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.4098,
+        "ms_per_segment": 0.4029,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 122,
         "segments": 122,
-        "wall_ms": 49.99
+        "wall_ms": 49.156
       }
     ],
     "tail_rebuild": [
       {
         "c": 30,
+        "fill_days": 30,
         "label": "DEFERRED",
-        "reason": "no carry-forward was measured: v2 is rebuilt from fixtures, never read from the predecessor block, and there is no source map. Real carry-forward needs the O2 materialization strategy, which does not exist yet. The probe's timings are deliberately NOT published here -- a wall-clock number in a DEFERRED row reads as evidence it is not.",
-        "rewrite_evidence": "sha256-content-digest (probe only)",
+        "reason": "no tail fold exists at s=30, c=30, fill=30: 30 predecessor day(s) and 0 newly aged day(s). An amplification ratio here would divide by an empty numerator's counterpart, not measure a rebuild.",
+        "rewrite_evidence": "sha256-content-digest",
         "s": 30
       },
       {
+        "amplification_scope": "single-fold",
         "c": 30,
-        "label": "DEFERRED",
-        "reason": "no carry-forward was measured: v2 is rebuilt from fixtures, never read from the predecessor block, and there is no source map. Real carry-forward needs the O2 materialization strategy, which does not exist yet. The probe's timings are deliberately NOT published here -- a wall-clock number in a DEFERRED row reads as evidence it is not.",
-        "rewrite_evidence": "sha256-content-digest (probe only)",
-        "s": 45
+        "carried_forward_days": 30,
+        "days_in_new_tail": 45,
+        "fill_days": 30,
+        "label": "LOCAL_SYNTHETIC",
+        "newly_aged_days": 15,
+        "predecessor_fill_days": 30,
+        "predecessor_published": true,
+        "predecessor_unchanged": true,
+        "reason": "real path: a published predecessor block was read through build_block's source map, its days pruned from the delta beforehand. Fixture extent, not production geometry, and not a capacity result. `write_amplification` is ONE fold at one fill level, not the \u00a710 lifecycle mean (S/C+1)/2, which averages every fold from empty to full; the two happen to agree at s=90/c=30 and disagree elsewhere, so this row does not corroborate the model.",
+        "rebuild_wall_ms": 907.306,
+        "rewrite_evidence": "sha256-content-digest",
+        "s": 45,
+        "source_group_opens": 4,
+        "source_map_complete": true,
+        "write_amplification": 3.0
+      },
+      {
+        "amplification_scope": "single-fold",
+        "c": 30,
+        "carried_forward_days": 30,
+        "days_in_new_tail": 60,
+        "fill_days": 30,
+        "label": "LOCAL_SYNTHETIC",
+        "newly_aged_days": 30,
+        "predecessor_fill_days": 30,
+        "predecessor_published": true,
+        "predecessor_unchanged": true,
+        "reason": "real path: a published predecessor block was read through build_block's source map, its days pruned from the delta beforehand. Fixture extent, not production geometry, and not a capacity result. `write_amplification` is ONE fold at one fill level, not the \u00a710 lifecycle mean (S/C+1)/2, which averages every fold from empty to full; the two happen to agree at s=90/c=30 and disagree elsewhere, so this row does not corroborate the model.",
+        "rebuild_wall_ms": 1151.996,
+        "rewrite_evidence": "sha256-content-digest",
+        "s": 90,
+        "source_group_opens": 4,
+        "source_map_complete": true,
+        "write_amplification": 2.0
+      },
+      {
+        "amplification_scope": "single-fold",
+        "c": 30,
+        "carried_forward_days": 60,
+        "days_in_new_tail": 90,
+        "fill_days": 60,
+        "label": "LOCAL_SYNTHETIC",
+        "newly_aged_days": 30,
+        "predecessor_fill_days": 60,
+        "predecessor_published": true,
+        "predecessor_unchanged": true,
+        "reason": "real path: a published predecessor block was read through build_block's source map, its days pruned from the delta beforehand. Fixture extent, not production geometry, and not a capacity result. `write_amplification` is ONE fold at one fill level, not the \u00a710 lifecycle mean (S/C+1)/2, which averages every fold from empty to full; the two happen to agree at s=90/c=30 and disagree elsewhere, so this row does not corroborate the model.",
+        "rebuild_wall_ms": 1750.782,
+        "rewrite_evidence": "sha256-content-digest",
+        "s": 90,
+        "source_group_opens": 4,
+        "source_map_complete": true,
+        "write_amplification": 3.0
       },
       {
         "c": 30,
+        "fill_days": 90,
         "label": "DEFERRED",
-        "reason": "no carry-forward was measured: v2 is rebuilt from fixtures, never read from the predecessor block, and there is no source map. Real carry-forward needs the O2 materialization strategy, which does not exist yet. The probe's timings are deliberately NOT published here -- a wall-clock number in a DEFERRED row reads as evidence it is not.",
-        "rewrite_evidence": "sha256-content-digest (probe only)",
+        "reason": "no tail fold exists at s=90, c=30, fill=90: 90 predecessor day(s) and 0 newly aged day(s). An amplification ratio here would divide by an empty numerator's counterpart, not measure a rebuild.",
+        "rewrite_evidence": "sha256-content-digest",
         "s": 90
       }
     ]
