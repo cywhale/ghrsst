@@ -427,11 +427,25 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
         construction = doc[doc.index("## Snapshot construction"):doc.index("## RAW GROUP-OPEN")]
         self.assertNotIn("construction p50 (ms)", construction)
         self.assertIn("NOT reproduced here", construction)
-        # NOT "does it match the current artifact" -- a STALE copied number would pass that,
-        # and stale is exactly the drift that occurred. No decimal figure may appear in this
-        # section at all.
-        stray = re.findall(r"\d+\.\d+", construction)
-        self.assertEqual(stray, [], f"hand-typed numbers in the construction section: {stray}")
+        # EVERY measured-timing section, not just the one that drifted first. The previous
+        # round guarded `Snapshot construction` and left the raw `open_group` table beside it
+        # unprotected -- where it had already drifted. Fixing the instance instead of the class
+        # is what let the same defect reappear one section over.
+        #
+        # NOT "does it match the current artifact": a STALE copied number would pass that, and
+        # stale is exactly what happened. No decimal figure may appear in these sections at all.
+        timing_sections = {
+            "snapshot construction": ("## Snapshot construction", "## RAW GROUP-OPEN"),
+            "raw group-open": ("## RAW GROUP-OPEN", "## Grouped read"),
+        }
+        for name, (begin, finish) in timing_sections.items():
+            with self.subTest(name):
+                body = doc[doc.index(begin):doc.index(finish)]
+                # §10.5 / §10.6 are spec references, not measurements.
+                body = re.sub(r"§\d+(\.\d+)*[a-z]?", "", body)
+                stray = re.findall(r"\d+\.\d+", body)
+                self.assertEqual(stray, [],
+                                 f"hand-typed numbers in the {name} section: {stray}")
         # a DEFERRED section may not carry a wall-clock number
         tail = doc[doc.index("## Tail rebuild"):doc.index("## DEFERRED — five metrics")]
         self.assertNotIn("rebuild (ms)", tail)

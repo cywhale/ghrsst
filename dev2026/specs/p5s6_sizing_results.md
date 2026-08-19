@@ -97,20 +97,18 @@ were conflated once and the difference is most of the work.
 The question §10.6 asks is whether these degrade **super-linearly** with segment count. Measured
 at the required 5 / 13 / 41 / 82 / 122 horizons:
 
-| segments | snapshot open (ms) | **ms per segment** | walk files | walk (ms) |
-|---|---|---|---|---|
-| 5 | 2.00 | 0.400 | 55 | 2.20 |
-| 13 | 5.34 | 0.411 | 143 | 5.53 |
-| 41 | 17.00 | 0.415 | 451 | 17.56 |
-| 82 | 34.54 | 0.421 | 902 | 33.58 |
-| 122 | 52.39 | **0.429** | 1 342 | 49.93 |
+**Timings are NOT reproduced here either.** The hand-typed table that used to sit above had
+already drifted from the artifact — the same failure as the construction section, one section
+over, because the previous round fixed the instance instead of the class. The authoritative
+values are `bench/results/p5s6_sizing_full.json` → `measured.snapshot_open`, and the guard now
+covers **every** measured-timing section rather than one of them.
 
-**These numbers are raw `zarr.open_group()` cost.** They exclude manifest validation, segment
-inspection, metadata binding and snapshot construction — which is most of what
-`SegmentedCubeStore` actually does on a generation change. Per-segment raw cost is flat to
-within 7 % across a 24× range, No super-linear term appears, so
-nothing here argues for the §10.5 super-block-merge escape hatch. This is **LOCAL** on a warm
-cache with tiny blocks; the production thresholds remain DEFERRED.
+What these numbers are: raw `zarr.open_group()` cost. They exclude manifest validation, segment
+inspection, metadata binding and snapshot construction — most of what `SegmentedCubeStore`
+actually does on a generation change, which is why the construction measurement exists beside
+them. The shape, which does not drift: per-segment raw cost is **flat** across the 5 → 122
+range, so no super-linear term appears and nothing here argues for the §10.5 super-block-merge
+escape hatch. **LOCAL** on a warm cache with tiny blocks; production thresholds remain DEFERRED.
 
 ## Grouped read — the REAL path (item 1, partial)
 
