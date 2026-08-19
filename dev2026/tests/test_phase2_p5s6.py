@@ -757,6 +757,16 @@ class TestCapacityGate(unittest.TestCase):
         self.assertEqual(g["shortfall_gb"], 0.0)
 
 
+PARITY_EV = {"kind": "value_parity", "variables": ["sst", "sst_anomaly", "sea_ice"],
+             "var_valid_checked": True, "nan_semantics_checked": True,
+             "verification_provenance": "sha256 per-day digest vs base, run 2026-08-19",
+             "day_range": ["2023-01-01", "2026-06-20"]}
+MANIFEST_EV = {"kind": "external_manifest", "source": "https://podaac.jpl.nasa.gov/...",
+               "day_coverage": ["2023-01-01", "2026-08-17"],
+               "download_procedure": "documented in ops runbook X",
+               "verification_method": "md5 from the provider manifest"}
+
+
 class TestHoldLifecycleClassification(unittest.TestCase):
     """Round 2. The first version authorized a release from membership + spatial window alone.
     Membership is not parity, and "bbox does not need it" is not "nothing needs it"."""
@@ -784,60 +794,60 @@ class TestHoldLifecycleClassification(unittest.TestCase):
     def test_membership_without_parity_or_recovery_is_recovery_policy_pending(self):
         out = self._c()
         self.assertEqual(out["klass"], "recovery_policy_pending")
-        self.assertIn("removes the local rebuild source", out["reason"])
-        self.assertFalse(out["evidence"]["base_value_parity_verified"])
-        self.assertFalse(out["evidence"]["recovery_source_verified"])
+        self.assertIn("none is sufficient", out["reason"])
+        self.assertIn("not whether these BYTES can be recovered", out["reason"])
+        self.assertFalse(out["evidence"]["recovery_content_verified"])
+        self.assertIsNotNone(out["evidence"]["recovery_evidence_rejected_because"])
 
-    def test_verified_parity_authorizes(self):
-        out = self._c(base_value_parity_verified=True)
+    def test_verified_parity_authorizes(self):  # noqa: D401
+        out = self._c(recovery_evidence=PARITY_EV)
         self.assertEqual(out["klass"], "releasable_after_approval")
         self.assertTrue(out["evidence"]["release_authorized"])
         self.assertIn("REQUIRES HUMAN APPROVAL", out["reason"])
 
     def test_a_verified_recovery_source_authorizes(self):
-        out = self._c(recovery_source_verified=True)
+        out = self._c(recovery_evidence=MANIFEST_EV)
         self.assertEqual(out["klass"], "releasable_after_approval")
 
     # ---- pre-P5 semantics --------------------------------------------------
     def test_absent_P5_roots_are_UNCHECKED_not_clear(self):
-        out = self._c(p5_roots_present=False, recovery_source_verified=True)
+        out = self._c(p5_roots_present=False, recovery_evidence=MANIFEST_EV)
         self.assertEqual(out["klass"], "repair_state_unknown_pre_p5")
         self.assertIn("UNCHECKED, not clear", out["reason"])
         self.assertNotEqual(out["klass"], "releasable_after_approval")
 
     def test_a_pending_repair_blocks_release(self):
-        out = self._c(wal_repairs_pending={"2026-01-01"}, recovery_source_verified=True)
+        out = self._c(wal_repairs_pending={"2026-01-01"}, recovery_evidence=MANIFEST_EV)
         self.assertEqual(out["klass"], "repair_state_unknown_pre_p5")
 
     # ---- reference / uniqueness -------------------------------------------
     def test_a_day_base_does_NOT_cover_is_a_unique_copy(self):
         out = self._c({"day": "2026-06-30", "hold_until": "2026-01-01T00:00:00+00:00"},
-                      recovery_source_verified=True)
+                      recovery_evidence=MANIFEST_EV)
         self.assertEqual(out["klass"], "blocked_unique_copy")
 
     def test_a_rollback_referenced_backup_is_not_releasable(self):
-        out = self._c(referenced_by_rollback=True, recovery_source_verified=True)
+        out = self._c(referenced_by_rollback=True, recovery_evidence=MANIFEST_EV)
         self.assertEqual(out["klass"], "referenced")
         self.assertIn("rollback", out["reason"])
 
     def test_an_entry_on_the_active_serving_path_is_not_releasable(self):
-        out = self._c(in_active_serving_path=True, recovery_source_verified=True)
+        out = self._c(in_active_serving_path=True, recovery_evidence=MANIFEST_EV)
         self.assertEqual(out["klass"], "referenced")
 
     def test_an_unexpired_hold_is_referenced(self):
         out = self._c({"day": "2026-01-01", "hold_until": "2026-09-01T00:00:00+00:00"},
-                      recovery_source_verified=True)
+                      recovery_evidence=MANIFEST_EV)
         self.assertEqual(out["klass"], "referenced")
 
     def test_an_untracked_path_is_NEVER_releasable(self):
-        out = self._c(tracked_in_manifest=False, recovery_source_verified=True,
-                      base_value_parity_verified=True)
+        out = self._c(tracked_in_manifest=False, recovery_evidence=PARITY_EV)
         self.assertEqual(out["klass"], "inconsistent_or_unknown")
 
     def test_missing_metadata_fails_closed(self):
         for entry in ({"day": "2026-01-01"}, {"hold_until": "2026-08-13T00:00:00+00:00"}):
             with self.subTest(sorted(entry)):
-                self.assertEqual(self._c(entry, recovery_source_verified=True)["klass"],
+                self.assertEqual(self._c(entry, recovery_evidence=MANIFEST_EV)["klass"],
                                  "inconsistent_or_unknown")
 
     def test_no_objection_can_be_overridden_by_recovery_evidence(self):
@@ -854,10 +864,109 @@ class TestHoldLifecycleClassification(unittest.TestCase):
         ]
         for name, kw in cases:
             with self.subTest(name):
-                out = self._c(base_value_parity_verified=True,
-                              recovery_source_verified=True, **kw)
+                out = self._c(recovery_evidence=PARITY_EV, **kw)
                 self.assertNotEqual(out["klass"], "releasable_after_approval")
                 self.assertFalse(out["evidence"]["release_authorized"])
+
+
+class TestRecoveryEvidenceContract(unittest.TestCase):
+    """Day-set coverage and supersession are deliberately not recovery proof."""
+
+    def test_no_evidence_is_rejected(self):
+        self.assertIsNotNone(sizing.validate_recovery_evidence(None))
+
+    def test_a_bare_boolean_cannot_stand_in(self):
+        for bad in (True, 1, "yes", [], "value_parity"):
+            with self.subTest(repr(bad)):
+                self.assertIsNotNone(sizing.validate_recovery_evidence(bad))
+
+    def test_an_unknown_kind_is_rejected(self):
+        self.assertIsNotNone(sizing.validate_recovery_evidence(
+            {"kind": "day_set_coverage", "source": "x"}))
+
+    def test_every_required_field_is_required(self):
+        for drop in ("variables", "var_valid_checked", "nan_semantics_checked",
+                     "verification_provenance", "day_range"):
+            with self.subTest(drop):
+                ev = {k: v for k, v in PARITY_EV.items() if k != drop}
+                self.assertIsNotNone(sizing.validate_recovery_evidence(ev))
+
+    def test_flags_must_be_exactly_True(self):
+        for bad in ("true", 1, "false"):
+            with self.subTest(repr(bad)):
+                self.assertIsNotNone(sizing.validate_recovery_evidence(
+                    {**PARITY_EV, "var_valid_checked": bad}))
+
+    def test_valid_evidence_of_each_kind_passes(self):
+        self.assertIsNone(sizing.validate_recovery_evidence(PARITY_EV))
+        self.assertIsNone(sizing.validate_recovery_evidence(MANIFEST_EV))
+
+
+class TestAuditEntryPointMatchesTheArtifact(unittest.TestCase):
+    """The artifact must be GENERATED by the committed classifier, not assembled beside it."""
+
+    def _run(self):
+        import datetime as dt
+        ev = json.loads(open(os.path.join(_DEV2026, "bench", "results",
+                                          "p5s6_vm24_hold_evidence.json")).read())
+        s, e = (dt.date.fromisoformat(ev["base_days"][0]),
+                dt.date.fromisoformat(ev["base_days"][1]))
+        run = dict(ev, base_days=[(s + dt.timedelta(days=i)).isoformat()
+                                  for i in range((e - s).days + 1)])
+        return sizing.audit_hold_lifecycle_from_evidence(run)
+
+    def test_the_artifact_matches_a_fresh_run_of_the_audit(self):
+        fresh = self._run()
+        with open(os.path.join(_DEV2026, "bench", "results",
+                               "p5s6_vm24_readonly.json")) as fh:
+            stored = json.load(fh)["hold_lifecycle_audit"]
+        self.assertEqual([e["klass"] for e in stored["entries"]],
+                         [e["klass"] for e in fresh["entries"]])
+        self.assertEqual(stored["currently_reclaimable_gib"],
+                         fresh["currently_reclaimable_gib"])
+
+    def test_the_production_evidence_authorizes_NOTHING(self):
+        fresh = self._run()
+        self.assertEqual(fresh["currently_reclaimable_gib"], 0.0)
+        for e in fresh["entries"]:
+            self.assertNotEqual(e["klass"], "releasable_after_approval")
+            self.assertFalse(e["evidence"]["release_authorized"])
+
+    def test_the_audit_is_marked_audit_only_and_no_deletion(self):
+        fresh = self._run()
+        self.assertTrue(fresh["audit_only"])
+        self.assertFalse(fresh["deletion_performed"])
+
+    def test_incomplete_evidence_fails_closed(self):
+        for drop in ("measured_utc", "base_days", "spatial_window", "p5_roots_present",
+                     "entries", "now_utc", "host"):
+            with self.subTest(drop):
+                import datetime as dt
+                ev = json.loads(open(os.path.join(
+                    _DEV2026, "bench", "results", "p5s6_vm24_hold_evidence.json")).read())
+                ev["base_days"] = ["2023-01-01"]
+                ev.pop(drop)
+                out = sizing.audit_hold_lifecycle_from_evidence(ev)
+                self.assertEqual(out["verdict"], "FAIL_CLOSED")
+                self.assertIn(drop, out["reason"])
+
+    def test_the_big_entries_report_MORE_than_one_blocker(self):
+        """Reporting only the first blocker reads as "fix this and it releases"."""
+        fresh = self._run()
+        daily = fresh["entries"][0]
+        self.assertEqual(daily["klass"], "repair_state_unknown_pre_p5")
+        self.assertTrue(daily["also_blocking"])
+        self.assertTrue(any("recovery evidence" in b for b in daily["also_blocking"]))
+
+    def test_supplying_valid_evidence_WOULD_authorize_on_a_p5_host(self):
+        """Otherwise "always blocked" would satisfy every assertion above."""
+        out = sizing.classify_hold_entry(
+            entry={"day": "2023-01-01", "hold_until": "2026-08-13T00:00:00+00:00"},
+            now_utc="2026-08-19T07:40:00+00:00", base_days={"2023-01-01"},
+            spatial_window=("2026-06-27", "2026-08-17"),
+            recovery_evidence=MANIFEST_EV, p5_roots_present=True)
+        self.assertEqual(out["klass"], "releasable_after_approval")
+        self.assertTrue(out["evidence"]["release_authorized"])
 
 
 if __name__ == "__main__":

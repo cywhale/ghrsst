@@ -1,0 +1,119 @@
+{
+  "base_days": [
+    "2023-01-01",
+    "2026-06-26"
+  ],
+  "base_days_are_a_gapless_range": true,
+  "base_days_source": "base zarr.json attributes: 1273 days, 2023-01-01..2026-06-26, zero gaps",
+  "collection_method": "read-only ssh: hold/manifest.jsonl, store zarr.json attributes, healthz, du -sb, ls. No write of any kind.",
+  "entries": [
+    {
+      "bytes": 2353299279803,
+      "record": {
+        "days": [
+          "2023-01-01",
+          "2026-06-20"
+        ],
+        "hold_until": "2026-08-13T03:19:41Z"
+      },
+      "recovery_evidence": null,
+      "recovery_evidence_absent_because": "local NetCDF covers only 2026-07-12..2026-08-17 -- not one of these days; no external recovery manifest is recorded; base/hold value parity was not verified",
+      "tracked_in_manifest": true,
+      "what": "daily staging holds, 1267 day directories (2023-01-01..2026-06-20)"
+    },
+    {
+      "bytes": 44000000000,
+      "record": {
+        "days": [
+          "2026-05-30",
+          "2026-06-26"
+        ],
+        "hold_until": "2026-07-23T13:58:45Z"
+      },
+      "recovery_evidence": null,
+      "recovery_evidence_absent_because": "day-set coverage by base and the live delta, plus supersession by two later swaps, is what round 2 relied on. Neither is content-recovery proof: no value parity, no fingerprint identity against an immutable generation, no external manifest",
+      "tracked_in_manifest": true,
+      "what": "expired delta pre-prune backup 2026-07-09 (days 2026-05-30..2026-07-08)"
+    },
+    {
+      "bytes": 59423011956,
+      "record": {
+        "days": [
+          "2026-06-05",
+          "2026-06-26"
+        ],
+        "hold_until": "2026-08-11T07:51:45Z"
+      },
+      "recovery_evidence": null,
+      "recovery_evidence_absent_because": "as above",
+      "tracked_in_manifest": true,
+      "what": "expired delta pre-prune backup 2026-07-28 (days 2026-06-05..2026-07-26)"
+    },
+    {
+      "bytes": 63614571775,
+      "record": {
+        "days": [
+          "2026-06-05",
+          "2026-06-26"
+        ],
+        "hold_until": "2026-09-01T13:27:27Z"
+      },
+      "recovery_evidence": null,
+      "referenced_by_rollback": true,
+      "tracked_in_manifest": true,
+      "what": "newest delta pre-prune backup 2026-08-18"
+    },
+    {
+      "bytes": 40802189312,
+      "record": {
+        "days": [
+          "2026-06-05",
+          "2026-06-26"
+        ],
+        "hold_until": null
+      },
+      "recovery_evidence": null,
+      "tracked_in_manifest": false,
+      "what": "delta copy outside the hold manifest: p4build.20260727T021310Z"
+    },
+    {
+      "bytes": 3221225472,
+      "record": {
+        "days": [
+          "2026-06-05",
+          "2026-06-26"
+        ],
+        "hold_until": null
+      },
+      "recovery_evidence": null,
+      "tracked_in_manifest": false,
+      "what": "delta copy outside the hold manifest: pre-gapfix.20260625T133355"
+    }
+  ],
+  "host": "odb24",
+  "local_netcdf": {
+    "bytes": 23625668015,
+    "coverage": [
+      "2026-07-12",
+      "2026-08-17"
+    ],
+    "covers_daily_hold_range": false,
+    "dir": "src/",
+    "files": 32
+  },
+  "measured_utc": "2026-08-19T07:40:00Z",
+  "now_utc": "2026-08-19T07:40:00+00:00",
+  "p5_roots_checked": [
+    "p5_blocks",
+    "p5_repairs",
+    "p5_anchor",
+    "base_blocks"
+  ],
+  "p5_roots_present": false,
+  "provenance": "VM24_PRODUCTION_READ_ONLY",
+  "spatial_window": [
+    "2026-06-27",
+    "2026-08-17"
+  ],
+  "wal_repairs_pending": null
+}

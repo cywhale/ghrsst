@@ -754,11 +754,56 @@ HOLD_CLASSES = ("referenced", "blocked_unique_copy", "repair_state_unknown_pre_p
                 "recovery_policy_pending", "releasable_after_approval",
                 "inconsistent_or_unknown")
 
+#: The only three things that count as proof a hold's CONTENT is recoverable. Day-set coverage
+#: is not on this list, and neither is supersession: both describe which dates exist somewhere,
+#: not whether the bytes can be got back.
+RECOVERY_EVIDENCE_KINDS = ("value_parity", "external_manifest", "immutable_generation")
+
+_REQUIRED_EVIDENCE_FIELDS = {
+    "value_parity": ("variables", "var_valid_checked", "nan_semantics_checked",
+                     "verification_provenance", "day_range"),
+    "external_manifest": ("source", "day_coverage", "download_procedure",
+                          "verification_method"),
+    "immutable_generation": ("generation_id", "fingerprint", "provenance",
+                             "supports_rollback"),
+}
+
+
+def validate_recovery_evidence(evidence) -> Optional[str]:
+    """`None` when the evidence proves content recovery; otherwise why it does not.
+
+    Strict about types on purpose. `bool(x)` accepts the string "false"; a missing field
+    defaulting to `True` accepts nothing at all; a set collapses duplicates into apparent
+    agreement. Each of those has already produced a wrong verdict somewhere in this project, so
+    the fields are checked for exact types rather than truthiness."""
+    if evidence is None:
+        return "no recovery evidence supplied"
+    if type(evidence) is not dict:
+        return f"recovery evidence must be a dict, got {type(evidence).__name__}"
+    kind = evidence.get("kind")
+    if kind not in RECOVERY_EVIDENCE_KINDS:
+        return (f"unknown recovery evidence kind {kind!r}; must be one of "
+                f"{', '.join(RECOVERY_EVIDENCE_KINDS)}")
+    missing = [f for f in _REQUIRED_EVIDENCE_FIELDS[kind] if f not in evidence]
+    if missing:
+        return f"{kind} evidence is missing {', '.join(missing)}"
+    for flag in ("var_valid_checked", "nan_semantics_checked", "supports_rollback"):
+        if flag in evidence and evidence[flag] is not True:
+            return f"{flag} must be exactly True, got {evidence[flag]!r}"
+    for field in ("verification_provenance", "verification_method", "download_procedure",
+                  "fingerprint", "generation_id", "provenance", "source"):
+        if field in evidence:
+            if type(evidence[field]) is not str or not evidence[field].strip():
+                return f"{field} must be a non-empty string"
+    if kind == "value_parity":
+        if type(evidence["variables"]) is not list or not evidence["variables"]:
+            return "value_parity evidence must list the variables it checked"
+    return None
+
 
 def classify_hold_entry(*, entry: dict, now_utc: str, base_days: set,
                         spatial_window: Sequence[str],
-                        base_value_parity_verified: bool = False,
-                        recovery_source_verified: bool = False,
+                        recovery_evidence: Optional[dict] = None,
                         p5_roots_present: bool = False,
                         wal_repairs_pending: Optional[set] = None,
                         referenced_by_rollback: bool = False,
@@ -766,45 +811,51 @@ def classify_hold_entry(*, entry: dict, now_utc: str, base_days: set,
                         tracked_in_manifest: bool = True) -> dict:
     """Classify ONE hold entry, read-only. Deletes nothing and authorizes nothing.
 
-    ## What each piece of evidence does and does NOT establish
+    ## Evidence, as separate facts
 
-    The first version of this collapsed several different questions into one verdict, and got
-    the answer wrong. They are separate fields now because they are separate facts:
-
-    - `base_membership_covered` -- base's day SET contains the day. Says nothing about values.
-    - `base_value_parity_verified` -- base's BYTES for the day match the held copy. This is what
-      would make base a substitute; membership alone never was.
-    - `bbox_spatially_unneeded` -- the day is outside the enforced spatial window, so bbox does
-      not need it. **This alone can never authorize a release**: it says nothing about
-      point/time-range, about a base rebuild, or about recovery.
-    - `recovery_source_verified` -- some OTHER retrievable copy exists (NetCDF on disk, or a
-      recorded external manifest with a usable download window). Without it, deleting a daily
-      hold removes the local rebuild source for that day.
-    - `release_authorized` -- true only when base can substitute for the day AND a recovery path
-      survives the deletion.
+    - `base_membership_covered` -- base's day SET contains the day. Not a statement about values.
+    - `bbox_spatially_unneeded` -- outside the enforced spatial window, so bbox does not need it.
+      **Never sufficient**: silent about point/time-range, base rebuild and recovery.
+    - `recovery_content_verified` -- one of the three `RECOVERY_EVIDENCE_KINDS`, validated. Day-set
+      coverage and supersession are deliberately NOT among them: "the live delta holds the same
+      dates" says nothing about whether these bytes can be recovered.
+    - `release_authorized` -- only with validated recovery evidence and no outstanding objection.
 
     ## Pre-P5 hosts
 
-    When the P5 roots are absent there is no repair WAL to read, so "no pending repair" is
-    **not a finding**. It is `repair_state_unknown_pre_p5`: unchecked, not clear.
+    Absent P5 roots mean there is no repair WAL to read. That is
+    `repair_state_unknown_pre_p5` -- unchecked, not clear -- and it blocks authorization. Accepting
+    a pre-P5 release is an operator policy, never a classifier default.
     """
     days = list(entry.get("days") or ([entry["day"]] if entry.get("day") else []))
-    ev = {"base_membership_covered": None, "base_value_parity_verified": False,
-          "bbox_spatially_unneeded": None, "recovery_source_verified": False,
+    why = validate_recovery_evidence(recovery_evidence)
+    ev = {"base_membership_covered": None, "bbox_spatially_unneeded": None,
+          "recovery_content_verified": why is None,
+          "recovery_evidence_kind": (recovery_evidence or {}).get("kind") if why is None else None,
+          "recovery_evidence_rejected_because": why,
           "release_authorized": False}
 
     def out(klass, reason):
-        return {"klass": klass, "days": days, "evidence": ev, "reason": reason}
+        # Every OTHER outstanding objection, not just the first one to fire. Reporting only the
+        # blocker that happened to be checked first reads as "fix this and it is releasable",
+        # which for these entries is false twice over.
+        also = []
+        if klass != "recovery_policy_pending" and why is not None and klass not in (
+                "inconsistent_or_unknown", "blocked_unique_copy"):
+            also.append(f"recovery evidence: {why}")
+        if klass != "repair_state_unknown_pre_p5" and not p5_roots_present:
+            also.append("repair state unchecked (P5 roots absent)")
+        return {"klass": klass, "days": days, "evidence": ev, "reason": reason,
+                "also_blocking": also}
 
     if not tracked_in_manifest:
         return out("inconsistent_or_unknown",
                    "present on disk but absent from the hold manifest, so no lifecycle state "
-                   "exists for it; an untracked path is what a manual cleanup leaves behind")
+                   "exists; an untracked path is what a manual cleanup leaves behind")
     if not days:
         return out("inconsistent_or_unknown", "the record names no day")
     if not entry.get("hold_until"):
         return out("inconsistent_or_unknown", "no hold_until; the retention window is unknown")
-
     if in_active_serving_path:
         return out("referenced", "still on the active serving path")
     if referenced_by_rollback:
@@ -813,43 +864,74 @@ def classify_hold_entry(*, entry: dict, now_utc: str, base_days: set,
     ev["base_membership_covered"] = all(d in base_days for d in days)
     ev["bbox_spatially_unneeded"] = not (
         spatial_window and any(spatial_window[0] <= d <= spatial_window[1] for d in days))
-    ev["base_value_parity_verified"] = bool(base_value_parity_verified)
-    ev["recovery_source_verified"] = bool(recovery_source_verified)
 
     if not ev["base_membership_covered"]:
         missing = sorted(d for d in days if d not in base_days)
         return out("blocked_unique_copy",
-                   f"{len(missing)} day(s) are not in base, first {missing[0]}: this is the "
-                   f"only local copy and releasing it loses the day")
-
+                   f"{len(missing)} day(s) are not in base, first {missing[0]}: only local copy")
     if not ev["bbox_spatially_unneeded"]:
         return out("referenced", "day(s) fall inside the enforced spatial window")
-
     if not p5_roots_present:
         return out("repair_state_unknown_pre_p5",
-                   "the P5 roots are absent, so no repair WAL exists to consult. Repair state "
-                   "is UNCHECKED, not clear, and an unchecked precondition cannot authorize a "
-                   "release")
+                   "the P5 roots are absent, so no repair WAL exists to consult. Repair state is "
+                   "UNCHECKED, not clear, and an unchecked precondition cannot authorize a "
+                   "release. Accepting a pre-P5 release is an operator policy decision")
     if set(days) & set(wal_repairs_pending or ()):
         return out("repair_state_unknown_pre_p5", "repair/refold outstanding for day(s) held")
-
     if entry["hold_until"] > now_utc:
         return out("referenced", f"hold_until {entry['hold_until']} has not passed")
 
-    # Everything above is necessary. NONE of it is sufficient: membership is not parity, and an
-    # expired window is not a recovery plan.
-    if not (ev["base_value_parity_verified"] or ev["recovery_source_verified"]):
+    if why is not None:
         return out("recovery_policy_pending",
-                   "base covers the day SET and the retention window has passed, but base/hold "
-                   "VALUE parity is unverified and no recovery source is confirmed. Deleting "
-                   "this removes the local rebuild source for those days. Needs an operator "
-                   "policy decision, not a classifier's verdict")
+                   f"every necessary condition holds, but none is sufficient: {why}. Day-set "
+                   f"coverage and supersession describe which DATES exist elsewhere, not "
+                   f"whether these BYTES can be recovered. Needs an operator policy decision")
 
     ev["release_authorized"] = True
     return out("releasable_after_approval",
-               "base substitutes for the day (membership plus verified parity or a confirmed "
-               "recovery source), the window has passed, and nothing references it. RELEASE "
-               "STILL REQUIRES HUMAN APPROVAL: this authorizes nothing on its own")
+               f"validated {ev['recovery_evidence_kind']} recovery evidence, base covers the "
+               f"days, the window has passed and nothing references it. RELEASE STILL REQUIRES "
+               f"HUMAN APPROVAL: this authorizes nothing on its own")
+
+
+def audit_hold_lifecycle_from_evidence(evidence: dict) -> dict:
+    """The committed, reproducible audit path: raw evidence in, classified verdicts out.
+
+    The production artifact is generated by THIS function. Round 2's verdicts were assembled by
+    hand alongside the classifier, so the two could disagree and nothing would notice."""
+    required = ("measured_utc", "host", "now_utc", "base_days", "spatial_window",
+                "p5_roots_present", "entries")
+    missing = [f for f in required if f not in evidence]
+    if missing:
+        return {"audit_only": True, "deletion_performed": False,
+                "verdict": "FAIL_CLOSED",
+                "reason": f"evidence is missing {', '.join(missing)}"}
+    base_days = set(evidence["base_days"])
+    results = []
+    for e in evidence["entries"]:
+        r = classify_hold_entry(
+            entry=e.get("record", {}), now_utc=evidence["now_utc"], base_days=base_days,
+            spatial_window=evidence["spatial_window"],
+            recovery_evidence=e.get("recovery_evidence"),
+            p5_roots_present=bool(evidence["p5_roots_present"]),
+            wal_repairs_pending=set(evidence.get("wal_repairs_pending") or ()),
+            referenced_by_rollback=bool(e.get("referenced_by_rollback")),
+            in_active_serving_path=bool(e.get("in_active_serving_path")),
+            tracked_in_manifest=bool(e.get("tracked_in_manifest", True)))
+        results.append({"what": e.get("what"), "bytes": e.get("bytes"),
+                        "gib": round((e.get("bytes") or 0) / (1 << 30), 1), **r})
+    reclaimable = sum(r["bytes"] or 0 for r in results
+                      if r["klass"] == "releasable_after_approval")
+    return {
+        "audit_only": True, "deletion_performed": False, "verdict": "COMPLETE",
+        "measured_utc": evidence["measured_utc"], "host": evidence["host"],
+        "p5_roots_present": evidence["p5_roots_present"],
+        "entries": results,
+        "currently_reclaimable_bytes": reclaimable,
+        "currently_reclaimable_gib": round(reclaimable / (1 << 30), 1),
+        "note": ("every `release_authorized` above traces to validated recovery evidence in the "
+                 "input. Nothing was deleted."),
+    }
 
 
 # --------------------------------------------------------------------------- deferred
