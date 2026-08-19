@@ -757,5 +757,73 @@ class TestCapacityGate(unittest.TestCase):
         self.assertEqual(g["shortfall_gb"], 0.0)
 
 
+class TestHoldLifecycleClassification(unittest.TestCase):
+    """Read-only classification. It authorizes nothing; the tests exist so that the one verdict
+    that could lose data is the hardest to reach."""
+
+    NOW = "2026-08-19T07:12:51+00:00"
+    WINDOW = ("2026-06-27", "2026-08-17")
+    BASE = {f"2026-06-{d:02d}" for d in range(1, 27)} | {"2026-01-01"}
+
+    def _c(self, entry, **kw):
+        kw.setdefault("base_days", self.BASE)
+        kw.setdefault("spatial_window", self.WINDOW)
+        return sizing.classify_hold_entry(entry=entry, now_utc=self.NOW, **kw)
+
+    def test_a_clean_expired_hold_is_releasable(self):
+        out = self._c({"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"})
+        self.assertEqual(out["klass"], "releasable_after_approval")
+        self.assertIn("REQUIRES HUMAN APPROVAL", out["reason"])
+
+    def test_a_day_base_does_NOT_cover_is_a_unique_copy(self):
+        out = self._c({"day": "2026-06-30", "hold_until": "2026-01-01T00:00:00+00:00"})
+        self.assertEqual(out["klass"], "blocked_unique_copy")
+        self.assertIn("only local copy", out["reason"])
+
+    def test_a_day_inside_the_spatial_window_is_still_referenced(self):
+        out = self._c({"day": "2026-07-01", "hold_until": "2026-01-01T00:00:00+00:00"},
+                      base_days=self.BASE | {"2026-07-01"})
+        self.assertEqual(out["klass"], "referenced")
+
+    def test_an_unexpired_hold_is_referenced(self):
+        out = self._c({"day": "2026-01-01", "hold_until": "2026-09-01T00:00:00+00:00"})
+        self.assertEqual(out["klass"], "referenced")
+        self.assertIn("has not passed", out["reason"])
+
+    def test_a_pending_repair_blocks_release(self):
+        out = self._c({"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"},
+                      wal_repairs_pending={"2026-01-01"})
+        self.assertEqual(out["klass"], "repair_or_refold_pending")
+
+    def test_an_untracked_path_fails_closed(self):
+        out = self._c({"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"},
+                      tracked_in_manifest=False)
+        self.assertEqual(out["klass"], "inconsistent_or_unknown")
+        self.assertIn("not recorded in the hold manifest", out["reason"])
+
+    def test_missing_metadata_fails_closed(self):
+        for entry in ({"day": "2026-01-01"}, {"hold_until": "2026-08-13T00:00:00+00:00"}):
+            with self.subTest(sorted(entry)):
+                self.assertEqual(self._c(entry)["klass"], "inconsistent_or_unknown")
+
+    def test_repair_outranks_expiry_and_coverage(self):
+        """Ordering: a pending repair must win even when everything else looks releasable."""
+        out = self._c({"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"},
+                      wal_repairs_pending={"2026-01-01"})
+        self.assertNotEqual(out["klass"], "releasable_after_approval")
+
+    def test_only_one_class_can_ever_authorize_a_release(self):
+        self.assertIn("releasable_after_approval", sizing.HOLD_CLASSES)
+        for entry, kw in (({"day": "2026-06-30", "hold_until": "2026-01-01T00:00:00+00:00"}, {}),
+                          ({"day": "2026-01-01", "hold_until": "2026-09-01T00:00:00+00:00"}, {}),
+                          ({"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"},
+                           {"wal_repairs_pending": {"2026-01-01"}}),
+                          ({"day": "2026-01-01", "hold_until": "2026-08-13T00:00:00+00:00"},
+                           {"tracked_in_manifest": False})):
+            with self.subTest(str(entry)[:40]):
+                self.assertNotEqual(self._c(entry, **kw)["klass"],
+                                    "releasable_after_approval")
+
+
 if __name__ == "__main__":
     unittest.main()

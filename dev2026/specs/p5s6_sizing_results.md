@@ -350,6 +350,52 @@ What remains true: a 2 TB monolith rebuild is far further out of reach than one 
 which is the constraint O2 exists to remove. But **O2 cannot run on VM24 at today's free
 space**, and no local result changes that.
 
+### Hold / lifecycle audit — **AUDIT ONLY, NO DELETION PERFORMED**
+
+Read-only: `hold/manifest.jsonl` plus `du -sb`. Nothing was deleted, moved or modified, and this
+classification **authorizes nothing**.
+
+| class | what | size | releasable? |
+|---|---|---|---|
+| `releasable_after_approval` | 1267 daily staging holds, `2023-01-01`..`2026-06-20` | ~2192 GiB | yes, **with approval** |
+| `releasable_after_approval` | 2 expired delta backups (07-09, 07-28) | ~96 GiB | yes, **with approval** |
+| `referenced` | newest delta backup (08-18), `hold_until` 2026-09-01 | ~59 GiB | **no** |
+| `inconsistent_or_unknown` | 2 delta copies **not in the hold manifest** | ~41 GiB | **not determinable** |
+
+The daily holds qualify because base is **gapless across 2023-01-01..2026-06-26** (1273 days,
+read from the store's own attributes), so every held day is served by base for point/range; and
+the newest held day, `2026-06-20`, falls **before** the enforced spatial window starts
+(`2026-06-27`), so none is needed for bbox.
+
+`blocked_unique_copy` and `repair_or_refold_pending` are both **empty**, and the reason is
+recorded rather than assumed: the P5 roots (`p5_blocks`, `p5_repairs`, `p5_anchor`,
+`base_blocks`) are **absent on this host**, so no repair WAL or Phase A state exists to consult.
+Empty by construction, not by inspection — a distinction that matters if P5 is ever deployed
+there.
+
+The two untracked delta copies are deliberately **excluded** from the reclaimable total. They
+are on disk with no hold record, which is exactly what a manual cleanup leaves behind; releasing
+them is an ops decision, not this audit's.
+
+### Does it clear G18?
+
+| | GiB |
+|---|---|
+| `currently_reclaimable` | **2288.0** |
+| `free_now` | 267.0 |
+| `free_after_hypothetical_reclaim` | 2555.0 |
+| `required_free_before_build` (250 + 153.3) | 403.3 |
+| `remaining_shortfall` | **0.0** |
+
+**Disk expansion is not required** — roughly 17× what the 136.3 GiB shortfall needs. But
+theoretical reclaim is not reclaimed capacity: **G18 remains BLOCKED** until a human approves
+the release and it actually happens.
+
+One measurement note, because it nearly produced a wrong number: `du --block-size=1G` per
+directory summed to 2534 GiB against a 2347 GiB total, since it rounds each of 1267 entries up.
+Every figure here is `du -sb` bytes, and the parts summing to the measured whole is the check
+that caught it.
+
 ## Not delivered in this pass
 
 - **O2 materialization strategy, source-map extension, disk gate, manifest/provenance/rollback

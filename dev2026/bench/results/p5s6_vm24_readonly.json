@@ -45,6 +45,7 @@
       "verdict": "NOT_ADJUDICATED"
     },
     "G18_capacity": {
+      "audit_note": "A hold audit finds ~2288 GiB releasable after approval, which would clear the 136.3 GiB shortfall. G18 remains BLOCKED: audit_only, no deletion performed.",
       "reason": "projected_free_after 113.7 GB < HARD_RESERVE 250 GB; shortfall 136.3 GB. 403.3 GB free would be needed. Blocked even with temp and growth set to zero.",
       "verdict": "BLOCKED"
     },
@@ -97,6 +98,93 @@
         ]
       }
     }
+  },
+  "hold_lifecycle_audit": {
+    "base_coverage": {
+      "days": 1273,
+      "earliest": "2023-01-01",
+      "gaps": 0,
+      "latest": "2026-06-26",
+      "source": "base zarr.json attributes, read directly"
+    },
+    "candidates": [
+      {
+        "basis": "every day is inside base's gapless 2023-01-01..2026-06-26 range, so base serves point/range for all of them; the newest held day 2026-06-20 is before the enforced spatial window starts (2026-06-27), so none is needed for bbox; hold_until has passed",
+        "bytes": 2353299279803,
+        "day_range": [
+          "2023-01-01",
+          "2026-06-20"
+        ],
+        "gib": 2191.7,
+        "hold_until": "2026-08-13T03:19:41Z (PASSED)",
+        "klass": "releasable_after_approval",
+        "path_glob": "hold/mur.zarr.day-<date>.pre-prune-20260730T031941Z-5fbaa5",
+        "safe_to_release": "yes, SUBJECT TO HUMAN APPROVAL",
+        "what": "daily staging holds, 1267 day directories"
+      },
+      {
+        "basis": "superseded by two later prune swaps; their days are covered by base (<=2026-06-26) or by the live delta (2026-06-27..2026-08-17)",
+        "bytes": 103423011956,
+        "gib": 96.3,
+        "hold_until": "2026-07-23 and 2026-08-11 (both PASSED)",
+        "klass": "releasable_after_approval",
+        "path_glob": "hold/mur_timecube_s8_t90_sh128.delta.zarr.pre-prune-{20260709,20260728}*",
+        "safe_to_release": "yes, SUBJECT TO HUMAN APPROVAL",
+        "what": "expired delta pre-prune backups (2026-07-09, 2026-07-28)"
+      },
+      {
+        "basis": "inside its retention window; it is the reverse-swap target for the most recent prune",
+        "bytes": 63614571775,
+        "gib": 59.2,
+        "hold_until": "2026-09-01T13:27:27Z (NOT passed)",
+        "klass": "referenced",
+        "path": "hold/mur_timecube_s8_t90_sh128.delta.zarr.pre-prune-20260818T132723Z-7c3b72",
+        "safe_to_release": "NO",
+        "what": "newest delta pre-prune backup (2026-08-18)"
+      },
+      {
+        "basis": "present on disk but NOT recorded in hold/manifest.jsonl, so no lifecycle state exists for them. Excluded from the reclaimable total by policy: an untracked path is what a manual cleanup would have left behind, and it is not this audit's to authorize",
+        "klass": "inconsistent_or_unknown",
+        "paths": [
+          "mur_timecube_s8_t90_sh128.delta.zarr.p4build.20260727T021310Z (~38 GB)",
+          "mur_timecube_s8_t90_sh128.delta.zarr.pre-gapfix.20260625T133355 (~3 GB)"
+        ],
+        "safe_to_release": "NOT DETERMINABLE without an ops decision",
+        "what": "two delta copies outside the hold manifest"
+      }
+    ],
+    "capacity": {
+      "currently_reclaimable_bytes": 2456722291759,
+      "currently_reclaimable_gib": 2288.0,
+      "disk_expansion_required": false,
+      "excluded_from_reclaimable_gib": {
+        "referenced_newest_delta_backup": 59.2,
+        "untracked_paths": 41.0
+      },
+      "free_after_hypothetical_reclaim_gib": 2555.0,
+      "free_now_gib": 267.0,
+      "remaining_shortfall_gib": 0.0,
+      "required_free_before_build_gib": 403.3,
+      "unblocks_G18_if_executed": true
+    },
+    "conclusion": "~2288 GiB is theoretically reclaimable against a 136.3 GiB shortfall -- roughly 17x what G18 needs. DISK EXPANSION IS NOT REQUIRED. But nothing was deleted, theoretical reclaim is not reclaimed capacity, and G18 stays BLOCKED until a human approves the release and it actually happens.",
+    "deletion_performed": false,
+    "enforced_spatial_window": [
+      "2026-06-27",
+      "2026-08-17"
+    ],
+    "hold_manifest_entries": {
+      "delta_prune_swap": 3,
+      "staging_prune": 1267,
+      "unparsable": 0
+    },
+    "label": "VM24_PRODUCTION_READ_ONLY",
+    "measured_utc": "2026-08-19T07:20:00Z",
+    "measurement_note": "`du --block-size=1G` per directory summed to 2534 GiB against a 2347 GiB total, because it rounds each of 1267 entries UP. All figures here are `du -sb` bytes; the daily and backup totals sum to the measured hold total, which is the check that caught it.",
+    "method": "hold/manifest.jsonl read + du -sb; no path was modified",
+    "mode": "audit_only",
+    "p5_roots_note": "p5_blocks / p5_repairs / p5_anchor / base_blocks are all ABSENT, so no repair WAL, Phase A state or segmented manifest exists on this host. `repair_or_refold_pending` is therefore empty by construction rather than by inspection, and that distinction is recorded rather than hidden.",
+    "p5_roots_present": false
   },
   "host": "odb24",
   "measured_local": "2026-08-19T15:12:51+08:00",

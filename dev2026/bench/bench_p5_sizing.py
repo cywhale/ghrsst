@@ -749,6 +749,67 @@ def capacity_gate(*, free_now_gb: float, s: int = DEFAULT_S,
     }
 
 
+# ------------------------------------------------- hold / lifecycle audit (read-only)
+HOLD_CLASSES = ("referenced", "blocked_unique_copy", "repair_or_refold_pending",
+                "releasable_after_approval", "inconsistent_or_unknown")
+
+
+def classify_hold_entry(*, entry: dict, now_utc: str, base_days: set,
+                        spatial_window: Sequence[str],
+                        wal_repairs_pending: Optional[set] = None,
+                        tracked_in_manifest: bool = True) -> dict:
+    """Classify ONE hold entry. Read-only reasoning; deletes nothing, ever.
+
+    Fail-closed by construction: the releasable verdict is the LAST branch, reachable only when
+    every prior objection has been positively cleared. Anything unverifiable lands in
+    `inconsistent_or_unknown`, never in `releasable_after_approval`.
+
+    The order matters and is the S5 lifecycle's, not a convenience: an entry that is still
+    referenced, or is the only copy of a day base cannot serve, or has repair work outstanding,
+    is not releasable no matter what its `hold_until` says."""
+    days = list(entry.get("days") or ([entry["day"]] if entry.get("day") else []))
+    reasons = []
+
+    if not tracked_in_manifest:
+        return {"klass": "inconsistent_or_unknown", "days": days,
+                "reason": ("present on disk but not recorded in the hold manifest, so no "
+                           "lifecycle state exists for it. Not releasable: an untracked path "
+                           "is exactly what a manual `rm` would have left behind.")}
+    if not days:
+        return {"klass": "inconsistent_or_unknown", "days": [],
+                "reason": "the hold record names no day; its coverage cannot be established"}
+    hold_until = entry.get("hold_until")
+    if not hold_until:
+        return {"klass": "inconsistent_or_unknown", "days": days,
+                "reason": "no hold_until in the record; the retention window is unknown"}
+
+    pending = set(wal_repairs_pending or ())
+    overlap = sorted(set(days) & pending)
+    if overlap:
+        return {"klass": "repair_or_refold_pending", "days": days,
+                "reason": f"repair/refold outstanding for {overlap[:3]}"}
+
+    uncovered = sorted(d for d in days if d not in base_days)
+    if uncovered:
+        return {"klass": "blocked_unique_copy", "days": days,
+                "reason": (f"{len(uncovered)} day(s) are not in base, first {uncovered[0]}: "
+                           f"this hold is the only local copy and releasing it loses the day")}
+
+    if spatial_window and any(spatial_window[0] <= d <= spatial_window[1] for d in days):
+        return {"klass": "referenced", "days": days,
+                "reason": (f"day(s) fall inside the enforced spatial window "
+                           f"{spatial_window[0]}..{spatial_window[1]} and are still served")}
+
+    if hold_until > now_utc:
+        return {"klass": "referenced", "days": days,
+                "reason": f"hold_until {hold_until} has not passed (now {now_utc})"}
+
+    return {"klass": "releasable_after_approval", "days": days,
+            "reason": ("base covers every day, none fall inside the spatial window, no repair "
+                       "is outstanding, and hold_until has passed. RELEASE STILL REQUIRES "
+                       "HUMAN APPROVAL: this classification authorizes nothing.")}
+
+
 # --------------------------------------------------------------------------- deferred
 def deferred_metrics() -> dict:
     """What cannot be established here. Each carries a reason and NO number."""
