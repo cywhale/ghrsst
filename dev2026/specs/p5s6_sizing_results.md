@@ -350,8 +350,20 @@ What remains true: a 2 TB monolith rebuild is far further out of reach than one 
 which is the constraint O2 exists to remove. But **O2 cannot run on VM24 at today's free
 space**, and no local result changes that.
 
-### Hold / lifecycle audit — **AUDIT ONLY, NO DELETION PERFORMED** (revision 3)
+### Hold / lifecycle audit — **AUDIT ONLY, NO DELETION PERFORMED** (revision 4)
 
+> **Revision 3 had two bypasses of its own, both now closed.** Its audit read day sets as
+> two-element lists, so `set()` produced a **two-day set where 1267 days were meant** — and the
+> test helper expanded the ranges *before* calling, so the test corrected the evidence and then
+> checked the audit. It also used `bool()` on four raw flags, so `p5_roots_present="false"`
+> coerced to `True` and bypassed the pre-P5 block entirely. Ranges now carry a declared
+> `day_count` and are expanded **and verified by the audit**; every raw flag requires
+> `type(x) is bool`.
+>
+> Expanding the real day sets made two entries **more** blocked, not less: the expired delta
+> backups run to `2026-07-08` and `2026-07-26`, past base's `2026-06-26`, so base cannot serve
+> those days at all — `blocked_unique_copy`. The endpoint form hid that.
+>
 > **Revision 2 is withdrawn too.** It kept the two expired delta backups releasable on **day-set
 > coverage** and **supersession** — the same category error as revision 1, one level down.
 > Coverage says which *dates* exist elsewhere; it says nothing about whether *these bytes* can
@@ -376,13 +388,13 @@ and a test supplies `True`, `1`, `"yes"` and `"value_parity"` to prove it.
 
 #### Result
 
-| entry | size | class | authorized? |
-|---|---|---|---|
-| 1267 daily holds | ~2192 GiB | `repair_state_unknown_pre_p5` **+ no recovery evidence** | no |
-| expired delta backup 07-09 | ~41 GiB | same, two blockers | no |
-| expired delta backup 07-28 | ~55 GiB | same, two blockers | no |
-| newest delta backup 08-18 | ~59 GiB | `referenced` (rollback target) | no |
-| 2 untracked delta copies | ~41 GiB | `inconsistent_or_unknown` | no |
+| entry | days | size | class | authorized? |
+|---|---|---|---|---|
+| daily holds | 1267 | ~2192 GiB | `repair_state_unknown_pre_p5` **+ no recovery evidence** | no |
+| expired delta backup 07-09 | 40 | ~41 GiB | `blocked_unique_copy` | no |
+| expired delta backup 07-28 | 52 | ~55 GiB | `blocked_unique_copy` | no |
+| newest delta backup 08-18 | 52 | ~59 GiB | `referenced` (rollback target) | no |
+| 2 untracked delta copies | 52 / 21 | ~41 GiB | `inconsistent_or_unknown` | no |
 
 Each entry carries `also_blocking`, so the artifact never reads as "fix this one thing and it
 releases" — for the large entries, two independent conditions are unmet.
@@ -399,7 +411,7 @@ classifier default.
 | withheld pending operator policy | 2288.0 |
 | `free_now` | 267.0 |
 | **`minimum_free`** (HARD_RESERVE 250 + additional 153.3) | **403.3** |
-| **`recommended_free`** | **600.0** |
+| **`recommended_free`** (a **target**, not a solution — nothing added, nothing reclaimed) | **600.0** |
 | shortfall against minimum | 136.3 |
 
 **40 GiB was the arithmetic gap in revision 2, not a practical expansion size, and it no longer

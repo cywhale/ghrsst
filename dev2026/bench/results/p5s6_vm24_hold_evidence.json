@@ -1,8 +1,11 @@
 {
-  "base_days": [
-    "2023-01-01",
-    "2026-06-26"
-  ],
+  "base_day_range": {
+    "day_count": 1273,
+    "end": "2026-06-26",
+    "gaps": 0,
+    "start": "2023-01-01"
+  },
+  "base_day_range_source": "base zarr.json attributes: 1273 days, contiguous, verified gapless by expanding the range and comparing to the attribute list on VM24",
   "base_days_are_a_gapless_range": true,
   "base_days_source": "base zarr.json attributes: 1273 days, 2023-01-01..2026-06-26, zero gaps",
   "collection_method": "read-only ssh: hold/manifest.jsonl, store zarr.json attributes, healthz, du -sb, ls. No write of any kind.",
@@ -10,10 +13,11 @@
     {
       "bytes": 2353299279803,
       "record": {
-        "days": [
-          "2023-01-01",
-          "2026-06-20"
-        ],
+        "day_range": {
+          "day_count": 1267,
+          "end": "2026-06-20",
+          "start": "2023-01-01"
+        },
         "hold_until": "2026-08-13T03:19:41Z"
       },
       "recovery_evidence": null,
@@ -24,10 +28,11 @@
     {
       "bytes": 44000000000,
       "record": {
-        "days": [
-          "2026-05-30",
-          "2026-06-26"
-        ],
+        "day_range": {
+          "day_count": 40,
+          "end": "2026-07-08",
+          "start": "2026-05-30"
+        },
         "hold_until": "2026-07-23T13:58:45Z"
       },
       "recovery_evidence": null,
@@ -38,10 +43,11 @@
     {
       "bytes": 59423011956,
       "record": {
-        "days": [
-          "2026-06-05",
-          "2026-06-26"
-        ],
+        "day_range": {
+          "day_count": 52,
+          "end": "2026-07-26",
+          "start": "2026-06-05"
+        },
         "hold_until": "2026-08-11T07:51:45Z"
       },
       "recovery_evidence": null,
@@ -52,10 +58,11 @@
     {
       "bytes": 63614571775,
       "record": {
-        "days": [
-          "2026-06-05",
-          "2026-06-26"
-        ],
+        "day_range": {
+          "day_count": 52,
+          "end": "2026-08-17",
+          "start": "2026-06-27"
+        },
         "hold_until": "2026-09-01T13:27:27Z"
       },
       "recovery_evidence": null,
@@ -66,10 +73,11 @@
     {
       "bytes": 40802189312,
       "record": {
-        "days": [
-          "2026-06-05",
-          "2026-06-26"
-        ],
+        "day_range": {
+          "day_count": 52,
+          "end": "2026-07-26",
+          "start": "2026-06-05"
+        },
         "hold_until": null
       },
       "recovery_evidence": null,
@@ -79,10 +87,11 @@
     {
       "bytes": 3221225472,
       "record": {
-        "days": [
-          "2026-06-05",
-          "2026-06-26"
-        ],
+        "day_range": {
+          "day_count": 21,
+          "end": "2026-06-25",
+          "start": "2026-06-05"
+        },
         "hold_until": null
       },
       "recovery_evidence": null,
@@ -111,6 +120,7 @@
   ],
   "p5_roots_present": false,
   "provenance": "VM24_PRODUCTION_READ_ONLY",
+  "schema_note": "day sets are stored as RANGES with a declared day_count, and the audit expands and verifies them itself. They used to be two endpoints in a list that `set()` turned into a two-day set, with the test helper expanding them before the call -- so the test corrected the evidence and then checked the audit.",
   "spatial_window": [
     "2026-06-27",
     "2026-08-17"
