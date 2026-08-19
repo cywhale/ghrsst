@@ -160,7 +160,7 @@
   "measured": {
     "grouped_read": [
       {
-        "expected_segments_for_request": 1,
+        "expected_segments_for_request": 4,
         "fixture_geometry": {
           "nx": 24,
           "ny": 24,
@@ -173,15 +173,47 @@
         "observed_open_calls": 0,
         "observed_segments_touched": 0,
         "opens_during_read_must_be_zero": true,
-        "parity_is_falsifiable": true,
-        "parity_mismatches": [],
-        "parity_note": "the cell was overwritten after the measured read, so a check that re-reads instead of using the returned rows sees -12346.5 and fails",
-        "parity_ok": true,
-        "parity_oracle": "a sentinel written directly into the block's raw cells via zarr BEFORE the measured read, then checked on that request's own returned row",
-        "read_ms": 2.354,
+        "raw_cell_canary_is_falsifiable": true,
+        "raw_cell_canary_mismatches": [],
+        "raw_cell_canary_note": "the cell was overwritten after the measured read, so a check that re-reads instead of using the returned rows sees -12346.5 and fails",
+        "raw_cell_canary_ok": true,
+        "raw_cell_canary_oracle": "a sentinel written directly into the block's raw cells via zarr BEFORE the measured read, then checked on that request's own returned row",
+        "raw_cell_canary_scope": "ONE probe day, ONE variable (sst), ONE cell. It shows the measured request serves real bytes; it is NOT parity over all returned rows or all variables.",
+        "read_ms": 9.283,
         "read_path": "SegmentedCubeStore.point_series",
-        "requested_days": 10,
-        "returned_days": 10,
+        "requested_days": 40,
+        "returned_days": 40,
+        "segments_touched_observable": {
+          "label": "DEFERRED",
+          "reason": "counting segments a READ touches needs a chunk-level observable (a counting store around each segment), not `open_group`, which \u00a76.2 guarantees is never called during a read. Not built here."
+        },
+        "spy_target": "store.time_cube.zarr.open_group",
+        "used_manifest": true
+      },
+      {
+        "expected_segments_for_request": 2,
+        "fixture_geometry": {
+          "nx": 24,
+          "ny": 24,
+          "segments": 4,
+          "total_days": 40
+        },
+        "label": "LOCAL_SYNTHETIC",
+        "manifest_segments": 4,
+        "note": "LOCAL SYNTHETIC. Not VM24 evidence.",
+        "observed_open_calls": 0,
+        "observed_segments_touched": 0,
+        "opens_during_read_must_be_zero": true,
+        "raw_cell_canary_is_falsifiable": true,
+        "raw_cell_canary_mismatches": [],
+        "raw_cell_canary_note": "the cell was overwritten after the measured read, so a check that re-reads instead of using the returned rows sees -12346.5 and fails",
+        "raw_cell_canary_ok": true,
+        "raw_cell_canary_oracle": "a sentinel written directly into the block's raw cells via zarr BEFORE the measured read, then checked on that request's own returned row",
+        "raw_cell_canary_scope": "ONE probe day, ONE variable (sst), ONE cell. It shows the measured request serves real bytes; it is NOT parity over all returned rows or all variables.",
+        "read_ms": 4.569,
+        "read_path": "SegmentedCubeStore.point_series",
+        "requested_days": 20,
+        "returned_days": 20,
         "segments_touched_observable": {
           "label": "DEFERRED",
           "reason": "counting segments a READ touches needs a chunk-level observable (a counting store around each segment), not `open_group`, which \u00a76.2 guarantees is never called during a read. Not built here."
@@ -203,12 +235,13 @@
         "observed_open_calls": 0,
         "observed_segments_touched": 0,
         "opens_during_read_must_be_zero": true,
-        "parity_is_falsifiable": true,
-        "parity_mismatches": [],
-        "parity_note": "the cell was overwritten after the measured read, so a check that re-reads instead of using the returned rows sees -12346.5 and fails",
-        "parity_ok": true,
-        "parity_oracle": "a sentinel written directly into the block's raw cells via zarr BEFORE the measured read, then checked on that request's own returned row",
-        "read_ms": 2.538,
+        "raw_cell_canary_is_falsifiable": true,
+        "raw_cell_canary_mismatches": [],
+        "raw_cell_canary_note": "the cell was overwritten after the measured read, so a check that re-reads instead of using the returned rows sees -12346.5 and fails",
+        "raw_cell_canary_ok": true,
+        "raw_cell_canary_oracle": "a sentinel written directly into the block's raw cells via zarr BEFORE the measured read, then checked on that request's own returned row",
+        "raw_cell_canary_scope": "ONE probe day, ONE variable (sst), ONE cell. It shows the measured request serves real bytes; it is NOT parity over all returned rows or all variables.",
+        "read_ms": 2.819,
         "read_path": "SegmentedCubeStore.point_series",
         "requested_days": 5,
         "returned_days": 5,
@@ -224,37 +257,37 @@
       {
         "files": 55,
         "label": "LOCAL",
-        "ms_per_1k_files": 35.2379,
+        "ms_per_1k_files": 39.7129,
         "segments": 5,
-        "wall_ms": 1.938
+        "wall_ms": 2.184
       },
       {
         "files": 143,
         "label": "LOCAL",
-        "ms_per_1k_files": 38.1745,
+        "ms_per_1k_files": 36.1107,
         "segments": 13,
-        "wall_ms": 5.459
+        "wall_ms": 5.164
       },
       {
         "files": 451,
         "label": "LOCAL",
-        "ms_per_1k_files": 38.2642,
+        "ms_per_1k_files": 42.4279,
         "segments": 41,
-        "wall_ms": 17.257
+        "wall_ms": 19.135
       },
       {
         "files": 902,
         "label": "LOCAL",
-        "ms_per_1k_files": 38.1545,
+        "ms_per_1k_files": 40.6375,
         "segments": 82,
-        "wall_ms": 34.415
+        "wall_ms": 36.655
       },
       {
         "files": 1342,
         "label": "LOCAL",
-        "ms_per_1k_files": 37.6475,
+        "ms_per_1k_files": 38.2338,
         "segments": 122,
-        "wall_ms": 50.523
+        "wall_ms": 51.31
       }
     ],
     "segment_calls": [
@@ -338,8 +371,8 @@
         "label": "LOCAL_SYNTHETIC",
         "measures": "SegmentedCubeStore(manifest_dir) construction",
         "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
-        "p50_ms": 35.006,
-        "p95_ms": 36.676,
+        "p50_ms": 37.16,
+        "p95_ms": 37.704,
         "segments": 5
       },
       {
@@ -360,8 +393,8 @@
         "label": "LOCAL_SYNTHETIC",
         "measures": "SegmentedCubeStore(manifest_dir) construction",
         "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
-        "p50_ms": 93.807,
-        "p95_ms": 95.402,
+        "p50_ms": 94.191,
+        "p95_ms": 99.977,
         "segments": 13
       },
       {
@@ -382,8 +415,8 @@
         "label": "LOCAL_SYNTHETIC",
         "measures": "SegmentedCubeStore(manifest_dir) construction",
         "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
-        "p50_ms": 303.661,
-        "p95_ms": 310.935,
+        "p50_ms": 300.248,
+        "p95_ms": 300.311,
         "segments": 41
       },
       {
@@ -404,8 +437,8 @@
         "label": "LOCAL_SYNTHETIC",
         "measures": "SegmentedCubeStore(manifest_dir) construction",
         "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
-        "p50_ms": 615.276,
-        "p95_ms": 619.369,
+        "p50_ms": 594.729,
+        "p95_ms": 596.503,
         "segments": 82
       },
       {
@@ -426,8 +459,8 @@
         "label": "LOCAL_SYNTHETIC",
         "measures": "SegmentedCubeStore(manifest_dir) construction",
         "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
-        "p50_ms": 889.81,
-        "p95_ms": 903.39,
+        "p50_ms": 871.519,
+        "p95_ms": 879.863,
         "segments": 122
       }
     ],
@@ -435,47 +468,47 @@
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.4687,
+        "ms_per_segment": 0.3959,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 5,
         "segments": 5,
-        "wall_ms": 2.344
+        "wall_ms": 1.979
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.4197,
+        "ms_per_segment": 0.3944,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 13,
         "segments": 13,
-        "wall_ms": 5.457
+        "wall_ms": 5.127
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.3804,
+        "ms_per_segment": 0.4265,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 41,
         "segments": 41,
-        "wall_ms": 15.596
+        "wall_ms": 17.487
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.4126,
+        "ms_per_segment": 0.3641,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 82,
         "segments": 82,
-        "wall_ms": 33.836
+        "wall_ms": 29.857
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.3831,
+        "ms_per_segment": 0.3948,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 122,
         "segments": 122,
-        "wall_ms": 46.74
+        "wall_ms": 48.168
       }
     ],
     "tail_rebuild": [

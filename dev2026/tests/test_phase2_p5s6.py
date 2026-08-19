@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import unittest
 
@@ -422,6 +423,15 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
         # the doc must not choose a configuration, and must say so
         self.assertIn("No configuration is chosen", doc)
         self.assertNotIn("SELECTED", doc)
+        # No hand-copied construction timings: they drifted from the artifact within one round.
+        construction = doc[doc.index("## Snapshot construction"):doc.index("## RAW GROUP-OPEN")]
+        self.assertNotIn("construction p50 (ms)", construction)
+        self.assertIn("NOT reproduced here", construction)
+        # NOT "does it match the current artifact" -- a STALE copied number would pass that,
+        # and stale is exactly the drift that occurred. No decimal figure may appear in this
+        # section at all.
+        stray = re.findall(r"\d+\.\d+", construction)
+        self.assertEqual(stray, [], f"hand-typed numbers in the construction section: {stray}")
         # a DEFERRED section may not carry a wall-clock number
         tail = doc[doc.index("## Tail rebuild"):doc.index("## DEFERRED — five metrics")]
         self.assertNotIn("rebuild (ms)", tail)
@@ -483,14 +493,22 @@ class TestGroupedReadUsesTheRealPath(unittest.TestCase):
         self.assertIn("chunk-level observable",
                       out["segments_touched_observable"]["reason"])
 
+    def test_the_canary_states_its_LIMITED_scope(self):
+        """One day, one variable, one cell. Calling it "parity" invited the reading that every
+        returned row and variable had been checked; none of that is true."""
+        out = sizing.measure_grouped_read(segments=4, total_days=40, request_days=10)
+        scope = out["raw_cell_canary_scope"]
+        self.assertIn("ONE probe day", scope)
+        self.assertIn("NOT parity", scope)
+
     def test_values_match_a_COMMON_oracle_not_a_second_independent_store(self):
         """Parity against the bytes the fixture wrote, so two stores disagreeing cannot be
         reported as agreement."""
         out = sizing.measure_grouped_read(segments=4, total_days=40, request_days=10)
-        self.assertTrue(out["parity_ok"], out["parity_mismatches"])
-        self.assertIn("sentinel written directly", out["parity_oracle"])
-        self.assertEqual(out["parity_mismatches"], [])
-        self.assertIn("overwritten after the measured read", out["parity_note"])
+        self.assertTrue(out["raw_cell_canary_ok"], out["raw_cell_canary_mismatches"])
+        self.assertIn("sentinel written directly", out["raw_cell_canary_oracle"])
+        self.assertEqual(out["raw_cell_canary_mismatches"], [])
+        self.assertIn("overwritten after the measured read", out["raw_cell_canary_note"])
 
     def test_the_parity_check_CAN_fail(self):
         """`parity_ok: True` proves nothing unless False is reachable. Disabling the comparison
@@ -498,9 +516,9 @@ class TestGroupedReadUsesTheRealPath(unittest.TestCase):
         existed."""
         bad = sizing.measure_grouped_read(segments=4, total_days=40, request_days=10,
                                           _negative_control=True)
-        self.assertFalse(bad["parity_ok"])
-        self.assertTrue(bad["parity_mismatches"])
-        entry = bad["parity_mismatches"][0]
+        self.assertFalse(bad["raw_cell_canary_ok"])
+        self.assertTrue(bad["raw_cell_canary_mismatches"])
+        entry = bad["raw_cell_canary_mismatches"][0]
         self.assertIn("expected_raw_cell", entry)
         self.assertNotAlmostEqual(entry["got"], entry["expected_raw_cell"], places=3)
 
@@ -519,7 +537,15 @@ class TestTheRealMeasurementsReachTheArtifacts(unittest.TestCase):
                 for row in grouped:
                     self.assertEqual(row["read_path"], "SegmentedCubeStore.point_series")
                     self.assertEqual(row["spy_target"], "store.time_cube.zarr.open_group")
-                    self.assertTrue(row["parity_ok"])
+                    self.assertTrue(row["raw_cell_canary_ok"])
+                # the artifact must hold at least one genuinely CROSS-segment request
+                spans = [r["expected_segments_for_request"] for r in grouped]
+                self.assertGreaterEqual(max(spans), 2,
+                                        "no persisted grouped-read row crosses a segment "
+                                        "boundary, so the artifact holds no cross-segment "
+                                        "evidence")
+                self.assertGreaterEqual(max(spans), 4,
+                                        "at least one row should span every segment")
                 construction = art["measured"]["snapshot_construction"]
                 self.assertTrue(construction)
                 for row in construction:

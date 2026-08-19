@@ -522,13 +522,16 @@ def measure_grouped_read(*, segments: int, total_days: int, request_days: int,
             "returned_days": len(rows),
             "requested_days": len(requested),
             "read_ms": round(read_ms, 3),
-            "parity_ok": not mismatches,
-            "parity_is_falsifiable": True,
-            "parity_note": parity_note,
-            "parity_oracle": ("a sentinel written directly into the block's raw cells via "
+            "raw_cell_canary_ok": not mismatches,
+            "raw_cell_canary_is_falsifiable": True,
+            "raw_cell_canary_note": parity_note,
+            "raw_cell_canary_scope": ("ONE probe day, ONE variable (sst), ONE cell. It shows the "
+                                      "measured request serves real bytes; it is NOT parity over "
+                                      "all returned rows or all variables."),
+            "raw_cell_canary_oracle": ("a sentinel written directly into the block's raw cells via "
                               "zarr BEFORE the measured read, then checked on that "
                               "request's own returned row"),
-            "parity_mismatches": mismatches,
+            "raw_cell_canary_mismatches": mismatches,
             "fixture_geometry": {"ny": ny, "nx": nx, "total_days": total_days,
                                  "segments": segments},
             "note": "LOCAL SYNTHETIC. Not VM24 evidence.",
@@ -652,7 +655,12 @@ def build_report(*, quick: bool = False) -> dict:
             # They were described in the results doc and absent from the JSON, so the
             # consistency tests could not see the omission.
             "grouped_read": [
-                measure_grouped_read(segments=4, total_days=40, request_days=10),
+                # A request spanning ALL FOUR segments. The persisted rows previously covered
+                # only 10- and 5-day requests, which at total_days=40/segments=4 both land
+                # inside one segment -- so the artifact held no cross-segment evidence at all.
+                measure_grouped_read(segments=4, total_days=40, request_days=40),
+                # ...and one spanning two, so the artifact shows the count moving.
+                measure_grouped_read(segments=4, total_days=40, request_days=20),
                 measure_grouped_read(segments=4, total_days=40, request_days=5,
                                      request_within_one_segment=True),
             ],

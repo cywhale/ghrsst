@@ -76,19 +76,18 @@ Blocks now carry **30 days each**, recorded in the artifact as `days_per_segment
 `total_days`. One day per segment made the 5/13/41/82/122 horizons into one-day blocks, which
 understates exactly the day-metadata and inspection cost this measurement exists to capture.
 
-| segments | total days | construction p50 (ms) | ms / segment |
-|---|---|---|---|
-| 5 | 150 | 36.3 | 7.3 |
-| 13 | 390 | 95.5 | 7.3 |
-| 41 | 1 230 | 297.8 | 7.3 |
-| 82 | 2 460 | 584.1 | 7.1 |
-| 122 | 3 660 | 864.7 | 7.1 |
+**The timings are NOT reproduced here.** An earlier revision hand-copied them and they drifted
+from the artifact within one round — the same artifact-drift failure this document has already
+hit twice. The authoritative values are
+`bench/results/p5s6_sizing_full.json` → `measured.snapshot_construction`, and a test asserts this
+section carries no hand-typed millisecond table.
 
-Per-segment construction is flat, but the **absolute** cost is now visible in a way the raw
-group-open figure hid: ~865 ms at the S=30 / +10 y horizon of 122 segments, against ~52 ms for
-raw opens over the same count. That is the difference between a bare `open_group` and everything
-`SegmentedCubeStore` does around it. **LOCAL_SYNTHETIC at 16×16 spatial extent — not a
-production number, and it adjudicates nothing.**
+What the shape shows, which does not drift: per-segment construction is **flat** across
+5 → 122 segments, while the **absolute** cost at the S=30 / +10 y horizon is an order of
+magnitude above the raw `open_group` figure for the same segment count. That gap is everything
+`SegmentedCubeStore` does around a bare open — validation, inspection, binding, snapshot build —
+and it is exactly what the earlier conflation hid. **LOCAL_SYNTHETIC at 16×16 spatial extent —
+not a production number, and it adjudicates nothing.**
 
 The raw-`open_group` table below is kept beside it, still labelled as raw cost, because the two
 were conflated once and the difference is most of the work.
@@ -134,13 +133,16 @@ Consequently:
   to grow with the request width. **LOCAL_SYNTHETIC.**
 - **observed segments touched by a read** — **DEFERRED**: it needs a chunk-level observable (a
   counting store around each segment), which is not built here.
-- **value parity** — a sentinel is written **directly into the block's raw cells via zarr**,
+- **raw-cell canary** (deliberately not called "parity") — a sentinel is written **directly into the block's raw cells via zarr**,
   bypassing the read path, and then read back **through `point_series()`**. Comparing
   `point_series()` to `point_series()` proves only determinism: if it returned the wrong cell,
   both sides return the same wrong cell. A **negative control** (`_negative_control=True`)
   compares against a value that was never written and must report a mismatch, because
-  `parity_ok: True` proves nothing unless `False` is reachable — a mutation disabling the
-  comparison outright survived until that control existed. **LOCAL_SYNTHETIC.**
+  `raw_cell_canary_ok: True` proves nothing unless `False` is reachable — a mutation disabling
+  the comparison outright survived until that control existed.
+  **Scope: ONE probe day, ONE variable, ONE cell.** It shows the measured request serves real
+  bytes; it is **not** parity over all returned rows or all variables, and the field names say
+  so. **LOCAL_SYNTHETIC.**
 
 Both measurements are now **in the generated artifacts**, not only in this prose: they were
 described here and absent from the JSON, so the consistency tests could not see the omission.
