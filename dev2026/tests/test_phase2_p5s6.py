@@ -278,5 +278,65 @@ class TestTheReportIsWellFormed(unittest.TestCase):
             self.assertIn(window, report["H3"])
 
 
+class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
+    """Round-3 finding. The code and the results doc were corrected; the committed JSON still
+    said `H5.label = MODEL` and `tail_rebuild.label = LOCAL`, so three artefacts of the same
+    round disagreed. That is the artifact drift P5 has hit repeatedly, and it is checked here
+    rather than remembered."""
+
+    RESULTS = os.path.join(_DEV2026, "bench", "results")
+
+    def _artifact(self, stamp):
+        path = os.path.join(self.RESULTS, f"p5s6_sizing_{stamp}.json")
+        self.assertTrue(os.path.isfile(path), f"missing artifact {path}")
+        with open(path) as fh:
+            return json.load(fh)
+
+    def _labels(self, node, out=None):
+        """Every (path, label) pair, so a drifted label is located and not just counted."""
+        out = {} if out is None else out
+
+        def walk(n, trail):
+            if isinstance(n, dict):
+                if "label" in n:
+                    out[trail] = n["label"]
+                for k, v in n.items():
+                    walk(v, f"{trail}.{k}")
+            elif isinstance(n, list):
+                for i, v in enumerate(n):
+                    walk(v, f"{trail}[{i}]")
+
+        walk(node, "")
+        return out
+
+    def test_the_committed_quick_artifact_has_the_generators_labels(self):
+        fresh = sizing.build_report(quick=True)
+        self.assertEqual(self._labels(self._artifact("quick")), self._labels(fresh),
+                         "the committed artifact's labels differ from what the harness now "
+                         "produces — regenerate it")
+
+    def test_both_artifacts_carry_the_WITHDRAWALS(self):
+        for stamp in ("quick", "full"):
+            with self.subTest(stamp):
+                a = self._artifact(stamp)
+                self.assertEqual(a["H5"]["label"], "DEFERRED")
+                self.assertIn("reason", a["H5"])
+                for row in a["measured"]["tail_rebuild"]:
+                    self.assertEqual(row["label"], "DEFERRED")
+                    self.assertIn("materialization strategy", row["reason"])
+                for row in a["measured"]["segment_calls"]:
+                    self.assertIn("NOT the grouped read path", row["measures"])
+                for row in a["measured"]["snapshot_open"]:
+                    self.assertIn("NOT O2 snapshot-open cost", row["measures"])
+                    self.assertIn("SegmentedCubeStore", row["not_measured"])
+
+    def test_no_artifact_claims_a_production_gate_PASS(self):
+        for stamp in ("quick", "full"):
+            with self.subTest(stamp):
+                a = self._artifact(stamp)
+                for gate in ("G3", "H7", "G16"):
+                    self.assertEqual(a["gates"][gate]["verdict"], "NOT_ADJUDICATED")
+
+
 if __name__ == "__main__":
     unittest.main()

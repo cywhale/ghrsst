@@ -82,7 +82,8 @@
       90,
       124
     ],
-    "label": "MODEL"
+    "label": "DEFERRED",
+    "reason": "S6 requires MEASURED crossing-range latency versus delta span. Nothing here runs a TieredCube read at spans 31/45/64/90/124; the numbers below are volume arithmetic only and are not a latency measurement."
   },
   "H7": {
     "horizons": {
@@ -161,16 +162,16 @@
       {
         "files": 55,
         "label": "LOCAL",
-        "ms_per_1k_files": 39.5182,
+        "ms_per_1k_files": 40.2424,
         "segments": 5,
-        "wall_ms": 2.174
+        "wall_ms": 2.213
       },
       {
         "files": 143,
         "label": "LOCAL",
-        "ms_per_1k_files": 38.3709,
+        "ms_per_1k_files": 38.2547,
         "segments": 13,
-        "wall_ms": 5.487
+        "wall_ms": 5.47
       }
     ],
     "segment_calls": [
@@ -182,6 +183,7 @@
           "ny": 64
         },
         "label": "PRODUCTION_GEOMETRY_FIXTURE",
+        "measures": "stores this harness opened directly; NOT the grouped read path. No manifest, no SegmentedCubeStore, no point_series().",
         "note": "chunk geometry is production's; spatial extent is not",
         "observed_chunk_keys": 60,
         "observed_open_paths": [
@@ -201,6 +203,7 @@
           "ny": 64
         },
         "label": "PRODUCTION_GEOMETRY_FIXTURE",
+        "measures": "stores this harness opened directly; NOT the grouped read path. No manifest, no SegmentedCubeStore, no point_series().",
         "note": "chunk geometry is production's; spatial extent is not",
         "observed_chunk_keys": 60,
         "observed_open_paths": [
@@ -215,17 +218,21 @@
     "snapshot_open": [
       {
         "label": "LOCAL",
-        "ms_per_segment": 0.4235,
+        "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
+        "ms_per_segment": 0.4755,
+        "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 5,
         "segments": 5,
-        "wall_ms": 2.118
+        "wall_ms": 2.377
       },
       {
         "label": "LOCAL",
-        "ms_per_segment": 0.3774,
+        "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
+        "ms_per_segment": 0.3979,
+        "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 13,
         "segments": 13,
-        "wall_ms": 4.906
+        "wall_ms": 5.173
       }
     ],
     "tail_rebuild": [
@@ -233,9 +240,10 @@
         "c": 30,
         "carried_forward_days": 30,
         "days_in_new_tail": 30,
-        "label": "LOCAL",
+        "label": "DEFERRED",
         "modelled_amplification": 1.0,
-        "rebuild_wall_ms": 20.03,
+        "reason": "v2 is rebuilt from fixtures, not read from the predecessor block. `carried_forward_days` is arithmetic, not read evidence, and there is no source map. Real carry-forward needs the O2 materialization strategy, which does not exist yet.",
+        "rebuild_wall_ms": 19.74,
         "rewrite_evidence": "sha256-content-digest",
         "rewritten_files": 0,
         "rewritten_files_touched_only": 0,
@@ -245,9 +253,10 @@
         "c": 30,
         "carried_forward_days": 30,
         "days_in_new_tail": 60,
-        "label": "LOCAL",
+        "label": "DEFERRED",
         "modelled_amplification": 2.0,
-        "rebuild_wall_ms": 20.8,
+        "reason": "v2 is rebuilt from fixtures, not read from the predecessor block. `carried_forward_days` is arithmetic, not read evidence, and there is no source map. Real carry-forward needs the O2 materialization strategy, which does not exist yet.",
+        "rebuild_wall_ms": 20.09,
         "rewrite_evidence": "sha256-content-digest",
         "rewritten_files": 7,
         "rewritten_files_touched_only": 0,
