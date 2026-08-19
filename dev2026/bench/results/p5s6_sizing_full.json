@@ -162,37 +162,37 @@
       {
         "files": 55,
         "label": "LOCAL",
-        "ms_per_1k_files": 39.231,
+        "ms_per_1k_files": 37.9083,
         "segments": 5,
-        "wall_ms": 2.158
+        "wall_ms": 2.085
       },
       {
         "files": 143,
         "label": "LOCAL",
-        "ms_per_1k_files": 34.8788,
+        "ms_per_1k_files": 38.7541,
         "segments": 13,
-        "wall_ms": 4.988
+        "wall_ms": 5.542
       },
       {
         "files": 451,
         "label": "LOCAL",
-        "ms_per_1k_files": 39.9839,
+        "ms_per_1k_files": 38.0212,
         "segments": 41,
-        "wall_ms": 18.033
+        "wall_ms": 17.148
       },
       {
         "files": 902,
         "label": "LOCAL",
-        "ms_per_1k_files": 37.8793,
+        "ms_per_1k_files": 37.8443,
         "segments": 82,
-        "wall_ms": 34.167
+        "wall_ms": 34.136
       },
       {
         "files": 1342,
         "label": "LOCAL",
-        "ms_per_1k_files": 38.2158,
+        "ms_per_1k_files": 37.4004,
         "segments": 122,
-        "wall_ms": 51.286
+        "wall_ms": 50.191
       }
     ],
     "segment_calls": [
@@ -261,47 +261,47 @@
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.3609,
+        "ms_per_segment": 0.458,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 5,
         "segments": 5,
-        "wall_ms": 1.805
+        "wall_ms": 2.29
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.3849,
+        "ms_per_segment": 0.3454,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 13,
         "segments": 13,
-        "wall_ms": 5.003
+        "wall_ms": 4.49
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.405,
+        "ms_per_segment": 0.3453,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 41,
         "segments": 41,
-        "wall_ms": 16.604
+        "wall_ms": 14.156
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.4289,
+        "ms_per_segment": 0.4236,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 82,
         "segments": 82,
-        "wall_ms": 35.172
+        "wall_ms": 34.739
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.391,
+        "ms_per_segment": 0.3974,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 122,
         "segments": 122,
-        "wall_ms": 47.701
+        "wall_ms": 48.481
       }
     ],
     "tail_rebuild": [

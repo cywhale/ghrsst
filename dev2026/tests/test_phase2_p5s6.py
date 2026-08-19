@@ -224,11 +224,17 @@ class TestDeferredIsNeverAPass(unittest.TestCase):
                        "days_in_new_tail", "rewritten_files_touched_only",
                        "modelled_amplification"):
             self.assertNotIn(banned, out)
+        banned = ("rebuild_wall_ms", "rewritten_files", "rewritten_files_touched_only",
+                  "carried_forward_days", "days_in_new_tail", "modelled_amplification")
         for stamp in ("quick", "full"):
             path = os.path.join(_DEV2026, "bench", "results", f"p5s6_sizing_{stamp}.json")
             with open(path) as fh:
-                for row in json.load(fh)["measured"]["tail_rebuild"]:
-                    self.assertNotIn("rebuild_wall_ms", row)
+                rows = json.load(fh)["measured"]["tail_rebuild"]
+            self.assertTrue(rows)
+            for row in rows:
+                for key in banned:              # the whole set, on every row, in both artifacts
+                    with self.subTest(stamp=stamp, key=key):
+                        self.assertNotIn(key, row)
 
     def test_production_scale_metrics_are_marked_DEFERRED_with_a_reason(self):
         deferred = sizing.deferred_metrics()
@@ -323,6 +329,39 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
         walk(node, "")
         return out
 
+    #: Keys whose values are wall-clock or otherwise run-dependent. Everything else is a CLAIM
+    #: and must match the generator exactly.
+    VOLATILE = ("wall_ms", "ms_per_segment", "ms_per_1k_files", "files", "observed_chunk_keys",
+                "observed_metadata_reads", "observed_open_paths", "observed_segment_calls",
+                "reported_segment_calls")
+
+    def _claims(self, node, out=None, trail=""):
+        """Every non-volatile leaf, keyed by path: the report's claims minus its timings."""
+        out = {} if out is None else out
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k in self.VOLATILE:
+                    continue
+                self._claims(v, out, f"{trail}.{k}")
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                self._claims(v, out, f"{trail}[{i}]")
+        else:
+            out[trail] = node
+        return out
+
+    def test_the_committed_artifacts_match_the_generators_CLAIMS_not_just_labels(self):
+        """Labels alone left `reason`, `measures` and `not_measured` free to drift: the
+        generator could be reworded and a stale artifact would still pass. Everything except
+        run-dependent timings is compared."""
+        for stamp, quick in (("quick", True), ("full", False)):
+            with self.subTest(stamp):
+                fresh = self._claims(sizing.build_report(quick=quick))
+                stale = self._claims(self._artifact(stamp))
+                self.assertEqual(stale, fresh,
+                                 f"the committed {stamp} artifact's claims differ from what the "
+                                 f"harness now produces — regenerate it")
+
     def test_the_committed_artifacts_have_the_generators_labels(self):
         """BOTH artifacts. Checking only `quick` left every label unique to the full grid --
         S=45, the 41/82/122 horizons -- free to drift unnoticed."""
@@ -362,6 +401,14 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
         # the withdrawals must be visible in the prose, not only in the JSON
         for phrase in ("WITHDRAWN AS EVIDENCE", "raw group-open", "DEFERRED"):
             self.assertIn(phrase, doc)
+        # the doc must carry the artifact's OWN withdrawal wording, not a paraphrase that can
+        # drift away from it
+        flat = " ".join(doc.split())
+        self.assertIn("materialization strategy", flat)
+        self.assertIn("materialization strategy",
+                      " ".join(art["measured"]["tail_rebuild"][0]["reason"].split()))
+        self.assertIn("NOT O2 snapshot-open cost", art["measured"]["snapshot_open"][0]["measures"])
+        self.assertIn("not O2 snapshot-open", flat)
         # and the pre-withdrawal headings must be gone
         for stale in ("## LOCAL — tail rebuild and carry-forward",
                       "## LOCAL — snapshot-open and metadata scan",

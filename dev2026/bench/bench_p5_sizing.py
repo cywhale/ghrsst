@@ -363,13 +363,14 @@ def _tail_rebuild_probe(*, s: int, c: int, touch_without_changing: bool = False)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def measure_tail_rebuild(*, s: int, c: int, touch_without_changing: bool = False) -> dict:
-    """DEFERRED — and therefore carrying NO numbers.
+def measure_tail_rebuild(*, s: int, c: int) -> dict:
+    """DEFERRED — and therefore carrying NO numbers. Runs nothing.
 
-    `_tail_rebuild_probe()` still runs the fixture work, because the content-digest guard (a
-    file whose mtime moved and whose bytes did not is not a rewrite) is worth keeping under
-    test. But its numbers are not published: a `rebuild_wall_ms` sitting in a DEFERRED row reads
-    as performance evidence, and this harness never measured a real carry-forward."""
+    It used to accept `touch_without_changing` and ignore it, which is worse than not accepting
+    it: a caller could pass the flag and believe a probe had run. The content-digest guard lives
+    in `_tail_rebuild_probe()`, which does run the fixture work — a file whose mtime moved and
+    whose bytes did not is not a rewrite — but whose timings are deliberately not published
+    here, because a `rebuild_wall_ms` in a DEFERRED row reads as evidence it is not."""
     return {
         "label": "DEFERRED", "s": s, "c": c,
         "reason": ("no carry-forward was measured: v2 is rebuilt from fixtures, never read from "
