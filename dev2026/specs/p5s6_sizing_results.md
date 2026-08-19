@@ -72,6 +72,24 @@ segment inspection, metadata binding and snapshot build — what a generation ch
 start actually pay. p50/p95 over repeated constructions, fixture geometry and the warm-cache
 assumption are recorded with every row. **LOCAL_SYNTHETIC; adjudicates no gate.**
 
+Blocks now carry **30 days each**, recorded in the artifact as `days_per_segment` and
+`total_days`. One day per segment made the 5/13/41/82/122 horizons into one-day blocks, which
+understates exactly the day-metadata and inspection cost this measurement exists to capture.
+
+| segments | total days | construction p50 (ms) | ms / segment |
+|---|---|---|---|
+| 5 | 150 | 36.3 | 7.3 |
+| 13 | 390 | 95.5 | 7.3 |
+| 41 | 1 230 | 297.8 | 7.3 |
+| 82 | 2 460 | 584.1 | 7.1 |
+| 122 | 3 660 | 864.7 | 7.1 |
+
+Per-segment construction is flat, but the **absolute** cost is now visible in a way the raw
+group-open figure hid: ~865 ms at the S=30 / +10 y horizon of 122 segments, against ~52 ms for
+raw opens over the same count. That is the difference between a bare `open_group` and everything
+`SegmentedCubeStore` does around it. **LOCAL_SYNTHETIC at 16×16 spatial extent — not a
+production number, and it adjudicates nothing.**
+
 The raw-`open_group` table below is kept beside it, still labelled as raw cost, because the two
 were conflated once and the difference is most of the work.
 

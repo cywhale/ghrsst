@@ -175,9 +175,10 @@
         "opens_during_read_must_be_zero": true,
         "parity_is_falsifiable": true,
         "parity_mismatches": [],
+        "parity_note": "the cell was overwritten after the measured read, so a check that re-reads instead of using the returned rows sees -12346.5 and fails",
         "parity_ok": true,
-        "parity_oracle": "a sentinel written directly into the block's raw cells via zarr, then read back through point_series()",
-        "read_ms": 2.768,
+        "parity_oracle": "a sentinel written directly into the block's raw cells via zarr BEFORE the measured read, then checked on that request's own returned row",
+        "read_ms": 2.266,
         "read_path": "SegmentedCubeStore.point_series",
         "requested_days": 10,
         "returned_days": 10,
@@ -204,9 +205,10 @@
         "opens_during_read_must_be_zero": true,
         "parity_is_falsifiable": true,
         "parity_mismatches": [],
+        "parity_note": "the cell was overwritten after the measured read, so a check that re-reads instead of using the returned rows sees -12346.5 and fails",
         "parity_ok": true,
-        "parity_oracle": "a sentinel written directly into the block's raw cells via zarr, then read back through point_series()",
-        "read_ms": 2.634,
+        "parity_oracle": "a sentinel written directly into the block's raw cells via zarr BEFORE the measured read, then checked on that request's own returned row",
+        "read_ms": 2.616,
         "read_path": "SegmentedCubeStore.point_series",
         "requested_days": 5,
         "returned_days": 5,
@@ -222,16 +224,16 @@
       {
         "files": 55,
         "label": "LOCAL",
-        "ms_per_1k_files": 50.8606,
+        "ms_per_1k_files": 37.7273,
         "segments": 5,
-        "wall_ms": 2.797
+        "wall_ms": 2.075
       },
       {
         "files": 143,
         "label": "LOCAL",
-        "ms_per_1k_files": 37.0385,
+        "ms_per_1k_files": 40.5367,
         "segments": 13,
-        "wall_ms": 5.296
+        "wall_ms": 5.797
       }
     ],
     "segment_calls": [
@@ -279,9 +281,11 @@
       {
         "cache_assumption": "warm: the tree was constructed once before sampling",
         "fixture_geometry": {
+          "days_per_segment": 30,
           "nx": 16,
           "ny": 16,
-          "segments": 5
+          "segments": 5,
+          "total_days": 150
         },
         "includes": [
           "manifest_validation",
@@ -292,16 +296,18 @@
         "label": "LOCAL_SYNTHETIC",
         "measures": "SegmentedCubeStore(manifest_dir) construction",
         "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
-        "p50_ms": 39.647,
-        "p95_ms": 44.073,
+        "p50_ms": 36.875,
+        "p95_ms": 37.7,
         "segments": 5
       },
       {
         "cache_assumption": "warm: the tree was constructed once before sampling",
         "fixture_geometry": {
+          "days_per_segment": 30,
           "nx": 16,
           "ny": 16,
-          "segments": 13
+          "segments": 13,
+          "total_days": 390
         },
         "includes": [
           "manifest_validation",
@@ -312,8 +318,8 @@
         "label": "LOCAL_SYNTHETIC",
         "measures": "SegmentedCubeStore(manifest_dir) construction",
         "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
-        "p50_ms": 92.206,
-        "p95_ms": 94.518,
+        "p50_ms": 93.905,
+        "p95_ms": 97.034,
         "segments": 13
       }
     ],
@@ -321,20 +327,20 @@
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.4259,
+        "ms_per_segment": 0.3763,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 5,
         "segments": 5,
-        "wall_ms": 2.13
+        "wall_ms": 1.881
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.3537,
+        "ms_per_segment": 0.3621,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 13,
         "segments": 13,
-        "wall_ms": 4.598
+        "wall_ms": 4.707
       }
     ],
     "tail_rebuild": [

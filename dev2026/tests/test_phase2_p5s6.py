@@ -490,6 +490,7 @@ class TestGroupedReadUsesTheRealPath(unittest.TestCase):
         self.assertTrue(out["parity_ok"], out["parity_mismatches"])
         self.assertIn("sentinel written directly", out["parity_oracle"])
         self.assertEqual(out["parity_mismatches"], [])
+        self.assertIn("overwritten after the measured read", out["parity_note"])
 
     def test_the_parity_check_CAN_fail(self):
         """`parity_ok: True` proves nothing unless False is reachable. Disabling the comparison
@@ -537,6 +538,15 @@ class TestSnapshotOpenIsTheRealConstruction(unittest.TestCase):
         self.assertEqual(out["measures"], "SegmentedCubeStore(manifest_dir) construction")
         for phase in ("manifest_validation", "segment_inspection", "snapshot_build"):
             self.assertIn(phase, out["includes"])
+
+    def test_segments_carry_a_REPRESENTATIVE_day_count(self):
+        """One day per segment made the horizons into one-day blocks, understating the
+        day-metadata and inspection cost this measurement exists to capture."""
+        out = sizing.measure_snapshot_construction(segments=5, days_per_segment=30)
+        geom = out["fixture_geometry"]
+        self.assertEqual(geom["days_per_segment"], 30)
+        self.assertEqual(geom["total_days"], 5 * 30)
+        self.assertGreater(geom["total_days"], geom["segments"])
 
     def test_it_reports_p50_and_p95_and_the_fixture_geometry(self):
         out = sizing.measure_snapshot_construction(segments=5)

@@ -423,13 +423,32 @@ def measure_grouped_read(*, segments: int, total_days: int, request_days: int,
         else:
             requested = days[-request_days:]
 
+        probe = sc.SegmentedCubeStore(root)
+        manifest_segments = len(probe._meta.stores)
+
+        # The sentinel is written BEFORE the measured read, so parity is checked on the ROWS the
+        # measurement actually returned. Writing it afterwards and verifying with a second
+        # single-day read proved only that some other read could see it -- not that the request
+        # under measurement served those bytes.
+        import numpy as np
+        probe_day = requested[len(requested) // 2]
+        seg_path, day_idx = None, None
+        for sp, meta in zip(probe._meta.stores, probe._meta.segment_metas):
+            days_here = list(getattr(meta, "days", []))
+            if probe_day in days_here:
+                seg_path, day_idx = sp.path, days_here.index(probe_day)
+                break
+        sentinel = -12345.5
+        if seg_path is not None:
+            g = tc.zarr.open_group(seg_path, mode="a")
+            g["sst"][day_idx] = np.full_like(np.asarray(g["sst"][day_idx]), sentinel)
+
+        # A snapshot taken AFTER the write, so the measured read serves the sentinel bytes.
         store = sc.SegmentedCubeStore(root)
-        manifest_segments = len(store._meta.stores)
+        expected = {sp for sp, meta in zip(store._meta.stores, store._meta.segment_metas)
+                    if set(getattr(meta, "days", [])) & set(requested)}
         store.point_series(LON, LAT, requested, list(VARS))          # warm
 
-        # `segmented_cube` does not import zarr: it delegates to `TimeCubeStore`, so THAT is
-        # the module boundary the implementation actually resolves `open_group` through.
-        # Patching a name the implementation never uses would observe nothing and pass.
         real_open, opened = tc.zarr.open_group, []
 
         def spy(path, *a, **kw):
@@ -439,48 +458,42 @@ def measure_grouped_read(*, segments: int, total_days: int, request_days: int,
         tc.zarr.open_group = spy
         try:
             t0 = time.perf_counter()
-            rows = store.point_series(LON, LAT, requested, list(VARS))
+            rows = store.point_series(LON, LAT, requested, list(VARS))   # THE measured read
             read_ms = (time.perf_counter() - t0) * 1000.0
         finally:
             tc.zarr.open_group = real_open
 
         touched = {p for p in opened if p.startswith(tmp)}
-        # Which segments SHOULD answer, from the manifest -- not from the read.
-        expected = {sp for sp, meta in zip(store._meta.stores, store._meta.segment_metas)
-                    if set(getattr(meta, "days", [])) & set(requested)}
 
-        # Parity against RAW CELLS, not against a second call to the method under test.
-        # Comparing `point_series()` to `point_series()` proves only that it is deterministic:
-        # if it returned the wrong cell, both sides would return the same wrong cell.
-        #
-        # So a sentinel is written directly into one day's slab, through zarr, bypassing the
-        # read path entirely -- and then read back THROUGH `point_series()`. If the value comes
-        # out as the sentinel, the read really is serving those bytes.
-        import numpy as np
-        probe_day = requested[len(requested) // 2]
-        seg_path, day_idx = None, None
-        for sp, meta in zip(store._meta.stores, store._meta.segment_metas):
-            days_here = list(getattr(meta, "days", []))
-            if probe_day in days_here:
-                # `_meta.stores` holds TimeCubeStore objects, not paths.
-                seg_path, day_idx = sp.path, days_here.index(probe_day)
-                break
-        sentinel = -12345.5
-        # `_negative_control` compares against a value that was NOT written, so the check must
-        # report a mismatch. Without it, `parity_ok: True` is unfalsifiable -- disabling the
-        # comparison entirely also yields True, which is how a mutation of exactly that survived.
+        # AFTER the measured read, overwrite the same cell with a different value. Now the rows
+        # the measurement returned and anything read later disagree by construction -- so a
+        # parity check that quietly re-reads instead of using those rows is detectable. Without
+        # this, "check `rows`" and "issue a fresh read" are observationally identical and a
+        # mutation swapping one for the other survives.
+        post_read_value = sentinel - 1.0
+        if seg_path is not None:
+            g2 = tc.zarr.open_group(seg_path, mode="a")
+            g2["sst"][day_idx] = np.full_like(np.asarray(g2["sst"][day_idx]), post_read_value)
+
+        # `_negative_control` compares against a value never written, so the check must report a
+        # mismatch. `parity_ok: True` is unfalsifiable without it -- disabling the comparison
+        # entirely also yields True, which is how a mutation of exactly that survived.
         expected_cell = sentinel + (1.0 if _negative_control else 0.0)
         mismatches = []
-        if seg_path is not None:
-            g = tc.zarr.open_group(seg_path, mode="a")
-            g["sst"][day_idx] = np.full_like(np.asarray(g["sst"][day_idx]), sentinel)
-            fresh = sc.SegmentedCubeStore(root)                 # a snapshot that sees the write
-            got = fresh.point_series(LON, LAT, [probe_day], ["sst"])
-            if not got or abs(float(got[0]["sst"]) - expected_cell) > 1e-6:
-                mismatches.append({"day": probe_day, "expected_raw_cell": expected_cell,
-                                   "got": (got[0]["sst"] if got else None)})
-        else:
+        if seg_path is None:
             mismatches.append({"day": probe_day, "error": "no segment claims this day"})
+        else:
+            measured = [r for r in rows if r.get("date") == probe_day]
+            if not measured:
+                mismatches.append({"day": probe_day,
+                                   "error": "the measured request did not return the probe day"})
+            elif abs(float(measured[0]["sst"]) - expected_cell) > 1e-6:
+                mismatches.append({"day": probe_day, "expected_raw_cell": expected_cell,
+                                   "got": measured[0]["sst"],
+                                   "source": "the measured request's own row"})
+        parity_note = ("the cell was overwritten after the measured read, so a check that "
+                       "re-reads instead of using the returned rows sees "
+                       f"{post_read_value} and fails")
 
         return {
             "label": "LOCAL_SYNTHETIC",
@@ -511,8 +524,10 @@ def measure_grouped_read(*, segments: int, total_days: int, request_days: int,
             "read_ms": round(read_ms, 3),
             "parity_ok": not mismatches,
             "parity_is_falsifiable": True,
+            "parity_note": parity_note,
             "parity_oracle": ("a sentinel written directly into the block's raw cells via "
-                              "zarr, then read back through point_series()"),
+                              "zarr BEFORE the measured read, then checked on that "
+                              "request's own returned row"),
             "parity_mismatches": mismatches,
             "fixture_geometry": {"ny": ny, "nx": nx, "total_days": total_days,
                                  "segments": segments},
@@ -523,7 +538,7 @@ def measure_grouped_read(*, segments: int, total_days: int, request_days: int,
 
 
 def measure_snapshot_construction(*, segments: int, ny: int = 16, nx: int = 16,
-                                  repeats: int = 5) -> dict:
+                                  days_per_segment: int = 30, repeats: int = 5) -> dict:
     """The real `SegmentedCubeStore(manifest_dir)` cost: validation, inspection, binding, build.
 
     This is what a generation change and a process start actually pay. `measure_snapshot_open`
@@ -532,7 +547,10 @@ def measure_snapshot_construction(*, segments: int, ny: int = 16, nx: int = 16,
     from store import segmented_cube as sc
     tmp = tempfile.mkdtemp(prefix="p5s6-construct-")
     try:
-        total = max(segments, 1)
+        # One day per segment made 5/13/41/82/122 into horizons of ONE-day blocks, which
+        # understates day-metadata and inspection cost -- the very thing this measures. Blocks
+        # now carry a representative day count, and the artifact records it.
+        total = max(segments * days_per_segment, 1)
         root, _days = _real_segmented_fixture(tmp, segments=segments, total_days=total,
                                               ny=ny, nx=nx)
         sc.SegmentedCubeStore(root)                                   # warm the cache
@@ -551,7 +569,8 @@ def measure_snapshot_construction(*, segments: int, ny: int = 16, nx: int = 16,
                          "snapshot_build"],
             "segments": segments,
             "p50_ms": round(p50, 3), "p95_ms": round(p95, 3),
-            "fixture_geometry": {"ny": ny, "nx": nx, "segments": segments},
+            "fixture_geometry": {"ny": ny, "nx": nx, "segments": segments,
+                                 "days_per_segment": days_per_segment, "total_days": total},
             "cache_assumption": "warm: the tree was constructed once before sampling",
             "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
         }
