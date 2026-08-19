@@ -291,8 +291,11 @@ class TestTheReportIsWellFormed(unittest.TestCase):
         self.assertEqual(sorted(report["grid"]["C"]), [30, 45, 90])
 
     def test_H5_covers_the_required_delta_spans(self):
+        """The full report measures all five; `quick` measures the first two by design, and the
+        constant is what the full run walks."""
+        self.assertEqual(sorted(sizing.H5_DELTA_SPANS), [31, 45, 64, 90, 124])
         report = sizing.build_report(quick=True)
-        self.assertEqual(sorted(report["H5"]["delta_spans"]), [31, 45, 64, 90, 124])
+        self.assertTrue(set(report["H5"]["spans_measured"]) <= set(sizing.H5_DELTA_SPANS))
 
     def test_H3_covers_the_required_windows(self):
         report = sizing.build_report(quick=True)
@@ -382,8 +385,11 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
         for stamp in ("quick", "full"):
             with self.subTest(stamp):
                 a = self._artifact(stamp)
-                self.assertEqual(a["H5"]["label"], "DEFERRED")
-                self.assertIn("reason", a["H5"])
+                # H5 was DEFERRED because it was not measured. It is measured now, through a
+                # real TieredCube, so the withdrawal no longer applies -- and the assertion is
+                # replaced rather than deleted, so the artifact still has to say which.
+                self.assertEqual(a["H5"]["label"], "LOCAL_SYNTHETIC")
+                self.assertTrue(a["H5"]["measured"])
                 for row in a["measured"]["tail_rebuild"]:
                     self.assertEqual(row["label"], "DEFERRED")
                     self.assertIn("materialization strategy", row["reason"])
@@ -604,6 +610,74 @@ class TestSnapshotOpenIsTheRealConstruction(unittest.TestCase):
         self.assertGreater(real["p50_ms"], raw["wall_ms"] / 10.0,
                            "construction should not be cheaper than a fraction of raw opens")
         self.assertIn("NOT O2 snapshot-open cost", raw["measures"])
+
+
+class TestH5CrossingLatency(unittest.TestCase):
+    """H5: crossing-range latency versus delta span, through a REAL `TieredCube`.
+
+    Base and delta are built from ONE authoritative oracle, so a value disagreement is a real
+    disagreement rather than two fixtures that were never the same data. Every number is
+    LOCAL_SYNTHETIC and adjudicates nothing."""
+
+    def test_the_spans_are_the_required_ones(self):
+        out = sizing.measure_h5_latency(quick=True)
+        self.assertEqual(out["label"], "LOCAL_SYNTHETIC")
+        self.assertEqual(sorted(out["spans_measured"]), sorted(sizing.H5_DELTA_SPANS)[:2])
+
+    def test_it_uses_a_real_TieredCube_not_a_loop(self):
+        row = sizing.measure_h5_span(delta_span=31)
+        self.assertEqual(row["read_path"], "TieredCube.point_series")
+        self.assertTrue(row["used_base_and_delta"])
+
+    def test_each_span_covers_base_only_crossing_and_delta_only(self):
+        row = sizing.measure_h5_span(delta_span=31)
+        for kind in ("base_only", "crossing", "delta_only"):
+            with self.subTest(kind):
+                case = row["requests"][kind]
+                self.assertGreater(case["returned_days"], 0)
+                self.assertEqual(case["returned_days"], case["requested_days"])
+                self.assertGreater(case["p50_ms"], 0.0)
+                self.assertGreaterEqual(case["p95_ms"], case["p50_ms"])
+                # the TIMED rows, not a separate check, must show delta winning
+                self.assertTrue(case["timed_rows_served_delta_values"],
+                                "the timed read did not serve delta's values; it may not have "
+                                "gone through the TieredCube at all")
+        self.assertGreater(row["requests"]["delta_only"]["delta_owned_days_in_response"], 0)
+
+    def test_the_crossing_request_really_spans_both_tiers(self):
+        """Otherwise "crossing" is just a base read with a longer name."""
+        row = sizing.measure_h5_span(delta_span=31)
+        sources = row["requests"]["crossing"]["day_sources"]
+        self.assertIn("base", sources.values())
+        self.assertIn("delta", sources.values())
+
+    def test_delta_wins_for_a_day_both_tiers_hold(self):
+        """The composition rule, asserted on values from the ONE oracle."""
+        row = sizing.measure_h5_span(delta_span=31)
+        self.assertTrue(row["delta_precedence_ok"])
+        self.assertEqual(row["delta_precedence_mismatches"], [])
+
+    def test_the_precedence_check_CAN_fail(self):
+        bad = sizing.measure_h5_span(delta_span=31, _negative_control=True)
+        self.assertFalse(bad["delta_precedence_ok"])
+        self.assertTrue(bad["delta_precedence_mismatches"])
+
+    def test_the_fixture_and_cache_assumptions_are_recorded(self):
+        row = sizing.measure_h5_span(delta_span=31)
+        self.assertIn("ny", row["fixture_geometry"])
+        self.assertIn("warm", row["cache_assumption"])
+        self.assertEqual(row["delta_span_days"], 31)
+
+    def test_H5_reaches_the_artifacts_and_adjudicates_nothing(self):
+        for stamp in ("quick", "full"):
+            with self.subTest(stamp):
+                path = os.path.join(_DEV2026, "bench", "results", f"p5s6_sizing_{stamp}.json")
+                with open(path) as fh:
+                    art = json.load(fh)
+                h5 = art["H5"]
+                self.assertEqual(h5["label"], "LOCAL_SYNTHETIC")
+                self.assertTrue(h5["measured"])
+                self.assertEqual(art["gates"]["G3"]["verdict"], "NOT_ADJUDICATED")
 
 
 if __name__ == "__main__":

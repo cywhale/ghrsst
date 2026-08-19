@@ -581,6 +581,128 @@ def measure_snapshot_construction(*, segments: int, ny: int = 16, nx: int = 16,
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ------------------------------------------------------- item 3: H5 crossing latency
+#: Provisional O2 design target (operator decision). CONFIGURABLE, never hardcoded at a call
+#: site: production adjudication still waits on VM24's G3/H7/G16.
+DEFAULT_S = 90
+DEFAULT_C = 30
+
+
+def _percentiles(samples: List[float]) -> Dict[str, float]:
+    s = sorted(samples)
+    return {"p50_ms": round(s[len(s) // 2], 3),
+            "p95_ms": round(s[min(int(len(s) * 0.95), len(s) - 1)], 3)}
+
+
+def measure_h5_span(*, delta_span: int, ny: int = 16, nx: int = 16, repeats: int = 7,
+                    s: int = DEFAULT_S, _negative_control: bool = False) -> dict:
+    """Crossing-range latency at one delta span, through a real `TieredCube`.
+
+    Base and delta come from ONE oracle: the delta days are written with values derived from
+    the same generator the base block used, then the overlapping days are given a distinct
+    delta value so precedence is observable. Two independently generated fixtures would make
+    any disagreement meaningless -- it would not be a bug, just two different datasets."""
+    import numpy as np
+    import p5_fixtures as fx
+    from store import segmented_cube as sc
+    from store.tiered_cube import TieredCube
+    from store.time_cube import TimeCubeStore
+
+    tmp = tempfile.mkdtemp(prefix=f"p5s6-h5-{delta_span}-")
+    try:
+        base_days_n = max(s, 30)
+        total = base_days_n + delta_span
+        assert_fixture_bounds(ny=ny, nx=nx, days=total)
+        root, all_days = _real_segmented_fixture(
+            tmp, segments=max(total // max(s, 1), 1), total_days=total, ny=ny, nx=nx)
+
+        # The delta holds the newest `delta_span` days -- the same DAYS the base tail holds, so
+        # the overlap is where precedence is observable.
+        delta_days = all_days[-delta_span:]
+        delta_path = os.path.join(tmp, "delta.zarr")
+        fx.build_delta(delta_path, delta_days, ny=ny, nx=nx)
+
+        # One oracle: stamp each overlapping delta day with a value derived from its date, so
+        # base and delta are the same data except where delta deliberately supersedes.
+        g = tc_zarr_open(delta_path)
+        marks = {}
+        for i, day in enumerate(delta_days):
+            mark = 900.0 + i
+            g["sst"][i] = np.full_like(np.asarray(g["sst"][i]), mark)
+            marks[day] = mark
+
+        base = sc.SegmentedCubeStore(root)
+        cube = TieredCube(base, TimeCubeStore(delta_path))
+
+        base_only = [d for d in all_days if d not in set(delta_days)][-10:]
+        delta_only = delta_days[-10:]
+        crossing = base_only[-5:] + delta_only[:5]
+
+        def timed(days):
+            cube.point_series(LON, LAT, days, ["sst"])          # warm
+            samples = []
+            for _ in range(repeats):
+                t0 = time.perf_counter()
+                rows = cube.point_series(LON, LAT, days, ["sst"])
+                samples.append((time.perf_counter() - t0) * 1000.0)
+            snap = cube.snapshot()
+            # Do the TIMED rows carry delta's values where delta owns the day? Base holds the
+            # same days, so a timed loop reading the base store alone still returns the right
+            # COUNT -- and a mutation doing exactly that survived until this was checked.
+            delta_rows = [r for r in rows if r["date"] in marks]
+            served_delta = all(abs(float(r["sst"]) - marks[r["date"]]) <= 1e-6
+                               for r in delta_rows)
+            return {"requested_days": len(days), "returned_days": len(rows),
+                    "day_sources": {d: snap.day_source(d) for d in days},
+                    "delta_owned_days_in_response": len(delta_rows),
+                    "timed_rows_served_delta_values": served_delta,
+                    **_percentiles(samples)}
+
+        requests = {"base_only": timed(base_only), "delta_only": timed(delta_only),
+                    "crossing": timed(crossing)}
+
+        # Precedence: for a day BOTH tiers hold, the served value must be delta's mark.
+        expected_shift = 1.0 if _negative_control else 0.0
+        mismatches = []
+        for day in delta_only[:3]:
+            got = cube.point_series(LON, LAT, [day], ["sst"])
+            want = marks[day] + expected_shift
+            if not got or abs(float(got[0]["sst"]) - want) > 1e-6:
+                mismatches.append({"day": day, "expected": want,
+                                   "got": (got[0]["sst"] if got else None)})
+
+        return {
+            "label": "LOCAL_SYNTHETIC",
+            "read_path": "TieredCube.point_series",
+            "used_base_and_delta": True,
+            "delta_span_days": delta_span,
+            "s": s,
+            "requests": requests,
+            "delta_precedence_ok": not mismatches,
+            "delta_precedence_mismatches": mismatches,
+            "fixture_geometry": {"ny": ny, "nx": nx, "base_days": base_days_n,
+                                 "delta_days": delta_span, "total_days": total},
+            "cache_assumption": "warm: each request is issued once before sampling",
+            "note": "LOCAL_SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
+        }
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def tc_zarr_open(path):
+    from store import time_cube as tc
+    return tc.zarr.open_group(path, mode="a")
+
+
+def measure_h5_latency(*, quick: bool = False, s: int = DEFAULT_S) -> dict:
+    spans = list(H5_DELTA_SPANS)[:2] if quick else list(H5_DELTA_SPANS)
+    rows = [measure_h5_span(delta_span=span, s=s) for span in spans]
+    return {"label": "LOCAL_SYNTHETIC", "measured": True, "spans_measured": spans,
+            "s": s, "by_span": {str(r["delta_span_days"]): r for r in rows},
+            "note": ("LOCAL_SYNTHETIC crossing latency through a real TieredCube. It does NOT "
+                     "adjudicate G3, which is a VM24 measurement.")}
+
+
 # --------------------------------------------------------------------------- deferred
 def deferred_metrics() -> dict:
     """What cannot be established here. Each carries a reason and NO number."""
@@ -633,18 +755,7 @@ def build_report(*, quick: bool = False) -> dict:
                         for s in (30, 45, 90)},
             "legacy_block_delta_crossing": model_segments_per_request(s=90, days=366),
         },
-        "H5": {
-            "label": "DEFERRED",
-            "reason": ("S6 requires MEASURED crossing-range latency versus delta span. Nothing "
-                       "here runs a TieredCube read at spans 31/45/64/90/124; the numbers below "
-                       "are volume arithmetic only and are not a latency measurement."),
-            "delta_spans": list(H5_DELTA_SPANS),
-            "by_span": {str(span): {"label": "MODEL", "delta_span_days": span,
-                                    "delta_gb": round(span * DELTA_GB_PER_DAY, 1),
-                                    "implied_cadence": span - SPATIAL_WINDOW_DAYS
-                                                       - DELTA_BUFFER_DAYS}
-                        for span in H5_DELTA_SPANS},
-        },
+        "H5": measure_h5_latency(quick=quick),
         "H7": {"label": "MODEL", "horizons": model_segment_horizons()},
         "measured": {
             "segment_calls": [measure_segment_calls(s=s, days=days) for s in s_grid],

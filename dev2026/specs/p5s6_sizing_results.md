@@ -229,14 +229,53 @@ the +10 y projection. Both are DEFERRED, and both need VM24 read-only.
 3. **G16 thresholds** — metadata scan and snapshot open on the real tree.
 4. **Peak temp disk** — confirming 141 GB requires building a real block.
 
-## Items 3 and 4 — NOT STARTED
+## H5 — crossing latency through a real `TieredCube` (item 3, DELIVERED)
 
-- **H5 synthetic `TieredCube` latency** across spans 31/45/64/90/124: not implemented. The H5
-  section remains DEFERRED and volume arithmetic only.
-- **O2 tail carry-forward**: not implemented. No predecessor-read path, no source map, no
-  successor block. `measure_tail_rebuild` remains DEFERRED and publishes no numbers.
+`measure_h5_span()` builds a published base **and** a delta from **one oracle**: the delta days
+are the same days the base tail holds, then stamped with a distinct per-day value so precedence
+is observable. Two independently generated fixtures would make any disagreement meaningless —
+it would not be a bug, just two different datasets.
 
-Neither was begun, and neither is claimed at any level.
+Each span measures **base-only**, **crossing** and **delta-only** requests through
+`TieredCube.point_series()`, recording p50/p95, requested vs returned day counts, and
+`day_source` per day. Spans: **31 / 45 / 64 / 90 / 124** in the full run; the first two in
+`quick`.
+
+Asserted, not assumed:
+
+- the crossing request really spans **both** tiers (`day_source` contains base *and* delta) —
+  otherwise "crossing" is a base read with a longer name;
+- **delta wins** for days both tiers hold, checked on the **timed rows themselves**. Base holds
+  the same days, so a timed loop reading base alone returns the right *count* — a mutation doing
+  exactly that survived until the values were checked;
+- a **negative control** makes the precedence check fail on demand, so `ok: True` is falsifiable.
+
+Timings are in the artifact under `H5.by_span`, not reproduced here. **LOCAL_SYNTHETIC: it does
+not adjudicate G3, which is a VM24 measurement.**
+
+## Provisional design target
+
+**S=90 / C=30**, an operator decision recorded here, held as `DEFAULT_S` / `DEFAULT_C`
+**configuration** in the harness and never hardcoded at a call site. Production adjudication
+still waits on VM24's G3 / H7 / G16.
+
+## Item 4 — NOT STARTED
+
+**O2 tail carry-forward.** One finding that changes its shape: the carry-forward contract
+**already exists** in S3's `build_block` — `predecessor_path`, `predecessor_present`,
+`resolve_source_map()` with authority order delta → block → daily → hold, delta-wins for late
+corrections, `rebuild_source_set = predecessor_present ∪ newly_present`, and a refusal for any
+day whose source cannot be resolved *before* anything is written. So O2 is **exercising and
+measuring that path**, not building a second source-map or provenance truth beside it.
+
+Not started here, and `measure_tail_rebuild` remains DEFERRED and publishes no numbers.
+
+## VM24 — NOT MEASURED
+
+Read-only VM24 measurement is authorised but **was not performed in this round**. No SSH was
+opened, no service, mount, disk, inode or FD reading was taken, and no VM24 number appears
+anywhere in the artifacts. Every measurement here is LOCAL_SYNTHETIC, and G3 / H7 / G16 remain
+**NOT_ADJUDICATED** rather than BLOCKED — nothing was attempted and then obstructed.
 
 ## Not delivered in this pass
 
