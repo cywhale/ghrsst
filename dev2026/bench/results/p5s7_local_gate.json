@@ -1,0 +1,301 @@
+{
+  "fixture": {
+    "base_days": 400,
+    "block_days": 90,
+    "delta_days": 10,
+    "nx": 16,
+    "ny": 16,
+    "segments": 5
+  },
+  "gates": {
+    "G1": {
+      "adjudicated_by": [
+        "tests.test_phase2_p5s7_http.TestPointAndRangeThroughHTTP",
+        "tests.test_phase2_p5s7_http.TestNegativeControl"
+      ],
+      "errors": 0,
+      "failures": 0,
+      "label": "LOCAL_SYNTHETIC",
+      "tests_run": 7,
+      "verdict": "PASS"
+    },
+    "G10": {
+      "adjudicated_by": [
+        "tests.test_phase2_p5s7_load.TestGenerationChangeDuringLoad"
+      ],
+      "errors": 0,
+      "failures": 0,
+      "label": "LOCAL_SYNTHETIC",
+      "tests_run": 2,
+      "verdict": "PASS"
+    },
+    "G11": {
+      "adjudicated_by": [
+        "tests.test_phase2_p5s7_http.TestSpatialContractThroughHTTP"
+      ],
+      "errors": 0,
+      "failures": 0,
+      "label": "LOCAL_SYNTHETIC",
+      "tests_run": 3,
+      "verdict": "PASS"
+    },
+    "G12": {
+      "adjudicated_by": [
+        "tests.test_phase2_p5s7_http.TestPointAndRangeThroughHTTP.test_the_route_header_is_cube_for_point_and_range",
+        "tests.test_phase2_p5s7_http.TestPointAndRangeThroughHTTP.test_MAX_DAYS_is_enforced_with_413",
+        "tests.test_phase2_p5s7_load.TestConcurrencyParityAndContract.test_the_error_contract_is_unchanged_under_load"
+      ],
+      "errors": 0,
+      "failures": 0,
+      "label": "LOCAL_SYNTHETIC",
+      "tests_run": 3,
+      "verdict": "PASS"
+    },
+    "G2": {
+      "adjudicated_by": [
+        "tests.test_phase2_p5s7_http.TestPointAndRangeThroughHTTP.test_a_range_CROSSING_every_segment_and_the_delta"
+      ],
+      "errors": 0,
+      "failures": 0,
+      "label": "LOCAL_SYNTHETIC",
+      "tests_run": 1,
+      "verdict": "PASS"
+    },
+    "G3": {
+      "label": "LOCAL_SYNTHETIC",
+      "local_observation": {
+        "point_p95_ratio_vs_monolith": 0.963,
+        "threshold": "<= 1.25"
+      },
+      "reason": "the +25% gate is against the CURRENT production TieredCube baseline on VM24. A fixture-extent ratio cannot settle it, and promoting it would be exactly the local-to-production upgrade S7 forbids.",
+      "verdict": "NOT_ADJUDICATED"
+    },
+    "G4": {
+      "label": "LOCAL_SYNTHETIC",
+      "local_observation": {
+        "p95_ms": 5.405,
+        "range_days": 366,
+        "threshold": "< 4000 ms"
+      },
+      "reason": "measured on a 16x16 fixture; production geometry is 17999 x 36000, so the local wall time is not evidence for the 4 s bound.",
+      "verdict": "NOT_ADJUDICATED"
+    },
+    "G5": {
+      "label": "LOCAL_SYNTHETIC",
+      "measured": {
+        "rss_growth_mb": 0.3
+      },
+      "reason": "bounded RSS with no growth across a sustained run at concurrency 1-16, in ONE local process at fixture extent; not a production memory budget.",
+      "verdict": "PASS"
+    },
+    "G6": {
+      "label": "LOCAL_SYNTHETIC",
+      "measured": {
+        "fd_growth": 0,
+        "thread_growth": 3
+      },
+      "reason": "no unbounded fd or thread growth across repeats at FIXED maximum concurrency; segment handles are not reopened per request. The one-time pool sizing as concurrency rises 1->16 is reported under `pool_sizing` and deliberately not gated. Local process, fixture segment count.",
+      "verdict": "PASS"
+    },
+    "G7": {
+      "label": "LOCAL_SYNTHETIC",
+      "measured": {
+        "gate_can_fail": true,
+        "hard_reserve_bytes": 268435456
+      },
+      "reason": "the shipped disk_precheck is exercised in both directions with a real non-zero reserve, so the gate provably CAN fail. What is NOT measured is the temp disk a real production-geometry fold consumes -- G7's actual threshold ('one block + margin, never a second full base').",
+      "verdict": "PARTIAL"
+    },
+    "G8": {
+      "adjudicated_by": [
+        "tests.test_phase2_p5s7_load.TestPrePublicationFailure"
+      ],
+      "errors": 0,
+      "failures": 0,
+      "label": "LOCAL_SYNTHETIC",
+      "tests_run": 2,
+      "verdict": "PASS"
+    },
+    "G9": {
+      "adjudicated_by": [
+        "tests.test_phase2_p5s7_load.TestPostPublicationRollback"
+      ],
+      "errors": 0,
+      "failures": 0,
+      "label": "LOCAL_SYNTHETIC",
+      "tests_run": 1,
+      "verdict": "PASS"
+    }
+  },
+  "gates_green": [
+    "G1",
+    "G10",
+    "G11",
+    "G12",
+    "G2",
+    "G5",
+    "G6",
+    "G8",
+    "G9"
+  ],
+  "gates_not_green": {
+    "G3": "NOT_ADJUDICATED",
+    "G4": "NOT_ADJUDICATED",
+    "G7": "PARTIAL"
+  },
+  "label": "LOCAL_SYNTHETIC",
+  "measured": {
+    "concurrency": {
+      "axis_note": "`concurrency` is simultaneous in-flight HTTP requests. It is NOT the fold cadence C=30, which is a different quantity sharing the letter.",
+      "baseline": {
+        "open_fds": 10,
+        "rss_mb": 86.0,
+        "threads": 21
+      },
+      "by_concurrency": [
+        {
+          "concurrency": 1,
+          "open_fds": 10,
+          "p50_ms": 5.337,
+          "p95_ms": 6.314,
+          "requests": 6,
+          "rss_mb": 86.0,
+          "threads": 21,
+          "wall_s": 0.026
+        },
+        {
+          "concurrency": 4,
+          "open_fds": 10,
+          "p50_ms": 14.084,
+          "p95_ms": 26.025,
+          "requests": 24,
+          "rss_mb": 86.4,
+          "threads": 23,
+          "wall_s": 0.089
+        },
+        {
+          "concurrency": 8,
+          "open_fds": 10,
+          "p50_ms": 28.328,
+          "p95_ms": 53.505,
+          "requests": 48,
+          "rss_mb": 88.6,
+          "threads": 34,
+          "wall_s": 0.182
+        },
+        {
+          "concurrency": 16,
+          "open_fds": 10,
+          "p50_ms": 49.628,
+          "p95_ms": 94.496,
+          "requests": 96,
+          "rss_mb": 89.4,
+          "threads": 35,
+          "wall_s": 0.361
+        }
+      ],
+      "caveat": "one process, which also runs the client; its allocations are inside the same RSS. Shows unbounded growth or its absence, not a production budget.",
+      "errors": [],
+      "growth": {
+        "open_fds": 0,
+        "rss_mb": 0.3,
+        "threads": 3
+      },
+      "label": "LOCAL_SYNTHETIC",
+      "levels": [
+        1,
+        4,
+        8,
+        16
+      ],
+      "pool_sizing": {
+        "open_fds": 0,
+        "rss_mb": 3.4,
+        "threads": 14
+      },
+      "rounds": 6,
+      "sustained": {
+        "concurrency": 16,
+        "repeats": 6,
+        "samples": [
+          {
+            "open_fds": 10,
+            "repeat": 0,
+            "rss_mb": 90.1,
+            "threads": 39
+          },
+          {
+            "open_fds": 10,
+            "repeat": 1,
+            "rss_mb": 90.2,
+            "threads": 41
+          },
+          {
+            "open_fds": 10,
+            "repeat": 2,
+            "rss_mb": 90.2,
+            "threads": 41
+          },
+          {
+            "open_fds": 10,
+            "repeat": 3,
+            "rss_mb": 90.3,
+            "threads": 41
+          },
+          {
+            "open_fds": 10,
+            "repeat": 4,
+            "rss_mb": 90.3,
+            "threads": 41
+          },
+          {
+            "open_fds": 10,
+            "repeat": 5,
+            "rss_mb": 90.4,
+            "threads": 42
+          }
+        ]
+      }
+    },
+    "disk_gate": {
+      "caveat": "the shipped gate's arithmetic on THIS filesystem. It does not measure the temp disk a real fold consumes, and says nothing about VM24 free space, which is separately BLOCKED.",
+      "fail_case_ok": false,
+      "gate_can_fail": true,
+      "hard_reserve_bytes": 268435456,
+      "label": "LOCAL_SYNTHETIC",
+      "pass_case_ok": true,
+      "reserve_is_nonzero": true
+    },
+    "latency": {
+      "caveat": "fixture extent (16x16 spatial, 400 base days). The G3 +25% and G4 <4 s thresholds are production thresholds; a fixture-scale ratio cannot settle them.",
+      "label": "LOCAL_SYNTHETIC",
+      "point_p95_ms_monolith_baseline": 1.338,
+      "point_p95_ms_segmented": 1.289,
+      "point_p95_ratio": 0.963,
+      "range_days": 366,
+      "range_p50_ms": 5.122,
+      "range_p95_ms": 5.405,
+      "repeats": 40,
+      "segments": 5
+    }
+  },
+  "not_adjudicated_here": [
+    "G3",
+    "G4",
+    "H7",
+    "G16",
+    "G18"
+  ],
+  "provisional_configuration": {
+    "C": 30,
+    "S": 90,
+    "status": "provisional; NOT a final selection"
+  },
+  "s7_gate": {
+    "consequence": "S8 is NOT authored while any gate is not green (spec S14 P5-S7 'Stop if').",
+    "met": false,
+    "requirement": "G1-G12 all green simultaneously"
+  },
+  "scope": "local-only: temp-dir synthetic stores, one process. No VM24, no GHRSST_* production store, no cron/PM2/systemd/NGINX, no prune/swap/compaction/repair/hold cleanup, no production deletion.",
+  "step": "P5-S7"
+}
