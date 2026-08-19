@@ -36,6 +36,7 @@ from store.store_access import ALLOWED_FIELDS, StoreAccess  # noqa: E402
 from store.hybrid_router import HybridRouter  # noqa: E402
 from store.time_cube import TimeCubeStore  # noqa: E402
 from store.tiered_cube import TieredCube  # noqa: E402
+from store.segmented_cube import SegmentedCubeStore  # noqa: E402
 from store.bbox_encode import (CANONICAL_FORMAT, COMPACT_FORMATS, COVERAGEJSON_FORMATS,  # noqa: E402
                                ENCODERS, PUBLIC_BASE_FORMATS)
 from store import spatial_policy  # noqa: E402
@@ -139,17 +140,30 @@ async def lifespan(app: FastAPI):
     )
     # optional time-cube for multi-day point/range routing (P2-S5 hybrid routing).
     # Unset / missing -> router uses the daily store for everything (== P1 behaviour).
+    # P5-S7: the base may be a manifest-driven SEGMENTED store or the legacy monolith.
+    # `GHRSST_BLOCK_MANIFEST_DIR` wins when both are set — a manifest is an explicit statement
+    # of which blocks are authoritative, and silently preferring the monolith beside it would
+    # serve a generation nobody published. Nothing below this line changes: `HybridRouter` and
+    # the route contract see a cube either way (§4.0, Q4).
     cube = None
+    mf_dir = os.environ.get("GHRSST_BLOCK_MANIFEST_DIR")
     tc_path = os.environ.get("GHRSST_TIMECUBE_PATH")
-    if tc_path and os.path.isdir(tc_path):
-        try:
+    try:
+        if mf_dir and os.path.isdir(mf_dir):
+            cube = SegmentedCubeStore(mf_dir)
+        elif tc_path and os.path.isdir(tc_path):
             cube = TimeCubeStore(tc_path)
+        if cube is not None:
             # optional delta cube (time_chunk=1, cheap appends) -> tier base+delta
             dc_path = os.environ.get("GHRSST_DELTACUBE_PATH")
             if dc_path and os.path.isdir(dc_path):
                 cube = TieredCube(cube, TimeCubeStore(dc_path))
-        except Exception as e:  # noqa: BLE001
-            print(f"[GHRSST] time-cube load skipped: {e}")
+    except Exception as e:  # noqa: BLE001
+        # A base that cannot be constructed must not be replaced by a DIFFERENT one: falling
+        # back from a broken manifest to the monolith beside it would serve unpublished bytes
+        # under a healthy /healthz. Serve daily-only and say so.
+        print(f"[GHRSST] cube load skipped: {e}")
+        cube = None
     app.state.router = HybridRouter(app.state.store, cube)
     app.state.bex = BoundedExecutor(cfg.ZARR_WORKERS, cfg.OVERLOAD_QUEUE_MAX, cfg.OVERLOAD_WAIT_MS)
 
@@ -545,6 +559,32 @@ async def read_points(request: Request, body: PointsRequest):
     return _json(rows, headers=_no_store())  # batch: never cache (URI-only key)
 
 
+def _base_of(cube):
+    """The base tier, whether or not a delta is composed on top of it."""
+    if cube is None:
+        return None
+    return cube.base if isinstance(cube, TieredCube) else cube
+
+
+def _base_kind(cube) -> Optional[str]:
+    base = _base_of(cube)
+    if base is None:
+        return None
+    return "segmented" if isinstance(base, SegmentedCubeStore) else "monolith"
+
+
+def _segment_count(cube) -> Optional[int]:
+    base = _base_of(cube)
+    #: `None` (not 0) for a monolith: it has no segments, which is not the same as having none
+    #: left. A 0 here would read as a segmented base that lost every block.
+    return len(base.segment_paths) if isinstance(base, SegmentedCubeStore) else None
+
+
+def _base_generation(cube) -> Optional[int]:
+    base = _base_of(cube)
+    return base.generation if isinstance(base, SegmentedCubeStore) else None
+
+
 def _rss_mb() -> Optional[float]:
     """Current process RSS in MB (this worker). Portable; None if unavailable."""
     try:
@@ -587,6 +627,11 @@ async def healthz(request: Request):
             "cube_loaded": cube is not None,
             "cube_kind": (None if cube is None else
                           ("tiered" if isinstance(cube, TieredCube) else "timecube")),
+            # P5 segmented observability. §16-Q4: segments are exposed HERE and in logs, never
+            # as a public route name — `X-Store-Route` stays `cube` whatever the base is.
+            "cube_base_kind": _base_kind(cube),
+            "cube_segment_count": _segment_count(cube),
+            "cube_generation": _base_generation(cube),
             "cube_latest": (cube.latest if cube else None),
             "cube_day_count": (cube.day_count if cube else 0),
             "cube_latest_in_sync": (cube.latest == l if cube else None),
