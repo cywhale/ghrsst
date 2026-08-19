@@ -139,6 +139,42 @@ class TestNothingIsCoerced(unittest.TestCase):
                     partition_delta_days(live_delta_days=value, audit=_audit(),
                                          approval=_approval())
 
+    def test_NON_ZERO_PADDED_dates_are_refused(self):
+        """`strptime` accepts `2026-6-1`; it then compares and sorts wrong against the
+        zero-padded days every other source emits, and a consistently non-canonical input set
+        would have partitioned cleanly and dropped the wrong days."""
+        for bad in ("2026-6-1", "2026-06-1", "2026-6-01", "2026-006-01", " 2026-06-01",
+                    "2026-06-01 ", "26-06-01"):
+            with self.subTest(bad):
+                with self.assertRaises(DegradedPruneRefused) as cm:
+                    partition_delta_days(live_delta_days=LIVE + [bad], audit=_audit(),
+                                         approval=_approval())
+                self.assertIn("live_delta_days", str(cm.exception))
+
+    def test_a_CONSISTENTLY_non_canonical_input_set_is_still_refused(self):
+        """The case the shape check exists for: every list agrees, so nothing downstream would
+        notice. The refusal has to come from the format itself."""
+        loose = ["2026-6-1", "2026-6-2"]
+        audit = _audit(candidates=loose, blocked=[], calendar=loose)
+        with self.assertRaises(DegradedPruneRefused) as cm:
+            partition_delta_days(live_delta_days=loose, audit=audit,
+                                 approval=_approval(loose))
+        self.assertIn("zero-padded", str(cm.exception))
+
+    def test_a_str_SUBCLASS_is_not_a_str(self):
+        class Sneaky(str):
+            pass
+        with self.assertRaises(DegradedPruneRefused):
+            partition_delta_days(live_delta_days=LIVE + [Sneaky("2026-07-01")],
+                                 audit=_audit(), approval=_approval())
+
+    def test_a_list_SUBCLASS_is_not_a_list(self):
+        class Sneaky(list):
+            pass
+        with self.assertRaises(DegradedPruneRefused):
+            partition_delta_days(live_delta_days=Sneaky(LIVE), audit=_audit(),
+                                 approval=_approval())
+
     def test_a_non_date_entry_is_refused(self):
         for bad in ("a", "2026-13-01", "2026-06-31", "20260601", "", 20260601, None, True):
             with self.subTest(repr(bad)):

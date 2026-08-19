@@ -24,8 +24,10 @@ away from data loss, and the arithmetic belongs somewhere it can be tested.
   offer; that gate still decides whether they may go.
 - **Nothing is coerced.** `list(...)` accepts a string and yields its characters; `str(x)` turns
   `True` into a plausible approver name. Every day list must be a raw `list` of `YYYY-MM-DD`
-  strings, and `approved_by` / `approval_ref` must be raw non-empty strings. Input that has to be
-  converted before it can be checked was never the input the checker was written for.
+  strings, and `approved_by` / `approval_ref` must be raw non-empty strings. Dates must be
+  **canonical**: `2026-6-1` parses happily and then sorts and compares wrong against the
+  zero-padded days every other source emits. Input that has to be converted before it can be
+  checked was never the input the checker was written for.
 - **The audit's own sets must partition.** `delta_prune_candidates ∪
   blocked_need_compaction_first` must equal `drop_candidates_by_calendar` exactly. Without that,
   a tampered audit can introduce a base-covered day that was never a calendar candidate at all,
@@ -37,8 +39,12 @@ away from data loss, and the arithmetic belongs somewhere it can be tested.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence
+
+#: Canonical zero-padded ISO day. `strptime` alone accepts `2026-6-1`.
+_ISO_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 #: The approval an operator must supply to enter degraded mode.
 APPROVAL_FIELDS = ("approved_by", "approval_ref", "approved_candidates")
@@ -49,31 +55,52 @@ class DegradedPruneRefused(Exception):
 
 
 def _day_list(value, what: str) -> List[str]:
-    """A raw list of ISO dates, or a refusal. No coercion of any kind.
+    """A raw list of CANONICAL ISO dates, or a refusal. No coercion, no near-misses.
 
-    `list("2026-06-01")` is `['2', '0', '2', ...]` -- a perfectly well-formed day list as far as
-    every downstream check is concerned, and completely wrong. So the type is checked before the
-    contents, and the contents are checked as dates rather than as strings that look date-ish."""
-    if not isinstance(value, list):
+    `list("2026-06-01")` is `['2', '0', '2', ...]` -- a well-formed day list as far as every
+    later check is concerned, and completely wrong. So the type is checked before the contents.
+
+    `strptime` is not enough on its own: it accepts `2026-6-1` and `2026-06-1`, which compare as
+    strings against zero-padded days from every other source and silently sort wrong. The shape
+    is pinned with a regex, and the round trip through `date.isoformat()` is what makes
+    "canonical" mean canonical rather than "parsed without complaint".
+
+    `type(x) is list` / `type(x) is str` rather than `isinstance`: a `str` subclass that
+    overrides comparison would pass an isinstance check and then behave like something else
+    entirely in a set operation."""
+    if type(value) is not list:
         raise DegradedPruneRefused(
             f"{what} must be a list of 'YYYY-MM-DD' strings, got {type(value).__name__}. It is "
             f"not converted: a string would iterate into characters and pass every later check.")
     for item in value:
-        if not isinstance(item, str):
+        if type(item) is not str:
             raise DegradedPruneRefused(
                 f"{what} contains a {type(item).__name__} ({item!r}); every entry must be a "
                 f"'YYYY-MM-DD' string")
+        if not _ISO_DAY.match(item):
+            raise DegradedPruneRefused(
+                f"{what} contains {item!r}, which is not a zero-padded 'YYYY-MM-DD' date. "
+                f"`2026-6-1` parses, but it compares and sorts wrong against every other "
+                f"source, which all emit zero-padded days.")
         try:
-            datetime.strptime(item, "%Y-%m-%d")
+            parsed = datetime.strptime(item, "%Y-%m-%d").date()
         except ValueError:
             raise DegradedPruneRefused(
-                f"{what} contains {item!r}, which is not a 'YYYY-MM-DD' date") from None
+                f"{what} contains {item!r}, which is not a real date") from None
+        # Redundant GIVEN the regex above -- nothing matches `^\d{4}-\d{2}-\d{2}$`, parses,
+        # and round-trips to a different string -- and a mutation removing it survives, so it is
+        # deliberately NOT counted as a verified guard. It is kept as the second line if the
+        # regex is ever loosened, which is exactly when it would start to matter.
+        if parsed.isoformat() != item:
+            raise DegradedPruneRefused(
+                f"{what} contains {item!r}, which is not its own canonical form "
+                f"({parsed.isoformat()!r})")
     return list(value)
 
 
 def _required_text(value, what: str) -> str:
     """A raw non-empty string. `str(True)` is 'True', which reads like an approver."""
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise DegradedPruneRefused(
             f"{what} must be a string, got {type(value).__name__} ({value!r}). It is not "
             f"converted: an approval record that had to be stringified is not a record.")
