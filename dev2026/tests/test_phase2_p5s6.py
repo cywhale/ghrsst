@@ -162,6 +162,29 @@ class TestCountersAreCheckedAgainstObservedOperations(unittest.TestCase):
                          "the harness's tally must equal what the store actually saw")
         self.assertGreater(out["observed_chunk_keys"], 0)
 
+    def test_the_observation_is_a_LIST_OF_PATHS_not_a_number_the_harness_chose(self):
+        """`reported == observed` passes if the observation is quietly replaced by the tally.
+        The paths are what the store actually opened, and the harness cannot invent them."""
+        out = sizing.measure_segment_calls(s=30, days=90)
+        paths = out["observed_open_paths"]
+        self.assertEqual(len(paths), out["observed_segment_calls"])
+        self.assertEqual(len(set(paths)), len(paths), "each segment counted once")
+        for name in paths:
+            self.assertTrue(name.startswith("block_") and name.endswith(".zarr"), name)
+        self.assertEqual(sorted(paths),
+                         sorted(f"block_{i:03d}.zarr" for i in range(3)))
+
+    def test_a_read_inside_ONE_block_observes_one_open_not_the_block_count(self):
+        """The case that makes the observation falsifiable. With a full read, observed always
+        equals reported no matter where `observed` came from -- so a mutation replacing the
+        observation with the tally survived. Here they MUST differ."""
+        out = sizing.measure_segment_calls(s=30, days=90, open_only_first=True)
+        self.assertEqual(out["reported_segment_calls"], 3)
+        self.assertEqual(out["observed_segment_calls"], 1,
+                         "only one block was read; the tally says three")
+        self.assertEqual(out["observed_open_paths"], ["block_000.zarr"])
+        self.assertLess(out["observed_segment_calls"], out["reported_segment_calls"])
+
     def test_more_segments_means_more_observed_calls(self):
         """The direction the whole sizing question turns on, measured rather than modelled."""
         small_s = sizing.measure_segment_calls(s=30, days=90)

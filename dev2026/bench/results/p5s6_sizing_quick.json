@@ -1,0 +1,451 @@
+{
+  "H3": {
+    "1_day": {
+      "bytes_per_chunk": 23040,
+      "bytes_per_var": 23040,
+      "chunks": 1,
+      "days": 1,
+      "label": "MODEL",
+      "s": 90
+    },
+    "366_day": {
+      "S=30": {
+        "bytes_per_chunk": 7680,
+        "bytes_per_var": 99840,
+        "chunks": 13,
+        "days": 366,
+        "label": "MODEL",
+        "s": 30
+      },
+      "S=45": {
+        "bytes_per_chunk": 11520,
+        "bytes_per_var": 103680,
+        "chunks": 9,
+        "days": 366,
+        "label": "MODEL",
+        "s": 45
+      },
+      "S=90": {
+        "bytes_per_chunk": 23040,
+        "bytes_per_var": 115200,
+        "chunks": 5,
+        "days": 366,
+        "label": "MODEL",
+        "s": 90
+      }
+    },
+    "legacy_block_delta_crossing": {
+      "days": 366,
+      "label": "MODEL",
+      "plus_delta_tier": 1,
+      "s": 90,
+      "segments": 5
+    }
+  },
+  "H5": {
+    "by_span": {
+      "124": {
+        "delta_gb": 135.2,
+        "delta_span_days": 124,
+        "implied_cadence": 90,
+        "label": "MODEL"
+      },
+      "31": {
+        "delta_gb": 33.8,
+        "delta_span_days": 31,
+        "implied_cadence": -3,
+        "label": "MODEL"
+      },
+      "45": {
+        "delta_gb": 49.1,
+        "delta_span_days": 45,
+        "implied_cadence": 11,
+        "label": "MODEL"
+      },
+      "64": {
+        "delta_gb": 69.8,
+        "delta_span_days": 64,
+        "implied_cadence": 30,
+        "label": "MODEL"
+      },
+      "90": {
+        "delta_gb": 98.1,
+        "delta_span_days": 90,
+        "implied_cadence": 56,
+        "label": "MODEL"
+      }
+    },
+    "delta_spans": [
+      31,
+      45,
+      64,
+      90,
+      124
+    ],
+    "label": "MODEL"
+  },
+  "H7": {
+    "horizons": {
+      "S=30": {
+        "+10y": 122,
+        "+3y": 37,
+        "+5y": 61
+      },
+      "S=45": {
+        "+10y": 82,
+        "+3y": 25,
+        "+5y": 41
+      },
+      "S=90": {
+        "+10y": 41,
+        "+3y": 13,
+        "+5y": 21
+      },
+      "label": "MODEL"
+    },
+    "label": "MODEL"
+  },
+  "deferred": {
+    "inode_headroom": {
+      "label": "DEFERRED",
+      "reason": "`df -i` free inodes on the production filesystem. A temp dir on this machine says nothing about VM24's inode table, and a full inode table is an outage with plenty of free bytes. Needs VM24 read-only."
+    },
+    "metadata_scan_on_the_production_tree": {
+      "label": "DEFERRED",
+      "reason": "Scan cost is dominated by the filesystem's directory implementation and cache state at ~1.7M-6.6M files. Local timings do not extrapolate."
+    },
+    "open_fd_and_RSS_under_sustained_load": {
+      "label": "DEFERRED",
+      "reason": "H7's C=8/16 over 10 minutes is an S7 load-gate measurement against the real store; this harness runs no HTTP layer."
+    },
+    "peak_temp_disk_at_production_scale": {
+      "label": "DEFERRED",
+      "reason": "47/71/141 GB is arithmetic from 1.57 GB/day. Confirming it requires building one real block, which is a VM24 mutation."
+    },
+    "production_366d_point_latency": {
+      "label": "DEFERRED",
+      "reason": "\u00a710.4's 0.65 ms per extra segment call is a laptop-measured projection against a VM24 baseline of 76-100 ms. Measuring it at fixture extent would produce a number that looks like the gate and is not."
+    }
+  },
+  "fixture_anchor_day": "2026-06-27",
+  "fixture_anchor_note": "Committed historical FIXTURE anchor, used so the block grid is reproducible across runs. It describes this harness only, and says nothing about the state of any live store.",
+  "gates": {
+    "G16": {
+      "reason": "metadata-scan and snapshot-open shapes are measured locally; the production thresholds are not",
+      "verdict": "NOT_ADJUDICATED"
+    },
+    "G3": {
+      "reason": "the 366-day p95 gate is against the VM24 baseline; nothing measured at fixture extent can decide it",
+      "verdict": "NOT_ADJUDICATED"
+    },
+    "H7": {
+      "reason": "inode headroom and sustained-load fd/RSS are DEFERRED",
+      "verdict": "NOT_ADJUDICATED"
+    }
+  },
+  "grid": {
+    "C": [
+      30,
+      45,
+      90
+    ],
+    "S": [
+      30,
+      45,
+      90
+    ]
+  },
+  "harness": "bench_p5_sizing",
+  "measured": {
+    "metadata_scan": [
+      {
+        "files": 55,
+        "label": "LOCAL",
+        "ms_per_1k_files": 39.5182,
+        "segments": 5,
+        "wall_ms": 2.174
+      },
+      {
+        "files": 143,
+        "label": "LOCAL",
+        "ms_per_1k_files": 38.3709,
+        "segments": 13,
+        "wall_ms": 5.487
+      }
+    ],
+    "segment_calls": [
+      {
+        "days": 60,
+        "fixture_shape": {
+          "days": 60,
+          "nx": 64,
+          "ny": 64
+        },
+        "label": "PRODUCTION_GEOMETRY_FIXTURE",
+        "note": "chunk geometry is production's; spatial extent is not",
+        "observed_chunk_keys": 60,
+        "observed_open_paths": [
+          "block_000.zarr",
+          "block_001.zarr"
+        ],
+        "observed_segment_calls": 2,
+        "open_only_first": false,
+        "reported_segment_calls": 2,
+        "s": 30
+      },
+      {
+        "days": 60,
+        "fixture_shape": {
+          "days": 60,
+          "nx": 64,
+          "ny": 64
+        },
+        "label": "PRODUCTION_GEOMETRY_FIXTURE",
+        "note": "chunk geometry is production's; spatial extent is not",
+        "observed_chunk_keys": 60,
+        "observed_open_paths": [
+          "block_000.zarr"
+        ],
+        "observed_segment_calls": 1,
+        "open_only_first": false,
+        "reported_segment_calls": 1,
+        "s": 90
+      }
+    ],
+    "snapshot_open": [
+      {
+        "label": "LOCAL",
+        "ms_per_segment": 0.4235,
+        "observed_metadata_reads": 5,
+        "segments": 5,
+        "wall_ms": 2.118
+      },
+      {
+        "label": "LOCAL",
+        "ms_per_segment": 0.3774,
+        "observed_metadata_reads": 13,
+        "segments": 13,
+        "wall_ms": 4.906
+      }
+    ],
+    "tail_rebuild": [
+      {
+        "c": 30,
+        "carried_forward_days": 30,
+        "days_in_new_tail": 30,
+        "label": "LOCAL",
+        "modelled_amplification": 1.0,
+        "rebuild_wall_ms": 20.03,
+        "rewrite_evidence": "sha256-content-digest",
+        "rewritten_files": 0,
+        "rewritten_files_touched_only": 0,
+        "s": 30
+      },
+      {
+        "c": 30,
+        "carried_forward_days": 30,
+        "days_in_new_tail": 60,
+        "label": "LOCAL",
+        "modelled_amplification": 2.0,
+        "rebuild_wall_ms": 20.8,
+        "rewrite_evidence": "sha256-content-digest",
+        "rewritten_files": 7,
+        "rewritten_files_touched_only": 0,
+        "s": 90
+      }
+    ]
+  },
+  "model": {
+    "decompressed_bytes": {
+      "S=30": {
+        "bytes_per_chunk": 7680,
+        "bytes_per_var": 99840,
+        "chunks": 13,
+        "days": 366,
+        "label": "MODEL",
+        "s": 30
+      },
+      "S=45": {
+        "bytes_per_chunk": 11520,
+        "bytes_per_var": 103680,
+        "chunks": 9,
+        "days": 366,
+        "label": "MODEL",
+        "s": 45
+      },
+      "S=90": {
+        "bytes_per_chunk": 23040,
+        "bytes_per_var": 115200,
+        "chunks": 5,
+        "days": 366,
+        "label": "MODEL",
+        "s": 90
+      }
+    },
+    "delta_span": {
+      "C=30": {
+        "c": 30,
+        "delta_gb": 69.8,
+        "delta_span_max": 64,
+        "label": "MODEL",
+        "s": 90
+      },
+      "C=45": {
+        "c": 45,
+        "delta_gb": 86.1,
+        "delta_span_max": 79,
+        "label": "MODEL",
+        "s": 90
+      },
+      "C=90": {
+        "c": 90,
+        "delta_gb": 135.2,
+        "delta_span_max": 124,
+        "label": "MODEL",
+        "s": 90
+      }
+    },
+    "file_counts": {
+      "S=30": {
+        "base_files_at_plus_10y": 19586761,
+        "files_per_block": 119286,
+        "files_per_day": 3976.2,
+        "label": "MODEL",
+        "legacy_monolith_files": 5061703,
+        "s": 30,
+        "shards_per_var": 39762
+      },
+      "S=45": {
+        "base_files_at_plus_10y": 13057841,
+        "files_per_block": 119286,
+        "files_per_day": 2650.8,
+        "label": "MODEL",
+        "legacy_monolith_files": 3374468,
+        "s": 45,
+        "shards_per_var": 39762
+      },
+      "S=90": {
+        "base_files_at_plus_10y": 6528920,
+        "files_per_block": 119286,
+        "files_per_day": 1325.4,
+        "label": "MODEL",
+        "legacy_monolith_files": 1687234,
+        "s": 90,
+        "shards_per_var": 39762
+      }
+    },
+    "horizons": {
+      "S=30": {
+        "+10y": 122,
+        "+3y": 37,
+        "+5y": 61
+      },
+      "S=45": {
+        "+10y": 82,
+        "+3y": 25,
+        "+5y": 41
+      },
+      "S=90": {
+        "+10y": 41,
+        "+3y": 13,
+        "+5y": 21
+      },
+      "label": "MODEL"
+    },
+    "label": "MODEL",
+    "peak_temp_disk_gb": {
+      "S=30": 47.1,
+      "S=45": 70.7,
+      "S=90": 141.3
+    },
+    "segments_per_request": {
+      "S=30": {
+        "days": 366,
+        "label": "MODEL",
+        "plus_delta_tier": 1,
+        "s": 30,
+        "segments": 13
+      },
+      "S=45": {
+        "days": 366,
+        "label": "MODEL",
+        "plus_delta_tier": 1,
+        "s": 45,
+        "segments": 9
+      },
+      "S=90": {
+        "days": 366,
+        "label": "MODEL",
+        "plus_delta_tier": 1,
+        "s": 90,
+        "segments": 5
+      }
+    },
+    "write_amplification": {
+      "S=30,C=30": {
+        "amplification": 1.0,
+        "c": 30,
+        "folds_per_year": 12.2,
+        "gb_written_per_year": 573.0,
+        "label": "MODEL",
+        "s": 30
+      },
+      "S=45,C=30": {
+        "amplification": 1.25,
+        "c": 30,
+        "folds_per_year": 12.2,
+        "gb_written_per_year": 717.0,
+        "label": "MODEL",
+        "s": 45
+      },
+      "S=45,C=45": {
+        "amplification": 1.0,
+        "c": 45,
+        "folds_per_year": 8.1,
+        "gb_written_per_year": 573.0,
+        "label": "MODEL",
+        "s": 45
+      },
+      "S=90,C=30": {
+        "amplification": 2.0,
+        "c": 30,
+        "folds_per_year": 12.2,
+        "gb_written_per_year": 1147.0,
+        "label": "MODEL",
+        "s": 90
+      },
+      "S=90,C=45": {
+        "amplification": 1.5,
+        "c": 45,
+        "folds_per_year": 8.1,
+        "gb_written_per_year": 860.0,
+        "label": "MODEL",
+        "s": 90
+      },
+      "S=90,C=90": {
+        "amplification": 1.0,
+        "c": 90,
+        "folds_per_year": 4.1,
+        "gb_written_per_year": 573.0,
+        "label": "MODEL",
+        "s": 90
+      }
+    }
+  },
+  "production_geometry": {
+    "delta": {
+      "shard_spatial": 256,
+      "spatial_chunk": 256,
+      "time_chunk": 1
+    },
+    "legacy_time_chunk": 90,
+    "nx": 36000,
+    "ny": 17999,
+    "vars": [
+      "sst",
+      "sst_anomaly",
+      "sea_ice"
+    ]
+  },
+  "scope": "LOCAL AND SYNTHETIC ONLY \u2014 no VM24, no production path, no cron"
+}
