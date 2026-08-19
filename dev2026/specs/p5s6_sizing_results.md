@@ -319,8 +319,36 @@ delta span, and the delta span is what this measurement shows dominating read la
 | **H7 fd/RSS** | **NOT_ADJUDICATED** | 22 fds, 78 MB RSS at rest; H7 asks for C=8/16 under sustained load, which is not a read-only measurement. |
 | **G16** | **NOT_ADJUDICATED** | metadata scan / snapshot-open on the production tree were not measured; walking a 5.4 T store is not a low-rate probe. |
 
-Disk: **267 G free of 6.0 T (96 % used)** — the 141 GB peak temp disk for one S=90 block fits,
-with margin, and a 2 TB monolith rebuild does not. That is the constraint O2 exists to remove.
+### Capacity gate (§7.1c / G18) — **BLOCKED**
+
+**The earlier claim in this document that "141 GB fits with margin" was wrong, and is
+withdrawn.** It compared the block size alone against free space. The gate is
+`projected_free_after ≥ HARD_RESERVE`, and `additional` is never the block alone:
+
+| term | value | source |
+|---|---|---|
+| `free_now` | 267 GB | `df` avail, measured |
+| `new_block` (S=90 × 1.62 GB/day) | 145.8 GB | measured base rate |
+| `temp` / checkpoint / artifacts | 2 GB | estimate |
+| `growth_during_build` (2.74 GB/day × 2 d) | 5.5 GB | measured ingest rate, **assumed** duration |
+| **`additional`** | **153.3 GB** | |
+| **`projected_free_after`** | **113.7 GB** | `free_now − additional` |
+| `HARD_RESERVE` | **250 GB** | §7.1c / P4-S4 §6 |
+
+**113.7 GB < 250 GB → BLOCKED.** Shortfall **136.3 GB**; the build would need **403.3 GB** free.
+
+It stays blocked with `temp` and `growth` set to **zero** — the block alone breaches the
+reserve — so the verdict does not depend on how the soft terms are estimated, and the assumed
+2-day build duration does not change it either.
+
+`HARD_RESERVE` is **not** adjusted here. Lowering a reserve to make a gate pass is an ops policy
+decision raised separately, never an implementation detail; a test pins it at 250 GB. The
+arithmetic is cross-checked against the shipped `build_block.disk_precheck` on identical inputs,
+so this is production's formula rather than a second one.
+
+What remains true: a 2 TB monolith rebuild is far further out of reach than one 90-day block,
+which is the constraint O2 exists to remove. But **O2 cannot run on VM24 at today's free
+space**, and no local result changes that.
 
 ## Not delivered in this pass
 

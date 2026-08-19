@@ -703,6 +703,52 @@ def measure_h5_latency(*, quick: bool = False, s: int = DEFAULT_S) -> dict:
                      "adjudicate G3, which is a VM24 measurement.")}
 
 
+# ------------------------------------------------- capacity gate (§7.1c, G18)
+GB = 1 << 30
+#: The floor the SERVING system needs (§7.1c / P4-S4 §6). NOT tunable from here: lowering it to
+#: make a gate pass is an ops policy decision, not an implementation detail, and this harness
+#: must never be the place it happens.
+HARD_RESERVE_GB = 250
+
+
+def capacity_gate(*, free_now_gb: float, s: int = DEFAULT_S,
+                  base_gb_per_day: float, ingest_gb_per_day: float,
+                  build_days: float = 2.0, temp_gb: float = 2.0,
+                  hard_reserve_gb: float = HARD_RESERVE_GB) -> dict:
+    """§7.1c: `free_now - additional >= HARD_RESERVE`, with every term named.
+
+    `additional` is the block estimate PLUS temp/checkpoint artifacts PLUS growth during the
+    build -- never the block size alone. Reporting only the block size is how "141 GB fits"
+    gets said about a machine that cannot host the build.
+
+    The arithmetic is `build_block.disk_precheck`'s, and a test asserts the two agree on
+    identical inputs rather than trusting that they look similar."""
+    new_block_gb = round(s * base_gb_per_day, 1)
+    growth_gb = round(ingest_gb_per_day * build_days, 1)
+    additional_gb = round(new_block_gb + temp_gb + growth_gb, 1)
+    projected_gb = round(free_now_gb - additional_gb, 1)
+    ok = projected_gb >= hard_reserve_gb
+    return {
+        "label": "VM24_PRODUCTION_READ_ONLY",
+        "formula": "projected_free_after = free_now - (new_block + temp + growth)",
+        "s": s,
+        "free_now_gb": free_now_gb,
+        "new_block_gb": new_block_gb,
+        "temp_checkpoint_artifacts_gb": temp_gb,
+        "growth_during_build_gb": growth_gb,
+        "build_days_assumed": build_days,
+        "additional_gb": additional_gb,
+        "hard_reserve_gb": hard_reserve_gb,
+        "projected_free_after_gb": projected_gb,
+        "gate_ok": ok,
+        "verdict": "PASS" if ok else "BLOCKED",
+        "shortfall_gb": 0.0 if ok else round(hard_reserve_gb - projected_gb, 1),
+        "free_now_required_gb": round(hard_reserve_gb + additional_gb, 1),
+        "note": ("HARD_RESERVE is NOT adjustable here. If it needs to change, that is an ops "
+                 "policy decision raised separately -- never a change made to let a gate pass."),
+    }
+
+
 # --------------------------------------------------------------------------- deferred
 def deferred_metrics() -> dict:
     """What cannot be established here. Each carries a reason and NO number."""

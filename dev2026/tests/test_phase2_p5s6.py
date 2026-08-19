@@ -680,5 +680,82 @@ class TestH5CrossingLatency(unittest.TestCase):
                 self.assertEqual(art["gates"]["G3"]["verdict"], "NOT_ADJUDICATED")
 
 
+class TestCapacityGate(unittest.TestCase):
+    """§7.1c / G18. The conclusion I published -- "141 GB fits with margin" -- was wrong: it
+    counted the block and nothing else, and compared it to free space rather than to
+    HARD_RESERVE."""
+
+    #: measured on VM24, 2026-08-19
+    FREE_GB = 267.0
+    BASE_GB_DAY = 1.62
+    INGEST_GB_DAY = 2.74          # base 1.62 + delta 1.12, both measured
+
+    def _gate(self, **kw):
+        return sizing.capacity_gate(free_now_gb=self.FREE_GB,
+                                    base_gb_per_day=self.BASE_GB_DAY,
+                                    ingest_gb_per_day=self.INGEST_GB_DAY, **kw)
+
+    def test_additional_is_more_than_the_block(self):
+        g = self._gate()
+        self.assertGreater(g["additional_gb"], g["new_block_gb"],
+                           "additional must include temp/checkpoint and growth")
+        self.assertGreater(g["growth_during_build_gb"], 0)
+
+    def test_the_gate_is_BLOCKED_at_the_measured_free_space(self):
+        g = self._gate()
+        self.assertEqual(g["verdict"], "BLOCKED")
+        self.assertFalse(g["gate_ok"])
+        self.assertLess(g["projected_free_after_gb"], g["hard_reserve_gb"])
+        self.assertGreater(g["shortfall_gb"], 0)
+
+    def test_it_is_BLOCKED_even_under_the_most_FAVOURABLE_assumptions(self):
+        """No zeroing of temp or growth rescues it -- the block alone already breaches the
+        reserve. So the verdict does not depend on how the soft terms are estimated."""
+        g = self._gate(build_days=0.0, temp_gb=0.0)
+        self.assertEqual(g["verdict"], "BLOCKED")
+        self.assertLess(g["projected_free_after_gb"], g["hard_reserve_gb"])
+
+    def test_the_reserve_is_not_lowered_to_make_it_pass(self):
+        self.assertEqual(sizing.HARD_RESERVE_GB, 250)
+        self.assertIn("ops policy decision", self._gate()["note"])
+
+    def test_it_reports_what_free_space_WOULD_be_needed(self):
+        g = self._gate()
+        self.assertAlmostEqual(g["free_now_required_gb"],
+                               g["hard_reserve_gb"] + g["additional_gb"], places=1)
+        self.assertGreater(g["free_now_required_gb"], self.FREE_GB)
+
+    def test_the_arithmetic_agrees_with_the_SHIPPED_precheck(self):
+        """Not "looks similar": the same inputs through `build_block.disk_precheck`, whose
+        formula is the one production uses."""
+        from unittest import mock
+        from ingest import build_block as bb
+
+        g = self._gate()
+        free_bytes = int(self.FREE_GB * (1 << 30))
+
+        class FakeStat:
+            f_bavail = free_bytes
+            f_frsize = 1
+
+        with mock.patch("os.statvfs", return_value=FakeStat()):
+            shipped = bb.disk_precheck(
+                ".", block_bytes_estimate=int(g["new_block_gb"] * (1 << 30)),
+                temp_bytes=int(g["temp_checkpoint_artifacts_gb"] * (1 << 30)),
+                growth_bytes=int(g["growth_during_build_gb"] * (1 << 30)),
+                hard_reserve_bytes=int(g["hard_reserve_gb"] * (1 << 30)))
+        self.assertFalse(shipped["ok"], "the shipped precheck must also refuse")
+        self.assertAlmostEqual(shipped["projected_free_after_bytes"] / (1 << 30),
+                               g["projected_free_after_gb"], places=0)
+
+    def test_a_machine_with_enough_room_PASSES(self):
+        """Otherwise "always BLOCKED" would satisfy every test above."""
+        g = sizing.capacity_gate(free_now_gb=500.0, base_gb_per_day=self.BASE_GB_DAY,
+                                 ingest_gb_per_day=self.INGEST_GB_DAY)
+        self.assertEqual(g["verdict"], "PASS")
+        self.assertTrue(g["gate_ok"])
+        self.assertEqual(g["shortfall_gb"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
