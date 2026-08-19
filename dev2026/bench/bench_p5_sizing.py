@@ -399,7 +399,8 @@ def _real_segmented_fixture(tmp: str, *, segments: int, total_days: int, ny: int
 
 def measure_grouped_read(*, segments: int, total_days: int, request_days: int,
                          request_within_one_segment: bool = False,
-                         ny: int = 24, nx: int = 24) -> dict:
+                         ny: int = 24, nx: int = 24,
+                         _negative_control: bool = False) -> dict:
     """`SegmentedCubeStore.point_series()` against a real manifest, observed from outside.
 
     The spy replaces `zarr.open_group` **in the implementation's own module namespace**
@@ -448,11 +449,38 @@ def measure_grouped_read(*, segments: int, total_days: int, request_days: int,
         expected = {sp for sp, meta in zip(store._meta.stores, store._meta.segment_metas)
                     if set(getattr(meta, "days", [])) & set(requested)}
 
-        # Parity against the values the fixture wrote, re-read from the block itself: one
-        # authoritative source, not two stores whose disagreement could be called parity.
-        oracle = store.point_series(LON, LAT, requested, list(VARS))
-        mismatches = [r["date"] for r, o in zip(rows, oracle)
-                      if r.get("sst") != o.get("sst")]
+        # Parity against RAW CELLS, not against a second call to the method under test.
+        # Comparing `point_series()` to `point_series()` proves only that it is deterministic:
+        # if it returned the wrong cell, both sides would return the same wrong cell.
+        #
+        # So a sentinel is written directly into one day's slab, through zarr, bypassing the
+        # read path entirely -- and then read back THROUGH `point_series()`. If the value comes
+        # out as the sentinel, the read really is serving those bytes.
+        import numpy as np
+        probe_day = requested[len(requested) // 2]
+        seg_path, day_idx = None, None
+        for sp, meta in zip(store._meta.stores, store._meta.segment_metas):
+            days_here = list(getattr(meta, "days", []))
+            if probe_day in days_here:
+                # `_meta.stores` holds TimeCubeStore objects, not paths.
+                seg_path, day_idx = sp.path, days_here.index(probe_day)
+                break
+        sentinel = -12345.5
+        # `_negative_control` compares against a value that was NOT written, so the check must
+        # report a mismatch. Without it, `parity_ok: True` is unfalsifiable -- disabling the
+        # comparison entirely also yields True, which is how a mutation of exactly that survived.
+        expected_cell = sentinel + (1.0 if _negative_control else 0.0)
+        mismatches = []
+        if seg_path is not None:
+            g = tc.zarr.open_group(seg_path, mode="a")
+            g["sst"][day_idx] = np.full_like(np.asarray(g["sst"][day_idx]), sentinel)
+            fresh = sc.SegmentedCubeStore(root)                 # a snapshot that sees the write
+            got = fresh.point_series(LON, LAT, [probe_day], ["sst"])
+            if not got or abs(float(got[0]["sst"]) - expected_cell) > 1e-6:
+                mismatches.append({"day": probe_day, "expected_raw_cell": expected_cell,
+                                   "got": (got[0]["sst"] if got else None)})
+        else:
+            mismatches.append({"day": probe_day, "error": "no segment claims this day"})
 
         return {
             "label": "LOCAL_SYNTHETIC",
@@ -482,7 +510,9 @@ def measure_grouped_read(*, segments: int, total_days: int, request_days: int,
             "requested_days": len(requested),
             "read_ms": round(read_ms, 3),
             "parity_ok": not mismatches,
-            "parity_oracle": "fixture-authored values re-read from the block",
+            "parity_is_falsifiable": True,
+            "parity_oracle": ("a sentinel written directly into the block's raw cells via "
+                              "zarr, then read back through point_series()"),
             "parity_mismatches": mismatches,
             "fixture_geometry": {"ny": ny, "nx": nx, "total_days": total_days,
                                  "segments": segments},
@@ -599,6 +629,16 @@ def build_report(*, quick: bool = False) -> dict:
             "snapshot_open": [measure_snapshot_open(segments=n) for n in horizons],
             "metadata_scan": [measure_metadata_scan(segments=n) for n in horizons],
             "tail_rebuild": [measure_tail_rebuild(s=s, c=30) for s in s_grid],
+            # The two real-path measurements belong in the ARTIFACT, not only in the prose.
+            # They were described in the results doc and absent from the JSON, so the
+            # consistency tests could not see the omission.
+            "grouped_read": [
+                measure_grouped_read(segments=4, total_days=40, request_days=10),
+                measure_grouped_read(segments=4, total_days=40, request_days=5,
+                                     request_within_one_segment=True),
+            ],
+            "snapshot_construction": [measure_snapshot_construction(segments=n)
+                                      for n in horizons],
         },
         "deferred": deferred_metrics(),
         "gates": {

@@ -116,8 +116,16 @@ Consequently:
   to grow with the request width. **LOCAL_SYNTHETIC.**
 - **observed segments touched by a read** — **DEFERRED**: it needs a chunk-level observable (a
   counting store around each segment), which is not built here.
-- **value parity** — against the fixture's own values re-read from the block, one authoritative
-  oracle rather than two stores whose disagreement could be called parity. **LOCAL_SYNTHETIC.**
+- **value parity** — a sentinel is written **directly into the block's raw cells via zarr**,
+  bypassing the read path, and then read back **through `point_series()`**. Comparing
+  `point_series()` to `point_series()` proves only determinism: if it returned the wrong cell,
+  both sides return the same wrong cell. A **negative control** (`_negative_control=True`)
+  compares against a value that was never written and must report a mismatch, because
+  `parity_ok: True` proves nothing unless `False` is reachable — a mutation disabling the
+  comparison outright survived until that control existed. **LOCAL_SYNTHETIC.**
+
+Both measurements are now **in the generated artifacts**, not only in this prose: they were
+described here and absent from the JSON, so the consistency tests could not see the omission.
 
 ## Segment calls — NOT the grouped read path (withdrawn, superseded above)
 

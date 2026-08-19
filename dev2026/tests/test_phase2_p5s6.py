@@ -39,7 +39,8 @@ import bench_p5_sizing as sizing  # noqa: E402
 
 _DEV2026 = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-LABELS = ("MODEL", "PRODUCTION_GEOMETRY_FIXTURE", "LOCAL", "DEFERRED")
+LABELS = ("MODEL", "PRODUCTION_GEOMETRY_FIXTURE", "LOCAL", "LOCAL_SYNTHETIC",
+          "DEFERRED")
 
 
 class TestProductionGeometryConstants(unittest.TestCase):
@@ -336,7 +337,8 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
     #: observed_open_paths or observed_segment_calls had been edited by hand still passed the
     #: test that was introduced to stop exactly that. Excluding an observation from the
     #: comparison is indistinguishable from not observing it.
-    VOLATILE = ("wall_ms", "ms_per_segment", "ms_per_1k_files")
+    VOLATILE = ("wall_ms", "ms_per_segment", "ms_per_1k_files", "read_ms",
+                "p50_ms", "p95_ms")
 
     def _claims(self, node, out=None, trail=""):
         """Every non-volatile leaf, keyed by path: the report's claims minus its timings."""
@@ -485,9 +487,44 @@ class TestGroupedReadUsesTheRealPath(unittest.TestCase):
         """Parity against the bytes the fixture wrote, so two stores disagreeing cannot be
         reported as agreement."""
         out = sizing.measure_grouped_read(segments=4, total_days=40, request_days=10)
-        self.assertTrue(out["parity_ok"])
-        self.assertEqual(out["parity_oracle"], "fixture-authored values re-read from the block")
+        self.assertTrue(out["parity_ok"], out["parity_mismatches"])
+        self.assertIn("sentinel written directly", out["parity_oracle"])
         self.assertEqual(out["parity_mismatches"], [])
+
+    def test_the_parity_check_CAN_fail(self):
+        """`parity_ok: True` proves nothing unless False is reachable. Disabling the comparison
+        outright also yields True, and a mutation doing exactly that survived until this test
+        existed."""
+        bad = sizing.measure_grouped_read(segments=4, total_days=40, request_days=10,
+                                          _negative_control=True)
+        self.assertFalse(bad["parity_ok"])
+        self.assertTrue(bad["parity_mismatches"])
+        entry = bad["parity_mismatches"][0]
+        self.assertIn("expected_raw_cell", entry)
+        self.assertNotAlmostEqual(entry["got"], entry["expected_raw_cell"], places=3)
+
+
+class TestTheRealMeasurementsReachTheArtifacts(unittest.TestCase):
+    """They were in the results doc and not in the JSON, so nothing could detect the omission."""
+
+    def test_both_artifacts_carry_the_grouped_read_and_the_constructor(self):
+        for stamp in ("quick", "full"):
+            with self.subTest(stamp):
+                path = os.path.join(_DEV2026, "bench", "results", f"p5s6_sizing_{stamp}.json")
+                with open(path) as fh:
+                    art = json.load(fh)
+                grouped = art["measured"]["grouped_read"]
+                self.assertTrue(grouped)
+                for row in grouped:
+                    self.assertEqual(row["read_path"], "SegmentedCubeStore.point_series")
+                    self.assertEqual(row["spy_target"], "store.time_cube.zarr.open_group")
+                    self.assertTrue(row["parity_ok"])
+                construction = art["measured"]["snapshot_construction"]
+                self.assertTrue(construction)
+                for row in construction:
+                    self.assertEqual(row["measures"],
+                                     "SegmentedCubeStore(manifest_dir) construction")
+                    self.assertGreater(row["p50_ms"], 0.0)
 
 
 class TestSnapshotOpenIsTheRealConstruction(unittest.TestCase):
