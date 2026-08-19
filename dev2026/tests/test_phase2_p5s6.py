@@ -992,6 +992,21 @@ class TestAuditEntryPointMatchesTheArtifact(unittest.TestCase):
                 out = sizing.audit_hold_lifecycle_from_evidence(ev)
                 self.assertEqual(out["verdict"], "FAIL_CLOSED")
 
+    def test_wal_repairs_pending_is_not_laundered_by_set(self):
+        """`set("2026-01-01")` is a set of characters, and it looks perfectly legal."""
+        for bad in ("2026-01-01", ["2026-1-1"], [1], ["2026-01-01", "2026-01-01"], {"a"}):
+            with self.subTest(repr(bad)):
+                ev = self._evidence()
+                ev["wal_repairs_pending"] = bad
+                out = sizing.audit_hold_lifecycle_from_evidence(ev)
+                self.assertEqual(out["verdict"], "FAIL_CLOSED")
+                self.assertIn("wal_repairs_pending", out["reason"])
+
+    def test_a_valid_repairs_list_is_accepted(self):
+        ev = self._evidence()
+        ev["wal_repairs_pending"] = ["2026-01-01"]
+        self.assertEqual(sizing.audit_hold_lifecycle_from_evidence(ev)["verdict"], "COMPLETE")
+
     def test_the_day_sets_are_EXPANDED_not_two_endpoints(self):
         """1267 days, not 2. The endpoint form silently made membership a two-day check."""
         fresh = self._run()
@@ -1015,6 +1030,42 @@ class TestAuditEntryPointMatchesTheArtifact(unittest.TestCase):
             recovery_evidence=MANIFEST_EV, p5_roots_present=True)
         self.assertEqual(out["klass"], "releasable_after_approval")
         self.assertTrue(out["evidence"]["release_authorized"])
+
+
+class TestTheResultsDocHasNoSupersededCapacityClaims(unittest.TestCase):
+    """A document carrying two contradictory capacity conclusions is how the wrong one gets
+    read. This one has been wrong about capacity three times, so the stale text is deleted
+    rather than annotated."""
+
+    def setUp(self):
+        with open(os.path.join(_DEV2026, "specs", "p5s6_sizing_results.md")) as fh:
+            self.doc = fh.read()
+        with open(os.path.join(_DEV2026, "bench", "results",
+                               "p5s6_vm24_readonly.json")) as fh:
+            self.cap = json.load(fh)["hold_lifecycle_audit"]["capacity"]
+
+    def test_the_withdrawn_conclusions_do_not_appear_as_current(self):
+        for stale in ("Disk expansion is not required",
+                      "| `releasable_after_approval` | 1267 daily",
+                      "yes, **with approval** |"):
+            with self.subTest(stale[:40]):
+                self.assertNotIn(stale, self.doc)
+
+    def test_the_capacity_figures_match_the_artifact(self):
+        self.assertIn(f"| {self.cap['withheld_pending_operator_policy_gib']} |", self.doc)
+        self.assertIn(f"**{self.cap['minimum_free_gib']}**", self.doc)
+        self.assertIn(f"**{self.cap['recommended_free_gib']}**", self.doc)
+
+    def test_currently_reclaimable_is_stated_as_zero(self):
+        self.assertEqual(self.cap["currently_reclaimable_gib"], 0.0)
+        self.assertIn("| `currently_reclaimable` | **0.0** |", self.doc)
+
+    def test_the_superseded_section_does_not_restate_its_numbers(self):
+        i = self.doc.index("### Superseded historical audit")
+        section = self.doc[i:i + 1400]
+        self.assertIn("DO NOT USE AS CURRENT STATE", section)
+        self.assertIn("not reproduced here", section)
+        self.assertNotIn("| ~2192 GiB |", section)
 
 
 if __name__ == "__main__":

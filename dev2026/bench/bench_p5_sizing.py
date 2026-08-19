@@ -952,6 +952,26 @@ def expand_day_range(spec, what: str) -> List[str]:
     return [(start + _dt.timedelta(days=i)).isoformat() for i in range(span)]
 
 
+def _repairs_pending(value) -> set:
+    """A raw list of canonical days, or a refusal. `set(x)` on a string yields its characters
+    and on a malformed list quietly collapses duplicates -- both turn broken input into a
+    legal-looking set, and a set that looks legal is one that gets reasoned from."""
+    if value is None:
+        return set()
+    if type(value) is not list:
+        raise _EvidenceError(f"wal_repairs_pending must be a list or null, got "
+                             f"{type(value).__name__}; a string would iterate into characters")
+    for d in value:
+        if type(d) is not str or not _ISO_DAY.match(d):
+            raise _EvidenceError(f"wal_repairs_pending contains {d!r}; every entry must be a "
+                                 f"canonical YYYY-MM-DD string")
+    dupes = sorted({d for d in value if value.count(d) > 1})
+    if dupes:
+        raise _EvidenceError(f"wal_repairs_pending repeats {dupes}; de-duplicating would "
+                             f"launder a malformed list into a legal-looking set")
+    return set(value)
+
+
 def audit_hold_lifecycle_from_evidence(evidence: dict) -> dict:
     """The committed, reproducible audit path: raw evidence in, classified verdicts out.
 
@@ -985,7 +1005,7 @@ def audit_hold_lifecycle_from_evidence(evidence: dict) -> dict:
                 entry=entry, now_utc=evidence["now_utc"], base_days=base_days,
                 spatial_window=window, recovery_evidence=e.get("recovery_evidence"),
                 p5_roots_present=p5_present,
-                wal_repairs_pending=set(evidence.get("wal_repairs_pending") or ()),
+                wal_repairs_pending=_repairs_pending(evidence.get("wal_repairs_pending")),
                 referenced_by_rollback=_strict_bool(
                     e.get("referenced_by_rollback", False), f"{what}.referenced_by_rollback"),
                 in_active_serving_path=_strict_bool(
