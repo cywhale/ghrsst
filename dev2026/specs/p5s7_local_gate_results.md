@@ -15,9 +15,11 @@ Branch `dev2026-p5-s6-o2-local`, based on `5f8450c`.
 - Harness: [`../bench/bench_p5s7_local_gate.py`](../bench/bench_p5s7_local_gate.py)
 - Tests: [`../tests/test_phase2_p5s7_http.py`](../tests/test_phase2_p5s7_http.py) (HTTP surface)
   and [`../tests/test_phase2_p5s7_load.py`](../tests/test_phase2_p5s7_load.py) (load, lifecycle,
-  disk gate), committed **failing first**; consistency guards in
-  [`../tests/test_phase2_p5s7_report.py`](../tests/test_phase2_p5s7_report.py) — **42/42** across
-  the three modules, **8 mutations killed**, no survivors
+  disk gate) and
+  [`../tests/test_phase2_p5s7_wiring.py`](../tests/test_phase2_p5s7_wiring.py) (base-tier
+  authority), committed **failing first**; consistency guards in
+  [`../tests/test_phase2_p5s7_report.py`](../tests/test_phase2_p5s7_report.py) — **55/55** across
+  the four modules, **12 mutations killed**, no survivors
 - Artifact: `../bench/results/p5s7_local_gate.json`
 
 **S = 90 / C = 30 remains a provisional configuration.** Nothing in this step selects it.
@@ -38,6 +40,42 @@ would serve unpublished bytes under a healthy `/healthz`.
 
 This is why the tests go through `TestClient` rather than calling `HybridRouter` or `TieredCube`.
 Testing the layer beneath the contract would not have noticed any of it.
+
+## Manifest authority must fail closed — the review finding
+
+The first version of that wiring selected the base with `if os.path.isdir(mf_dir) … elif
+tc_path …`. A configured-but-**missing** manifest path — a typo, or a volume not yet mounted —
+therefore fell through the `elif` and **silently loaded the legacy monolith**, serving a
+different base than the deployment asked for, under a `/healthz` that looked healthy.
+
+The predicate is now *"is a manifest **configured**"*, never *"does the manifest path happen to
+exist right now"*:
+
+| `GHRSST_BLOCK_MANIFEST_DIR` | outcome |
+|---|---|
+| unset, or empty (`FOO=` clears a variable in a unit file) | legacy `GHRSST_TIMECUBE_PATH` fallback remains allowed |
+| set and valid | `SegmentedCubeStore` wins; the monolith is **never opened** |
+| set but missing, a non-directory, malformed, or stale | **fail closed**: no cube of any kind, `cube_loaded: false`, explicitly daily-only |
+
+The failure cases assert the actual object in `app.state.router.cube` as well as `/healthz` — a
+test reading only the endpoint would pass on a build that installed a monolith and mislabelled
+it — and walk every store in the tier to prove the monolith path was not opened. A day only the
+base holds is refused with 400 rather than answered from the monolith, while the daily window
+keeps serving: failing closed on the base must not take the daily tier down with it.
+
+### A second defect this uncovered, in signed-off S2 code
+
+`GHRSST_BLOCK_MANIFEST_DIR` **without** a delta is a legal deployment, and it only became
+reachable once the app could build a segmented base. It crashed:
+`HybridRouter._CubeSnapshot.covers_days` read `_meta.day_index`, a `TimeCubeStore` field that a
+`SegmentedCubeStore` snapshot does not carry — until now a segmented base was only ever reached
+*through* `TieredCube`, which has its own snapshot.
+
+**This required a one-line change to S2's `store/hybrid_router.py`, and is flagged for review.**
+It does not alter S2/S5 concurrency semantics: the snapshot is still captured once per request in
+`__init__`, and the fix answers from the day set *already captured there* instead of dereferencing
+`_meta` a second time. It is membership-identical for the monolith, whose `day_index` is built as
+`{d: i for i, d in enumerate(days)}` — the same keys. No new read is introduced; one is removed.
 
 ## Where the verdicts come from
 
@@ -97,9 +135,12 @@ concurrency-16 sample against the concurrency-1 baseline and reported thread gro
 the executor pool sizing itself once as load rose. That is a pool doing its job, not a leak. The
 harness now runs a **sustained phase at fixed maximum concurrency** and judges G5/G6 on growth
 across those repeats; the one-time pool sizing is reported separately under `pool_sizing` and
-deliberately not gated. The threshold is 4 threads rather than 0 because workers are reaped
-asynchronously and the count oscillates by a couple between samples; the failure mode G6 names is
-monotonic growth.
+deliberately not gated. Growth is judged on the **plateau** — the second half of the samples — after three warm-up
+bursts at maximum concurrency. The pool climbs for the first repeats and then flattens at its
+ceiling; measuring from the first sample reports that ramp as growth, which is what made an
+earlier run flip G6 to `NOT_ADJUDICATED`. The full sample list is recorded in the artifact so the
+shape can be checked rather than taken on trust, and the threshold is 4 threads rather than 0
+because workers are reaped asynchronously. The failure mode G6 names is monotonic growth.
 
 ## G7 — why PARTIAL and not PASS
 
@@ -115,7 +156,7 @@ BLOCKED (267 GiB available against a 403.3 GiB minimum)**.
 
 ## Mutation verification
 
-Eight mutations, each run **serially** from a git-clean tree and restored with `git checkout`,
+Twelve mutations, each run **serially** from a git-clean tree and restored with `git checkout`,
 never from a local copy — an earlier P5 round corrupted its own source by re-copying a backup
 taken from an already-mutated file. Every mutation targets **production code**, not the harness's
 own counters; a mutation that only broke a bench tally would prove the bench measures itself.
@@ -130,6 +171,10 @@ own counters; a mutation that only broke a bench tally would prove the bench mea
 | the disk gate always returns `ok` | disk-gate tests |
 | the segmented refresh becomes a no-op | generation-change-during-load tests |
 | `/healthz` reports a segmented base as a monolith | wiring test |
+| the base is selected on `isdir` (**the reported blocker, reintroduced verbatim**) | missing-manifest fail-closed tests |
+| the monolith is loaded when the manifest fails to construct | malformed/stale manifest tests |
+| an empty manifest env is treated as configured | legacy-fallback tests |
+| `covers_days` reads `_meta.day_index` again | segmented-without-delta tests |
 
 **No survivors.** One *target* within the disk-gate mutation did not fail — the artifact
 consistency test, which reads the committed JSON and therefore cannot observe a change in live

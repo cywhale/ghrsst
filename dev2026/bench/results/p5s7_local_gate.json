@@ -11,12 +11,13 @@
     "G1": {
       "adjudicated_by": [
         "tests.test_phase2_p5s7_http.TestPointAndRangeThroughHTTP",
-        "tests.test_phase2_p5s7_http.TestNegativeControl"
+        "tests.test_phase2_p5s7_http.TestNegativeControl",
+        "tests.test_phase2_p5s7_wiring"
       ],
       "errors": 0,
       "failures": 0,
       "label": "LOCAL_SYNTHETIC",
-      "tests_run": 7,
+      "tests_run": 20,
       "verdict": "PASS"
     },
     "G10": {
@@ -64,7 +65,7 @@
     "G3": {
       "label": "LOCAL_SYNTHETIC",
       "local_observation": {
-        "point_p95_ratio_vs_monolith": 0.963,
+        "point_p95_ratio_vs_monolith": 1.035,
         "threshold": "<= 1.25"
       },
       "reason": "the +25% gate is against the CURRENT production TieredCube baseline on VM24. A fixture-extent ratio cannot settle it, and promoting it would be exactly the local-to-production upgrade S7 forbids.",
@@ -73,7 +74,7 @@
     "G4": {
       "label": "LOCAL_SYNTHETIC",
       "local_observation": {
-        "p95_ms": 5.405,
+        "p95_ms": 5.42,
         "range_days": 366,
         "threshold": "< 4000 ms"
       },
@@ -83,7 +84,7 @@
     "G5": {
       "label": "LOCAL_SYNTHETIC",
       "measured": {
-        "rss_growth_mb": 0.3
+        "rss_growth_mb": 0.0
       },
       "reason": "bounded RSS with no growth across a sustained run at concurrency 1-16, in ONE local process at fixture extent; not a production memory budget.",
       "verdict": "PASS"
@@ -92,7 +93,7 @@
       "label": "LOCAL_SYNTHETIC",
       "measured": {
         "fd_growth": 0,
-        "thread_growth": 3
+        "thread_growth": 0
       },
       "reason": "no unbounded fd or thread growth across repeats at FIXED maximum concurrency; segment handles are not reopened per request. The one-time pool sizing as concurrency rises 1->16 is reported under `pool_sizing` and deliberately not gated. Local process, fixture segment count.",
       "verdict": "PASS"
@@ -149,57 +150,57 @@
       "axis_note": "`concurrency` is simultaneous in-flight HTTP requests. It is NOT the fold cadence C=30, which is a different quantity sharing the letter.",
       "baseline": {
         "open_fds": 10,
-        "rss_mb": 86.0,
+        "rss_mb": 87.6,
         "threads": 21
       },
       "by_concurrency": [
         {
           "concurrency": 1,
           "open_fds": 10,
-          "p50_ms": 5.337,
-          "p95_ms": 6.314,
+          "p50_ms": 5.099,
+          "p95_ms": 6.12,
           "requests": 6,
-          "rss_mb": 86.0,
+          "rss_mb": 87.7,
           "threads": 21,
           "wall_s": 0.026
         },
         {
           "concurrency": 4,
           "open_fds": 10,
-          "p50_ms": 14.084,
-          "p95_ms": 26.025,
+          "p50_ms": 15.105,
+          "p95_ms": 25.106,
           "requests": 24,
-          "rss_mb": 86.4,
-          "threads": 23,
-          "wall_s": 0.089
+          "rss_mb": 88.2,
+          "threads": 24,
+          "wall_s": 0.09
         },
         {
           "concurrency": 8,
           "open_fds": 10,
-          "p50_ms": 28.328,
-          "p95_ms": 53.505,
+          "p50_ms": 24.124,
+          "p95_ms": 50.377,
           "requests": 48,
-          "rss_mb": 88.6,
-          "threads": 34,
-          "wall_s": 0.182
+          "rss_mb": 89.8,
+          "threads": 31,
+          "wall_s": 0.176
         },
         {
           "concurrency": 16,
           "open_fds": 10,
-          "p50_ms": 49.628,
-          "p95_ms": 94.496,
+          "p50_ms": 52.121,
+          "p95_ms": 89.898,
           "requests": 96,
-          "rss_mb": 89.4,
+          "rss_mb": 91.4,
           "threads": 35,
-          "wall_s": 0.361
+          "wall_s": 0.358
         }
       ],
       "caveat": "one process, which also runs the client; its allocations are inside the same RSS. Shows unbounded growth or its absence, not a production budget.",
       "errors": [],
       "growth": {
         "open_fds": 0,
-        "rss_mb": 0.3,
-        "threads": 3
+        "rss_mb": 0.0,
+        "threads": 0
       },
       "label": "LOCAL_SYNTHETIC",
       "levels": [
@@ -210,48 +211,50 @@
       ],
       "pool_sizing": {
         "open_fds": 0,
-        "rss_mb": 3.4,
+        "rss_mb": 3.8,
         "threads": 14
       },
       "rounds": 6,
       "sustained": {
         "concurrency": 16,
+        "growth_basis": "plateau (second half of samples)",
+        "growth_measured_from_sample": 3,
         "repeats": 6,
         "samples": [
           {
             "open_fds": 10,
             "repeat": 0,
-            "rss_mb": 90.1,
-            "threads": 39
+            "rss_mb": 92.5,
+            "threads": 41
           },
           {
             "open_fds": 10,
             "repeat": 1,
-            "rss_mb": 90.2,
+            "rss_mb": 92.5,
             "threads": 41
           },
           {
             "open_fds": 10,
             "repeat": 2,
-            "rss_mb": 90.2,
-            "threads": 41
+            "rss_mb": 92.5,
+            "threads": 42
           },
           {
             "open_fds": 10,
             "repeat": 3,
-            "rss_mb": 90.3,
-            "threads": 41
+            "rss_mb": 92.5,
+            "threads": 42
           },
           {
             "open_fds": 10,
             "repeat": 4,
-            "rss_mb": 90.3,
-            "threads": 41
+            "rss_mb": 92.5,
+            "threads": 42
           },
           {
             "open_fds": 10,
             "repeat": 5,
-            "rss_mb": 90.4,
+            "rss_mb": 92.5,
             "threads": 42
           }
         ]
@@ -269,12 +272,12 @@
     "latency": {
       "caveat": "fixture extent (16x16 spatial, 400 base days). The G3 +25% and G4 <4 s thresholds are production thresholds; a fixture-scale ratio cannot settle them.",
       "label": "LOCAL_SYNTHETIC",
-      "point_p95_ms_monolith_baseline": 1.338,
-      "point_p95_ms_segmented": 1.289,
-      "point_p95_ratio": 0.963,
+      "point_p95_ms_monolith_baseline": 1.202,
+      "point_p95_ms_segmented": 1.244,
+      "point_p95_ratio": 1.035,
       "range_days": 366,
-      "range_p50_ms": 5.122,
-      "range_p95_ms": 5.405,
+      "range_p50_ms": 5.032,
+      "range_p95_ms": 5.42,
       "repeats": 40,
       "segments": 5
     }

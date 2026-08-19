@@ -68,8 +68,11 @@ LON, LAT = 104.0, 5.0
 #: gate -> the test ids that adjudicate it. Kept beside the harness so a gate can never be
 #: reported green by a table that no longer matches the suite.
 GATE_TESTS: Dict[str, List[str]] = {
+    # Base-tier authority belongs to G1: which base answers decides the values, so a silent
+    # fall-through to the legacy monolith is a semantic failure, not merely a config wart.
     "G1": ["tests.test_phase2_p5s7_http.TestPointAndRangeThroughHTTP",
-           "tests.test_phase2_p5s7_http.TestNegativeControl"],
+           "tests.test_phase2_p5s7_http.TestNegativeControl",
+           "tests.test_phase2_p5s7_wiring"],
     "G2": ["tests.test_phase2_p5s7_http.TestPointAndRangeThroughHTTP"
            ".test_a_range_CROSSING_every_segment_and_the_delta"],
     "G8": ["tests.test_phase2_p5s7_load.TestPrePublicationFailure"],
@@ -278,7 +281,8 @@ def measure_concurrency(fixture, *, rounds=6) -> dict:
             # sizing itself once (bounded, expected) and a leak (monotonic). Only a fixed
             # concurrency held across repeats can tell them apart, and G6 asks about the second.
             top = max(CONCURRENCY_LEVELS)
-            burst(top)
+            for _ in range(3):        # let the worker pool reach its ceiling BEFORE sampling
+                burst(top)
             gc.collect()
             for i in range(SUSTAINED_REPEATS):
                 burst(top)
@@ -292,13 +296,21 @@ def measure_concurrency(fixture, *, rounds=6) -> dict:
             else:
                 os.environ[k] = v
     end = rows[-1] if rows else {}
-    first_s, last_s = (sustained[0], sustained[-1]) if sustained else ({}, {})
+    # Judged on the PLATEAU (second half of the samples), not from the first one. A pool that
+    # is still sizing up during the opening repeats produces a rising-then-flat curve; measuring
+    # from sample 0 reports that ramp as growth. The question G5/G6 ask is whether the curve
+    # ever flattens, so the comparison starts once it has. The full sample list is recorded
+    # below so the shape can be checked rather than taken on trust.
+    mid = len(sustained) // 2
+    first_s, last_s = (sustained[mid], sustained[-1]) if sustained else ({}, {})
     return {
         "label": LABEL, "levels": list(CONCURRENCY_LEVELS), "rounds": rounds,
         "baseline": {"rss_mb": base_rss, "open_fds": base_fds, "threads": base_thr},
         "by_concurrency": rows,
         "sustained": {"concurrency": max(CONCURRENCY_LEVELS),
-                      "repeats": SUSTAINED_REPEATS, "samples": sustained},
+                      "repeats": SUSTAINED_REPEATS, "samples": sustained,
+                      "growth_measured_from_sample": (len(sustained) // 2) if sustained else None,
+                      "growth_basis": "plateau (second half of samples)"},
         # One-time pool sizing as concurrency rises 1 -> 16. Reported, never gated: a worker
         # pool that grows to serve more simultaneous requests is doing its job.
         "pool_sizing": {"rss_mb": (round(end.get("rss_mb", 0) - (base_rss or 0), 1)

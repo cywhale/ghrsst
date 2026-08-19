@@ -149,7 +149,14 @@ async def lifespan(app: FastAPI):
     mf_dir = os.environ.get("GHRSST_BLOCK_MANIFEST_DIR")
     tc_path = os.environ.get("GHRSST_TIMECUBE_PATH")
     try:
-        if mf_dir and os.path.isdir(mf_dir):
+        # The predicate is "is a manifest CONFIGURED", never "does the manifest path happen to
+        # exist right now". Selecting on `os.path.isdir(mf_dir)` let a typo'd or not-yet-mounted
+        # manifest fall through the `elif` to the legacy monolith, silently downgrading the
+        # deployment to a different base and serving bytes no manifest ever authorized — under a
+        # /healthz that looked healthy. A non-empty setting is the deployment's choice of
+        # authority, so every failure under it is fail-closed (the constructor raises, and the
+        # handler below leaves `cube` None => explicitly daily-only).
+        if mf_dir:
             cube = SegmentedCubeStore(mf_dir)
         elif tc_path and os.path.isdir(tc_path):
             cube = TimeCubeStore(tc_path)

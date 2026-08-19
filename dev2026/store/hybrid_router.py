@@ -101,16 +101,24 @@ class _WholeCube:
     It captures that store's own immutable `_Meta` once, so the request still gets a single
     view rather than repeated live reads."""
 
-    __slots__ = ("_store", "_meta", "days")
+    __slots__ = ("_store", "_meta", "days", "_dayset")
 
     def __init__(self, store):
         self._store = store
         self._meta = store._meta
         self.days = tuple(self._meta.days)
+        self._dayset = frozenset(self.days)
 
     def covers_days(self, days):
-        di = self._meta.day_index
-        return all(d in di for d in days)
+        # Answered from the days ALREADY captured in `__init__`, not from `_meta.day_index`.
+        # `day_index` is a `TimeCubeStore` field; a `SegmentedCubeStore` snapshot carries
+        # `day_map` instead, so reaching for it raised AttributeError the moment a segmented
+        # base was used WITHOUT a delta (a manifest with no `GHRSST_DELTACUBE_PATH`) — a
+        # configuration that only became reachable when the app learned to build one.
+        # Membership-identical for the monolith, whose `day_index` is
+        # `{d: i for i, d in enumerate(days)}`, and it drops a second `_meta` dereference
+        # rather than adding one: the single captured view per request is unchanged.
+        return all(d in self._dayset for d in days)
 
     def point_series(self, lon, lat, days, fields):
         return self._store.point_series_from(self._meta, lon, lat, days, fields)
