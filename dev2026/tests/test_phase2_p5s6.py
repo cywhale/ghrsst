@@ -202,19 +202,33 @@ class TestCountersAreCheckedAgainstObservedOperations(unittest.TestCase):
 class TestRewriteEvidenceIsContentNotMtime(unittest.TestCase):
     """§P5-S0's rule: mtime and size do not prove a rewrite."""
 
-    def test_the_rebuild_measurement_uses_content_digests(self):
-        out = sizing.measure_tail_rebuild(s=30, c=30)
+    def test_the_rebuild_probe_uses_content_digests(self):
+        out = sizing._tail_rebuild_probe(s=30, c=30)
         self.assertEqual(out["rewrite_evidence"], "sha256-content-digest")
         self.assertIn("carried_forward_days", out)
         self.assertIn("rewritten_files", out)
 
     def test_a_file_touched_but_unchanged_is_NOT_counted_as_rewritten(self):
-        out = sizing.measure_tail_rebuild(s=30, c=30, touch_without_changing=True)
+        out = sizing._tail_rebuild_probe(s=30, c=30, touch_without_changing=True)
         self.assertEqual(out["rewritten_files_touched_only"], 0,
                          "mtime moved and content did not; that is not a rewrite")
 
 
 class TestDeferredIsNeverAPass(unittest.TestCase):
+
+    def test_a_DEFERRED_tail_rebuild_publishes_no_numbers(self):
+        """A `rebuild_wall_ms` in a DEFERRED row reads as performance evidence."""
+        out = sizing.measure_tail_rebuild(s=30, c=30)
+        self.assertEqual(out["label"], "DEFERRED")
+        for banned in ("rebuild_wall_ms", "rewritten_files", "carried_forward_days",
+                       "days_in_new_tail", "rewritten_files_touched_only",
+                       "modelled_amplification"):
+            self.assertNotIn(banned, out)
+        for stamp in ("quick", "full"):
+            path = os.path.join(_DEV2026, "bench", "results", f"p5s6_sizing_{stamp}.json")
+            with open(path) as fh:
+                for row in json.load(fh)["measured"]["tail_rebuild"]:
+                    self.assertNotIn("rebuild_wall_ms", row)
 
     def test_production_scale_metrics_are_marked_DEFERRED_with_a_reason(self):
         deferred = sizing.deferred_metrics()
@@ -309,11 +323,15 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
         walk(node, "")
         return out
 
-    def test_the_committed_quick_artifact_has_the_generators_labels(self):
-        fresh = sizing.build_report(quick=True)
-        self.assertEqual(self._labels(self._artifact("quick")), self._labels(fresh),
-                         "the committed artifact's labels differ from what the harness now "
-                         "produces — regenerate it")
+    def test_the_committed_artifacts_have_the_generators_labels(self):
+        """BOTH artifacts. Checking only `quick` left every label unique to the full grid --
+        S=45, the 41/82/122 horizons -- free to drift unnoticed."""
+        for stamp, quick in (("quick", True), ("full", False)):
+            with self.subTest(stamp):
+                fresh = sizing.build_report(quick=quick)
+                self.assertEqual(self._labels(self._artifact(stamp)), self._labels(fresh),
+                                 f"the committed {stamp} artifact's labels differ from what the "
+                                 f"harness now produces — regenerate it")
 
     def test_both_artifacts_carry_the_WITHDRAWALS(self):
         for stamp in ("quick", "full"):
@@ -329,6 +347,34 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
                 for row in a["measured"]["snapshot_open"]:
                     self.assertIn("NOT O2 snapshot-open cost", row["measures"])
                     self.assertIn("SegmentedCubeStore", row["not_measured"])
+
+    def test_the_results_doc_agrees_with_the_artifacts(self):
+        """The third artefact. Round 2 corrected the code and the doc and left the JSON stale;
+        nothing stops the reverse next time unless the doc is checked as well."""
+        doc_path = os.path.join(_DEV2026, "specs", "p5s6_sizing_results.md")
+        with open(doc_path) as fh:
+            doc = fh.read()
+        art = self._artifact("full")
+        self.assertIn("H5", doc)
+        for gate in ("G3", "H7", "G16"):
+            self.assertEqual(art["gates"][gate]["verdict"], "NOT_ADJUDICATED")
+            self.assertIn("NOT_ADJUDICATED", doc)
+        # the withdrawals must be visible in the prose, not only in the JSON
+        for phrase in ("WITHDRAWN AS EVIDENCE", "raw group-open", "DEFERRED"):
+            self.assertIn(phrase, doc)
+        # and the pre-withdrawal headings must be gone
+        for stale in ("## LOCAL — tail rebuild and carry-forward",
+                      "## LOCAL — snapshot-open and metadata scan",
+                      "## PRODUCTION_GEOMETRY_FIXTURE — segment calls"):
+            self.assertNotIn(stale, doc, f"stale heading survives: {stale}")
+        # the doc must not choose a configuration, and must say so
+        self.assertIn("No configuration is chosen", doc)
+        self.assertNotIn("SELECTED", doc)
+        # a DEFERRED section may not carry a wall-clock number
+        tail = doc[doc.index("## Tail rebuild"):doc.index("## DEFERRED — five metrics")]
+        self.assertNotIn("rebuild (ms)", tail)
+        # normalized: the doc hard-wraps, so a contiguous match is a test about line breaks
+        self.assertIn("removed rather than relabelled", " ".join(tail.split()))
 
     def test_no_artifact_claims_a_production_gate_PASS(self):
         for stamp in ("quick", "full"):

@@ -23,7 +23,7 @@ path is touched anywhere in this step.
 Branch `dev2026-p5-s6-o2-local`, based on the merged tip `7902b61`.
 
 - Harness: [`../bench/bench_p5_sizing.py`](../bench/bench_p5_sizing.py)
-- Tests: [`../tests/test_phase2_p5s6.py`](../tests/test_phase2_p5s6.py) — **28/28**, committed
+- Tests: [`../tests/test_phase2_p5s6.py`](../tests/test_phase2_p5s6.py) — **33/33**, committed
   **failing first**; **11 guards mutation-verified**
 - Artifacts: `../bench/results/p5s6_sizing_quick.json`, `p5s6_sizing_full.json`
 
@@ -106,20 +106,20 @@ where the two *must* differ: `open_only_first` reads a window landing inside one
 tally still says three, and the test asserts `observed = 1`, `reported = 3`. Both mutations now
 fail. A counter that agrees with itself under every input the tests supply is not verified.
 
-## Tail rebuild — DEFERRED, not measured
+## Tail rebuild — DEFERRED, and therefore no numbers
 
-Rewrite evidence is a **sha256 content digest**, never mtime or size. A companion test moves
-every mtime forward without changing a byte and asserts **0** files are counted as rewritten.
+No carry-forward was measured. `v2` is rebuilt from fixtures, never read from the predecessor
+block, and there is no source map — so `carried_forward_days` was arithmetic wearing the label
+of read evidence. The earlier table of rebuild wall times has been **removed rather than
+relabelled**: a millisecond figure sitting under a `DEFERRED` heading reads as performance
+evidence no matter what the heading says.
 
-| S | C | carried-forward days | rewritten files | rebuild (ms) |
-|---|---|---|---|---|
-| 30 | 30 | 30 | 0 | 21.0 |
-| 45 | 30 | 30 | 7 | 20.2 |
-| 90 | 30 | 30 | 7 | 21.0 |
+A probe (`_tail_rebuild_probe`) still runs the fixture work, because the guard it exercises is
+worth keeping under test: rewrite evidence is a **sha256 content digest**, and a companion test
+moves every mtime forward without changing a byte and asserts **0** files are counted as
+rewritten. The probe's timings are not published.
 
-S=30/C=30 rewrites nothing because the block seals exactly at the cadence — there is no tail to
-carry forward. That is the shape §10.2's `amplification = 1.0` describes, arrived at from the
-disk rather than from the formula.
+Real carry-forward needs the O2 materialization strategy, which does not exist yet.
 
 ## DEFERRED — five metrics, no numbers
 
@@ -145,7 +145,7 @@ report and failing on the string.
 ## Is S=90 / C=30 still viable?
 
 **The modelled case is unchanged and still favours it; the measured case is now withdrawn, so
-this section rests on MODEL alone.** Nothing here selects S=90/C=30. What the evidence
+this section rests on MODEL alone.** No configuration is chosen in this document. What the evidence
 supports:
 
 - it holds segments per 366-day request at the **minimum of the three sizes (5)**, which is the

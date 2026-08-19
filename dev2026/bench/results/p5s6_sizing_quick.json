@@ -162,16 +162,16 @@
       {
         "files": 55,
         "label": "LOCAL",
-        "ms_per_1k_files": 40.2424,
+        "ms_per_1k_files": 39.0288,
         "segments": 5,
-        "wall_ms": 2.213
+        "wall_ms": 2.147
       },
       {
         "files": 143,
         "label": "LOCAL",
-        "ms_per_1k_files": 38.2547,
+        "ms_per_1k_files": 38.8077,
         "segments": 13,
-        "wall_ms": 5.47
+        "wall_ms": 5.55
       }
     ],
     "segment_calls": [
@@ -219,47 +219,35 @@
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.4755,
+        "ms_per_segment": 0.3728,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 5,
         "segments": 5,
-        "wall_ms": 2.377
+        "wall_ms": 1.864
       },
       {
         "label": "LOCAL",
         "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
-        "ms_per_segment": 0.3979,
+        "ms_per_segment": 0.4635,
         "not_measured": "SegmentedCubeStore(manifest_dir): manifest validation, segment inspection, metadata binding, snapshot build",
         "observed_metadata_reads": 13,
         "segments": 13,
-        "wall_ms": 5.173
+        "wall_ms": 6.026
       }
     ],
     "tail_rebuild": [
       {
         "c": 30,
-        "carried_forward_days": 30,
-        "days_in_new_tail": 30,
         "label": "DEFERRED",
-        "modelled_amplification": 1.0,
-        "reason": "v2 is rebuilt from fixtures, not read from the predecessor block. `carried_forward_days` is arithmetic, not read evidence, and there is no source map. Real carry-forward needs the O2 materialization strategy, which does not exist yet.",
-        "rebuild_wall_ms": 19.74,
-        "rewrite_evidence": "sha256-content-digest",
-        "rewritten_files": 0,
-        "rewritten_files_touched_only": 0,
+        "reason": "no carry-forward was measured: v2 is rebuilt from fixtures, never read from the predecessor block, and there is no source map. Real carry-forward needs the O2 materialization strategy, which does not exist yet. The probe's timings are deliberately NOT published here -- a wall-clock number in a DEFERRED row reads as evidence it is not.",
+        "rewrite_evidence": "sha256-content-digest (probe only)",
         "s": 30
       },
       {
         "c": 30,
-        "carried_forward_days": 30,
-        "days_in_new_tail": 60,
         "label": "DEFERRED",
-        "modelled_amplification": 2.0,
-        "reason": "v2 is rebuilt from fixtures, not read from the predecessor block. `carried_forward_days` is arithmetic, not read evidence, and there is no source map. Real carry-forward needs the O2 materialization strategy, which does not exist yet.",
-        "rebuild_wall_ms": 20.09,
-        "rewrite_evidence": "sha256-content-digest",
-        "rewritten_files": 7,
-        "rewritten_files_touched_only": 0,
+        "reason": "no carry-forward was measured: v2 is rebuilt from fixtures, never read from the predecessor block, and there is no source map. Real carry-forward needs the O2 materialization strategy, which does not exist yet. The probe's timings are deliberately NOT published here -- a wall-clock number in a DEFERRED row reads as evidence it is not.",
+        "rewrite_evidence": "sha256-content-digest (probe only)",
         "s": 90
       }
     ]

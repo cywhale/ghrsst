@@ -315,7 +315,7 @@ def measure_metadata_scan(*, segments: int) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def measure_tail_rebuild(*, s: int, c: int, touch_without_changing: bool = False) -> dict:
+def _tail_rebuild_probe(*, s: int, c: int, touch_without_changing: bool = False) -> dict:
     """Rebuilding a tail block after `c` more days, carrying the predecessor's days forward.
 
     Rewrite evidence is a **content digest**. A file whose mtime moved and whose bytes did not
@@ -347,7 +347,7 @@ def measure_tail_rebuild(*, s: int, c: int, touch_without_changing: bool = False
         after = _digest_tree(v2)
         rewritten = sum(1 for k, v in after.items() if before.get(k) != v)
 
-        return {"label": "DEFERRED",
+        return {"label": "PROBE",
                 "reason": ("v2 is rebuilt from fixtures, not read from the predecessor block. "
                            "`carried_forward_days` is arithmetic, not read evidence, and there "
                            "is no source map. Real carry-forward needs the O2 materialization "
@@ -361,6 +361,24 @@ def measure_tail_rebuild(*, s: int, c: int, touch_without_changing: bool = False
                 "modelled_amplification": model_write_amplification(s=s, c=c)["amplification"]}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def measure_tail_rebuild(*, s: int, c: int, touch_without_changing: bool = False) -> dict:
+    """DEFERRED — and therefore carrying NO numbers.
+
+    `_tail_rebuild_probe()` still runs the fixture work, because the content-digest guard (a
+    file whose mtime moved and whose bytes did not is not a rewrite) is worth keeping under
+    test. But its numbers are not published: a `rebuild_wall_ms` sitting in a DEFERRED row reads
+    as performance evidence, and this harness never measured a real carry-forward."""
+    return {
+        "label": "DEFERRED", "s": s, "c": c,
+        "reason": ("no carry-forward was measured: v2 is rebuilt from fixtures, never read from "
+                   "the predecessor block, and there is no source map. Real carry-forward needs "
+                   "the O2 materialization strategy, which does not exist yet. The probe's "
+                   "timings are deliberately NOT published here -- a wall-clock number in a "
+                   "DEFERRED row reads as evidence it is not."),
+        "rewrite_evidence": "sha256-content-digest (probe only)",
+    }
 
 
 # --------------------------------------------------------------------------- deferred
