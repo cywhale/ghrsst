@@ -15,7 +15,9 @@ Branch `dev2026-p5-s6-o2-local`, based on `5f8450c`.
 - Harness: [`../bench/bench_p5s7_local_gate.py`](../bench/bench_p5s7_local_gate.py)
 - Tests: [`../tests/test_phase2_p5s7_http.py`](../tests/test_phase2_p5s7_http.py) (HTTP surface)
   and [`../tests/test_phase2_p5s7_load.py`](../tests/test_phase2_p5s7_load.py) (load, lifecycle,
-  disk gate), committed **failing first**
+  disk gate), committed **failing first**; consistency guards in
+  [`../tests/test_phase2_p5s7_report.py`](../tests/test_phase2_p5s7_report.py) — **42/42** across
+  the three modules, **8 mutations killed**, no survivors
 - Artifact: `../bench/results/p5s7_local_gate.json`
 
 **S = 90 / C = 30 remains a provisional configuration.** Nothing in this step selects it.
@@ -110,6 +112,30 @@ What is **not** measured is G7's actual threshold: the temp disk a real producti
 consumes ("≈ one block + margin; never a second full base"). The gate's arithmetic is verified;
 the quantity it gates is not. Local free space also says nothing about VM24, where **G18 remains
 BLOCKED (267 GiB available against a 403.3 GiB minimum)**.
+
+## Mutation verification
+
+Eight mutations, each run **serially** from a git-clean tree and restored with `git checkout`,
+never from a local copy — an earlier P5 round corrupted its own source by re-copying a backup
+taken from an already-mutated file. Every mutation targets **production code**, not the harness's
+own counters; a mutation that only broke a bench tally would prove the bench measures itself.
+
+| mutation | killed by |
+|---|---|
+| the app prefers the monolith over the manifest | segmented-store wiring tests |
+| the segment count is exposed as the public route name | route-contract test |
+| the `MAX_DAYS` 413 is dropped | route-contract test, and the under-load error-contract test |
+| `rollback_to` consumes the generation archive | post-publication rollback tests |
+| `publish` skips manifest validation | pre-publication failure test |
+| the disk gate always returns `ok` | disk-gate tests |
+| the segmented refresh becomes a no-op | generation-change-during-load tests |
+| `/healthz` reports a segmented base as a monolith | wiring test |
+
+**No survivors.** One *target* within the disk-gate mutation did not fail — the artifact
+consistency test, which reads the committed JSON and therefore cannot observe a change in live
+code. That is a scope boundary rather than a hole, and it was verified rather than assumed:
+regenerating the artifact under the mutation makes that test fail. The code path itself is killed
+by the disk-gate tests, so the two directions are both covered.
 
 ## Still not adjudicated, and why
 
