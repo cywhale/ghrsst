@@ -89,10 +89,12 @@ magnitude above the raw `open_group` figure for the same segment count. That gap
 and it is exactly what the earlier conflation hid. **LOCAL_SYNTHETIC at 16×16 spatial extent —
 not a production number, and it adjudicates nothing.**
 
-The raw-`open_group` table below is kept beside it, still labelled as raw cost, because the two
-were conflated once and the difference is most of the work.
+The raw-`open_group` **measurement** is retained alongside it — in the artifact, under
+`measured.snapshot_open`, still labelled as raw cost — because the two were conflated once and
+the difference is most of the work. No table is reproduced in this document: see the section
+below for why.
 
-## RAW GROUP-OPEN COST (not O2 snapshot-open) — kept for contrast
+## RAW GROUP-OPEN COST (not O2 snapshot-open) — retained in the artifact, for contrast
 
 The question §10.6 asks is whether these degrade **super-linearly** with segment count. Measured
 at the required 5 / 13 / 41 / 82 / 122 horizons:
