@@ -329,11 +329,14 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
         walk(node, "")
         return out
 
-    #: Keys whose values are wall-clock or otherwise run-dependent. Everything else is a CLAIM
-    #: and must match the generator exactly.
-    VOLATILE = ("wall_ms", "ms_per_segment", "ms_per_1k_files", "files", "observed_chunk_keys",
-                "observed_metadata_reads", "observed_open_paths", "observed_segment_calls",
-                "reported_segment_calls")
+    #: ONLY wall-clock. Everything else -- including every `observed_*` count and the walked
+    #: `files` total -- is deterministic given the fixture, so it is a claim and must match.
+    #:
+    #: The first version excluded all of them as "run-dependent", which meant an artifact whose
+    #: observed_open_paths or observed_segment_calls had been edited by hand still passed the
+    #: test that was introduced to stop exactly that. Excluding an observation from the
+    #: comparison is indistinguishable from not observing it.
+    VOLATILE = ("wall_ms", "ms_per_segment", "ms_per_1k_files")
 
     def _claims(self, node, out=None, trail=""):
         """Every non-volatile leaf, keyed by path: the report's claims minus its timings."""
