@@ -1,6 +1,22 @@
 # P5-S6 — block-size / cadence sizing: RESULTS
 
-Status: **HARNESS DELIVERED. NO PRODUCTION GATE ADJUDICATED.**
+Status: **MODEL DELIVERED. THE THREE "MEASUREMENTS" DO NOT USE THE O2 READ PATH AND ARE
+WITHDRAWN AS EVIDENCE.** No production gate adjudicated.
+
+> **Review round 2 correction — read this before any table below.** Three measurements went
+> around the code they claimed to measure, and the fourth measured arithmetic:
+>
+> | claimed | actually measured | now |
+> |---|---|---|
+> | segment calls on the grouped read path | stores *this harness* opened in a loop — no manifest, no `SegmentedCubeStore`, no `point_series()` | **not production-path evidence** |
+> | O2 snapshot-open cost | raw `zarr.open_group()` — no manifest validation, segment inspection, metadata binding or snapshot build | **raw group-open cost, relabelled** |
+> | H5 crossing latency vs delta span | nothing; the table is volume arithmetic | **DEFERRED** |
+> | tail rebuild carry-forward | `v2` rebuilt from fixtures, never read from the predecessor; `carried_forward_days` is a computed number | **DEFERRED** |
+>
+> `open_only_first` is an artificial restriction of the harness's own loop, not a real request,
+> so it does not rescue the first row. Rebuilding these against `SegmentedCubeStore` /
+> `TieredCube` — the path `bench_p5_segmented_read.py` already exercises — is the next step and
+> is **not done here**.
 `[MUT-STG]` — local and synthetic only. No VM24, SSH, `GHRSST_*` store, cron, PM2 or production
 path is touched anywhere in this step.
 
@@ -49,7 +65,7 @@ Two model corrections the tests forced, both against the spec's own tables:
   snapshot opens. `floor` gave 40 at S=90/+10 y where the spec says 41, and the tail block is
   exactly that difference.
 
-## LOCAL — snapshot-open and metadata scan
+## RAW GROUP-OPEN COST (not O2 snapshot-open) — withdrawn as an O2 measurement
 
 The question §10.6 asks is whether these degrade **super-linearly** with segment count. Measured
 at the required 5 / 13 / 41 / 82 / 122 horizons:
@@ -62,11 +78,14 @@ at the required 5 / 13 / 41 / 82 / 122 horizons:
 | 82 | 34.54 | 0.421 | 902 | 33.58 |
 | 122 | 52.39 | **0.429** | 1 342 | 49.93 |
 
-**Per-segment cost is flat to within 7 % across a 24× range.** No super-linear term appears, so
+**These numbers are raw `zarr.open_group()` cost.** They exclude manifest validation, segment
+inspection, metadata binding and snapshot construction — which is most of what
+`SegmentedCubeStore` actually does on a generation change. Per-segment raw cost is flat to
+within 7 % across a 24× range, No super-linear term appears, so
 nothing here argues for the §10.5 super-block-merge escape hatch. This is **LOCAL** on a warm
 cache with tiny blocks; the production thresholds remain DEFERRED.
 
-## PRODUCTION_GEOMETRY_FIXTURE — segment calls, against observed operations
+## Segment calls — NOT the grouped read path (withdrawn)
 
 Reported (from the day→segment map) versus **observed** (which stores `zarr.open_group` actually
 opened), over a 90-day read:
@@ -87,7 +106,7 @@ where the two *must* differ: `open_only_first` reads a window landing inside one
 tally still says three, and the test asserts `observed = 1`, `reported = 3`. Both mutations now
 fail. A counter that agrees with itself under every input the tests supply is not verified.
 
-## LOCAL — tail rebuild and carry-forward
+## Tail rebuild — DEFERRED, not measured
 
 Rewrite evidence is a **sha256 content digest**, never mtime or size. A companion test moves
 every mtime forward without changing a byte and asserts **0** files are counted as rewritten.
@@ -125,7 +144,8 @@ report and failing on the string.
 
 ## Is S=90 / C=30 still viable?
 
-**On the local and modelled evidence, yes — and nothing here can confirm it.** What the evidence
+**The modelled case is unchanged and still favours it; the measured case is now withdrawn, so
+this section rests on MODEL alone.** Nothing here selects S=90/C=30. What the evidence
 supports:
 
 - it holds segments per 366-day request at the **minimum of the three sizes (5)**, which is the
@@ -134,7 +154,8 @@ supports:
   not block size (§10.1), measured across all three S values in test;
 - its cost is **2.0× write amplification** (≈1 146 GB/year) and **141 GB** peak temp disk, versus
   ~2 000 GB for one monolith rebuild;
-- snapshot-open per segment is flat, so the 41-segment +10 y horizon shows no scaling term.
+- raw group-open per segment is flat, which is *suggestive* for the 41-segment +10 y horizon
+  and is **not** an O2 snapshot-open result.
 
 What would overturn it: a production 366-day p95 outside the G3 budget, or inode headroom below
 the +10 y projection. Both are DEFERRED, and both need VM24 read-only.

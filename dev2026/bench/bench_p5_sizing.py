@@ -251,7 +251,10 @@ def measure_segment_calls(*, s: int, days: int = 90,
                 chunk_keys += int(g["sst"][:, 0, 0].size)
         observed_paths = sorted({p for p in spy.opened if p.startswith(tmp)})
         observed = len(observed_paths)
-        return {"label": "PRODUCTION_GEOMETRY_FIXTURE", "s": s, "days": days,
+        return {"label": "PRODUCTION_GEOMETRY_FIXTURE",
+                "measures": ("stores this harness opened directly; NOT the grouped read path. "
+                             "No manifest, no SegmentedCubeStore, no point_series()."),
+                "s": s, "days": days,
                 "reported_segment_calls": reported,
                 "observed_segment_calls": observed,
                 # The paths themselves, so a test can check the count against something the
@@ -283,7 +286,11 @@ def measure_snapshot_open(*, segments: int) -> dict:
             for i in range(segments):
                 zarr.open_group(os.path.join(tmp, f"b{i:04d}.zarr"), mode="r")
             wall_ms = (time.perf_counter() - t0) * 1000.0
-        return {"label": "LOCAL", "segments": segments, "wall_ms": round(wall_ms, 3),
+        return {"label": "LOCAL",
+                "measures": "raw zarr.open_group cost, NOT O2 snapshot-open cost",
+                "not_measured": ("SegmentedCubeStore(manifest_dir): manifest validation, "
+                                 "segment inspection, metadata binding, snapshot build"),
+                "segments": segments, "wall_ms": round(wall_ms, 3),
                 "observed_metadata_reads": len([p for p in spy.opened if p.startswith(tmp)]),
                 "ms_per_segment": round(wall_ms / max(segments, 1), 4)}
     finally:
@@ -340,7 +347,12 @@ def measure_tail_rebuild(*, s: int, c: int, touch_without_changing: bool = False
         after = _digest_tree(v2)
         rewritten = sum(1 for k, v in after.items() if before.get(k) != v)
 
-        return {"label": "LOCAL", "s": s, "c": c,
+        return {"label": "DEFERRED",
+                "reason": ("v2 is rebuilt from fixtures, not read from the predecessor block. "
+                           "`carried_forward_days` is arithmetic, not read evidence, and there "
+                           "is no source map. Real carry-forward needs the O2 materialization "
+                           "strategy, which does not exist yet."),
+                "s": s, "c": c,
                 "rewrite_evidence": "sha256-content-digest",
                 "carried_forward_days": carried, "days_in_new_tail": total,
                 "rewritten_files": rewritten,
@@ -404,7 +416,10 @@ def build_report(*, quick: bool = False) -> dict:
             "legacy_block_delta_crossing": model_segments_per_request(s=90, days=366),
         },
         "H5": {
-            "label": "MODEL",
+            "label": "DEFERRED",
+            "reason": ("S6 requires MEASURED crossing-range latency versus delta span. Nothing "
+                       "here runs a TieredCube read at spans 31/45/64/90/124; the numbers below "
+                       "are volume arithmetic only and are not a latency measurement."),
             "delta_spans": list(H5_DELTA_SPANS),
             "by_span": {str(span): {"label": "MODEL", "delta_span_days": span,
                                     "delta_gb": round(span * DELTA_GB_PER_DAY, 1),
