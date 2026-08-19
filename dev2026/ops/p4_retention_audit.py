@@ -206,6 +206,17 @@ def delta_prune(base: dict, delta: dict, window_days: int, delta_buffer: int, *,
     GLOBAL PRECONDITION (P4-S4 §4.1): if the recent spatial window is not confirmed contiguous
     (``window_ok`` False), NO delta prune candidate is emitted — even for older days base already covers —
     repair the window hole first."""
+    # `_dayset()` returns a SET, so a store listing a day twice arrives here already collapsed
+    # and every downstream candidate looks legal. `--strict` would flag it later via
+    # `_collect_failures()`, but this function must not emit a usable answer from a malformed
+    # store in the first place: the runbook reads THIS block to choose the day sets.
+    for label, info in (("delta", delta), ("base", base)):
+        raw = list(info.get("physical_days") or []) if info.get("present") else []
+        repeats = sorted({d for d in raw if raw.count(d) > 1})
+        if repeats:
+            return {"available": False,
+                    "reason": (f"{label} lists day(s) {repeats} more than once; the store is "
+                               f"malformed and no prune candidate may be derived from it")}
     dd = sorted(_dayset(delta))
     if not dd:
         return {"available": False, "reason": "no delta days"}
@@ -231,9 +242,25 @@ def delta_prune(base: dict, delta: dict, window_days: int, delta_buffer: int, *,
         "keep_window_days": window_days + delta_buffer,
         "delta_buffer_days": delta_buffer,
         "keep_day_count": len(keep_days),
+        # Four DIFFERENT sets. They were easy to confuse, and the 2026-08 rehearsal showed
+        # what the confusion costs: 22 calendar candidates, only 4 of them base-covered.
+        #
+        #   drop_candidates_by_calendar   -- older than the keep window. Says nothing about base.
+        #   delta_prune_candidates        -- of those, the ones base COVERS. The only set a prune
+        #                                    may drop.
+        #   blocked_need_compaction_first -- of those, the ones base does NOT cover. Never
+        #                                    droppable until they are compacted in.
+        #
+        # There is deliberately NO "approved" set here. Approval happens later, at the prune
+        # stage (`ops.degraded_prune`), and a field in the audit named for it would imply an
+        # approval exists when none has been given.
         "drop_candidates_by_calendar": drop_candidates,
+        # NOT "base covers the days we are about to drop" -- that is true of
+        # `delta_prune_candidates` by construction. It means "base covers EVERY calendar drop
+        # candidate, so nothing is blocked". False whenever any day is blocked, even when there
+        # are eligible candidates to drop: the rehearsal's 4-of-22 case reports False.
         "base_covers_all_drop_candidates": (not blocked and bool(drop_candidates)),
-        "delta_prune_candidates": eligible,          # eligible ONLY after base coverage — dry-run
+        "delta_prune_candidates": eligible,          # eligible ONLY after base coverage -- dry-run
         "delta_prune_candidate_count": len(eligible),
         "blocked_need_compaction_first": blocked,
         "reason": reason,
