@@ -1,0 +1,121 @@
+{
+  "provenance": "VM24_PRODUCTION_READ_ONLY",
+  "separate_from": "p5s6_sizing_{quick,full}.json are LOCAL_SYNTHETIC and must not be merged with this file",
+  "host": "odb24",
+  "measured_utc": "2026-08-19T07:12:51Z",
+  "measured_local": "2026-08-19T15:12:51+08:00",
+  "authorization": "read-only measurement, explicitly authorized by the operator in-session",
+  "operations_performed": [
+    "ssh BatchMode date/hostname",
+    "uptime, df -h, df -i, free -m, findmnt",
+    "GET /healthz",
+    "pm2 jlist (read-only)",
+    "/proc/<pid>/{status,fd} reads",
+    "du -sh on the base and delta store directories",
+    "21 serial GET /api/ghrsst point-range requests (7 per window, 0.3 s apart)"
+  ],
+  "operations_refused_by_policy": [
+    "prune", "swap", "compaction", "repair", "hold hard-delete",
+    "cron / PM2 / systemd modification", "any write to GHRSST data",
+    "production code or config modification", "full rebuild"
+  ],
+  "stability": {
+    "label": "VM24_PRODUCTION_READ_ONLY",
+    "verdict": "STABLE",
+    "uptime": "5 days, 1:50",
+    "load_average": [0.10, 0.11, 0.11],
+    "note": "stable throughout; no measurement was marked BLOCKED"
+  },
+  "filesystem": {
+    "label": "VM24_PRODUCTION_READ_ONLY",
+    "target": "/home/odbadmin/Data",
+    "device": "/dev/sdc1",
+    "fstype": "ext4",
+    "size": "6.0T",
+    "used": "5.4T",
+    "avail": "267G",
+    "use_pct": 96,
+    "inodes_total": 402653184,
+    "inodes_used": 177162844,
+    "inodes_free": 225490340,
+    "inodes_use_pct": 44
+  },
+  "memory": {
+    "label": "VM24_PRODUCTION_READ_ONLY",
+    "total_mb": 64395,
+    "used_mb": 5351,
+    "available_mb": 59043
+  },
+  "service": {
+    "label": "VM24_PRODUCTION_READ_ONLY",
+    "healthz_status": "ok",
+    "pm2_ghrsst": "online",
+    "api_pid": 1116725,
+    "api_rss_kb": 79576,
+    "api_open_fds": 22,
+    "api_threads": 35,
+    "supervisor_pid": 1116720,
+    "supervisor_rss_kb": 30400,
+    "executor_queue_depth": 0,
+    "executor_limit": 20,
+    "cube_kind": "tiered",
+    "cube_latest_in_sync": true,
+    "cube_refresh_ttl_s": 300
+  },
+  "store_bounds": {
+    "label": "VM24_PRODUCTION_READ_ONLY",
+    "point_earliest": "2023-01-01",
+    "point_latest": "2026-08-17",
+    "point_day_count": 1325,
+    "delta_latest": "2026-08-17",
+    "delta_day_count": 52,
+    "spatial_window": ["2026-06-27", "2026-08-17"],
+    "daily_earliest": "2026-06-21",
+    "daily_latest": "2026-08-17",
+    "daily_day_count": 58,
+    "base_du": "2.1T",
+    "delta_du": "58G"
+  },
+  "model_validation": {
+    "label": "VM24_PRODUCTION_READ_ONLY",
+    "note": "the §10.3 per-day volumes, checked against the real stores for the first time",
+    "delta_gb_per_day_measured": 1.12,
+    "delta_gb_per_day_modelled": 1.09,
+    "base_gb_per_day_measured": 1.62,
+    "base_gb_per_day_modelled": 1.57,
+    "method": "du -sh divided by the day counts healthz reports; both within ~3% of the model"
+  },
+  "h5_latency": {
+    "label": "VM24_PRODUCTION_READ_ONLY",
+    "endpoint": "GET /api/ghrsst?lon0=135&lat0=20&append=sst",
+    "method": "7 serial samples per window, 0.3 s apart, one warm request discarded first",
+    "concurrency": 1,
+    "cache_assumption": "warm: one discarded request per window before sampling",
+    "windows": {
+      "base_only": {"window": ["2026-05-01", "2026-06-20"], "returned_rows": 51,
+                    "p50_ms": 6.50, "p95_ms": 15.18},
+      "crossing": {"window": ["2026-06-10", "2026-07-10"], "returned_rows": 31,
+                   "p50_ms": 21.67, "p95_ms": 30.35},
+      "delta_only": {"window": ["2026-07-01", "2026-08-10"], "returned_rows": 41,
+                     "p50_ms": 46.27, "p95_ms": 49.10}
+    },
+    "finding": "delta-only is the SLOWEST despite returning fewer days than base-only (41 vs 51). Delta is t1/s256 geometry -- one chunk per day -- so a 41-day delta read touches ~41 chunks per variable, while base's (90,8,8) chunking serves 51 days from far fewer. This is §10.1's claim that cadence, not block size, governs the read cost of the delta tail, measured on production for the first time."
+  },
+  "gates": {
+    "G3": {"verdict": "NOT_ADJUDICATED",
+           "reason": "these are 1-concurrency point-range samples at one coordinate over 3 windows, not the 366-day p95 gate at its production percentile and load. They inform G3; they do not decide it."},
+    "H7_inode_headroom": {"verdict": "PASS_EVIDENCE_AVAILABLE",
+                          "reason": "225,490,340 free inodes against a +10y base projection of ~4.9M additional files -- roughly 46x headroom. Adjudication is the reviewer's, not this harness's."},
+    "H7_fd_rss": {"verdict": "NOT_ADJUDICATED",
+                  "reason": "22 open fds and 78 MB RSS at rest. H7 asks for C=8/16 under sustained load, which was not run: it is not a read-only measurement."},
+    "G16": {"verdict": "NOT_ADJUDICATED",
+            "reason": "metadata-scan and snapshot-open cost on the production tree were not measured; a full os.walk of a 5.4T store is not a low-rate read-only probe."}
+  },
+  "not_measured": [
+    "metadata scan / os.walk of the base tree",
+    "SegmentedCubeStore construction on production (no segmented manifest is deployed yet)",
+    "sustained-load fd/RSS at C=8/16",
+    "366-day p95 at production percentiles",
+    "peak temp disk for a real block build"
+  ]
+}

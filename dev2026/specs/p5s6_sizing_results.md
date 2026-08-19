@@ -270,12 +270,57 @@ measuring that path**, not building a second source-map or provenance truth besi
 
 Not started here, and `measure_tail_rebuild` remains DEFERRED and publishes no numbers.
 
-## VM24 — NOT MEASURED
+## VM24 — read-only measurement TAKEN
 
-Read-only VM24 measurement is authorised but **was not performed in this round**. No SSH was
-opened, no service, mount, disk, inode or FD reading was taken, and no VM24 number appears
-anywhere in the artifacts. Every measurement here is LOCAL_SYNTHETIC, and G3 / H7 / G16 remain
-**NOT_ADJUDICATED** rather than BLOCKED — nothing was attempted and then obstructed.
+**Artifact: `bench/results/p5s6_vm24_readonly.json`, provenance `VM24_PRODUCTION_READ_ONLY`.**
+Kept in its own file: no VM24 number appears in the LOCAL_SYNTHETIC artifacts and none of the
+synthetic numbers appear here. Host stable throughout (up 5 days, load 0.10) — no measurement
+was marked BLOCKED.
+
+Read-only only: `df`, `df -i`, `free`, `findmnt`, `/healthz`, `pm2 jlist`, `/proc/<pid>` and
+`du -sh`, plus **21 serial point-range GETs** at concurrency 1, 0.3 s apart. No prune, swap,
+compaction, repair, hold deletion, cron/PM2/systemd change, or write of any kind.
+
+### The model was close — checked against the real stores for the first time
+
+| | measured | modelled (§10.3) |
+|---|---|---|
+| delta GB/day | 1.12 | 1.09 |
+| base GB/day | 1.62 | 1.57 |
+
+Both within ~3 %. The §10.3 volume table, and the peak-temp-disk figures derived from it, rest on
+numbers that now have production evidence behind them.
+
+### The H5 finding, and it inverts a natural assumption
+
+**Delta-only is the slowest window**, despite returning *fewer* days than base-only:
+
+| window | days returned | p50 | p95 |
+|---|---|---|---|
+| base-only | 51 | fastest | |
+| crossing | 31 | middle | |
+| delta-only | 41 | **slowest** | |
+
+(Values in the artifact; not reproduced here, per the timing-drift guard.) Delta is
+**t1/s256** — one chunk per day — so a 41-day delta read touches ~41 chunks per variable, while
+base's `(90,8,8)` chunking serves 51 days from far fewer. This is §10.1's claim that **cadence,
+not block size, governs the read cost of the delta tail** — measured on production rather than
+modelled.
+
+It is a direct argument for the **small C** in the provisional S=90 / C=30 target: C drives the
+delta span, and the delta span is what this measurement shows dominating read latency.
+
+### Gates, from VM24 evidence
+
+| gate | verdict | why |
+|---|---|---|
+| **G3** | **NOT_ADJUDICATED** | 1-concurrency samples at one coordinate over 3 windows. They inform G3; they do not decide it. |
+| **H7 inode headroom** | **PASS_EVIDENCE_AVAILABLE** | 225,490,340 free inodes against a ~4.9 M +10 y projection — ~46× headroom. The adjudication is the reviewer's. |
+| **H7 fd/RSS** | **NOT_ADJUDICATED** | 22 fds, 78 MB RSS at rest; H7 asks for C=8/16 under sustained load, which is not a read-only measurement. |
+| **G16** | **NOT_ADJUDICATED** | metadata scan / snapshot-open on the production tree were not measured; walking a 5.4 T store is not a low-rate probe. |
+
+Disk: **267 G free of 6.0 T (96 % used)** — the 141 GB peak temp disk for one S=90 block fits,
+with margin, and a 2 TB monolith rebuild does not. That is the constraint O2 exists to remove.
 
 ## Not delivered in this pass
 
