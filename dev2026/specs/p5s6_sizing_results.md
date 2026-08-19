@@ -24,7 +24,7 @@ path is touched anywhere in this step.
 Branch `dev2026-p5-s6-o2-local`, based on the merged tip `7902b61`.
 
 - Harness: [`../bench/bench_p5_sizing.py`](../bench/bench_p5_sizing.py)
-- Tests: [`../tests/test_phase2_p5s6.py`](../tests/test_phase2_p5s6.py) — **107/107**, committed
+- Tests: [`../tests/test_phase2_p5s6.py`](../tests/test_phase2_p5s6.py) — **113/113**, committed
   **failing first**; and [`../tests/test_phase2_p5s6_o2.py`](../tests/test_phase2_p5s6_o2.py) —
   **17/17**, the O2 carry-forward path. **23 guards mutation-verified**, each mutation run
   serially from a git-clean tree.
@@ -303,17 +303,6 @@ not adjudicate G3, which is a VM24 measurement.**
 **configuration** in the harness and never hardcoded at a call site. Production adjudication
 still waits on VM24's G3 / H7 / G16.
 
-## Item 4 — NOT STARTED
-
-**O2 tail carry-forward.** One finding that changes its shape: the carry-forward contract
-**already exists** in S3's `build_block` — `predecessor_path`, `predecessor_present`,
-`resolve_source_map()` with authority order delta → block → daily → hold, delta-wins for late
-corrections, `rebuild_source_set = predecessor_present ∪ newly_present`, and a refusal for any
-day whose source cannot be resolved *before* anything is written. So O2 is **exercising and
-measuring that path**, not building a second source-map or provenance truth beside it.
-
-Not started here, and `measure_tail_rebuild` remains DEFERRED and publishes no numbers.
-
 ## VM24 — read-only measurement TAKEN
 
 **Artifact: `bench/results/p5s6_vm24_readonly.json`, provenance `VM24_PRODUCTION_READ_ONLY`.**
@@ -482,127 +471,6 @@ state cannot be checked at all.
 
 Otherwise: **expand the data volume** — minimum 403.3 GiB free, recommended 600 GiB.
 
-## H5 — crossing latency through a real `TieredCube` (item 3, DELIVERED)
-
-`measure_h5_span()` builds a published base **and** a delta from **one oracle**: the delta days
-are the same days the base tail holds, then stamped with a distinct per-day value so precedence
-is observable. Two independently generated fixtures would make any disagreement meaningless —
-it would not be a bug, just two different datasets.
-
-Each span measures **base-only**, **crossing** and **delta-only** requests through
-`TieredCube.point_series()`, recording p50/p95, requested vs returned day counts, and
-`day_source` per day. Spans: **31 / 45 / 64 / 90 / 124** in the full run; the first two in
-`quick`.
-
-Asserted, not assumed:
-
-- the crossing request really spans **both** tiers (`day_source` contains base *and* delta) —
-  otherwise "crossing" is a base read with a longer name;
-- **delta wins** for days both tiers hold, checked on the **timed rows themselves**. Base holds
-  the same days, so a timed loop reading base alone returns the right *count* — a mutation doing
-  exactly that survived until the values were checked;
-- a **negative control** makes the precedence check fail on demand, so `ok: True` is falsifiable.
-
-Timings are in the artifact under `H5.by_span`, not reproduced here. **LOCAL_SYNTHETIC: it does
-not adjudicate G3, which is a VM24 measurement.**
-
-## Provisional design target
-
-**S=90 / C=30**, an operator decision recorded here, held as `DEFAULT_S` / `DEFAULT_C`
-**configuration** in the harness and never hardcoded at a call site. Production adjudication
-still waits on VM24's G3 / H7 / G16.
-
-## Item 4 — NOT STARTED
-
-**O2 tail carry-forward.** One finding that changes its shape: the carry-forward contract
-**already exists** in S3's `build_block` — `predecessor_path`, `predecessor_present`,
-`resolve_source_map()` with authority order delta → block → daily → hold, delta-wins for late
-corrections, `rebuild_source_set = predecessor_present ∪ newly_present`, and a refusal for any
-day whose source cannot be resolved *before* anything is written. So O2 is **exercising and
-measuring that path**, not building a second source-map or provenance truth beside it.
-
-Not started here, and `measure_tail_rebuild` remains DEFERRED and publishes no numbers.
-
-## VM24 — read-only measurement TAKEN
-
-**Artifact: `bench/results/p5s6_vm24_readonly.json`, provenance `VM24_PRODUCTION_READ_ONLY`.**
-Kept in its own file: no VM24 number appears in the LOCAL_SYNTHETIC artifacts and none of the
-synthetic numbers appear here. Host stable throughout (up 5 days, load 0.10) — no measurement
-was marked BLOCKED.
-
-Read-only only: `df`, `df -i`, `free`, `findmnt`, `/healthz`, `pm2 jlist`, `/proc/<pid>` and
-`du -sh`, plus **21 serial point-range GETs** at concurrency 1, 0.3 s apart. No prune, swap,
-compaction, repair, hold deletion, cron/PM2/systemd change, or write of any kind.
-
-### The model was close — checked against the real stores for the first time
-
-| | measured | modelled (§10.3) |
-|---|---|---|
-| delta GB/day | 1.12 | 1.09 |
-| base GB/day | 1.62 | 1.57 |
-
-Both within ~3 %. The §10.3 volume table, and the peak-temp-disk figures derived from it, rest on
-numbers that now have production evidence behind them.
-
-### The H5 finding, and it inverts a natural assumption
-
-**Delta-only is the slowest window**, despite returning *fewer* days than base-only:
-
-| window | days returned | p50 | p95 |
-|---|---|---|---|
-| base-only | 51 | fastest | |
-| crossing | 31 | middle | |
-| delta-only | 41 | **slowest** | |
-
-(Values in the artifact; not reproduced here, per the timing-drift guard.) Delta is
-**t1/s256** — one chunk per day — so a 41-day delta read touches ~41 chunks per variable, while
-base's `(90,8,8)` chunking serves 51 days from far fewer. This is §10.1's claim that **cadence,
-not block size, governs the read cost of the delta tail** — measured on production rather than
-modelled.
-
-It is a direct argument for the **small C** in the provisional S=90 / C=30 target: C drives the
-delta span, and the delta span is what this measurement shows dominating read latency.
-
-### Gates, from VM24 evidence
-
-| gate | verdict | why |
-|---|---|---|
-| **G3** | **NOT_ADJUDICATED** | 1-concurrency samples at one coordinate over 3 windows. They inform G3; they do not decide it. |
-| **H7 inode headroom** | **PASS_EVIDENCE_AVAILABLE** | 225,490,340 free inodes against a ~4.9 M +10 y projection — ~46× headroom. The adjudication is the reviewer's. |
-| **H7 fd/RSS** | **NOT_ADJUDICATED** | 22 fds, 78 MB RSS at rest; H7 asks for C=8/16 under sustained load, which is not a read-only measurement. |
-| **G16** | **NOT_ADJUDICATED** | metadata scan / snapshot-open on the production tree were not measured; walking a 5.4 T store is not a low-rate probe. |
-
-### Capacity gate (§7.1c / G18) — **BLOCKED**
-
-**The earlier claim in this document that "141 GB fits with margin" was wrong, and is
-withdrawn.** It compared the block size alone against free space. The gate is
-`projected_free_after ≥ HARD_RESERVE`, and `additional` is never the block alone:
-
-| term | value | source |
-|---|---|---|
-| `free_now` | 267 GB | `df` avail, measured |
-| `new_block` (S=90 × 1.62 GB/day) | 145.8 GB | measured base rate |
-| `temp` / checkpoint / artifacts | 2 GB | estimate |
-| `growth_during_build` (2.74 GB/day × 2 d) | 5.5 GB | measured ingest rate, **assumed** duration |
-| **`additional`** | **153.3 GB** | |
-| **`projected_free_after`** | **113.7 GB** | `free_now − additional` |
-| `HARD_RESERVE` | **250 GB** | §7.1c / P4-S4 §6 |
-
-**113.7 GB < 250 GB → BLOCKED.** Shortfall **136.3 GB**; the build would need **403.3 GB** free.
-
-It stays blocked with `temp` and `growth` set to **zero** — the block alone breaches the
-reserve — so the verdict does not depend on how the soft terms are estimated, and the assumed
-2-day build duration does not change it either.
-
-`HARD_RESERVE` is **not** adjusted here. Lowering a reserve to make a gate pass is an ops policy
-decision raised separately, never an implementation detail; a test pins it at 250 GB. The
-arithmetic is cross-checked against the shipped `build_block.disk_precheck` on identical inputs,
-so this is production's formula rather than a second one.
-
-What remains true: a 2 TB monolith rebuild is far further out of reach than one 90-day block,
-which is the constraint O2 exists to remove. But **O2 cannot run on VM24 at today's free
-space**, and no local result changes that.
-
 ### Superseded historical audit (revisions 1–3) — **DO NOT USE AS CURRENT STATE**
 
 > Revisions 1–3 of the hold audit reached conclusions about what could be released and how much
@@ -618,9 +486,14 @@ space**, and no local result changes that.
 
 ## Not delivered in this pass
 
-- **O2 tail carry-forward** is now exercised and measured (see the tail-rebuild section) at
-  fixture extent. Still not delivered: **API parity and snapshot-safety tests, and the
-  manifest/provenance/rollback lifecycle at production geometry.** The disk gate exists in
-  `build_block` but the tail measurement deliberately bypasses it (`hard_reserve_bytes=0`) so a
-  temp-dir fixture can run, so nothing here is capacity evidence.
-- **S7 integration and any production deployment work** — explicitly out of scope.
+- **O2 tail carry-forward** is now exercised and measured — see the single authoritative status
+  in *Tail rebuild — LOCAL_SYNTHETIC*, and nowhere else in this document. It is
+  **LOCAL_SYNTHETIC only**, at fixture extent, and a row publishes numbers **only when the
+  provenance and source-map proof succeeds**; otherwise it degrades to `DEFERRED` with none.
+- **Not capacity evidence.** The disk gate exists in `build_block`, but the tail measurement
+  deliberately passes `hard_reserve_bytes=0` so a temp-dir fixture can run at all. Nothing in
+  this document speaks to VM24's free space, which is separately **BLOCKED**.
+- **Still not delivered:** API parity, snapshot-safety tests, and the
+  manifest/provenance/rollback lifecycle at **production geometry**.
+- **S7 integration and any production deployment work** — explicitly out of scope. Nothing here
+  has been deployed, and no VM24 or production action was taken in this pass.

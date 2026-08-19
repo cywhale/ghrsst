@@ -389,6 +389,100 @@ class TestTheReportIsWellFormed(unittest.TestCase):
             self.assertIn(window, report["H3"])
 
 
+class TestTheDocumentHasOneO2Status(unittest.TestCase):
+    """The results doc carried the O2 status in THREE places and two of them said the opposite.
+
+    O2 rewrote the tail-rebuild section to say the carry-forward path is exercised and measured,
+    while two `Item 4 — NOT STARTED` sections still said it had not begun — and those two were
+    part of a 121-line block duplicated wholesale by an earlier revision that appended instead
+    of editing. Every one of the artifact-drift guards passed throughout, because they all
+    resolve a section with `doc.index(...)`, which finds the first copy and never learns there
+    is a second. Correcting one copy of a claim is not correcting the claim."""
+
+    #: Stale O2 status text. Permitted only inside a section explicitly marked superseded.
+    BANNED = ("Item 4 — NOT STARTED", "Not started here", "measure_tail_rebuild remains DEFERRED")
+    SUPERSEDED_MARKERS = ("superseded", "withdrawn", "DO NOT USE AS CURRENT STATE", "historical")
+
+    def setUp(self):
+        with open(os.path.join(_DEV2026, "specs", "p5s6_sizing_results.md")) as fh:
+            self.doc = fh.read()
+
+    def _sections(self):
+        """`(heading, body, superseded)` per heading, with level-2 context inherited.
+
+        A level-3 subsection under a superseded level-2 heading is itself superseded; a
+        superseded level-3 heading does not make its parent superseded."""
+        out, heading, l2, buf = [], "(preamble)", "", []
+        for line in self.doc.split("\n"):
+            if line.startswith("## "):
+                out.append((heading, "\n".join(buf), l2))
+                heading = l2 = line
+                buf = []
+            elif line.startswith("### "):
+                out.append((heading, "\n".join(buf), l2))
+                heading, buf = line, []
+            else:
+                buf.append(line)
+        out.append((heading, "\n".join(buf), l2))
+        return [(h, b, any(m.lower() in (h + " " + parent).lower()
+                           for m in self.SUPERSEDED_MARKERS)) for h, b, parent in out]
+
+    @staticmethod
+    def _norm(text):
+        """Strip markdown emphasis and collapse whitespace before matching.
+
+        The doc writes ``measure_tail_rebuild`` in backticks and hard-wraps its paragraphs, so a
+        literal substring check misses the stale sentence and reports the document clean. A
+        guard that any formatting change defeats is worse than none: it reads as coverage."""
+        return " ".join(re.sub(r"[`*_]", "", text).split())
+
+    def _violations(self):
+        """Returned rather than asserted, so the self-check below can observe one. Under
+        `subTest` a failure is recorded instead of raised, and `assertRaises` never sees it."""
+        return [(h[:60], p) for h, body, superseded in self._sections() if not superseded
+                for p in self.BANNED if self._norm(p) in self._norm(h + "\n" + body)]
+
+    def test_no_stale_O2_status_outside_an_explicitly_superseded_section(self):
+        self.assertEqual(self._violations(), [])
+
+    def test_the_guard_would_catch_a_reintroduction(self):
+        """Without this, the test above passes just as happily on a document that never had the
+        stale text at all, and would keep passing if `_sections` silently returned nothing."""
+        self.assertTrue(self._sections())
+        self.doc += "\n## Item 4 — NOT STARTED\n\nNot started here.\n"
+        self.assertEqual(len(self._violations()), 2, "the reintroduced section was not caught")
+
+    def test_the_stale_wording_is_caught_THROUGH_markdown_formatting(self):
+        """The doc backticks the identifier and hard-wraps its prose, so the literal phrase
+        never appeared verbatim and the guard reported clean while the sentence was present."""
+        self.doc += ("\n## Still current\n\nNot started here, and `measure_tail_rebuild`\n"
+                     "remains DEFERRED and publishes no numbers.\n")
+        found = {p for _, p in self._violations()}
+        self.assertIn("measure_tail_rebuild remains DEFERRED", found)
+
+    def test_a_superseded_section_may_still_carry_the_old_wording(self):
+        """The record of what was wrong is worth keeping; it just may not read as current."""
+        self.doc += ("\n## Superseded — historical\n\nNot started here, and "
+                     "measure_tail_rebuild remains DEFERRED.\n")
+        self.assertEqual(self._violations(), [])
+
+    def test_no_heading_appears_twice(self):
+        """The duplicated block is the fault that let contradictory statuses coexist. Every
+        `doc.index()`-based guard in this file is blind to it."""
+        for level in ("## ", "### "):
+            seen = [ln for ln in self.doc.split("\n")
+                    if ln.startswith(level) and not ln.startswith(level + "#")]
+            dupes = sorted({h for h in seen if seen.count(h) > 1})
+            with self.subTest(level=level.strip()):
+                self.assertEqual(dupes, [], f"duplicated heading(s): {dupes}")
+
+    def test_the_tail_rebuild_section_is_the_only_O2_status(self):
+        headings = [ln for ln in self.doc.split("\n") if ln.startswith("## ")]
+        o2 = [h for h in headings if "Tail rebuild" in h or "Item 4" in h]
+        self.assertEqual(len(o2), 1, f"expected exactly one O2 status section, got {o2}")
+        self.assertIn("LOCAL_SYNTHETIC", o2[0])
+
+
 class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
     """Round-3 finding. The code and the results doc were corrected; the committed JSON still
     said `H5.label = MODEL` and `tail_rebuild.label = LOCAL`, so three artefacts of the same
