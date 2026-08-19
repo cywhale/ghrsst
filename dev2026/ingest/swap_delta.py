@@ -455,8 +455,12 @@ def execute_swap_plan(plan: dict, *, mode: str, hold_dir: str,
                     # consequential step in the runbook said no production mutation had occurred.
                     # Three fields now say three different things instead of one saying the
                     # wrong one:
-                    "staging_build_mutation": True,   # a staging store was built beside live
-                    "live_swap_performed": True,      # the LIVE delta path was switched
+                    # `staging_build_present` -- NOT `..._mutation`: this executor did not
+                    # build the staging store, it verified one was there and swapped it in.
+                    # Claiming the build would put a mutation in the audit trail under the name
+                    # of the function that did not perform it.
+                    "staging_build_present": True,
+                    "live_swap_performed": True,      # the LIVE delta path WAS switched
                     "production_mutation": True}      # ...which is a production mutation
         finally:
             fcntl.flock(lk, fcntl.LOCK_UN)

@@ -239,9 +239,10 @@ def delta_prune(base: dict, delta: dict, window_days: int, delta_buffer: int, *,
         #                                    may drop.
         #   blocked_need_compaction_first -- of those, the ones base does NOT cover. Never
         #                                    droppable until they are compacted in.
-        #   base_uncovered_approved_candidates -- days an operator approved that base does not
-        #                                    cover. Always empty here by construction; present so
-        #                                    a consumer can assert on it rather than infer it.
+        #
+        # There is deliberately NO "approved" set here. Approval happens later, at the prune
+        # stage (`ops.degraded_prune`), and a field in the audit named for it would imply an
+        # approval exists when none has been given.
         "drop_candidates_by_calendar": drop_candidates,
         # NOT "base covers the days we are about to drop" -- that is true of
         # `delta_prune_candidates` by construction. It means "base covers EVERY calendar drop
@@ -251,7 +252,6 @@ def delta_prune(base: dict, delta: dict, window_days: int, delta_buffer: int, *,
         "delta_prune_candidates": eligible,          # eligible ONLY after base coverage -- dry-run
         "delta_prune_candidate_count": len(eligible),
         "blocked_need_compaction_first": blocked,
-        "base_uncovered_approved_candidates": [],
         "reason": reason,
         "dry_run": True,
     }

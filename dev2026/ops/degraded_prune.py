@@ -22,6 +22,10 @@ away from data loss, and the arithmetic belongs somewhere it can be tested.
   rather than by the keep-window arithmetic happening to include them.
 - The base-coverage gate in `prune_delta` is **not** relaxed. This function decides which days to
   offer; that gate still decides whether they may go.
+- **Duplicates are a refusal, never a de-duplication.** A day listed twice in the live delta, the
+  audit or the approval means one of those is malformed. Quietly collapsing it would launder a
+  broken store into a legal-looking day set — and the physical index a prune relies on stops
+  being derivable from the day list.
 """
 from __future__ import annotations
 
@@ -49,10 +53,26 @@ def partition_delta_days(*, live_delta_days: Sequence[str], audit: dict,
     if not dp.get("available"):
         raise DegradedPruneRefused("the audit has no usable delta_prune block; a fresh audit is "
                                    "the only source of this run's day sets")
-    live = list(dict.fromkeys(live_delta_days))
+    live = list(live_delta_days)
+    dupes = sorted({d for d in live if live.count(d) > 1})
+    if dupes:
+        raise DegradedPruneRefused(
+            f"the live delta lists day(s) {dupes} more than once. Silently de-duplicating would "
+            f"launder a malformed store into a legal-looking day set, and the physical index a "
+            f"prune uses would no longer be derivable from the day list. Repair the store.")
     live_set = set(live)
     candidates = list(dp.get("delta_prune_candidates") or [])
     blocked = list(dp.get("blocked_need_compaction_first") or [])
+
+    # Checked HERE, not inside the approval branch: a malformed audit is malformed whether or
+    # not anyone approved anything, and inside the branch the "approval must equal the audit"
+    # check answered first, so this one could never fire.
+    for label, seq in (("candidate", candidates), ("blocked", blocked)):
+        dupes_ = sorted({d for d in seq if seq.count(d) > 1})
+        if dupes_:
+            raise DegradedPruneRefused(
+                f"the audit lists {label} day(s) {dupes_} more than once; it is malformed and "
+                f"no day set may be derived from it.")
 
     overlap = sorted(set(candidates) & set(blocked))
     if overlap:
@@ -79,7 +99,12 @@ def partition_delta_days(*, live_delta_days: Sequence[str], audit: dict,
                 f"approval.")
         if not str(approval["approved_by"]).strip() or not str(approval["approval_ref"]).strip():
             raise DegradedPruneRefused("approved_by and approval_ref must both be non-empty")
-        approved = list(dict.fromkeys(approval["approved_candidates"]))
+        approved = list(approval["approved_candidates"])
+        appr_dupes = sorted({d for d in approved if approved.count(d) > 1})
+        if appr_dupes:
+            raise DegradedPruneRefused(
+                f"the approval lists day(s) {appr_dupes} more than once. An approval is a record "
+                f"of what a human reviewed; de-duplicating it would change that record.")
         if sorted(approved) != sorted(candidates):
             raise DegradedPruneRefused(
                 f"the approval names {len(approved)} day(s) but the fresh audit lists "
