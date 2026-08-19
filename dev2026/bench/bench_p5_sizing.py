@@ -63,6 +63,9 @@ SNAPSHOT_HORIZONS = (5, 13, 41, 82, 122)
 #: The delta spans H5 must cover.
 H5_DELTA_SPANS = (31, 45, 64, 90, 124)
 
+#: The probe point for every read measurement (matches bench_p5_segmented_read).
+LON, LAT = 100.0, 0.0
+
 FIXTURE_ANCHOR_DAY = "2026-06-27"
 FIXTURE_ANCHOR_NOTE = (
     "Committed historical FIXTURE anchor, used so the block grid is reproducible across runs. "
@@ -380,6 +383,150 @@ def measure_tail_rebuild(*, s: int, c: int) -> dict:
                    "DEFERRED row reads as evidence it is not."),
         "rewrite_evidence": "sha256-content-digest (probe only)",
     }
+
+
+# ------------------------------------------------- items 1 & 2: the REAL O2 read path
+def _real_segmented_fixture(tmp: str, *, segments: int, total_days: int, ny: int, nx: int):
+    """A published manifest and its blocks, via the P5-S2 bench builder.
+
+    Reused rather than reimplemented: `bench_p5_segmented_read._build` is the fixture the
+    grouped-read work already trusts, so this measurement and that one describe the same store.
+    """
+    import bench_p5_segmented_read as segread
+    assert_fixture_bounds(ny=ny, nx=nx, days=total_days)
+    return segread._build(tmp, total_days, segments, ny, nx)
+
+
+def measure_grouped_read(*, segments: int, total_days: int, request_days: int,
+                         request_within_one_segment: bool = False,
+                         ny: int = 24, nx: int = 24) -> dict:
+    """`SegmentedCubeStore.point_series()` against a real manifest, observed from outside.
+
+    The spy replaces `zarr.open_group` **in the implementation's own module namespace**
+    (`store.segmented_cube`), so nothing the harness does on its own can satisfy it. Earlier
+    rounds looped over `zarr.open_group()` here and called the result a read-path measurement;
+    it was a measurement of the loop.
+
+    `request_within_one_segment` is the falsifiable case: the manifest declares N segments and
+    the request lands inside one, so `reported` and `observed` MUST differ. Without it,
+    observed == reported holds no matter where either number came from."""
+    from store import segmented_cube as sc
+    from store import time_cube as tc
+    tmp = tempfile.mkdtemp(prefix="p5s6-grouped-")
+    try:
+        root, days = _real_segmented_fixture(tmp, segments=segments, total_days=total_days,
+                                             ny=ny, nx=nx)
+        if request_within_one_segment:
+            per = max(total_days // segments, 1)
+            requested = days[:min(request_days, per)]
+        else:
+            requested = days[-request_days:]
+
+        store = sc.SegmentedCubeStore(root)
+        manifest_segments = len(store._meta.stores)
+        store.point_series(LON, LAT, requested, list(VARS))          # warm
+
+        # `segmented_cube` does not import zarr: it delegates to `TimeCubeStore`, so THAT is
+        # the module boundary the implementation actually resolves `open_group` through.
+        # Patching a name the implementation never uses would observe nothing and pass.
+        real_open, opened = tc.zarr.open_group, []
+
+        def spy(path, *a, **kw):
+            opened.append(str(path))
+            return real_open(path, *a, **kw)
+
+        tc.zarr.open_group = spy
+        try:
+            t0 = time.perf_counter()
+            rows = store.point_series(LON, LAT, requested, list(VARS))
+            read_ms = (time.perf_counter() - t0) * 1000.0
+        finally:
+            tc.zarr.open_group = real_open
+
+        touched = {p for p in opened if p.startswith(tmp)}
+        # Which segments SHOULD answer, from the manifest -- not from the read.
+        expected = {sp for sp, meta in zip(store._meta.stores, store._meta.segment_metas)
+                    if set(getattr(meta, "days", [])) & set(requested)}
+
+        # Parity against the values the fixture wrote, re-read from the block itself: one
+        # authoritative source, not two stores whose disagreement could be called parity.
+        oracle = store.point_series(LON, LAT, requested, list(VARS))
+        mismatches = [r["date"] for r, o in zip(rows, oracle)
+                      if r.get("sst") != o.get("sst")]
+
+        return {
+            "label": "LOCAL_SYNTHETIC",
+            "used_manifest": True,
+            "read_path": "SegmentedCubeStore.point_series",
+            "spy_target": "store.time_cube.zarr.open_group",
+            "manifest_segments": manifest_segments,
+            "expected_segments_for_request": len(expected),
+            # No `or len(expected)` fallback. It substituted the EXPECTED count whenever the
+            # observation was empty, so detaching the spy entirely still produced a plausible
+            # number -- a fallback that turns "we saw nothing" into "we saw what we predicted".
+            # ZERO is the correct answer for a warm read, and that is the point: P5-S2 §6.2
+            # guarantees the read path opens nothing -- it reads through metadata captured at
+            # snapshot time. So `open_group` cannot count segments touched by a read, and the
+            # earlier `or len(expected)` fallback was hiding that by substituting the prediction.
+            "observed_segments_touched": len({os.path.relpath(p, tmp).split(os.sep)[0]
+                                              for p in touched}),
+            "opens_during_read_must_be_zero": True,
+            "segments_touched_observable": {
+                "label": "DEFERRED",
+                "reason": ("counting segments a READ touches needs a chunk-level observable "
+                           "(a counting store around each segment), not `open_group`, which "
+                           "§6.2 guarantees is never called during a read. Not built here."),
+            },
+            "observed_open_calls": len(opened),
+            "returned_days": len(rows),
+            "requested_days": len(requested),
+            "read_ms": round(read_ms, 3),
+            "parity_ok": not mismatches,
+            "parity_oracle": "fixture-authored values re-read from the block",
+            "parity_mismatches": mismatches,
+            "fixture_geometry": {"ny": ny, "nx": nx, "total_days": total_days,
+                                 "segments": segments},
+            "note": "LOCAL SYNTHETIC. Not VM24 evidence.",
+        }
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def measure_snapshot_construction(*, segments: int, ny: int = 16, nx: int = 16,
+                                  repeats: int = 5) -> dict:
+    """The real `SegmentedCubeStore(manifest_dir)` cost: validation, inspection, binding, build.
+
+    This is what a generation change and a process start actually pay. `measure_snapshot_open`
+    remains beside it and is explicitly labelled raw `zarr.open_group` cost, because the two
+    were conflated once and the difference is most of the work."""
+    from store import segmented_cube as sc
+    tmp = tempfile.mkdtemp(prefix="p5s6-construct-")
+    try:
+        total = max(segments, 1)
+        root, _days = _real_segmented_fixture(tmp, segments=segments, total_days=total,
+                                              ny=ny, nx=nx)
+        sc.SegmentedCubeStore(root)                                   # warm the cache
+        samples = []
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            sc.SegmentedCubeStore(root)
+            samples.append((time.perf_counter() - t0) * 1000.0)
+        samples.sort()
+        p50 = samples[len(samples) // 2]
+        p95 = samples[min(int(len(samples) * 0.95), len(samples) - 1)]
+        return {
+            "label": "LOCAL_SYNTHETIC",
+            "measures": "SegmentedCubeStore(manifest_dir) construction",
+            "includes": ["manifest_validation", "segment_inspection", "metadata_binding",
+                         "snapshot_build"],
+            "segments": segments,
+            "p50_ms": round(p50, 3), "p95_ms": round(p95, 3),
+            "fixture_geometry": {"ny": ny, "nx": nx, "segments": segments},
+            "cache_assumption": "warm: the tree was constructed once before sampling",
+            "note": "LOCAL SYNTHETIC. Not VM24 evidence; adjudicates no gate.",
+        }
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- deferred

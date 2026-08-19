@@ -65,7 +65,17 @@ Two model corrections the tests forced, both against the spec's own tables:
   snapshot opens. `floor` gave 40 at S=90/+10 y where the spec says 41, and the tail block is
   exactly that difference.
 
-## RAW GROUP-OPEN COST (not O2 snapshot-open) — withdrawn as an O2 measurement
+## Snapshot construction — the REAL constructor (item 2)
+
+`measure_snapshot_construction()` times `SegmentedCubeStore(manifest_dir)`: manifest validation,
+segment inspection, metadata binding and snapshot build — what a generation change and a process
+start actually pay. p50/p95 over repeated constructions, fixture geometry and the warm-cache
+assumption are recorded with every row. **LOCAL_SYNTHETIC; adjudicates no gate.**
+
+The raw-`open_group` table below is kept beside it, still labelled as raw cost, because the two
+were conflated once and the difference is most of the work.
+
+## RAW GROUP-OPEN COST (not O2 snapshot-open) — kept for contrast
 
 The question §10.6 asks is whether these degrade **super-linearly** with segment count. Measured
 at the required 5 / 13 / 41 / 82 / 122 horizons:
@@ -85,7 +95,31 @@ within 7 % across a 24× range, No super-linear term appears, so
 nothing here argues for the §10.5 super-block-merge escape hatch. This is **LOCAL** on a warm
 cache with tiny blocks; the production thresholds remain DEFERRED.
 
-## Segment calls — NOT the grouped read path (withdrawn)
+## Grouped read — the REAL path (item 1, partial)
+
+`measure_grouped_read()` now builds a **published manifest**, constructs
+`SegmentedCubeStore(manifest_dir)`, and calls **`SegmentedCubeStore.point_series()`**. The
+observation is taken by patching `open_group` in **`store.time_cube`** — the boundary the
+implementation actually resolves it through, since `segmented_cube` delegates rather than
+importing zarr. Patching a name the implementation never uses would observe nothing and pass.
+
+**The measurement produced a correction, not a number.** A warm read observes **zero**
+`open_group` calls — and that is right: P5-S2 §6.2 guarantees the read path opens nothing,
+serving from metadata captured at snapshot time. So `open_group` **cannot** count segments a
+read touches, and my first version hid this behind an `or len(expected)` fallback that
+substituted the *predicted* count whenever the observation was empty. Detaching the spy
+entirely still passed. The fallback is gone; zero is reported as zero.
+
+Consequently:
+
+- **expected segments for a request** — derived from the manifest and the request, and asserted
+  to grow with the request width. **LOCAL_SYNTHETIC.**
+- **observed segments touched by a read** — **DEFERRED**: it needs a chunk-level observable (a
+  counting store around each segment), which is not built here.
+- **value parity** — against the fixture's own values re-read from the block, one authoritative
+  oracle rather than two stores whose disagreement could be called parity. **LOCAL_SYNTHETIC.**
+
+## Segment calls — NOT the grouped read path (withdrawn, superseded above)
 
 Reported (from the day→segment map) versus **observed** (which stores `zarr.open_group` actually
 opened), over a 90-day read:
@@ -166,6 +200,15 @@ the +10 y projection. Both are DEFERRED, and both need VM24 read-only.
 2. **H7 inode headroom** — `df -i` against the ~6.6 M projection.
 3. **G16 thresholds** — metadata scan and snapshot open on the real tree.
 4. **Peak temp disk** — confirming 141 GB requires building a real block.
+
+## Items 3 and 4 — NOT STARTED
+
+- **H5 synthetic `TieredCube` latency** across spans 31/45/64/90/124: not implemented. The H5
+  section remains DEFERRED and volume arithmetic only.
+- **O2 tail carry-forward**: not implemented. No predecessor-read path, no source map, no
+  successor block. `measure_tail_rebuild` remains DEFERRED and publishes no numbers.
+
+Neither was begun, and neither is claimed at any level.
 
 ## Not delivered in this pass
 

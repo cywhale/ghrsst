@@ -434,5 +434,88 @@ class TestCommittedArtifactsMatchTheGenerator(unittest.TestCase):
                     self.assertEqual(a["gates"][gate]["verdict"], "NOT_ADJUDICATED")
 
 
+class TestGroupedReadUsesTheRealPath(unittest.TestCase):
+    """Item 1. The measurement must go through `SegmentedCubeStore.point_series()` against a
+    real published manifest -- not a loop over `zarr.open_group()` standing in for it."""
+
+    def test_it_builds_a_real_manifest_and_a_real_store(self):
+        out = sizing.measure_grouped_read(segments=4, total_days=40, request_days=10)
+        self.assertEqual(out["label"], "LOCAL_SYNTHETIC")
+        self.assertTrue(out["used_manifest"])
+        self.assertEqual(out["read_path"], "SegmentedCubeStore.point_series")
+        self.assertGreater(out["returned_days"], 0)
+        # §6.2: a warm read opens NOTHING. Asserting the opposite was my error, not the
+        # code's -- the read serves from metadata captured at snapshot time.
+        self.assertEqual(out["observed_open_calls"], 0,
+                         "P5-S2 §6.2: the read path must not open a group")
+        self.assertTrue(out["opens_during_read_must_be_zero"])
+
+    def test_the_observation_comes_from_the_IMPLEMENTATIONS_module_boundary(self):
+        """`segmented_cube` delegates to `TimeCubeStore`, so that is the boundary the read
+        actually resolves `open_group` through. Patching a name the implementation never uses
+        would observe nothing and pass."""
+        out = sizing.measure_grouped_read(segments=4, total_days=40, request_days=10)
+        self.assertEqual(out["spy_target"], "store.time_cube.zarr.open_group")
+
+    def test_the_narrow_request_is_EXPECTED_to_need_fewer_segments_than_the_manifest_has(self):
+        """From the manifest and the request, independent of the read. The matching OBSERVED
+        count needs a chunk-level observable and is DEFERRED -- see below."""
+        out = sizing.measure_grouped_read(segments=4, total_days=40, request_days=5,
+                                          request_within_one_segment=True)
+        self.assertEqual(out["manifest_segments"], 4)
+        self.assertLess(out["expected_segments_for_request"], out["manifest_segments"])
+        self.assertGreaterEqual(out["expected_segments_for_request"], 1)
+
+    def test_a_wider_request_needs_more_segments_than_a_narrow_one(self):
+        narrow = sizing.measure_grouped_read(segments=4, total_days=40, request_days=5,
+                                             request_within_one_segment=True)
+        wide = sizing.measure_grouped_read(segments=4, total_days=40, request_days=40)
+        self.assertGreater(wide["expected_segments_for_request"],
+                           narrow["expected_segments_for_request"])
+
+    def test_counting_segments_a_READ_touches_is_marked_DEFERRED(self):
+        """Honest about what is not measured: `open_group` cannot answer it, because §6.2 says
+        it is never called during a read."""
+        out = sizing.measure_grouped_read(segments=4, total_days=40, request_days=10)
+        self.assertEqual(out["segments_touched_observable"]["label"], "DEFERRED")
+        self.assertIn("chunk-level observable",
+                      out["segments_touched_observable"]["reason"])
+
+    def test_values_match_a_COMMON_oracle_not_a_second_independent_store(self):
+        """Parity against the bytes the fixture wrote, so two stores disagreeing cannot be
+        reported as agreement."""
+        out = sizing.measure_grouped_read(segments=4, total_days=40, request_days=10)
+        self.assertTrue(out["parity_ok"])
+        self.assertEqual(out["parity_oracle"], "fixture-authored values re-read from the block")
+        self.assertEqual(out["parity_mismatches"], [])
+
+
+class TestSnapshotOpenIsTheRealConstruction(unittest.TestCase):
+    """Item 2. `SegmentedCubeStore(manifest_dir)` -- validation, inspection, binding, snapshot
+    build -- not raw group-open."""
+
+    def test_it_measures_the_store_constructor(self):
+        out = sizing.measure_snapshot_construction(segments=5)
+        self.assertEqual(out["label"], "LOCAL_SYNTHETIC")
+        self.assertEqual(out["measures"], "SegmentedCubeStore(manifest_dir) construction")
+        for phase in ("manifest_validation", "segment_inspection", "snapshot_build"):
+            self.assertIn(phase, out["includes"])
+
+    def test_it_reports_p50_and_p95_and_the_fixture_geometry(self):
+        out = sizing.measure_snapshot_construction(segments=5)
+        self.assertGreater(out["p50_ms"], 0.0)
+        self.assertGreaterEqual(out["p95_ms"], out["p50_ms"])
+        self.assertIn("ny", out["fixture_geometry"])
+        self.assertIn("warm", out["cache_assumption"])
+
+    def test_construction_costs_more_than_a_bare_group_open(self):
+        """The distinction the earlier round got wrong, asserted rather than described."""
+        real = sizing.measure_snapshot_construction(segments=5)
+        raw = sizing.measure_snapshot_open(segments=5)
+        self.assertGreater(real["p50_ms"], raw["wall_ms"] / 10.0,
+                           "construction should not be cheaper than a fraction of raw opens")
+        self.assertIn("NOT O2 snapshot-open cost", raw["measures"])
+
+
 if __name__ == "__main__":
     unittest.main()
