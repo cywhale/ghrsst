@@ -1002,6 +1002,33 @@ class TestAuditEntryPointMatchesTheArtifact(unittest.TestCase):
                 self.assertEqual(out["verdict"], "FAIL_CLOSED")
                 self.assertIn("wal_repairs_pending", out["reason"])
 
+    def test_a_missing_repairs_list_FAILS_CLOSED_on_a_p5_host(self):
+        """`[]` asserts the WAL was read and is clear; absence says nobody looked. On a
+        P5-enabled host they are opposite facts, and an unread WAL must not authorize."""
+        for value in (None, "__absent__"):
+            with self.subTest(repr(value)):
+                ev = self._evidence()
+                ev["p5_roots_present"] = True
+                if value == "__absent__":
+                    ev.pop("wal_repairs_pending", None)
+                else:
+                    ev["wal_repairs_pending"] = None
+                out = sizing.audit_hold_lifecycle_from_evidence(ev)
+                self.assertEqual(out["verdict"], "FAIL_CLOSED")
+                self.assertIn("nobody looked", out["reason"])
+
+    def test_an_EMPTY_list_is_accepted_on_a_p5_host(self):
+        """The assertion form must still work, or "always fail closed" would pass above."""
+        ev = self._evidence()
+        ev["p5_roots_present"] = True
+        ev["wal_repairs_pending"] = []
+        self.assertEqual(sizing.audit_hold_lifecycle_from_evidence(ev)["verdict"], "COMPLETE")
+
+    def test_absence_is_tolerated_only_BEFORE_p5(self):
+        ev = self._evidence()
+        self.assertFalse(ev["p5_roots_present"])
+        self.assertEqual(sizing.audit_hold_lifecycle_from_evidence(ev)["verdict"], "COMPLETE")
+
     def test_a_valid_repairs_list_is_accepted(self):
         ev = self._evidence()
         ev["wal_repairs_pending"] = ["2026-01-01"]
@@ -1061,11 +1088,21 @@ class TestTheResultsDocHasNoSupersededCapacityClaims(unittest.TestCase):
         self.assertIn("| `currently_reclaimable` | **0.0** |", self.doc)
 
     def test_the_superseded_section_does_not_restate_its_numbers(self):
+        """The previous pointer claimed to omit the old figures in a sentence that quoted them.
+        A number in a document gets requoted whatever the sentence around it says."""
         i = self.doc.index("### Superseded historical audit")
         section = self.doc[i:i + 1400]
         self.assertIn("DO NOT USE AS CURRENT STATE", section)
-        self.assertIn("not reproduced here", section)
-        self.assertNotIn("| ~2192 GiB |", section)
+        self.assertIn("None of their figures is", section)
+        import re as _re
+        self.assertEqual(_re.findall(r"\d+(?:\.\d+)?\s*GiB", section), [],
+                         "the superseded pointer must carry no capacity figure at all")
+
+    def test_the_withdrawn_capacity_claims_are_absent_from_the_WHOLE_doc(self):
+        for stale in ("2288", "disk expansion was not required",
+                      "Disk expansion is not required"):
+            with self.subTest(stale):
+                self.assertNotIn(stale, self.doc)
 
 
 if __name__ == "__main__":

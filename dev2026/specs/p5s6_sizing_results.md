@@ -559,18 +559,18 @@ What remains true: a 2 TB monolith rebuild is far further out of reach than one 
 which is the constraint O2 exists to remove. But **O2 cannot run on VM24 at today's free
 space**, and no local result changes that.
 
-### Superseded historical audit (revision 1) — **DO NOT USE AS CURRENT STATE**
+### Superseded historical audit (revisions 1–3) — **DO NOT USE AS CURRENT STATE**
 
-> Revision 1 of the hold audit concluded that the daily holds and two delta backups were
-> releasable, that ~2288 GiB was reclaimable, and that disk expansion was not required.
-> **Every one of those conclusions is wrong and was withdrawn.** The current state is the
-> revision 4 section above: **0.0 GiB reclaimable, G18 BLOCKED, minimum 403.3 GiB free needed**.
+> Revisions 1–3 of the hold audit reached conclusions about what could be released and how much
+> capacity that would recover. **All of them were withdrawn.** None of their figures is
+> reproduced here — not even to contradict, because a number in a document gets quoted whatever
+> the sentence around it says, and the previous version of this pointer proved that by restating
+> the very figures it claimed to omit.
 >
-> The superseded text is **not reproduced here**. Keeping a contradictory set of numbers in the
-> document — even labelled — is how an operator reads the wrong one, and this document has
-> already been wrong about capacity three times. The reasoning that replaced it is recorded in
-> the revision notes of `bench/results/p5s6_vm24_readonly.json` and in the commit history
-> (`1ff4fd5`, `848d4bb`, `3f228ca`).
+> The current state is the **revision 4** section above. The withdrawn reasoning, and why each
+> revision was wrong, is in the `revision_note` fields of
+> `bench/results/p5s6_vm24_readonly.json` and in commits `1ff4fd5`, `848d4bb`, `3f228ca`,
+> `dc3197e`.
 
 ## Not delivered in this pass
 

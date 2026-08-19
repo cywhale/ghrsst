@@ -952,11 +952,28 @@ def expand_day_range(spec, what: str) -> List[str]:
     return [(start + _dt.timedelta(days=i)).isoformat() for i in range(span)]
 
 
-def _repairs_pending(value) -> set:
-    """A raw list of canonical days, or a refusal. `set(x)` on a string yields its characters
-    and on a malformed list quietly collapses duplicates -- both turn broken input into a
-    legal-looking set, and a set that looks legal is one that gets reasoned from."""
+def _repairs_pending(value, *, required: bool) -> set:
+    """A raw list of canonical days, or a refusal.
+
+    ## Absence is ignorance; `[]` is an assertion
+
+    `[]` means "the WAL was read and no repair is outstanding". A missing field or `null` means
+    nobody looked. On a P5-enabled host those are opposite facts, and treating the second as the
+    first would let an unread WAL authorize a release -- so when `p5_roots_present` is true the
+    field is REQUIRED and must be a list.
+
+    Before P5 it is accepted as absent, because there is no WAL to read and the entry is
+    classified `repair_state_unknown_pre_p5` regardless.
+
+    `set(x)` on a string yields its characters and on a malformed list quietly collapses
+    duplicates -- both turn broken input into a legal-looking set, and a set that looks legal is
+    one that gets reasoned from."""
     if value is None:
+        if required:
+            raise _EvidenceError(
+                "wal_repairs_pending is missing or null while p5_roots_present is true. An "
+                "empty list asserts the WAL was read and is clear; absence says nobody looked, "
+                "and an unread WAL must not authorize a release. Supply [] or the pending days.")
         return set()
     if type(value) is not list:
         raise _EvidenceError(f"wal_repairs_pending must be a list or null, got "
@@ -1005,7 +1022,8 @@ def audit_hold_lifecycle_from_evidence(evidence: dict) -> dict:
                 entry=entry, now_utc=evidence["now_utc"], base_days=base_days,
                 spatial_window=window, recovery_evidence=e.get("recovery_evidence"),
                 p5_roots_present=p5_present,
-                wal_repairs_pending=_repairs_pending(evidence.get("wal_repairs_pending")),
+                wal_repairs_pending=_repairs_pending(
+                    evidence.get("wal_repairs_pending"), required=p5_present),
                 referenced_by_rollback=_strict_bool(
                     e.get("referenced_by_rollback", False), f"{what}.referenced_by_rollback"),
                 in_active_serving_path=_strict_bool(

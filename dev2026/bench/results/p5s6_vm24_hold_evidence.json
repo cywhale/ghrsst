@@ -125,5 +125,6 @@
     "2026-06-27",
     "2026-08-17"
   ],
-  "wal_repairs_pending": null
+  "wal_repairs_pending": null,
+  "wal_repairs_pending_note": "null because the P5 roots are ABSENT: there is no WAL to read. On a P5-enabled host this field is REQUIRED -- [] asserts the WAL was read and is clear, absence says nobody looked, and the audit fails closed on the latter."
 }
