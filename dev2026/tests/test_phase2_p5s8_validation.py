@@ -123,8 +123,7 @@ class TestTheG4RequestDescribesTheRequestActuallyMade(_Tmp):
 
     def _req(self, **over):
         rec = {"run_id": RUN, "start": "2026-01-01", "end": "2027-01-01",
-               "url": ("http://127.0.0.1:8080/api/ghrsst"
-                       "?lon0=135&lat0=20&start=2026-01-01&end=2027-01-01&append=sst"),
+               "url": rep.g4_url("2026-01-01", "2027-01-01"),
                "span_days": 366, "probe_rows": 366, "g4_samples": 2}
         rec.update(over)
         return rec
@@ -135,6 +134,39 @@ class TestTheG4RequestDescribesTheRequestActuallyMade(_Tmp):
 
     def test_the_valid_control_passes(self):
         rep.check_g4_request(self._req(), run_id=RUN)
+
+    def test_the_canonical_endpoint_is_the_deployed_one(self):
+        """VM24 serves gunicorn on 127.0.0.1:8035 (`conf/start_app.sh -b 127.0.0.1:8035`).
+        Staging found the contract pinned 8080, where nothing listens, so `g4-probe` could not
+        run at all. Pinned by value still — this run targets the canonical VM24 service
+        endpoint, not an arbitrary one."""
+        self.assertEqual(rep.G4_ENDPOINT, "http://127.0.0.1:8035/api/ghrsst")
+
+    def test_a_request_on_8035_is_ACCEPTED(self):
+        rep.check_g4_request(self._req(), run_id=RUN)          # positive regression
+
+    def test_a_request_on_the_stale_8080_endpoint_is_REFUSED(self):
+        """The negative half: the old pin must now be rejected, not merely unused."""
+        self._refuse(url=("http://127.0.0.1:8080/api/ghrsst?lon0=135&lat0=20"
+                          "&start=2026-01-01&end=2027-01-01&append=sst"))
+
+    def test_the_runbook_and_the_validator_share_one_endpoint(self):
+        """No second hardcoded URL: the probe builds its request from the shared constant."""
+        code = "\n".join(BLOCKS[tag] for tag in ("g4-probe", "g4-sample"))
+        self.assertNotIn("8080", code)
+        self.assertNotIn("http://127.0.0.1", code, "the probe hardcodes an endpoint")
+        self.assertIn("g4_url", code)
+
+    def test_no_stale_endpoint_survives_anywhere_in_the_contract(self):
+        import re as _re
+        for rel in ("ops/p5s8_report.py", "specs/p5s8_vm24_shadow_runbook.md"):
+            with self.subTest(rel):
+                with open(os.path.join(_DEV, rel)) as fh:
+                    body = fh.read()
+                live = [ln for ln in body.split("\n")
+                        if "127.0.0.1:8080" in ln and "stale" not in ln.lower()
+                        and "8035" not in ln]
+                self.assertEqual(live, [], f"a stale 8080 endpoint survives in {rel}")
 
     def test_dates_must_be_canonical_iso(self):
         for bad in ("2026-1-1", "01/01/2026", "2026-01-01T00:00:00", "20260101", "not-a-date"):
@@ -147,19 +179,18 @@ class TestTheG4RequestDescribesTheRequestActuallyMade(_Tmp):
         and the compact form was caught by the URL cross-check instead. So the URL is written to
         agree, leaving the canonicity rule as the only thing that can refuse it — otherwise two
         artifacts could record the same day in two spellings and compare unequal."""
-        compact = ("http://127.0.0.1:8080/api/ghrsst?lon0=135&lat0=20"
+        compact = (rep.G4_ENDPOINT + "?lon0=135&lat0=20"
                    "&start=20260101&end=2027-01-01&append=sst")
         self._refuse(start="20260101", url=compact)
 
     def test_the_span_arithmetic_must_agree_with_span_days(self):
         """The blocking case: `span_days` stays 366 while the dates say something else."""
-        self._refuse(start="2026-06-01",
-                     url=("http://127.0.0.1:8080/api/ghrsst?lon0=135&lat0=20"
-                          "&start=2026-06-01&end=2027-01-01&append=sst"))
+        self._refuse(start="2026-06-01", url=rep.g4_url("2026-06-01", "2027-01-01"))
 
     def test_the_url_must_be_the_expected_local_endpoint(self):
-        for bad_host in ("http://vm24:8080/api/ghrsst", "https://127.0.0.1:8080/api/ghrsst",
-                         "http://127.0.0.1:9999/api/ghrsst", "http://127.0.0.1:8080/api/other"):
+        for bad_host in ("http://vm24:8035/api/ghrsst", "https://127.0.0.1:8035/api/ghrsst",
+                         "http://127.0.0.1:9999/api/ghrsst", "http://127.0.0.1:8080/api/ghrsst",
+                         "http://127.0.0.1:8035/api/other"):
             with self.subTest(bad_host):
                 self._refuse(url=bad_host + "?lon0=135&lat0=20&start=2026-01-01"
                                             "&end=2027-01-01&append=sst")
@@ -171,12 +202,11 @@ class TestTheG4RequestDescribesTheRequestActuallyMade(_Tmp):
                           "end": "2027-01-01", "append": "sst"}
                 params.pop(drop)
                 query = "&".join(f"{k}={v}" for k, v in params.items())
-                self._refuse(url=f"http://127.0.0.1:8080/api/ghrsst?{query}")
+                self._refuse(url=f"{rep.G4_ENDPOINT}?{query}")
 
     def test_the_url_dates_must_match_the_recorded_dates(self):
         """A record whose URL asks for a different window than it claims to have measured."""
-        self._refuse(url=("http://127.0.0.1:8080/api/ghrsst?lon0=135&lat0=20"
-                          "&start=2026-06-01&end=2026-06-30&append=sst"))
+        self._refuse(url=rep.g4_url("2026-06-01", "2026-06-30"))
 
     def test_span_days_and_probe_rows_stay_pinned_to_366(self):
         self._refuse(span_days=365)

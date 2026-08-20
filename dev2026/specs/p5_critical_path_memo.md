@@ -311,6 +311,22 @@ ancestor that is not HEAD") and a `.gitignore` for byte-code caches, since impor
 checked-out tree would otherwise dirty it and fail the clean-worktree gate for a reason having
 nothing to do with the deployment.
 
+## Round 10 — the endpoint the deployment actually serves
+
+Staging `9557d4d` onto VM24 found the S8 contract pinned `http://127.0.0.1:8080/api/ghrsst`,
+where nothing listens: `conf/start_app.sh` runs `gunicorn … -b 127.0.0.1:8035`. `g4-probe` could
+not have run at all.
+
+The pin behaved correctly — it refused rather than measuring the wrong target — but the value
+was stale. Corrected to **`http://127.0.0.1:8035/api/ghrsst`**, and the URL is now built in one
+place (`g4_url()`), which the probe imports and `check_g4_request` validates against. The probe
+previously spelled its own URL out beside the pin, which is how the two came to disagree.
+
+It stays pinned **by value**, deliberately: an arbitrary endpoint would need its own deployment
+binding to mean anything, and this run targets the deployed service. A positive regression
+asserts 8035 is accepted, a negative one asserts the stale 8080 is now refused, and a third
+asserts no second endpoint survives anywhere in the contract.
+
 ## 4. Remaining blockers
 
 | blocker | state |

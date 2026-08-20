@@ -30,7 +30,12 @@ from ops.p5_roadmap import S8_PROFILES, S8_PREFLIGHT_FIELDS
 LABEL = "VM24_PRODUCTION_READ_ONLY"
 
 #: The endpoint every G4 request must use, and the parameters it must carry.
-G4_ENDPOINT = "http://127.0.0.1:8080/api/ghrsst"
+#: The canonical VM24 service endpoint. `conf/start_app.sh` runs
+#: `gunicorn ... -b 127.0.0.1:8035`, and staging found the contract pinned 8080, where nothing
+#: listens -- so `g4-probe` could not run at all. Still pinned BY VALUE rather than made
+#: configurable: an arbitrary endpoint would need its own deployment binding to mean anything,
+#: and this run targets the deployed service.
+G4_ENDPOINT = "http://127.0.0.1:8035/api/ghrsst"
 G4_REQUIRED_PARAMS = ("lon0", "lat0", "start", "end", "append")
 #: The canonical probe parameters. Pinned by VALUE, not merely required to exist: a request
 #: with a different coordinate or variable is a different measurement, and `span_days: 366`
@@ -405,6 +410,18 @@ IDENTITY_MODULES = {
     "legacy_baseline": ("ops.quiescence",),
     "p5_shadow": ("store.repair_wal", "store.segmented_cube"),
 }
+
+
+def g4_url(start: str, end: str) -> str:
+    """The canonical G4 request URL — the ONE place it is built.
+
+    The probe calls this and `check_g4_request` validates against the same constants, so the
+    runbook cannot carry a second endpoint that drifts from the validator. That drift is exactly
+    what staging hit: a hardcoded 8080 in the probe beside a pin the deployment had moved past."""
+    params = dict(G4_EXPECTED_PARAMS)
+    params["start"], params["end"] = start, end
+    query = "&".join(f"{k}={params[k]}" for k in G4_REQUIRED_PARAMS)
+    return f"{G4_ENDPOINT}?{query}"
 
 
 def identity_modules(profile: str):

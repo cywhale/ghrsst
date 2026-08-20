@@ -393,7 +393,7 @@ set -euo pipefail
 PYTHONPATH="$CODE_ROOT" "$PYTHON" - <<'PYEOF'
 import datetime as dt, json, os, subprocess, sys
 sys.path.insert(0, os.environ["CODE_ROOT"])
-from ops.p5s8_report import check_g4_response, ArtifactError   # one validator, both paths
+from ops.p5s8_report import check_g4_response, g4_url, ArtifactError   # one source of truth
 
 art, run_id = os.environ["ART"], os.environ["RUN_ID"]
 days = int(os.environ.get("FORCE_SPAN_DAYS", "366"))   # override exists so the guard is testable
@@ -404,8 +404,9 @@ span = (end - start).days + 1
 if span != 366:
     raise SystemExit(f"NO-GO: span is {span} days, not exactly 366")
 
-url = ("http://127.0.0.1:8080/api/ghrsst"
-       f"?lon0=135&lat0=20&start={start}&end={end}&append=sst")
+# Built from the shared constant, never spelled out here: a second URL in the runbook is a
+# second endpoint, and staging found one that the deployment had already moved past.
+url = g4_url(start.isoformat(), end.isoformat())
 out = subprocess.run(["curl", "-s", "-w", "\n%{http_code}", url],
                      capture_output=True, text=True)
 if out.returncode != 0:
@@ -658,7 +659,7 @@ placed, and adjudicates nothing. G4, H7's sustained half and both halves of G16 
 **`NOT_ADJUDICATED`** under it: nothing here redirects those collections away from production,
 and isolating them needs a real second service that a read-only step does not build. The earlier
 draft said "everything downstream runs against `$SHADOW_ROOT`" while G4 still called
-`127.0.0.1:8080`, H7 still read production PM2 and `/proc`, and G16 still walked `$G` — a false
+the local API, H7 still read production PM2 and `/proc`, and G16 still walked `$G` — a false
 claim, and production measurements wearing a shadow label.
 
 ### 6a. Filesystem safety gate
