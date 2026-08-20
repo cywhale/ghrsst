@@ -322,6 +322,63 @@ def _mark_superseded_gate(s6: dict, evidence: dict) -> None:
         f"verdict is unchanged.")
 
 
+def supersede_s6(s6: dict, evidence: dict) -> dict:
+    """Apply every supersession the S6 artifact needs, and RETURN it.
+
+    A pure function on purpose. While this was inline in `main()`, deleting a whole
+    supersession step and regenerating produced a file that still passed every check --
+    because `main()` rewrites the artifact from the copy it just read, so a step that ADDS
+    keys looks like a no-op once its keys are in the committed file. The generator was
+    preserving its own output and being credited with producing it.
+
+    Because it is pure and idempotent, a test can strip the marks off the committed artifact,
+    re-apply this, and demand the committed file back exactly. A dropped step then fails
+    instead of being inherited."""
+    s6 = json.loads(json.dumps(s6))
+    run_id = evidence["provenance"]["run_id"]
+    free_gib = evidence["capacity"]["free_now_gib"]
+
+    # Merging is not enough: the old block carried DERIVED fields -- projected_free_after_gb,
+    # gate_ok, and a provenance string naming 2026-08-19 -- all computed from 267 GiB. A merge
+    # leaves those behind, silently inconsistent with the free space beside them.
+    old_gate = s6.get("capacity_gate", {})
+    additional = float(old_gate.get("additional_gb", 153.3))
+    projected = round(free_gib - additional, 1)
+    s6["capacity_gate"] = {
+        **old_gate, **superseded_capacity_gate(evidence),
+        "projected_free_after_gb": projected,
+        "gate_ok": projected >= evidence["capacity"]["hard_reserve_gib"],
+        "inputs_provenance": {
+            **old_gate.get("inputs_provenance", {}),
+            "free_now_gb": (f"statvfs on {evidence['capacity']['filesystem_device']}, VM24 "
+                            f"{evidence['provenance']['measured_utc'][:10]}, run {run_id}"),
+        },
+    }
+    # The `filesystem` block is the 2026-08-19 snapshot -- size, used, avail, inode counts all
+    # from that day. Splicing a fresh `avail` into it would produce a half-updated record that
+    # is true of no single moment, so it is MARKED historical instead and points at the run
+    # that supersedes it.
+    fs = s6.get("filesystem")
+    if isinstance(fs, dict):
+        fs["as_of"] = "2026-08-19"
+        fs["status"] = "historical"
+        fs["superseded_by"] = (f"run {run_id} -- see bench/results/p5s8_vm24_readonly.json "
+                               f"for current free space")
+
+    _mark_superseded_gate(s6, evidence)
+
+    # The hold audit quotes free space as current state too.
+    hold = s6.get("hold_lifecycle_audit", {}).get("capacity")
+    if isinstance(hold, dict):
+        hold["free_now_gib"] = free_gib
+        hold["free_now_source"] = (f"superseded by run {run_id}; the 2026-08-19 figure is "
+                                   f"historical")
+    s6["capacity_gate_superseded_note"] = (
+        f"capacity_gate was regenerated from the collected S8 run {run_id}; the rest of this "
+        f"file remains the 2026-08-19 read-only measurement.")
+    return s6
+
+
 def main(argv=None) -> int:
     import argparse
     ap = argparse.ArgumentParser()
@@ -337,52 +394,9 @@ def main(argv=None) -> int:
         json.dump(evidence, fh, indent=2, sort_keys=True)
     print(f"wrote {out}")
 
-    # Supersede the capacity block of the S6 artifact IN PLACE, from the evidence above.
-    # Merging is not enough: the old block carried DERIVED fields -- projected_free_after_gb,
-    # gate_ok, and a provenance string naming 2026-08-19 -- all computed from 267 GiB. A merge
-    # leaves those behind, silently inconsistent with the free space beside them.
     s6_path = os.path.join(results, "p5s6_vm24_readonly.json")
     with open(s6_path) as fh:
-        s6 = json.load(fh)
-    old_gate = s6.get("capacity_gate", {})
-    fresh = superseded_capacity_gate(evidence)
-    additional = float(old_gate.get("additional_gb", 153.3))
-    free_gib = evidence["capacity"]["free_now_gib"]
-    projected = round(free_gib - additional, 1)
-    s6["capacity_gate"] = {
-        **old_gate, **fresh,
-        "projected_free_after_gb": projected,
-        "gate_ok": projected >= evidence["capacity"]["hard_reserve_gib"],
-        "inputs_provenance": {
-            **old_gate.get("inputs_provenance", {}),
-            "free_now_gb": (f"statvfs on {evidence['capacity']['filesystem_device']}, VM24 "
-                            f"{evidence['provenance']['measured_utc'][:10]}, run "
-                            f"{evidence['provenance']['run_id']}"),
-        },
-    }
-    # The `filesystem` block is the 2026-08-19 snapshot -- size, used, avail, inode counts all
-    # from that day. Splicing a fresh `avail` into it would produce a half-updated record that
-    # is true of no single moment, so it is MARKED historical instead and points at the run
-    # that supersedes it.
-    fs = s6.get("filesystem")
-    if isinstance(fs, dict):
-        fs["as_of"] = "2026-08-19"
-        fs["status"] = "historical"
-        fs["superseded_by"] = (f"run {evidence['provenance']['run_id']} -- see "
-                               f"bench/results/p5s8_vm24_readonly.json for current free space")
-
-    _mark_superseded_gate(s6, evidence)
-
-    # The hold audit quotes free space as current state too.
-    hold = s6.get("hold_lifecycle_audit", {}).get("capacity")
-    if isinstance(hold, dict):
-        hold["free_now_gib"] = free_gib
-        hold["free_now_source"] = (f"superseded by run {evidence['provenance']['run_id']}; the "
-                                   f"2026-08-19 figure is historical")
-    s6["capacity_gate_superseded_note"] = (
-        "capacity_gate was regenerated from the collected S8 run "
-        f"{evidence['provenance']['run_id']}; the rest of this file remains the 2026-08-19 "
-        "read-only measurement.")
+        s6 = supersede_s6(json.load(fh), evidence)
     with open(s6_path, "w") as fh:
         json.dump(s6, fh, indent=2, sort_keys=True)
     print(f"updated {s6_path}")
