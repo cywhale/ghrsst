@@ -35,12 +35,18 @@ LABEL = "VM24_PRODUCTION_READ_ONLY"
 #: listens -- so `g4-probe` could not run at all. Still pinned BY VALUE rather than made
 #: configurable: an arbitrary endpoint would need its own deployment binding to mean anything,
 #: and this run targets the deployed service.
-G4_ENDPOINT = "http://127.0.0.1:8035/api/ghrsst"
+#: ONE service authority. Two endpoint constants spelled out separately are two authorities,
+#: and staging already found one of them stale -- G4 pinned 8080 while the deployment served
+#: 8035 -- with the other happening to be right. Both endpoints derive from this base, so a
+#: deployment move cannot leave one behind.
+SERVICE_BASE = "http://127.0.0.1:8035"
+
+G4_ENDPOINT = SERVICE_BASE + "/api/ghrsst"
 #: The same service's health endpoint. It is the WINDOW AUTHORITY: how far the point history
 #: reaches is a property of the deployment, not of the clock on whatever host runs the runbook.
 #: The aborted 2026-08-20 run derived `end = date.today()` while `point_latest` was 2026-08-18,
 #: asked for two days that do not exist, and was refused for a window nothing should have built.
-HEALTHZ_URL = "http://127.0.0.1:8035/healthz"
+HEALTHZ_URL = SERVICE_BASE + "/healthz"
 
 #: The G4 window length, in days, inclusive of both ends.
 G4_SPAN_DAYS = 366
@@ -430,16 +436,43 @@ def check_healthz(payload) -> dict:
     so a body carrying those but not `point_latest` fails closed rather than falling back."""
     import datetime as _dt
 
-    if not isinstance(payload, dict):
+    if type(payload) is not dict:
         raise ArtifactError(
             f"/healthz body is {type(payload).__name__}, not an object")
+
+    # The service must report itself healthy. Answering at all is not the same thing: a body
+    # could carry a perfectly good point_latest while `status` said "degraded".
+    if "status" not in payload:
+        raise ArtifactError("/healthz carries no status field")
+    status = payload["status"]
+    if type(status) is not str:
+        raise ArtifactError(
+            f"/healthz status must be a str, got {type(status).__name__}. The type is checked "
+            f"BEFORE any conversion -- str() would launder a malformed value into a valid one.")
+    if status != "ok":
+        raise ArtifactError(f"/healthz status is {status!r}, not 'ok'")
+
+    return check_window_fields(payload)
+
+
+def check_window_fields(payload) -> dict:
+    """The window fields alone, without the `status` gate.
+
+    Split out so `check_g4_request` can re-validate the values a request RECORDED without
+    inventing a `status` the record never carried -- a synthesised field is exactly the kind of
+    laundering this module refuses everywhere else."""
+    import datetime as _dt
+
     if "point_latest" not in payload:
         raise ArtifactError(
             "/healthz carries no point_latest; `latest` and `daily_latest` are different "
             "questions and must not stand in for it")
     value = payload["point_latest"]
-    if not isinstance(value, str) or not value.strip():
-        raise ArtifactError(f"/healthz point_latest is not a string: {value!r}")
+    if type(value) is not str:              # exact type: a str SUBCLASS is not a str here
+        raise ArtifactError(
+            f"/healthz point_latest must be a str, got {type(value).__name__}")
+    if not value.strip():
+        raise ArtifactError("/healthz point_latest is empty")
     try:
         parsed = _dt.date.fromisoformat(value)
     except ValueError:
@@ -451,9 +484,11 @@ def check_healthz(payload) -> dict:
     if "point_day_count" not in payload:
         raise ArtifactError("/healthz carries no point_day_count")
     count = payload["point_day_count"]
-    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+    if type(count) is not int:              # excludes bool and every other int subclass
         raise ArtifactError(
-            f"/healthz point_day_count must be a positive integer; got {count!r}")
+            f"/healthz point_day_count must be an int, got {type(count).__name__}")
+    if count < 1:
+        raise ArtifactError(f"/healthz point_day_count must be positive; got {count!r}")
     if count < G4_SPAN_DAYS:
         raise ArtifactError(
             f"/healthz reports {count} point days, fewer than the {G4_SPAN_DAYS} the window "
@@ -752,8 +787,8 @@ def check_g4_request(data, *, run_id=None) -> dict:
     if data["healthz_url"] != HEALTHZ_URL:
         raise ArtifactError(
             f"g4_request.json healthz_url is {data['healthz_url']!r}, expected {HEALTHZ_URL!r}")
-    check_healthz({"point_latest": data["point_latest"],
-                   "point_day_count": data["point_day_count"]})
+    check_window_fields({"point_latest": data["point_latest"],
+                         "point_day_count": data["point_day_count"]})
     if data["end"] != data["point_latest"]:
         raise ArtifactError(
             f"g4_request.json ends at {data['end']!r} but the service's point_latest was "

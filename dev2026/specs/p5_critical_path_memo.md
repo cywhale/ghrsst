@@ -358,6 +358,27 @@ The aborted run's artifacts are **retained as evidence** at
 reading — **264.4 GiB free against a 403.3 GiB minimum** — is the current G18 evidence and
 supersedes the 2026-08-19 figure.
 
+## Round 12 — one service authority, and a health check that checks health
+
+| finding | correction |
+|---|---|
+| `check_healthz()` read `point_latest` without ever looking at `status` — a body could carry a perfectly good window while the service reported itself `degraded` | `status` is required, must be raw `str`, and must equal exactly `"ok"`. Missing, wrongly-typed and non-`ok` are three distinct defects, each refused on its own and each asserted independently |
+| `G4_ENDPOINT` and `HEALTHZ_URL` were spelled out separately — two authorities, and staging had already found one of them stale (8080 against a deployment serving 8035) while the other happened to be right | both derive from a single `SERVICE_BASE`. A regression rebinds the base and asserts **both** endpoints move; another asserts the host:port literal appears exactly once in the module |
+| healthz used `isinstance`, against the repository rule that types are checked **before** any conversion (`block_manifest._exact`) | exact `type(x) is dict / str / int`, with subclass controls for each and a `bool` control for the count — `True` is an `int` subclass and would otherwise satisfy every numeric check |
+
+`check_healthz()` was split so `check_g4_request` re-validates a recorded window through
+`check_window_fields()` rather than **synthesising a `status`** the record never carried — a
+fabricated field is the same laundering this module refuses everywhere else.
+
+Eight mutations, serial from a git-clean tree: **all killed, no survivors.** One needed a
+sharper control first — the body-type check was unbound, because `[]`, `"ok"`, `None` and `7`
+are rejected by `isinstance` too; only a genuine `dict` subclass separates the exact-type rule
+from the loose one.
+
+Unchanged and still asserted: `point_latest` (not `latest`/`daily_latest`) determines the
+366-day window; the sampler re-reads live `/healthz` before any timed sample; an edited request
+artifact cannot bypass that check; and the 2026-08-20 / 364-row request remains a refusal.
+
 ## 4. Remaining blockers
 
 | blocker | state |

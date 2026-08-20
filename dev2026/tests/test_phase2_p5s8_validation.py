@@ -371,6 +371,147 @@ class TestTheRequestIsBoundToTheHealthzWindow(_Tmp):
         self._refuse(point_latest="2026-08-20")
 
 
+# ------------------------------------------------------------ 2c. status and raw types
+class _StrSub(str):
+    """A `str` subclass. Passes `isinstance`, fails `type(x) is str`."""
+
+
+class _IntSub(int):
+    """An `int` subclass, as `bool` is."""
+
+
+class TestHealthzStatusIsRequired(_Tmp):
+    """`/healthz` answering at all is not the same as the service reporting itself healthy.
+    A body could carry a perfectly good `point_latest` while `status` said `degraded`."""
+
+    def _hz(self, **over):
+        rec = {"status": "ok", "point_latest": "2026-08-18", "point_day_count": 1326}
+        rec.update(over)
+        return rec
+
+    def _refuse(self, **over):
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_healthz(self._hz(**over))
+
+    def test_the_valid_control_passes(self):
+        out = rep.check_healthz(self._hz())
+        self.assertEqual(out["point_latest"], "2026-08-18")
+
+    def test_a_MISSING_status_is_refused(self):
+        hz = self._hz()
+        hz.pop("status")
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_healthz(hz)
+
+    def test_a_NON_STRING_status_is_refused(self):
+        for bad in (True, 1, None, ["ok"], {"v": "ok"}, _StrSub("ok")):
+            with self.subTest(repr(bad)):
+                self._refuse(status=bad)
+
+    def test_a_status_that_is_not_exactly_ok_is_refused(self):
+        for bad in ("OK", "ok ", " ok", "okay", "degraded", "error", ""):
+            with self.subTest(repr(bad)):
+                self._refuse(status=bad)
+
+    def test_each_status_failure_is_caught_on_its_own(self):
+        """Independence: a missing status, a wrongly-typed one and a non-ok one are three
+        different defects, and each must be refused without relying on the others."""
+        cases = {"missing": None, "wrong type": 1, "not ok": "degraded"}
+        for label, value in cases.items():
+            with self.subTest(label):
+                hz = self._hz()
+                if value is None:
+                    hz.pop("status")
+                else:
+                    hz["status"] = value
+                with self.assertRaises(rep.ArtifactError) as cm:
+                    rep.check_healthz(hz)
+                self.assertIn("status", str(cm.exception).lower())
+
+
+class _DictSub(dict):
+    """A `dict` subclass. Passes `isinstance`, fails `type(x) is dict`."""
+
+
+class TestHealthzUsesExactRawTypes(_Tmp):
+    """The repository's rule (`block_manifest._exact`): the type is checked BEFORE any
+    conversion, because `int()`/`str()` launder a malformed value into a well-formed one."""
+
+    def _hz(self, **over):
+        rec = {"status": "ok", "point_latest": "2026-08-18", "point_day_count": 1326}
+        rec.update(over)
+        return rec
+
+    def _refuse(self, **over):
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_healthz(self._hz(**over))
+
+    def test_the_valid_control_passes(self):
+        rep.check_healthz(self._hz())
+
+    def test_a_dict_SUBCLASS_body_is_refused(self):
+        """Mutation testing found the body check unbound: `[]`, `"ok"`, `None` and `7` are all
+        rejected by `isinstance` too, so only a genuine subclass distinguishes the exact-type
+        rule from the loose one."""
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_healthz(_DictSub(self._hz()))
+
+    def test_a_str_SUBCLASS_point_latest_is_refused(self):
+        self._refuse(point_latest=_StrSub("2026-08-18"))
+
+    def test_an_int_SUBCLASS_point_day_count_is_refused(self):
+        self._refuse(point_day_count=_IntSub(1326))
+
+    def test_a_bool_point_day_count_is_refused(self):
+        """`True` is an `int` subclass and would otherwise pass every numeric check."""
+        self._refuse(point_day_count=True)
+
+    def test_a_float_point_day_count_is_refused(self):
+        self._refuse(point_day_count=1326.0)
+
+
+class TestOneServiceAuthority(_Tmp):
+    """Two endpoint constants spelled out separately is two authorities. Staging already found
+    one of them stale (8080 while the deployment served 8035); the other happened to be right."""
+
+    def test_both_endpoints_derive_from_one_base(self):
+        from urllib.parse import urlparse
+        base = urlparse(rep.SERVICE_BASE)
+        for url in (rep.G4_ENDPOINT, rep.HEALTHZ_URL):
+            with self.subTest(url):
+                parsed = urlparse(url)
+                self.assertEqual((parsed.scheme, parsed.netloc), (base.scheme, base.netloc))
+                self.assertTrue(url.startswith(rep.SERVICE_BASE))
+
+    def test_the_values_are_still_pinned(self):
+        self.assertEqual(rep.SERVICE_BASE, "http://127.0.0.1:8035")
+        self.assertEqual(rep.G4_ENDPOINT, "http://127.0.0.1:8035/api/ghrsst")
+        self.assertEqual(rep.HEALTHZ_URL, "http://127.0.0.1:8035/healthz")
+
+    def test_changing_the_base_cannot_leave_one_endpoint_stale(self):
+        """The regression the derivation exists for: rebind the base and both must move. A
+        hardcoded endpoint would stay behind, which is exactly how 8080 survived."""
+        import importlib
+        with open(os.path.join(_DEV, "ops", "p5s8_report.py")) as fh:
+            src = fh.read()
+        moved = src.replace('SERVICE_BASE = "http://127.0.0.1:8035"',
+                            'SERVICE_BASE = "http://127.0.0.1:9999"', 1)
+        self.assertNotEqual(moved, src, "SERVICE_BASE is not defined as a single literal")
+        # `__file__` must be present: the module resolves its own package root from it.
+        ns = {"__file__": os.path.join(_DEV, "ops", "p5s8_report.py"),
+              "__name__": "p5s8_report_moved"}
+        exec(compile(moved, "p5s8_report_moved", "exec"), ns)
+        self.assertEqual(ns["G4_ENDPOINT"], "http://127.0.0.1:9999/api/ghrsst")
+        self.assertEqual(ns["HEALTHZ_URL"], "http://127.0.0.1:9999/healthz")
+
+    def test_no_endpoint_literal_is_spelled_out_twice(self):
+        with open(os.path.join(_DEV, "ops", "p5s8_report.py")) as fh:
+            body = fh.read()
+        # The host:port may appear once, in SERVICE_BASE. Anywhere else is a second authority.
+        self.assertEqual(body.count('"http://127.0.0.1:8035'), 1,
+                         "the service host:port is spelled out more than once")
+
+
 # ------------------------------------------------------------------ 3. pm2 roster
 class TestThePm2RosterIsValidatedAndBound(_Tmp):
 
