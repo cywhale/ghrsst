@@ -2034,6 +2034,31 @@ condition. Steps S0–S7 are **local-only**; S8–S10 are the VM24 boundary (§1
 - **Gate:** G1–G12 all green simultaneously. **Stop if:** any gate fails — S8 is not authored until this is
   green.
 
+#### Roadmap exception **P5-EX-1** — S8 authoring only, S7 gate still NOT MET
+
+P5-S7's "Stop if" says S8 is not authored until G1–G12 are green simultaneously. They are not:
+G1/G2/G5/G6/G8–G12 pass locally, **G3 and G4 are `NOT_ADJUDICATED`**, **G7 is `PARTIAL`**, and
+**G18 is `BLOCKED`** (267 GiB free against a 403.3 GiB minimum). Every one of those is
+production-dependent — and the S8 runbook is the instrument that collects the evidence to settle
+them, so waiting for them before authoring it is circular.
+
+This exception is therefore **narrow**:
+
+- **The S7 gate remains `NOT MET`.** Not a pass, not a partial pass, not a waiver. Nothing in
+  P5-S7's results may be recorded as a gate pass.
+- **S8 runbook authoring is allowed**, on the ground above and no other.
+- **S9 may later execute read-only / shadow evidence collection only**, after a **separate human
+  approval** this exception does not confer.
+- It authorizes **no** prune, swap, compaction, repair, deletion, production write, or
+  deployment.
+- **S10 still requires its own fresh written approval**; an S9 PASS does not confer it.
+- It **expires** when G3/G4/H7/G16 are adjudicated from production evidence and G18 is
+  unblocked, at which point S7 is re-adjudicated on its merits.
+
+Machine-readable in `ops/p5_roadmap.py` (`ROADMAP_EXCEPTION`, `authorizes()`), which fails
+closed, and enforced by `tests/test_phase2_p5_roadmap.py`. The critical path and the
+capacity-unlock decision are in [`p5_critical_path_memo.md`](p5_critical_path_memo.md).
+
 ### P5-S8 — VM24 read-only / shadow runbook (authoring only)  **[RO]**
 - **Out:** `p5s8_vm24_shadow_runbook.md` — read-only production measurement plus a shadow-copy rehearsal;
   concrete commands, abort conditions, artifact list, operator summary template. **Authoring only; nothing

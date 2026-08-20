@@ -1,0 +1,246 @@
+{
+  "capacity": {
+    "additional_gib": 153.3,
+    "currently_reclaimable_gib": 0.0,
+    "device": "/dev/sdc1",
+    "free_now_gib": 267.0,
+    "fstype": "ext4",
+    "hard_reserve_gib": 250,
+    "label": "VM24_PRODUCTION_READ_ONLY",
+    "measured_utc": "2026-08-19T07:40:00Z",
+    "minimum_free_gib": 403.3,
+    "mount": "/home/odbadmin/Data",
+    "recommended_basis": "the 403.3 GiB minimum plus ~200 GiB growth margin; at the measured 2.74 GiB/day combined ingest that is roughly 70 days of headroom.",
+    "recommended_free_gib": 600.0,
+    "shortfall_gib": 136.3,
+    "verdict": "BLOCKED"
+  },
+  "capacity_options": [
+    {
+      "name": "Expand the data volume",
+      "option": "A",
+      "preferred": true,
+      "proof_obligations": [
+        "df on the expanded volume shows free_now >= 403.3 GiB (600 GiB recommended)",
+        "the expansion is on the SAME filesystem that holds $G, so publication stays a same-filesystem os.replace"
+      ],
+      "recommended_gib": 600.0,
+      "requirement_gib": 403.3,
+      "why_preferred": "nothing about the storage topology changes, so every path semantic the manifest authority relies on is already proven."
+    },
+    {
+      "name": "External staging / compaction volume",
+      "option": "B",
+      "preferred": false,
+      "proof_obligations": [
+        "required free space on the staging volume, measured not assumed",
+        "mount persistence across reboot (fstab/systemd unit) and the correct filesystem type; flock is unreliable on NFS (S16-Q15)",
+        "atomic publication semantics: os.replace is atomic only WITHIN a filesystem, so a cross-device rename is not a commit point and must not be treated as one",
+        "rollback and backup coverage for the staging volume, including whether a whole-VM snapshot covers it -- the WAL anchor domain question in another form",
+        "no unsafe cross-filesystem rename assumptions anywhere in the build or publish path",
+        "the FINAL block location remains under the manifest root, so segment paths still resolve inside it and the containment guard still holds"
+      ],
+      "why_not_preferred": "it introduces a second filesystem into a design whose commit point is a same-filesystem rename. Every obligation above is a way that assumption can silently fail."
+    }
+  ],
+  "capacity_scope": {
+    "deletion_additionally_requires": [
+      "a recovery/parity policy decision by ops",
+      "recovery evidence of one of the three accepted kinds (verified value parity, a recorded external manifest, or an immutable generation with fingerprint provenance)",
+      "day-set membership is NOT sufficient: a new block covering the same days proves coverage, never value parity"
+    ],
+    "does_not_authorize": "deletion of the 1267 daily holds, or of any delta backup. The hold audit found 0.0 GiB currently reclaimable, and expanding the real day sets made two entries MORE blocked, not less.",
+    "enables": "compaction: the block build and publication can be attempted"
+  },
+  "compaction_posture": [
+    "ingest lock",
+    "pm2 stop/quiesce",
+    "build",
+    "publish",
+    "verify",
+    "prune/swap only after verification",
+    "pm2 start",
+    "api verification"
+  ],
+  "critical_path": [
+    {
+      "actor": "Claude + Codex",
+      "gate": null,
+      "name": "P5-S7 local implementation sign-off",
+      "note": "signed off at f85a96d; NOT an S7 gate pass",
+      "status": "COMPLETE",
+      "step": 1
+    },
+    {
+      "actor": "Claude (local only)",
+      "gate": null,
+      "name": "Roadmap exception + S8 runbook authoring",
+      "note": "this phase; authoring contacts no host",
+      "status": "IN_PROGRESS",
+      "step": 2
+    },
+    {
+      "actor": "IT / ops",
+      "gate": "G18",
+      "name": "IT capacity expansion, or an approved staging-volume design",
+      "note": "option A or option B; HARD_RESERVE is not lowered either way",
+      "status": "BLOCKED_ON_OPS",
+      "step": 3
+    },
+    {
+      "actor": "human",
+      "gate": null,
+      "name": "Fresh VM24 read-only / shadow approval",
+      "note": "not implied by the roadmap exception",
+      "status": "NOT_REQUESTED",
+      "step": 4
+    },
+    {
+      "actor": "Codex / ops",
+      "gate": null,
+      "name": "Execute S9 read-only evidence collection",
+      "note": "read-only throughout; shadow copies only",
+      "status": "NOT_STARTED",
+      "step": 5
+    },
+    {
+      "actor": "Codex",
+      "gate": "G3,G4,H7,G16,G18",
+      "name": "Re-adjudicate G3/G4/H7/G16/G18",
+      "note": "on production evidence; this is where the exception expires",
+      "status": "NOT_STARTED",
+      "step": 6
+    },
+    {
+      "actor": "human",
+      "gate": null,
+      "name": "Fresh S10 approval, if gates and capacity pass",
+      "note": "an S9 PASS does not confer it",
+      "status": "NOT_STARTED",
+      "step": 7
+    },
+    {
+      "actor": "Codex / ops",
+      "gate": null,
+      "name": "First compaction in the EXISTING quiesced posture",
+      "note": "ingest lock -> PM2 stop/quiesce -> build -> publish -> verify -> prune/swap ONLY after verification -> PM2 start -> API verification",
+      "status": "NOT_STARTED",
+      "step": 8
+    },
+    {
+      "actor": "ops",
+      "gate": null,
+      "name": "Classify old daily/hold data under the retention/recovery policy",
+      "note": "only after the new block is published AND verified. Never delete solely because the new block has the same day membership.",
+      "status": "NOT_STARTED",
+      "step": 9
+    },
+    {
+      "actor": "ops",
+      "gate": null,
+      "name": "Record actual freed bytes with a fresh df",
+      "note": "theoretical reclaim is not capacity evidence",
+      "status": "NOT_STARTED",
+      "step": 10
+    }
+  ],
+  "hard_reserve_is_fixed": true,
+  "label": "LOCAL_ONLY_PLANNING_DOCUMENT",
+  "next_approval_required": {
+    "blocking_step": 3,
+    "not_implied_by": "the P5-EX-1 roadmap exception",
+    "what": "IT capacity expansion (option A) or an approved staging-volume design (option B), then a fresh VM24 read-only / shadow approval"
+  },
+  "production_dependent_gates": {
+    "G16": "metadata-scan wall time and snapshot-open cost on the production tree",
+    "G18": "free disk on /dev/sdc1; BLOCKED at 267 GiB against a 403.3 GiB minimum",
+    "G3": "point p95 vs the CURRENT production TieredCube baseline on VM24",
+    "G4": "366-day p95 at production geometry (17999 x 36000)",
+    "H7": "fd/RSS under sustained load on the production process, plus inode headroom"
+  },
+  "roadmap_exception": {
+    "applies_to": "P5-S8 authoring only",
+    "authorizes": [
+      "s8_runbook_authoring",
+      "local_tests",
+      "local_documents"
+    ],
+    "does_not_authorize": [
+      "prune",
+      "swap",
+      "compaction",
+      "repair",
+      "hold_delete",
+      "deletion",
+      "production_write",
+      "deployment",
+      "cron_change",
+      "pm2_change",
+      "systemd_change",
+      "nginx_change",
+      "config_change",
+      "s9_execution",
+      "s10_rollout"
+    ],
+    "does_not_mark_s7_pass": true,
+    "expires_when": "G3/G4/H7/G16 are adjudicated from production evidence and G18 is unblocked; at that point S7 is re-adjudicated on its merits.",
+    "id": "P5-EX-1",
+    "rationale": "S14 P5-S7 says S8 is not authored until the S7 gate is green. G3, G4, H7 and G16 are production-dependent and G18 is blocked on disk, so no local synthetic test can turn them green. Waiting for them before authoring the read-only runbook that COLLECTS them is circular: the runbook is the instrument, not the conclusion.",
+    "s10_rollout": "requires its own fresh written approval; an S9 PASS does not confer it",
+    "s7_gate_state": "NOT_MET",
+    "s8_execution": "requires a separate human approval; authoring alone confers nothing",
+    "s9_execution": "read-only / shadow evidence collection only, and only after a separate human approval that is not implied by this exception"
+  },
+  "s7_gate": {
+    "green": [
+      "G1",
+      "G2",
+      "G5",
+      "G6",
+      "G8",
+      "G9",
+      "G10",
+      "G11",
+      "G12"
+    ],
+    "local_implementation": "SIGNED_OFF",
+    "not_green": {
+      "G3": "NOT_ADJUDICATED",
+      "G4": "NOT_ADJUDICATED",
+      "G7": "PARTIAL"
+    },
+    "note": "local implementation and wiring are signed off at f85a96d; that is not a gate pass and does not authorize S8 execution, only S8 authoring under the exception below.",
+    "verdict": "NOT_MET"
+  },
+  "s8_preflight_fields": [
+    "run_id",
+    "host",
+    "measured_utc",
+    "deploy_sha",
+    "code_root",
+    "python",
+    "pythonpath",
+    "anchor_root",
+    "anchor_domain_id",
+    "wal_root",
+    "wal_repairs_pending",
+    "manifest_root",
+    "manifest_generation",
+    "filesystem_device",
+    "filesystem_fstype",
+    "free_now_bytes",
+    "inodes_free",
+    "label"
+  ],
+  "s8_required_sections": {
+    "G16_metadata": "metadata-scan and snapshot-open evidence",
+    "G18_capacity": "capacity preflight",
+    "G3_G4_latency": "production latency measurement method for G3 and G4",
+    "H7_inodes": "inode headroom plus sustained fd/RSS/thread evidence",
+    "abort_conditions": "explicit abort conditions",
+    "artifacts": "artifact paths and provenance",
+    "identity_preflight": "WAL / anchor / deployment identity preflight",
+    "no_write": "no-write guarantees"
+  },
+  "scope": "planning and authoring only. No VM24 contact, no production action, no cleanup, and no capacity claim derived from local synthetic measurement."
+}
