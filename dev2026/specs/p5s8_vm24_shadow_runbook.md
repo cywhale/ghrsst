@@ -140,6 +140,7 @@ reject.
 # Run on: VM24
 set -euo pipefail
 : "${CODE_ROOT:?set CODE_ROOT}"
+: "${ART:?run the art-root block first}"; : "${RUN_ID:?run the art-root block first}"
 : "${PYTHON:?set PYTHON}"
 : "${DEPLOY_SHA:?set DEPLOY_SHA to the exact commit under measurement}"
 test -d "$CODE_ROOT" || { echo "NO-GO: CODE_ROOT missing: $CODE_ROOT"; exit 1; }
@@ -155,6 +156,25 @@ assert bm.__file__.startswith('$CODE_ROOT'), bm.__file__
 CANON="$(cd "$CODE_ROOT/.." && git rev-parse --verify "${DEPLOY_SHA}^{commit}" 2>/dev/null)" \
   || { echo "NO-GO: DEPLOY_SHA does not resolve to a commit"; exit 1; }
 [ "$CANON" = "$DEPLOY_SHA" ] || { echo "NO-GO: DEPLOY_SHA is not an exact commit id"; exit 1; }
+
+# Record WHAT WAS VERIFIED. A SHA in the preflight proves the preflight holds a SHA; only this
+# record says which commit was resolved, from which tree, and which module files were imported.
+PYTHONPATH="$CODE_ROOT" "$PYTHON" - "$CANON" <<'PYEOF'
+import hashlib, json, os, sys
+sys.path.insert(0, os.environ["CODE_ROOT"])
+import store.block_manifest as bm
+art, code_root = os.environ["ART"], os.environ["CODE_ROOT"]
+modules = {}
+for name, module in (("store.block_manifest", bm),):
+    path = os.path.realpath(module.__file__)
+    with open(path, "rb") as fh:
+        modules[name] = {"path": path, "sha256": hashlib.sha256(fh.read()).hexdigest()}
+rec = {"run_id": os.environ["RUN_ID"], "deploy_sha": sys.argv[1],
+       "code_root": code_root, "python": os.environ["PYTHON"], "modules": modules}
+with open(os.path.join(art, "identity.json"), "w") as fh:
+    json.dump(rec, fh, indent=2, sort_keys=True)
+print(f"identity recorded: {len(modules)} module fingerprint(s)")
+PYEOF
 echo "identity preflight OK: $CANON"
 ```
 
@@ -240,6 +260,7 @@ with open(os.path.join(art, "findmnt.txt")) as fh:
 if len(parts) < 2:
     raise SystemExit(f"NO-GO: findmnt output is not SOURCE FSTYPE TARGET: {parts!r}")
 rec = {"run_id": os.environ["RUN_ID"],
+       "data_root": os.path.realpath(g),          # what the G16 scan must have walked
        "filesystem_device": parts[0], "filesystem_fstype": parts[1],
        "free_now_bytes": int(st.f_bavail) * int(st.f_frsize),
        "inodes_free": int(st.f_favail)}
@@ -311,7 +332,8 @@ derived = {
     "label": "VM24_PRODUCTION_READ_ONLY",
 }
 derived.update({k: capacity[k] for k in
-                ("filesystem_device", "filesystem_fstype", "free_now_bytes", "inodes_free")
+                ("data_root", "filesystem_device", "filesystem_fstype",
+                 "free_now_bytes", "inodes_free")
                 if k in capacity})
 if profile == "p5_shadow":
     if "wal_repairs_pending" not in wal:
@@ -353,9 +375,11 @@ sample is kept, and any failure discards the whole run.
 # Run on: VM24
 set -euo pipefail
 : "${PYTHON:?set PYTHON}"; : "${ART:?run the art-root block first}"
-: "${RUN_ID:?run the art-root block first}"
-"$PYTHON" - <<'PYEOF'
+: "${RUN_ID:?run the art-root block first}"; : "${CODE_ROOT:?set CODE_ROOT}"
+PYTHONPATH="$CODE_ROOT" "$PYTHON" - <<'PYEOF'
 import datetime as dt, json, os, subprocess, sys
+sys.path.insert(0, os.environ["CODE_ROOT"])
+from ops.p5s8_report import check_g4_response, ArtifactError   # one validator, both paths
 
 art, run_id = os.environ["ART"], os.environ["RUN_ID"]
 days = int(os.environ.get("FORCE_SPAN_DAYS", "366"))   # override exists so the guard is testable
@@ -380,12 +404,12 @@ try:
     rows = json.loads(body)
 except Exception as e:
     raise SystemExit(f"NO-GO: probe body is not JSON ({e}); discard the entire run")
-if not isinstance(rows, list) or not rows:
-    raise SystemExit("NO-GO: probe body is not a non-empty list of rows")
-if not (isinstance(rows[0], dict) and "date" in rows[0] and "sst" in rows[0]):
-    raise SystemExit(f"NO-GO: unexpected row shape: {rows[0]!r}")
-if len(rows) != 366:
-    raise SystemExit(f"NO-GO: expected row count 366, got {len(rows)}")
+# Row by row: a list of 366 integers, or one repeating a day, has the right length and is
+# not an answer. The day set is what makes it a 366-day response.
+try:
+    check_g4_response(rows, start=start.isoformat(), end=end.isoformat())
+except ArtifactError as e:
+    raise SystemExit(f"NO-GO: {e}; discard the entire run")
 
 # The validated request, bound to this run. The sampler reads it rather than inheriting a
 # variable -- separate blocks are separate shells -- and the assembler cross-checks the sample
@@ -411,7 +435,7 @@ set -euo pipefail
 PYTHONPATH="$CODE_ROOT" "$PYTHON" - <<'PYEOF'
 import json, math, os, subprocess, sys, time
 sys.path.insert(0, os.environ["CODE_ROOT"])
-from ops.p5s8_report import check_g4_request, ArtifactError   # one validator, both sides
+from ops.p5s8_report import check_g4_request, check_g4_response, ArtifactError
 
 art, run_id = os.environ["ART"], os.environ["RUN_ID"]
 sleep_s = float(os.environ.get("G4_SLEEP", "0.3"))
@@ -448,9 +472,10 @@ for _ in range(want):
         rows = json.loads(body)
     except Exception as e:
         raise SystemExit(f"NO-GO: sample body is not JSON ({e}); discard the run")
-    if not isinstance(rows, list) or len(rows) != 366:
-        raise SystemExit(f"NO-GO: sample returned {len(rows) if isinstance(rows, list) else '?'}"
-                         f" rows, not 366; discard the run")
+    try:
+        check_g4_response(rows, start=req["start"], end=req["end"])
+    except ArtifactError as e:
+        raise SystemExit(f"NO-GO: sample response invalid ({e}); discard the run")
     if not math.isfinite(elapsed) or elapsed < 0:
         raise SystemExit(f"NO-GO: non-finite sample time {elapsed!r}")
     seconds.append(elapsed)

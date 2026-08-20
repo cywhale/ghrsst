@@ -192,7 +192,10 @@ class TestArtifactLifecycleIsExecutable(_Sandbox):
 class TestG4ProbeFailsClosed(_Sandbox):
 
     def _curl(self, code="200", body='[{"date":"x","sst":1.0}]', rows=366):
-        payload = json.dumps([{"date": f"d{i}", "sst": 1.0} for i in range(rows)]) \
+        import datetime as _dt
+        _end = _dt.date.today()
+        payload = json.dumps([{"date": (_end - _dt.timedelta(days=rows - 1 - i)).isoformat(),
+                               "sst": 1.0} for i in range(rows)]) \
             if rows is not None else body
         # Emulates `curl -s -w '\n%{http_code}'`: body, then the status on the last line.
         # The timing loop asks for `%{http_code} %{time_total}` and gets just those two.

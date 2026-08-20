@@ -272,9 +272,12 @@ class TestG4FailsClosed(unittest.TestCase):
         code = _code_only(self.doc)
         # The check moved from bash into the probe/sampler python, where it can also validate
         # the JSON shape and run on EVERY sample rather than only the first.
-        self.assertTrue(re.search(r"len\(rows\)\s*!=\s*366", code),
-                        "no executable check that the response really holds 366 rows")
-        self.assertIn("expected row count 366", code)
+        # The row check moved into `check_g4_response`, shared by the probe and the sampler,
+        # where it also verifies the day SET rather than only the length.
+        self.assertIn("check_g4_response", code)
+        # The message now lives with the rule, in the shared validator.
+        with open(os.path.join(_DEV, "ops", "p5s8_report.py")) as fh:
+            self.assertIn("expected {len(wanted)}", fh.read())
 
     def test_positive_control_prose_alone_does_not_satisfy_the_row_count_guard(self):
         prose_only = "```bash\ncurl -s \"$URL\"\n```\n\n| the row count does not match | aborts |"

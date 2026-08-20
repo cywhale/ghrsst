@@ -254,8 +254,11 @@ class TestEverySampledResponseIsValidated(_E2E):
         state = os.path.join(self.tmp, "curl_calls")
         with open(state, "w") as fh:
             fh.write("0")
-        good = json.dumps([{"date": f"d{i}", "sst": 1.0} for i in range(366)])
-        short = json.dumps([{"date": "d0", "sst": 1.0}])
+        import datetime as _dt
+        _end = _dt.date.today()
+        good = json.dumps([{"date": (_end - _dt.timedelta(days=365 - i)).isoformat(),
+                            "sst": 1.0} for i in range(366)])
+        short = json.dumps([{"date": _end.isoformat(), "sst": 1.0}])
         _stub(self.bin, "curl", f'''
 n=$(cat {state}); echo $((n+1)) > {state}
 if [ "$n" -lt {good_calls} ]; then BODY='{good}'; else BODY='{short}'; fi

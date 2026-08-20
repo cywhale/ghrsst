@@ -146,7 +146,13 @@ class _E2E(unittest.TestCase):
         jl = json.dumps([{"name": "ghrsst", "pid": p, "pm2_env": {"status": "online"}}
                          for p in pids])
         _stub(self.bin, "pm2", f"cat <<'JSON'\n{jl}\nJSON")
-        body = json.dumps([{"date": f"d{i}", "sst": 1.0} for i in range(366)])
+        # Real dates spanning the window the probe asks for. Placeholder "d0" strings were
+        # fine while only the row COUNT was checked; row-level validation makes a stub that
+        # cannot pass a real check a stub that tests nothing.
+        import datetime as _dt
+        _end = _dt.date.today()
+        body = json.dumps([{"date": (_end - _dt.timedelta(days=365 - i)).isoformat(),
+                            "sst": 1.0} for i in range(366)])
         # Real `curl -w` writes the BODY and then the -w trailer. The old stub short-circuited
         # the timing call with only a status, which no longer models curl now that every sample
         # is validated -- and a stub that does not model the tool tests the stub.

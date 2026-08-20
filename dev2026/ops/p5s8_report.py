@@ -45,7 +45,7 @@ class ArtifactError(Exception):
 
 #: Artifacts every profile must produce. `wal_state.json` is included for BOTH profiles: under
 #: `legacy_baseline` it carries the not-applicable record, which is itself evidence.
-_COMMON = ("run.json", "preflight.json", "wal_state.json", "capacity.json", "df_h.txt",
+_COMMON = ("run.json", "identity.json", "preflight.json", "wal_state.json", "capacity.json", "df_h.txt",
            "df_i.txt", "findmnt.txt", "g4_request.json", "g4_366d_seconds.txt",
            "pm2_jlist.json", "h7_fd_rss_timeseries.txt", "g16_metadata_scan.txt")
 
@@ -53,7 +53,7 @@ _COMMON = ("run.json", "preflight.json", "wal_state.json", "capacity.json", "df_
 #: provisioning record and the identity preflight, and none of the measurement series.
 _BY_PROFILE: Dict[str, tuple] = {
     "legacy_baseline": _COMMON,
-    "p5_shadow": ("run.json", "preflight.json", "wal_state.json", "capacity.json", "df_h.txt",
+    "p5_shadow": ("run.json", "identity.json", "preflight.json", "wal_state.json", "capacity.json", "df_h.txt",
                   "df_i.txt", "findmnt.txt", "shadow_verification.json"),
 }
 
@@ -90,6 +90,9 @@ EXAMPLE_STUBS = {
     "capacity.json": {"run_id": "TEST", "filesystem_device": "/dev/stub",
                       "filesystem_fstype": "ext4", "free_now_bytes": 1, "inodes_free": 1},
     "run.json": {"run_id": "TEST", "created_utc": "2027-01-01T00:00:00Z"},
+    #: Filled at import time from a real file, so the stub passes `check_identity` -- its
+    #: module fingerprint must match something that actually exists on disk.
+    "identity.json": None,
     #: A stub that PASSES `check_g4_request`, for the same reason the preflight stub must pass
     #: its validator: a rejected stub makes every test built on it a test of the stub.
     "g4_request.json": {"run_id": "TEST", "start": "2026-01-01", "end": "2027-01-01",
@@ -393,6 +396,109 @@ def _parse_pid_list(token, name: str):
     return pids
 
 
+#: Fields every G4 response row must carry.
+G4_ROW_FIELDS = ("date", "sst")
+
+
+def check_g4_response(rows, *, start: str, end: str) -> dict:
+    """The response body, row by row — the ONE validator both the probe and the sampler use.
+
+    A length check accepted a list of 366 integers, or one repeating a single day 366 times,
+    exactly as it accepted the real answer. What makes a 366-day response is the *day set*:
+    every day from `start` through `end`, once each, with no extras."""
+    import datetime as _dt
+
+    if not isinstance(rows, list):
+        raise ArtifactError(f"G4 response is not a list: {type(rows).__name__}")
+    try:
+        first = _dt.date.fromisoformat(start)
+        last = _dt.date.fromisoformat(end)
+    except ValueError as e:
+        raise ArtifactError(f"G4 window is not canonical ISO: {e}") from None
+    wanted = [first + _dt.timedelta(days=i) for i in range((last - first).days + 1)]
+    if len(rows) != len(wanted):
+        raise ArtifactError(f"G4 response has {len(rows)} rows, expected {len(wanted)}")
+
+    seen = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ArtifactError(
+                f"G4 response row {i} is {type(row).__name__}, not an object. A list of the "
+                f"right length is not a list of rows.")
+        missing = [f for f in G4_ROW_FIELDS if f not in row]
+        if missing:
+            raise ArtifactError(f"G4 response row {i} is missing field(s): {missing}")
+        value = row["date"]
+        if not isinstance(value, str):
+            raise ArtifactError(f"G4 response row {i} date is not a string: {value!r}")
+        try:
+            parsed = _dt.date.fromisoformat(value)
+        except ValueError:
+            raise ArtifactError(
+                f"G4 response row {i} date is not canonical ISO: {value!r}") from None
+        if parsed.isoformat() != value:
+            raise ArtifactError(f"G4 response row {i} date is not canonical: {value!r}")
+        seen.append(parsed)
+
+    duplicates = sorted({d.isoformat() for d in seen if seen.count(d) > 1})
+    if duplicates:
+        raise ArtifactError(f"G4 response repeats day(s): {duplicates[:3]}")
+    missing_days = sorted(d.isoformat() for d in set(wanted) - set(seen))
+    if missing_days:
+        raise ArtifactError(
+            f"G4 response is missing day(s) it claims to cover: {missing_days[:3]}")
+    extra = sorted(d.isoformat() for d in set(seen) - set(wanted))
+    if extra:
+        raise ArtifactError(f"G4 response carries day(s) outside the window: {extra[:3]}")
+    return {"rows": len(rows), "start": start, "end": end}
+
+
+def check_identity(data, *, run_id=None) -> dict:
+    """What the identity block actually verified.
+
+    A 40-character SHA in the preflight proves the preflight holds a SHA. It says nothing about
+    whether any block resolved that commit, or whether the modules the run imported came from
+    `$CODE_ROOT`. This is the record that does, and the assembler cross-checks the preflight
+    against it."""
+    import hashlib
+
+    if not isinstance(data, dict):
+        raise ArtifactError("identity.json must be an object")
+    if run_id is not None and data.get("run_id") != run_id:
+        raise ArtifactError(f"identity.json belongs to run {data.get('run_id')!r}")
+    sha = data.get("deploy_sha")
+    if not (isinstance(sha, str) and len(sha) == 40
+            and all(c in "0123456789abcdef" for c in sha)):
+        raise ArtifactError(
+            f"identity.json deploy_sha must be a full 40-char lowercase hex commit; got {sha!r}")
+    for field in ("code_root", "python"):
+        value = data.get(field)
+        if not (isinstance(value, str) and value.strip()):
+            raise ArtifactError(f"identity.json {field} must be a non-empty string; got {value!r}")
+    modules = data.get("modules")
+    if not isinstance(modules, dict) or not modules:
+        raise ArtifactError("identity.json records no imported modules")
+    root = os.path.realpath(data["code_root"])
+    for name, info in modules.items():
+        if not isinstance(info, dict) or "path" not in info or "sha256" not in info:
+            raise ArtifactError(f"identity.json module {name!r} has no path and fingerprint")
+        path = os.path.realpath(info["path"])
+        if not (path == root or path.startswith(root + os.sep)):
+            raise ArtifactError(
+                f"identity.json module {name!r} was imported from {path}, outside "
+                f"CODE_ROOT {root}. A runbook that reads correctly and imports from elsewhere "
+                f"is the failure the P4 rehearsal hit.")
+        try:
+            with open(path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
+        except OSError as e:
+            raise ArtifactError(f"identity.json module {name!r} is unreadable: {e}") from None
+        if digest != info["sha256"]:
+            raise ArtifactError(
+                f"identity.json module {name!r} fingerprint does not match the file on disk")
+    return data
+
+
 def check_pm2_roster(data, *, run_id=None):
     """The roster that names which processes the fd/RSS series describes.
 
@@ -425,7 +531,7 @@ def check_pm2_roster(data, *, run_id=None):
     return set(pids)
 
 
-def check_g16_scan(path: str, name: str, *, run_id=None) -> dict:
+def check_g16_scan(path: str, name: str, *, run_id=None, expected_root=None) -> dict:
     """`root=... files=N dirs=M wall_s=X`, all present, finite and non-negative."""
     _header(path, name, run_id)
     lines = _body_lines(path)
@@ -441,6 +547,10 @@ def check_g16_scan(path: str, name: str, *, run_id=None) -> dict:
             raise ArtifactError(f"{name} is missing {required!r}: {lines[0]!r}")
     if not fields["root"].strip():
         raise ArtifactError(f"{name} records no scan root")
+    if expected_root is not None and os.path.realpath(fields["root"]) != expected_root:
+        raise ArtifactError(
+            f"{name} scanned {fields['root']!r} but the run's data root is {expected_root!r}. "
+            f"A scan of a different tree is a valid measurement of the wrong thing.")
     files = _exact_nonneg_int(fields["files"], name, "files")   # counts, not measurements
     dirs = _exact_nonneg_int(fields["dirs"], name, "dirs")
     _finite_nonneg(fields["wall_s"], name, "wall_s")            # a duration; may be fractional
@@ -541,6 +651,9 @@ def assemble(art_dir: str, *, profile: str) -> dict:
             f"run.json declares run {marker.get('run_id')!r} but the artifact directory is "
             f"{run_id!r}; the run this evidence belongs to is not the one being assembled")
 
+    identity = check_identity(
+        _load_json(os.path.join(art_dir, "identity.json"), "identity.json"), run_id=run_id)
+
     roster_pids = None
     if "pm2_jlist.json" in names:
         roster_pids = check_pm2_roster(
@@ -553,13 +666,20 @@ def assemble(art_dir: str, *, profile: str) -> dict:
             _load_json(os.path.join(art_dir, "g4_request.json"), "g4_request.json"),
             run_id=run_id)
 
+    capacity = _load_json(os.path.join(art_dir, "capacity.json"), "capacity.json") \
+        if "capacity.json" in names else {}
+    expected_root = capacity.get("data_root")
+    if expected_root is not None:
+        expected_root = os.path.realpath(expected_root)
+
     #: Series parsers. `_check_nonempty` is kept only for the human-readable df/findmnt copies.
     parsers = {
         "g4_366d_seconds.txt": lambda p, n: check_g4_series(
             p, n, run_id=run_id, expected=(request or {}).get("g4_samples")),
         "h7_fd_rss_timeseries.txt": lambda p, n: check_h7_series(
             p, n, run_id=run_id, expected_pids=roster_pids),
-        "g16_metadata_scan.txt": lambda p, n: check_g16_scan(p, n, run_id=run_id),
+        "g16_metadata_scan.txt": lambda p, n: check_g16_scan(
+            p, n, run_id=run_id, expected_root=expected_root),
     }
 
     summary = {}
@@ -569,6 +689,19 @@ def assemble(art_dir: str, *, profile: str) -> dict:
             data = _load_json(path, name)
             if name == "preflight.json":
                 _check_preflight(data, profile, run_id=run_id)
+                # The preflight is cross-checked against what identity-preflight VERIFIED.
+                # A valid-looking SHA nobody resolved, or a code root nothing imported from,
+                # is refused here rather than believed.
+                for field in ("deploy_sha", "code_root", "python"):
+                    if data[field] != identity[field]:
+                        raise ArtifactError(
+                            f"preflight.json {field}={data[field]!r} disagrees with "
+                            f"identity.json {identity[field]!r}; the preflight names something "
+                            f"the identity check never verified")
+                if expected_root is not None and data.get("data_root") not in (None, expected_root):
+                    raise ArtifactError(
+                        f"preflight.json data_root={data['data_root']!r} disagrees with the "
+                        f"capacity record {expected_root!r}")
             elif name == "wal_state.json":
                 _check_wal(data, profile)
             elif name == "shadow_verification.json":
@@ -608,7 +741,22 @@ def main(argv=None) -> int:
 
 
 #: Filled here rather than at the literal, because it must pass the validators defined above.
+def _example_identity(run_id="TEST"):
+    import hashlib
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "store", "block_manifest.py")
+    with open(path, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    return {"run_id": run_id, "deploy_sha": "0" * 40, "code_root": root,
+            "python": "/stub/python",
+            "modules": {"store.block_manifest": {"path": path, "sha256": digest}}}
+
+
 EXAMPLE_STUBS["preflight.json"] = _example_preflight()
+EXAMPLE_STUBS["identity.json"] = _example_identity()
+#: The preflight stub must AGREE with the identity stub, since the assembler cross-checks them.
+EXAMPLE_STUBS["preflight.json"]["code_root"] = EXAMPLE_STUBS["identity.json"]["code_root"]
+EXAMPLE_STUBS["preflight.json"]["python"] = EXAMPLE_STUBS["identity.json"]["python"]
 
 
 if __name__ == "__main__":

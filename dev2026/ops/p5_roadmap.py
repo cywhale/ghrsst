@@ -231,6 +231,7 @@ S8_REQUIRED_SECTIONS = {
 #: Preflight fields every S8 run must record. A run missing any of them is not evidence.
 S8_PREFLIGHT_FIELDS = (
     "run_id", "host", "measured_utc", "deploy_sha", "code_root", "python", "pythonpath",
+    "data_root",
     "anchor_root", "anchor_domain_id", "wal_root", "wal_repairs_pending",
     "manifest_root", "manifest_generation", "filesystem_device", "filesystem_fstype",
     "free_now_bytes", "inodes_free", "label",
@@ -247,8 +248,8 @@ S8_PROFILES = {
         "purpose": ("baseline evidence from the CURRENT monolith deployment: G4 span timing, "
                     "G16 metadata scan, G18 capacity, H7 inode headroom."),
         "required_fields": ("run_id", "host", "measured_utc", "deploy_sha", "code_root",
-                            "python", "pythonpath", "filesystem_device", "filesystem_fstype",
-                            "free_now_bytes", "inodes_free", "label"),
+                            "python", "pythonpath", "data_root", "filesystem_device",
+                            "filesystem_fstype", "free_now_bytes", "inodes_free", "label"),
         #: Recorded as `not_applicable_with_reason`, never omitted. An absent field reads as
         #: clean; "does not apply, because ..." reads as what it is.
         "not_applicable": {

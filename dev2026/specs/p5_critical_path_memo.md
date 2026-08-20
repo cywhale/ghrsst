@@ -272,6 +272,28 @@ survivor was, again, a neighbouring check doing the work — every malformed dat
 cross-check. Binding the canonicity rule needed a date that parses, agrees with the URL, and is
 still not canonical.
 
+## Review round 8 — rows, roots and identity, each bound to its own evidence
+
+| finding | correction |
+|---|---|
+| a G4 response was accepted if it was a list of length 366 — a list of 366 integers, or one repeating a single day, passed exactly as the real answer did | one shared `check_g4_response`, used by **both** the probe and every sample: each row an object with the required fields, canonical dates, and exactly the day set from `start` through `end` — no duplicates, no gaps, nothing outside the window |
+| `check_g16_scan` required a non-empty `root`, so `root=/tmp/small-tree files=10` was a valid scan of the wrong tree | the capacity block records `data_root`, the preflight derives it, and the scan artifact's root must match it exactly |
+| a 40-character SHA in the preflight proves the preflight holds a SHA | `identity-preflight` now writes `identity.json` — the verified commit, code root, interpreter, and the **path and sha256 of every module it imported** — and the assembler refuses a preflight naming a different (perfectly valid) SHA, a different code root, or a module resolved outside `$CODE_ROOT` |
+
+Producer and validator share one schema: the runbook imports the validators rather than
+restating the rules, so a check cannot pass in the document and fail in the code.
+
+Twelve mutations, serial from a git-clean tree: nine killed, three **true equivalents** verified
+by re-running the suite under each. All three are structural rather than accidental — at a fixed
+length equal to the window, *duplicates*, *missing days* and *extra days* are the same condition
+seen from three sides, so any one detects the others' inputs; and `identity.json` is loaded
+before the required-artifact loop, so dropping it from the list still fails on the read. The
+redundant checks are kept for their messages, not for a distinct guarantee.
+
+Two stub corrections fell out, both the same lesson as earlier rounds: the `curl` stubs returned
+`date: "d0"` placeholders, which were fine while only the row count was checked and become a
+stub that cannot pass a real check the moment rows are validated.
+
 ## 4. Remaining blockers
 
 | blocker | state |
