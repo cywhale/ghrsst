@@ -212,6 +212,23 @@ CRITICAL_PATH: List[Dict] = [
      "note": "theoretical reclaim is not capacity evidence"},
 ]
 
+#: What has actually been executed. Recorded here so the memo cannot keep saying "not
+#: approved" about a run that completed -- which it did, because the blockers table was
+#: hand-maintained and drifted from the evidence beside it.
+S8_EXECUTION = {
+    "legacy_baseline": {
+        "status": "COMPLETED",
+        "run_id": "20260820T110036Z",
+        "detail": ("executed 2026-08-20 at deploy SHA 96ee79c; artifacts assembled on VM24 and "
+                   "copied back; NO gate adjudicated by this run"),
+    },
+    "p5_shadow": {"status": "NOT_STARTED",
+                  "detail": "verification-only profile; not run"},
+    "s9_shadow_execution": {"status": "NOT_STARTED",
+                            "detail": "requires its own separate human approval"},
+}
+
+
 #: The compaction posture, spelled out so step 8 cannot be paraphrased into something shorter.
 #:
 #: Corrected in review round 2: it now opens with the **compaction lock**, not the ingest lock.
