@@ -347,14 +347,29 @@ class TestCapacityFiguresAreLabelledHistorical(unittest.TestCase):
     snapshot of a filling volume. They stay usable and stay labelled."""
 
     def test_the_capacity_block_declares_its_status_and_date(self):
-        self.assertEqual(rm.CAPACITY["status"], "historical/provisional")
-        self.assertEqual(rm.CAPACITY["as_of"], "2026-08-19")
+        """Replaced, not deleted: the figures were historical until the 2026-08-20 S8 run
+        measured them. They are now MEASURED, and still carry a provenance and a refresh
+        obligation -- a measurement of a filling volume ages too."""
+        self.assertEqual(rm.CAPACITY["status"], "measured")
+        self.assertEqual(rm.CAPACITY["as_of"], "2026-08-20")
+        self.assertEqual(rm.CAPACITY["run_id"], "20260820T110036Z")
+        self.assertTrue(rm.CAPACITY["deploy_sha"].startswith("96ee79c"))
         self.assertTrue(rm.CAPACITY["must_refresh_before_use"])
 
     def test_it_says_what_must_happen_before_the_numbers_are_relied_on(self):
         why = rm.CAPACITY["refresh_requirement"].lower()
-        self.assertIn("read-only", why)
+        self.assertIn("re-run", why)
         self.assertIn("regenerate", why)
+        self.assertIn("never edit the values by hand", why)
+
+    def test_the_capacity_figures_are_not_typed_into_the_module(self):
+        """They are read from the generated evidence artifact. A literal here is how the
+        2026-08-19 figure outlived the run that superseded it."""
+        with open(os.path.join(_DEV, "ops", "p5_roadmap.py")) as fh:
+            body = fh.read()
+        self.assertNotIn("295.7", body, "a measured figure is hardcoded in the module")
+        self.assertNotIn("267.0", body)
+        self.assertIn("p5s8_vm24_readonly.json", body)
 
     def test_the_documents_repeat_the_label(self):
         for path in (RUNBOOK, os.path.join(_DEV, "specs", "p5_critical_path_memo.md")):

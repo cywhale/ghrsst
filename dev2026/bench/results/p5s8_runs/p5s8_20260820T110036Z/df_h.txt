@@ -1,0 +1,2 @@
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdc1       6.0T  5.4T  296G  95% /home/odbadmin/Data

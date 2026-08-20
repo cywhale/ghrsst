@@ -1,0 +1,8 @@
+{
+  "data_root": "/home/odbadmin/Data/ghrsst",
+  "filesystem_device": "/dev/sdc1",
+  "filesystem_fstype": "ext4",
+  "free_now_bytes": 317551714304,
+  "inodes_free": 231074856,
+  "run_id": "20260820T110036Z"
+}

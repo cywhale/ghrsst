@@ -12,8 +12,8 @@ That is not a gate pass and is not recorded as one anywhere.
 
 The goal is not to finish S7. It is to **complete safe compaction, materialize immutable blocks,
 and then release only the old daily/hold data that the retention and recovery policy permits.**
-Capacity is on the critical path for that, not a footnote: at 267 GiB free against a 403.3 GiB
-minimum, the block build cannot even be attempted.
+Capacity is on the critical path for that, not a footnote: at **295.7 GiB** free against a
+403.3 GiB minimum (measured 2026-08-20), the block build cannot even be attempted.
 
 ## 1. Roadmap exception P5-EX-1
 
@@ -26,7 +26,7 @@ everything — because the gates keeping S7 red are the ones only production can
 | **G4** | 366-day p95 at production geometry (17999 × 36000) |
 | **H7** | fd/RSS under sustained load on the production process, plus inode headroom |
 | **G16** | metadata-scan wall time and snapshot-open cost on the production tree |
-| **G18** | free disk on `/dev/sdc1` — **BLOCKED**, 267 GiB against a 403.3 GiB minimum |
+| **G18** | free disk on `/dev/sdc1` — **BLOCKED**, 295.7 GiB against a 403.3 GiB minimum |
 
 Waiting for those before authoring the read-only runbook that **collects** them is circular: the
 runbook is the instrument, not the conclusion.
@@ -56,15 +56,26 @@ tests can check the written policy for self-consistency. `POLICY_PREDICATE_IS_EN
 
 ## 2. Capacity unlock — the decision
 
-**These figures are historical and provisional.** They come from the VM24 read-only run of
-**2026-08-19** (`bench/results/p5s6_vm24_readonly.json`) — the newest evidence that exists, and
-also a one-day snapshot of a volume that has been filling since. **A current read-only scan log
-must be available before any go/no-go rests on them**, and when it is, every dependent artifact
-is regenerated from that evidence rather than edited by hand.
-`/dev/sdc1`, ext4, mounted at `/home/odbadmin/Data`, 6.0 T total, 96 % used, **267 GiB free**.
-The gate needs **403.3 GiB** (`HARD_RESERVE` 250 + additional 153.3); **600 GiB** is the
-recommended operational target — the minimum plus roughly 200 GiB of growth margin, which at the
-measured 2.74 GiB/day combined ingest is about 70 days of headroom.
+**Measured 2026-08-20**, run `20260820T110036Z`, deploy SHA `96ee79c`, host `odb24` — the S8
+`legacy_baseline` collection. `/dev/sdc1`, ext4, mounted at `/home/odbadmin/Data`.
+
+| | |
+|---|---|
+| free now | **295.7 GiB** (317,551,714,304 B) |
+| minimum required | **403.3 GiB** (`HARD_RESERVE` 250 + additional 153.3) |
+| shortfall | **≈ 107.6 GiB** |
+| recommended | 600 GiB — the minimum plus ~200 GiB growth margin, ≈ 70 days at the measured 2.74 GiB/day ingest |
+| **verdict** | **G18 BLOCKED** |
+
+Every figure above is **generated** by `ops/p5s8_evidence.py` from
+`bench/results/p5s8_runs/p5s8_20260820T110036Z/`, never typed. The 2026-08-19 reading of
+267 GiB is **historical** and must not be quoted as the current state.
+
+**The +31.4 GiB since the aborted 08:00 run is operator-reported attribution**, not a
+measurement: unrelated files under `~/Data` were moved by the operator, and the SRTM/terrain
+directory remains. It is **not** GHRSST reclaim, **not** automated cleanup, and **not** a
+sustainable capacity guarantee. The artifacts show that free space changed; they can never show
+why. G18 is BLOCKED either way.
 
 **`HARD_RESERVE` is not lowered to make G18 pass.** Lowering it changes the reported verdict
 without changing a single byte of free space.

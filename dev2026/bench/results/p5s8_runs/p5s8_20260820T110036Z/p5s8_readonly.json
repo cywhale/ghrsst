@@ -1,0 +1,68 @@
+{
+  "adjudicates": [],
+  "artifacts": {
+    "capacity.json": {
+      "kind": "json",
+      "ok": true
+    },
+    "df_h.txt": {
+      "bytes": 107,
+      "kind": "text"
+    },
+    "df_i.txt": {
+      "bytes": 133,
+      "kind": "text"
+    },
+    "findmnt.txt": {
+      "bytes": 37,
+      "kind": "text"
+    },
+    "g16_metadata_scan.txt": {
+      "dirs": 118721,
+      "files": 7126309,
+      "kind": "series"
+    },
+    "g4_366d_seconds.txt": {
+      "kind": "series",
+      "samples": 30
+    },
+    "g4_request.json": {
+      "kind": "json",
+      "ok": true
+    },
+    "h7_fd_rss_timeseries.txt": {
+      "kind": "series",
+      "samples": 60,
+      "workers": 1
+    },
+    "identity.json": {
+      "kind": "json",
+      "ok": true
+    },
+    "pm2_jlist.json": {
+      "kind": "json",
+      "ok": true
+    },
+    "preflight.json": {
+      "kind": "json",
+      "ok": true
+    },
+    "run.json": {
+      "kind": "json",
+      "ok": true
+    },
+    "wal_state.json": {
+      "kind": "json",
+      "ok": true
+    }
+  },
+  "label": "VM24_PRODUCTION_READ_ONLY",
+  "not_adjudicated": [
+    "G3",
+    "G16_snapshot_open",
+    "H7_sustained_load"
+  ],
+  "profile": "legacy_baseline",
+  "scope_note": "read-only evidence collection. No gate is adjudicated by this report alone; adjudication is a separate step with its own review.",
+  "step": "P5-S8"
+}

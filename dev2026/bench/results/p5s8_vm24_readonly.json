@@ -1,0 +1,81 @@
+{
+  "assembled_on_host": true,
+  "capacity": {
+    "change_attribution": {
+      "cause": "unrelated files under ~/Data were moved by the operator; the SRTM/terrain directory remains",
+      "from_run": "p5s8_20260820T080028Z (aborted at g4-probe)",
+      "is_automated_cleanup": false,
+      "is_ghrsst_reclaim": false,
+      "is_sustainable_guarantee": false,
+      "note": "recorded as attribution, not as a measurement: the artifacts show free space changed, never why. G18 remains BLOCKED either way.",
+      "observed_gib": 31.4,
+      "source": "operator-reported",
+      "to_run": "p5s8_20260820T110036Z"
+    },
+    "data_root": "/home/odbadmin/Data/ghrsst",
+    "filesystem_device": "/dev/sdc1",
+    "filesystem_fstype": "ext4",
+    "free_now_bytes": 317551714304,
+    "free_now_gib": 295.7,
+    "hard_reserve_gib": 250,
+    "inodes_free": 231074856,
+    "minimum_free_gib": 403.3,
+    "recommended_free_gib": 600.0,
+    "shortfall_gib": 107.6,
+    "verdict": "BLOCKED"
+  },
+  "g16": {
+    "metadata_scan": {
+      "dirs": 118721,
+      "files": 7126309,
+      "root": "/home/odbadmin/Data/ghrsst"
+    },
+    "snapshot_open": "NOT_ADJUDICATED",
+    "snapshot_open_reason": "no segmented manifest is deployed on VM24, so SegmentedCubeStore construction cannot be timed. Kept SEPARATE from the metadata-scan evidence above."
+  },
+  "g4": {
+    "adjudicates": [],
+    "concurrency": 1,
+    "note": "a legacy_baseline latency reading at concurrency 1. It adjudicates no production segmented or compaction gate: there is no segmented arm deployed to compare against.",
+    "p50_ms": 77.33,
+    "p95_ms": 110.62,
+    "point_latest": "2026-08-19",
+    "samples": 30,
+    "scope": "legacy_baseline",
+    "span_days": 366,
+    "window_authority": "healthz.point_latest",
+    "window_end": "2026-08-19",
+    "window_start": "2025-08-19"
+  },
+  "gates": {
+    "G16_metadata_scan": "EVIDENCE_COLLECTED",
+    "G16_snapshot_open": "NOT_ADJUDICATED",
+    "G18": "BLOCKED",
+    "G3": "NOT_ADJUDICATED",
+    "G4": "NOT_ADJUDICATED",
+    "H7_inode_headroom": "EVIDENCE_COLLECTED",
+    "H7_sustained_load": "NOT_ADJUDICATED"
+  },
+  "h7": {
+    "inodes_free": 231074856,
+    "sampled_pids": [
+      1212869
+    ],
+    "samples": 60,
+    "scope": "master_only",
+    "scope_reason": "the pid PM2 reports for the app is the GUNICORN MASTER; its worker children (-w 2) were not sampled, so these figures are the master's footprint and not the serving processes'.",
+    "sustained_load": "NOT_ADJUDICATED",
+    "sustained_load_reason": "no sustained load was generated: this runbook is read-only and must not load production.",
+    "workers_sampled": 1
+  },
+  "label": "VM24_PRODUCTION_READ_ONLY",
+  "provenance": {
+    "artifact_dir": "bench/results/p5s8_runs/p5s8_20260820T110036Z",
+    "deploy_sha": "96ee79c9af0d121924b0032e44f86000c3d63e10",
+    "derived_by": "ops/p5s8_evidence.py -- never typed by hand",
+    "host": "odb24",
+    "measured_utc": "2026-08-20T11:00:36.550586+00:00",
+    "profile": "legacy_baseline",
+    "run_id": "20260820T110036Z"
+  }
+}

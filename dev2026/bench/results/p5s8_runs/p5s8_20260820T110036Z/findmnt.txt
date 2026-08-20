@@ -1,0 +1,1 @@
+/dev/sdc1 ext4   /home/odbadmin/Data

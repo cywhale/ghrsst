@@ -1,0 +1,5 @@
+{
+  "not_applicable_with_reason": "legacy_baseline: no P5 repair WAL is deployed on this host, so neither a count nor zero is meaningful",
+  "run_id": "20260820T110036Z",
+  "wal_repairs_pending": null
+}

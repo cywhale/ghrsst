@@ -1,0 +1,26 @@
+{
+  "code_root": "/home/odbadmin/python/ghrsst-p5s8-96ee79c/dev2026",
+  "deploy_sha": "96ee79c9af0d121924b0032e44f86000c3d63e10",
+  "head_sha": "96ee79c9af0d121924b0032e44f86000c3d63e10",
+  "modules": {
+    "ops.p5_roadmap": {
+      "path": "/home/odbadmin/python/ghrsst-p5s8-96ee79c/dev2026/ops/p5_roadmap.py",
+      "sha256": "6209170cb35b3403b91b2dc503c26d066bdb76f04954ad5f1fd8a7607e91a5f1"
+    },
+    "ops.p5s8_report": {
+      "path": "/home/odbadmin/python/ghrsst-p5s8-96ee79c/dev2026/ops/p5s8_report.py",
+      "sha256": "f5b4f2bad54b9b48326c2900500c6ae9dbef1e0ea983b008f18a5fd1ffdcf3e4"
+    },
+    "ops.quiescence": {
+      "path": "/home/odbadmin/python/ghrsst-p5s8-96ee79c/dev2026/ops/quiescence.py",
+      "sha256": "afba56e9b74eed715665c0933c8e469012a1798d6fb19040af9e8fa6c97c8bc5"
+    },
+    "store.block_manifest": {
+      "path": "/home/odbadmin/python/ghrsst-p5s8-96ee79c/dev2026/store/block_manifest.py",
+      "sha256": "f458627be33c60dcc0143bea565bd512470a7ff569fcbcc66c157db821929c1f"
+    }
+  },
+  "python": "/home/odbadmin/python/ghrsst-dev2026-phase2/dev2026/.venv/bin/python",
+  "run_id": "20260820T110036Z",
+  "worktree_clean": true
+}

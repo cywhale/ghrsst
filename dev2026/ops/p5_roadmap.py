@@ -19,6 +19,7 @@ exception cannot be cited for a prune, a swap, a deletion or a deployment.
 """
 from __future__ import annotations
 
+import os
 from typing import Dict, List
 
 #: P5-S7's own verdict. Never "PASS" — the exception below routes around the deadlock, it does
@@ -76,31 +77,50 @@ ROADMAP_EXCEPTION = {
 
 # --------------------------------------------------------------------------- capacity
 #: From the VM24 read-only measurement (2026-08-19), `bench/results/p5s6_vm24_readonly.json`.
-CAPACITY = {
-    "label": "VM24_PRODUCTION_READ_ONLY",
-    #: The newest evidence that exists, and also a snapshot of a filling volume taken on one
-    #: day. Both are true, so it is used AND labelled. Refreshing it means a new read-only scan,
-    #: not an edit here.
-    "status": "historical/provisional",
-    "as_of": "2026-08-19",
-    "must_refresh_before_use": True,
-    "refresh_requirement": ("a current VM24 read-only scan log must be available before these "
-                            "figures are relied on for a go/no-go; when it is, regenerate every "
-                            "dependent artifact from that evidence rather than editing these "
-                            "values by hand."),
-    "measured_utc": "2026-08-19T07:40:00Z",
-    "device": "/dev/sdc1", "fstype": "ext4", "mount": "/home/odbadmin/Data",
-    "free_now_gib": 267.0,
-    "hard_reserve_gib": 250,
-    "additional_gib": 153.3,
-    "minimum_free_gib": 403.3,
-    "recommended_free_gib": 600.0,
-    "shortfall_gib": 136.3,
-    "currently_reclaimable_gib": 0.0,
-    "verdict": "BLOCKED",
-    "recommended_basis": ("the 403.3 GiB minimum plus ~200 GiB growth margin; at the measured "
-                          "2.74 GiB/day combined ingest that is roughly 70 days of headroom."),
-}
+def _measured_capacity():
+    """Read the capacity evidence GENERATED from the collected VM24 run.
+
+    These figures were hardcoded, and the 2026-08-20 run's numbers reached a report as prose
+    while this constant still said 267 GiB. A measurement that lives in a message is not
+    evidence. Loaded from `bench/results/p5s8_vm24_readonly.json`, which
+    `ops/p5s8_evidence.py` derives from the run artifacts and never by hand."""
+    import json
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(here, "bench", "results", "p5s8_vm24_readonly.json")
+    with open(path) as fh:
+        ev = json.load(fh)
+    cap, prov = ev["capacity"], ev["provenance"]
+    return {
+        "label": ev["label"],
+        "status": "measured",
+        "as_of": prov["measured_utc"][:10],
+        "run_id": prov["run_id"],
+        "deploy_sha": prov["deploy_sha"],
+        "host": prov["host"],
+        "source_artifact": "bench/results/p5s8_vm24_readonly.json",
+        "must_refresh_before_use": True,
+        "refresh_requirement": ("re-run the S8 legacy_baseline collection and regenerate this "
+                                "from the new artifacts; never edit the values by hand."),
+        "measured_utc": prov["measured_utc"],
+        "device": cap["filesystem_device"], "fstype": cap["filesystem_fstype"],
+        "mount": "/home/odbadmin/Data",
+        "free_now_gib": cap["free_now_gib"],
+        "hard_reserve_gib": cap["hard_reserve_gib"],
+        "additional_gib": 153.3,
+        "minimum_free_gib": cap["minimum_free_gib"],
+        "recommended_free_gib": cap["recommended_free_gib"],
+        "shortfall_gib": cap["shortfall_gib"],
+        "currently_reclaimable_gib": 0.0,
+        "verdict": cap["verdict"],
+        "change_attribution": cap["change_attribution"],
+        "recommended_basis": ("the minimum plus ~200 GiB growth margin; at the measured "
+                             "2.74 GiB/day combined ingest that is roughly 70 days of "
+                             "headroom."),
+    }
+
+
+CAPACITY = _measured_capacity()
+
 
 #: HARD_RESERVE is not a tuning knob. Lowering it to make G18 pass changes the reported verdict
 #: without changing a single byte of free space.

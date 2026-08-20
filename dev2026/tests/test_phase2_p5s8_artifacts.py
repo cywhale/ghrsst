@@ -521,6 +521,11 @@ class TestIdentityPreflightIsAnExecutableBlock(_Sandbox):
             shutil.copytree(os.path.join(_DEV, pkg), os.path.join(code, pkg),
                             dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("__pycache__"))
+        # ops.p5_roadmap reads the committed capacity evidence at import time -- the whole
+        # point of round 13 -- so a code tree without it is not a usable deployment.
+        os.makedirs(os.path.join(code, "bench", "results"), exist_ok=True)
+        shutil.copy(os.path.join(_DEV, "bench", "results", "p5s8_vm24_readonly.json"),
+                    os.path.join(code, "bench", "results", "p5s8_vm24_readonly.json"))
         subprocess.run(["git", "-C", repo, "add", "-A"], check=True, capture_output=True)
         subprocess.run(["git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t",
                         "commit", "-qm", "x"], check=True, capture_output=True)

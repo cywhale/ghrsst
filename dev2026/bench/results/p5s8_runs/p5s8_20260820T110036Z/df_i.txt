@@ -1,0 +1,2 @@
+Filesystem        Inodes     IUsed     IFree IUse% Mounted on
+/dev/sdc1      402653184 171578328 231074856   43% /home/odbadmin/Data
