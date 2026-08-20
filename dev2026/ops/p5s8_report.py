@@ -36,16 +36,16 @@ class ArtifactError(Exception):
 
 #: Artifacts every profile must produce. `wal_state.json` is included for BOTH profiles: under
 #: `legacy_baseline` it carries the not-applicable record, which is itself evidence.
-_COMMON = ("preflight.json", "wal_state.json", "capacity.json", "df_h.txt", "df_i.txt",
-           "findmnt.txt", "g4_366d_seconds.txt", "pm2_jlist.json",
-           "h7_fd_rss_timeseries.txt", "g16_metadata_scan.txt")
+_COMMON = ("run.json", "preflight.json", "wal_state.json", "capacity.json", "df_h.txt",
+           "df_i.txt", "findmnt.txt", "g4_request.json", "g4_366d_seconds.txt",
+           "pm2_jlist.json", "h7_fd_rss_timeseries.txt", "g16_metadata_scan.txt")
 
 #: The `p5_shadow` profile is verification-only (see `S8_PROFILES`), so it produces the
 #: provisioning record and the identity preflight, and none of the measurement series.
 _BY_PROFILE: Dict[str, tuple] = {
     "legacy_baseline": _COMMON,
-    "p5_shadow": ("preflight.json", "wal_state.json", "capacity.json", "df_h.txt", "df_i.txt",
-                  "findmnt.txt", "shadow_verification.json"),
+    "p5_shadow": ("run.json", "preflight.json", "wal_state.json", "capacity.json", "df_h.txt",
+                  "df_i.txt", "findmnt.txt", "shadow_verification.json"),
 }
 
 #: Minimal well-formed contents, used by tests to build a complete run without re-encoding the
@@ -76,8 +76,12 @@ EXAMPLE_STUBS = {
     "wal_state.json": {"wal_repairs_pending": None,
                        "not_applicable_with_reason": "legacy_baseline: no P5 WAL is deployed"},
     "pm2_jlist.json": [{"name": "ghrsst", "pid": 1, "pm2_env": {"status": "online"}}],
-    "capacity.json": {"filesystem_device": "/dev/stub", "filesystem_fstype": "ext4",
-                      "free_now_bytes": 1, "inodes_free": 1},
+    "capacity.json": {"run_id": "TEST", "filesystem_device": "/dev/stub",
+                      "filesystem_fstype": "ext4", "free_now_bytes": 1, "inodes_free": 1},
+    "run.json": {"run_id": "TEST", "created_utc": "2027-01-01T00:00:00Z"},
+    "g4_request.json": {"run_id": "TEST", "start": "2026-01-01", "end": "2027-01-01",
+                        "url": "http://127.0.0.1:8080/api/ghrsst?x=1", "span_days": 366,
+                        "probe_rows": 366, "g4_samples": 1},
     "shadow_verification.json": {"segments": 1, "generation": 1,
                                  "wal_root": "/stub/p5_repairs", "anchor_root": "/stub/anchor",
                                  "anchor_domain_id": "independent",
@@ -234,13 +238,146 @@ def _check_wal(data, profile: str) -> None:
 
 
 def _check_nonempty(path: str, name: str) -> int:
+    """Size only. Used for the human-readable `df`/`findmnt` copies, which have no schema of
+    their own -- never for a measurement series, where "not empty" once let the single line
+    `lol` pass as thirty latency samples."""
     try:
         size = os.path.getsize(path)
     except OSError as e:
         raise ArtifactError(f"{name} could not be stat'd: {e}") from None
     if size == 0:
-        raise ArtifactError(f"{name} is empty; an empty series is not a measurement")
+        raise ArtifactError(f"{name} is empty; an empty file is not a measurement")
     return size
+
+
+def _header(path: str, name: str, run_id) -> dict:
+    """Parse the `# run_id=... k=v ...` first line every series carries."""
+    with open(path) as fh:
+        first = fh.readline()
+    if not first.startswith("#"):
+        raise ArtifactError(f"{name} has no run header; it cannot be bound to a run")
+    fields = {}
+    for token in first[1:].split():
+        key, _, value = token.partition("=")
+        if key:
+            fields[key] = value
+    if "run_id" not in fields:
+        raise ArtifactError(f"{name} header declares no run_id")
+    if run_id is not None and fields["run_id"] != run_id:
+        raise ArtifactError(
+            f"{name} belongs to run {fields['run_id']!r}, not {run_id!r}; a file left by an "
+            f"earlier run is real evidence of a different run")
+    return fields
+
+
+def _body_lines(path: str):
+    with open(path) as fh:
+        return [ln.strip() for ln in fh.readlines()[1:] if ln.strip()]
+
+
+def _finite_nonneg(token: str, name: str, what: str) -> float:
+    try:
+        value = float(token)
+    except (TypeError, ValueError):
+        raise ArtifactError(f"{name}: {what} is not a number: {token!r}") from None
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ArtifactError(f"{name}: {what} is not finite: {token!r}")
+    if value < 0:
+        raise ArtifactError(f"{name}: {what} is negative: {token!r}")
+    return value
+
+
+def check_g4_series(path: str, name: str, *, run_id=None, expected=None) -> dict:
+    """Exact sample count, finite non-negative seconds."""
+    head = _header(path, name, run_id)
+    lines = _body_lines(path)
+    if not lines:
+        raise ArtifactError(f"{name} carries no samples")
+    values = [_finite_nonneg(ln, name, f"sample {i}") for i, ln in enumerate(lines)]
+    declared = head.get("samples")
+    if declared is not None and str(len(values)) != declared:
+        raise ArtifactError(
+            f"{name} declares {declared} samples and carries {len(values)}")
+    if expected is not None and len(values) != expected:
+        raise ArtifactError(
+            f"{name} holds {len(values)} samples; the validated request planned {expected}. "
+            f"A truncated series is a shorter measurement, not the one claimed.")
+    return {"samples": len(values)}
+
+
+def check_h7_series(path: str, name: str, *, run_id=None) -> dict:
+    """`ts npids fds rss` per line: numeric, non-negative, and a STABLE worker count."""
+    head = _header(path, name, run_id)
+    lines = _body_lines(path)
+    if not lines:
+        raise ArtifactError(f"{name} carries no samples")
+    counts = set()
+    for i, ln in enumerate(lines):
+        parts = ln.split()
+        if len(parts) != 4:
+            raise ArtifactError(f"{name} line {i} has {len(parts)} columns, expected 4: {ln!r}")
+        for col, what in zip(parts, ("timestamp", "pid count", "fd count", "rss")):
+            _finite_nonneg(col, name, f"line {i} {what}")
+        npids = int(float(parts[1]))
+        if npids < 1:
+            raise ArtifactError(f"{name} line {i} reports {npids} workers")
+        counts.add(npids)
+    if len(counts) > 1:
+        raise ArtifactError(
+            f"{name} worker count changes across the series: {sorted(counts)}. A series "
+            f"spanning two different sets of processes is not a series.")
+    declared = head.get("samples")
+    if declared is not None and str(len(lines)) != declared:
+        raise ArtifactError(f"{name} declares {declared} samples and carries {len(lines)}")
+    return {"samples": len(lines), "workers": counts.pop()}
+
+
+def check_g16_scan(path: str, name: str, *, run_id=None) -> dict:
+    """`root=... files=N dirs=M wall_s=X`, all present, finite and non-negative."""
+    _header(path, name, run_id)
+    lines = _body_lines(path)
+    if len(lines) != 1:
+        raise ArtifactError(f"{name} must carry exactly one result line; got {len(lines)}")
+    fields = {}
+    for token in lines[0].split():
+        key, _, value = token.partition("=")
+        if key:
+            fields[key] = value
+    for required in ("root", "files", "dirs", "wall_s"):
+        if required not in fields:
+            raise ArtifactError(f"{name} is missing {required!r}: {lines[0]!r}")
+    if not fields["root"].strip():
+        raise ArtifactError(f"{name} records no scan root")
+    for numeric in ("files", "dirs", "wall_s"):
+        _finite_nonneg(fields[numeric], name, numeric)
+    return {"files": int(float(fields["files"])), "dirs": int(float(fields["dirs"]))}
+
+
+_G4_REQUEST_FIELDS = ("run_id", "start", "end", "url", "span_days", "probe_rows", "g4_samples")
+
+
+def check_g4_request(data, *, run_id=None) -> dict:
+    if not isinstance(data, dict):
+        raise ArtifactError("g4_request.json must be an object")
+    missing = [f for f in _G4_REQUEST_FIELDS if f not in data]
+    if missing:
+        raise ArtifactError(f"g4_request.json is missing field(s): {missing}")
+    if run_id is not None and data["run_id"] != run_id:
+        raise ArtifactError(f"g4_request.json belongs to run {data['run_id']!r}")
+    for field in ("span_days", "probe_rows"):
+        value = data[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value != 366:
+            raise ArtifactError(
+                f"g4_request.json {field} must be exactly 366; got {value!r}. Editing it "
+                f"afterwards would let a shorter run be reported as a 366-day one.")
+    planned = data["g4_samples"]
+    if isinstance(planned, bool) or not isinstance(planned, int) or planned < 1:
+        raise ArtifactError(f"g4_request.json g4_samples must be a positive integer; "
+                            f"got {planned!r}")
+    for field in ("start", "end", "url"):
+        if not (isinstance(data[field], str) and data[field].strip()):
+            raise ArtifactError(f"g4_request.json {field} must be a non-empty string")
+    return data
 
 
 def _run_id_from(art_dir: str):
@@ -259,18 +396,45 @@ def assemble(art_dir: str, *, profile: str) -> dict:
     if missing:
         raise ArtifactError(f"the run did not produce required artifact(s): {missing}")
 
+    run_id = _run_id_from(art_dir)
+    marker = _load_json(os.path.join(art_dir, "run.json"), "run.json")
+    if not isinstance(marker, dict) or marker.get("run_id") != run_id:
+        raise ArtifactError(
+            f"run.json declares run {marker.get('run_id')!r} but the artifact directory is "
+            f"{run_id!r}; the run this evidence belongs to is not the one being assembled")
+
+    request = None
+    if "g4_request.json" in names:
+        request = check_g4_request(
+            _load_json(os.path.join(art_dir, "g4_request.json"), "g4_request.json"),
+            run_id=run_id)
+
+    #: Series parsers. `_check_nonempty` is kept only for the human-readable df/findmnt copies.
+    parsers = {
+        "g4_366d_seconds.txt": lambda p, n: check_g4_series(
+            p, n, run_id=run_id, expected=(request or {}).get("g4_samples")),
+        "h7_fd_rss_timeseries.txt": lambda p, n: check_h7_series(p, n, run_id=run_id),
+        "g16_metadata_scan.txt": lambda p, n: check_g16_scan(p, n, run_id=run_id),
+    }
+
     summary = {}
     for name in names:
         path = os.path.join(art_dir, name)
         if name.endswith(".json"):
             data = _load_json(path, name)
             if name == "preflight.json":
-                _check_preflight(data, profile, run_id=_run_id_from(art_dir))
+                _check_preflight(data, profile, run_id=run_id)
             elif name == "wal_state.json":
                 _check_wal(data, profile)
             elif name == "shadow_verification.json":
                 check_shadow_verification(data)
+            if (isinstance(data, dict) and "run_id" in data
+                    and data["run_id"] != run_id and name != "run.json"):
+                raise ArtifactError(
+                    f"{name} belongs to run {data['run_id']!r}, not {run_id!r}")
             summary[name] = {"kind": "json", "ok": True}
+        elif name in parsers:
+            summary[name] = {"kind": "series", **parsers[name](path, name)}
         else:
             summary[name] = {"kind": "text", "bytes": _check_nonempty(path, name)}
 

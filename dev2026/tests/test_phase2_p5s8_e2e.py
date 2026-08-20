@@ -147,13 +147,14 @@ class _E2E(unittest.TestCase):
                          for p in pids])
         _stub(self.bin, "pm2", f"cat <<'JSON'\n{jl}\nJSON")
         body = json.dumps([{"date": f"d{i}", "sst": 1.0} for i in range(366)])
+        # Real `curl -w` writes the BODY and then the -w trailer. The old stub short-circuited
+        # the timing call with only a status, which no longer models curl now that every sample
+        # is validated -- and a stub that does not model the tool tests the stub.
         _stub(self.bin, "curl", f'''
 args="$*"
-if [[ "$args" == *"time_total"* ]]; then echo "200 0.011"; exit 0; fi
-cat <<'JSON'
-{body}
-JSON
-if [[ "$args" == *"http_code"* ]]; then echo "200"; fi''')
+printf '%s' '{body}'
+if [[ "$args" == *"time_total"* ]]; then printf '\n200 0.011';
+elif [[ "$args" == *"http_code"* ]]; then printf '\n200'; fi''')
 
     # ---- runner -----------------------------------------------------
     def run_sequence(self, profile, stop_after=None):

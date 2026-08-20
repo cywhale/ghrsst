@@ -198,8 +198,16 @@ class TestTheArtifactContractIsHonoured(_Sandbox):
                 with open(path, "w") as fh:
                     json.dump(rep.EXAMPLE_STUBS[name], fh)
             else:
+                # Real series, not "sample 1": the parsers replaced the size check, so a
+                # placeholder body would make every test here a test of the placeholder.
+                bodies = {
+                    "g4_366d_seconds.txt": "# run_id=TEST samples=1 validated_rows=366\n0.01\n",
+                    "h7_fd_rss_timeseries.txt": "# run_id=TEST pids=[1] samples=1\n1 1 3 2048\n",
+                    "g16_metadata_scan.txt": ("# run_id=TEST\nroot=/stub files=2 dirs=1 "
+                                              "wall_s=0.5\n"),
+                }
                 with open(path, "w") as fh:
-                    fh.write("sample 1\n")
+                    fh.write(bodies.get(name, "sample 1\n"))
         return self.art
 
     def test_the_generator_lists_the_same_artifacts_the_document_promises(self):

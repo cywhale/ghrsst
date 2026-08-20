@@ -270,9 +270,11 @@ class TestG4FailsClosed(unittest.TestCase):
         artifact list, so a prose match survived deleting the check itself — the guard was
         reading the documentation of the rule instead of the rule."""
         code = _code_only(self.doc)
-        self.assertIn("ROWS", code)
-        self.assertTrue(re.search(r'\[\s*"\$ROWS"\s*-eq\s*366\s*\]', code),
+        # The check moved from bash into the probe/sampler python, where it can also validate
+        # the JSON shape and run on EVERY sample rather than only the first.
+        self.assertTrue(re.search(r"len\(rows\)\s*!=\s*366", code),
                         "no executable check that the response really holds 366 rows")
+        self.assertIn("expected row count 366", code)
 
     def test_positive_control_prose_alone_does_not_satisfy_the_row_count_guard(self):
         prose_only = "```bash\ncurl -s \"$URL\"\n```\n\n| the row count does not match | aborts |"

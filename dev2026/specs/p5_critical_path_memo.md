@@ -234,6 +234,29 @@ One survivor was a real gap: the "neither derived nor excusable" branch is unrea
 input is missing, because the required-input check fires first — so it needed its own case, a
 preflight field added with no derivation path, which must abort rather than be written blank.
 
+## Review round 6 — evidence that proves which run it came from
+
+| finding | correction |
+|---|---|
+| `$ART` could be reused, so an interrupted run's files satisfied the assembler exactly as fresh ones | `art-root` creates a **fresh** directory (`mkdir`, not `mkdir -p`) and writes `run.json`. Every producer stamps the `RUN_ID` — JSON records as a field, series as a `# run_id=…` header — and the assembler checks each against the marker and the directory name |
+| `_check_nonempty()` accepted any one-line string as a series, so `lol` passed as thirty latency samples | real parsers: exact sample counts and finite non-negative seconds; numeric `ts npids fds rss` columns with a **stable** worker count; `root=… files=… dirs=… wall_s=…` with the scan root recorded. `_check_nonempty` survives only for the human-readable `df`/`findmnt` copies, which have no schema |
+| `g4_request.json` was neither required nor validated | required for `legacy_baseline`, exact schema, run-bound, `span_days` and `probe_rows` pinned to 366, and its planned sample count **cross-checked against the series actually produced** |
+| only the G4 probe validated its response | every sample is validated — JSON shape and exactly 366 rows — so a service degrading to a short, valid-looking 200 refuses the run instead of being timed. The sampler also re-checks the request's run binding before spending 30 requests against production |
+| `json.load(open(...))` in `g4-sample` | context-managed, with a block-level guard asserting no fenced command opens a file outside a `with` |
+
+Twelve mutations, serial from a git-clean tree: eleven killed. **Six survived the first pass and
+five of those were real gaps** — each time a *different* check happened to catch the test's input,
+leaving the guard under test unbound. Closing them needed inputs chosen so only the intended
+check can fire: garbage with the right line count; a series shortened consistently in header and
+body; three columns with a **stable** pid column (`1 2 3` / `4 5 6` trips worker-stability
+instead); `capacity.json` and `wal_state.json` in the stale-artifact list, since neither has a
+validator of its own; and the stale-request case tested at the sampler rather than only at the
+assembler.
+
+The one remaining survivor is a **true equivalent**: dropping the required-field check in the
+metadata-scan parser leaves a `KeyError` on the following line, so the scan still fails closed —
+by a worse message, not by a weaker guarantee.
+
 ## 4. Remaining blockers
 
 | blocker | state |

@@ -100,7 +100,10 @@ PYEOF
 )
 [ "$UNDER" = "no" ] || { echo "NO-GO: ART_ROOT is under \$G: $ART_ROOT"; exit 1; }
 
-mkdir -p "$ART"
+# A FRESH directory, never a reused one. `mkdir -p` on an existing path silently adopts an
+# interrupted run's leftovers as this run's evidence; `mkdir` without -p refuses.
+[ -e "$ART" ] && { echo "NO-GO: artifact directory already exists: $ART"; exit 1; }
+mkdir "$ART"
 
 # (2) ... and must not share the production device. A sibling volume-mate still competes for
 # the free space G18 is blocked on. `set -e` makes a FAILED findmnt an abort, not two empty
@@ -109,6 +112,16 @@ PROD_DEV="$(findmnt -no SOURCE --target "$G")"
 ART_DEV="$(findmnt -no SOURCE --target "$ART")"
 [ -n "$PROD_DEV" ] && [ -n "$ART_DEV" ] || { echo "NO-GO: could not resolve mount sources"; exit 1; }
 [ "$PROD_DEV" != "$ART_DEV" ] || { echo "NO-GO: ART is on the production device ($PROD_DEV)"; exit 1; }
+# The run marker. Every producer stamps this RUN_ID into its output and the assembler checks
+# each one, so a file left by another run cannot pass as this run's evidence.
+"$PYTHON" - "$ART" "$RUN_ID" <<'PYEOF'
+import json, os, sys, datetime as dt
+art, run_id = sys.argv[1], sys.argv[2]
+with open(os.path.join(art, "run.json"), "w") as fh:
+    json.dump({"run_id": run_id,
+               "created_utc": dt.datetime.now(dt.timezone.utc).isoformat()},
+              fh, indent=2, sort_keys=True)
+PYEOF
 export RUN_ID ART
 echo "ART=$ART"
 ```
@@ -170,7 +183,8 @@ import json, os, sys
 sys.path.insert(0, os.environ["CODE_ROOT"])
 profile, art = os.environ["PROFILE"], os.environ["ART"]
 if profile == "legacy_baseline":
-    rec = {"wal_repairs_pending": None,
+    rec = {"run_id": os.environ["RUN_ID"],
+           "wal_repairs_pending": None,
            "not_applicable_with_reason": ("legacy_baseline: no P5 repair WAL is deployed on "
                                           "this host, so neither a count nor zero is "
                                           "meaningful")}
@@ -184,8 +198,8 @@ else:
     pending = len(state.blocked_days)
     if isinstance(pending, bool) or not isinstance(pending, int):
         raise SystemExit(f"NO-GO: WAL pending state is not an integer count: {pending!r}")
-    rec = {"wal_repairs_pending": pending, "wal_root": wal_root,
-           "blocked_days": sorted(state.blocked_days)}
+    rec = {"run_id": os.environ["RUN_ID"], "wal_repairs_pending": pending,
+           "wal_root": wal_root, "blocked_days": sorted(state.blocked_days)}
 with open(os.path.join(art, "wal_state.json"), "w") as fh:
     json.dump(rec, fh, indent=2, sort_keys=True)
 print(json.dumps(rec, sort_keys=True))
@@ -216,6 +230,7 @@ df -h "$G" > "$ART/df_h.txt"
 df -i "$G" > "$ART/df_i.txt"
 findmnt -no SOURCE,FSTYPE,TARGET --target "$G" > "$ART/findmnt.txt"
 [ -s "$ART/findmnt.txt" ] || { echo "NO-GO: findmnt produced no output for $G"; exit 1; }
+: "${RUN_ID:?run the art-root block first}"
 "$PYTHON" - "$G" "$ART" <<'PYEOF'
 import json, os, sys
 g, art = sys.argv[1], sys.argv[2]
@@ -224,7 +239,8 @@ with open(os.path.join(art, "findmnt.txt")) as fh:
     parts = fh.read().split()
 if len(parts) < 2:
     raise SystemExit(f"NO-GO: findmnt output is not SOURCE FSTYPE TARGET: {parts!r}")
-rec = {"filesystem_device": parts[0], "filesystem_fstype": parts[1],
+rec = {"run_id": os.environ["RUN_ID"],
+       "filesystem_device": parts[0], "filesystem_fstype": parts[1],
        "free_now_bytes": int(st.f_bavail) * int(st.f_frsize),
        "inodes_free": int(st.f_favail)}
 for key, value in rec.items():
@@ -336,87 +352,129 @@ sample is kept, and any failure discards the whole run.
 # block: g4-probe
 # Run on: VM24
 set -euo pipefail
-: "${PYTHON:?set PYTHON}"
-DAYS="${FORCE_SPAN_DAYS:-366}"          # override exists so the guard itself can be tested
-read -r S E <<<"$("$PYTHON" - "$DAYS" <<'PYEOF'
-import datetime as dt, sys
-n = int(sys.argv[1])
-e = dt.date.today(); s = e - dt.timedelta(days=n - 1)
-print(s.isoformat(), e.isoformat())
-PYEOF
-)"
-# The span is measured from the request that will actually be sent, not from the intent.
-SPAN=$("$PYTHON" - "$S" "$E" <<'PYEOF'
-import datetime as dt, sys
-a = dt.date.fromisoformat(sys.argv[1]); b = dt.date.fromisoformat(sys.argv[2])
-print((b - a).days + 1)
-PYEOF
-)
-[ "$SPAN" -eq 366 ] || { echo "NO-GO: span is $SPAN days, not exactly 366"; exit 1; }
+: "${PYTHON:?set PYTHON}"; : "${ART:?run the art-root block first}"
+: "${RUN_ID:?run the art-root block first}"
+"$PYTHON" - <<'PYEOF'
+import datetime as dt, json, os, subprocess, sys
 
-URL="http://127.0.0.1:8080/api/ghrsst?lon0=135&lat0=20&start=$S&end=$E&append=sst"
-RESP="$(curl -s -w '\n%{http_code}' "$URL")"
-CODE="$(printf '%s' "$RESP" | tail -n 1)"
-BODY="$(printf '%s' "$RESP" | sed '$d')"
-[ "$CODE" = "200" ] || { echo "NO-GO: probe returned HTTP $CODE; discard the entire run"; exit 1; }
+art, run_id = os.environ["ART"], os.environ["RUN_ID"]
+days = int(os.environ.get("FORCE_SPAN_DAYS", "366"))   # override exists so the guard is testable
+samples = int(os.environ.get("G4_SAMPLES", "30"))
 
-# Shape before count: an HTML error page and a `{"detail": ...}` both have a length.
-ROWS="$(printf '%s' "$BODY" | "$PYTHON" -c "
-import json, sys
-d = json.load(sys.stdin)
-assert isinstance(d, list), 'response is not a list of rows'
-assert d, 'response is an empty list'
-assert isinstance(d[0], dict) and 'date' in d[0] and 'sst' in d[0], 'unexpected row shape'
-print(len(d))
-")" || { echo "NO-GO: probe body failed validation; discard the entire run"; exit 1; }
-[ "$ROWS" -eq 366 ] || { echo "NO-GO: expected row count 366, got $ROWS"; exit 1; }
-# Explicit handoff: the sampler runs in its OWN shell, so an inherited $URL would be unbound.
-# Writing the validated request means the sampler cannot time a request the probe never checked.
-"$PYTHON" - "$ART" "$S" "$E" "$URL" "$ROWS" <<'PYEOF'
-import json, os, sys
-art, start, end, url, rows = sys.argv[1:6]
+end = dt.date.today(); start = end - dt.timedelta(days=days - 1)
+span = (end - start).days + 1
+if span != 366:
+    raise SystemExit(f"NO-GO: span is {span} days, not exactly 366")
+
+url = ("http://127.0.0.1:8080/api/ghrsst"
+       f"?lon0=135&lat0=20&start={start}&end={end}&append=sst")
+out = subprocess.run(["curl", "-s", "-w", "\n%{http_code}", url],
+                     capture_output=True, text=True)
+if out.returncode != 0:
+    raise SystemExit(f"NO-GO: curl failed with {out.returncode}")
+# rstrip first: a trailing newline would leave the status in the wrong partition
+body, _, code = out.stdout.rstrip("\n").rpartition("\n")
+if code.strip() != "200":
+    raise SystemExit(f"NO-GO: probe returned HTTP {code.strip()}; discard the entire run")
+try:
+    rows = json.loads(body)
+except Exception as e:
+    raise SystemExit(f"NO-GO: probe body is not JSON ({e}); discard the entire run")
+if not isinstance(rows, list) or not rows:
+    raise SystemExit("NO-GO: probe body is not a non-empty list of rows")
+if not (isinstance(rows[0], dict) and "date" in rows[0] and "sst" in rows[0]):
+    raise SystemExit(f"NO-GO: unexpected row shape: {rows[0]!r}")
+if len(rows) != 366:
+    raise SystemExit(f"NO-GO: expected row count 366, got {len(rows)}")
+
+# The validated request, bound to this run. The sampler reads it rather than inheriting a
+# variable -- separate blocks are separate shells -- and the assembler cross-checks the sample
+# count against the series actually produced.
 with open(os.path.join(art, "g4_request.json"), "w") as fh:
-    json.dump({"start": start, "end": end, "url": url, "probe_rows": int(rows),
-               "span_days": 366}, fh, indent=2, sort_keys=True)
+    json.dump({"run_id": run_id, "start": start.isoformat(), "end": end.isoformat(),
+               "url": url, "span_days": span, "probe_rows": len(rows),
+               "g4_samples": samples}, fh, indent=2, sort_keys=True)
+print(f"probe OK: {start}..{end}, {len(rows)} rows, {samples} samples planned")
 PYEOF
-echo "probe OK: $S..$E, $ROWS rows"
 ```
 
-Only once that probe passes are timing samples taken, and any non-200 **during** sampling
-discards the run too:
+Only once that probe passes are timing samples taken — and **every sample is validated the same
+way**. Checking the status alone would time a service that has degraded to a short, valid-looking
+200, and report the result as a 366-day latency:
 
 ```bash
 # block: g4-sample
 # Run on: VM24
 set -euo pipefail
-: "${ART:?run the art-root block first}"
-: "${PYTHON:?set PYTHON}"
-# The request comes from the probe's validated record, never from an inherited variable.
-[ -f "$ART/g4_request.json" ] || { echo "NO-GO: run g4-probe first"; exit 1; }
-URL="$("$PYTHON" -c "
-import json, sys
-rec = json.load(open(sys.argv[1]))
-assert rec['span_days'] == 366 and rec['probe_rows'] == 366, rec
-print(rec['url'])
-" "$ART/g4_request.json")" || { echo "NO-GO: g4_request.json is not a validated probe"; exit 1; }
-: > "$ART/g4_366d_seconds.txt"
-for i in $(seq 1 "${G4_SAMPLES:-30}"); do
-  OUT="$(curl -s -o /dev/null -w '%{http_code} %{time_total}' "$URL")"
-  CODE="${OUT%% *}"; T="${OUT##* }"
-  [ "$CODE" = "200" ] || { echo "NO-GO: HTTP $CODE during sampling; discard the run"; exit 1; }
-  echo "$T" >> "$ART/g4_366d_seconds.txt"
-  sleep "${G4_SLEEP:-0.3}"
-done
+: "${PYTHON:?set PYTHON}"; : "${ART:?run the art-root block first}"
+: "${RUN_ID:?run the art-root block first}"
+"$PYTHON" - <<'PYEOF'
+import json, math, os, subprocess, time
+
+art, run_id = os.environ["ART"], os.environ["RUN_ID"]
+sleep_s = float(os.environ.get("G4_SLEEP", "0.3"))
+
+req_path = os.path.join(art, "g4_request.json")
+if not os.path.isfile(req_path):
+    raise SystemExit("NO-GO: g4_request.json is missing; run g4-probe first")
+with open(req_path) as fh:                     # context-managed: no handle left to the GC
+    req = json.load(fh)
+if req.get("run_id") != run_id:
+    raise SystemExit(f"NO-GO: g4_request.json belongs to run {req.get('run_id')!r}")
+if req.get("span_days") != 366 or req.get("probe_rows") != 366:
+    raise SystemExit(f"NO-GO: g4_request.json is not a validated 366-day probe: {req}")
+
+url, want = req["url"], int(req["g4_samples"])
+seconds = []
+for _ in range(want):
+    out = subprocess.run(["curl", "-s", "-w", "\n%{http_code} %{time_total}", url],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        raise SystemExit(f"NO-GO: curl failed with {out.returncode}; discard the run")
+    body, _, trailer = out.stdout.rstrip("\n").rpartition("\n")
+    parts = trailer.split()
+    if len(parts) != 2:
+        raise SystemExit(f"NO-GO: unparseable curl trailer {trailer!r}")
+    code, elapsed = parts[0], float(parts[1])
+    if code != "200":
+        raise SystemExit(f"NO-GO: HTTP {code} during sampling; discard the run")
+    # EVERY response, not just the probe's: a degraded service returns 200 with fewer rows.
+    try:
+        rows = json.loads(body)
+    except Exception as e:
+        raise SystemExit(f"NO-GO: sample body is not JSON ({e}); discard the run")
+    if not isinstance(rows, list) or len(rows) != 366:
+        raise SystemExit(f"NO-GO: sample returned {len(rows) if isinstance(rows, list) else '?'}"
+                         f" rows, not 366; discard the run")
+    if not math.isfinite(elapsed) or elapsed < 0:
+        raise SystemExit(f"NO-GO: non-finite sample time {elapsed!r}")
+    seconds.append(elapsed)
+    time.sleep(sleep_s)
+
+if len(seconds) != want:
+    raise SystemExit(f"NO-GO: collected {len(seconds)} samples, planned {want}")
+path = os.path.join(art, "g4_366d_seconds.txt")
+with open(path, "w") as fh:
+    fh.write(f"# run_id={run_id} samples={len(seconds)} validated_rows=366\n")
+    for value in seconds:
+        fh.write(f"{value}\n")
+    fh.flush(); os.fsync(fh.fileno())
+print(f"g4: {len(seconds)} validated samples")
+PYEOF
 ```
 
-- **Rate:** serial, 0.3 s apart. This is a production service; a load generator is not
-  authorized here.
-- **G3** compares against the **current production** baseline. Until a segmented base is
-  deployed there is no segmented arm, so **G3 stays `NOT_ADJUDICATED`** and this profile records
-  the baseline half only. A ratio with one arm measured would be the local-to-production
-  promotion this whole phase exists to avoid.
-- **Percentiles:** record the sample count beside every percentile. A p95 over 7 samples is the
-  second-worst value, not a percentile.
+Inode headroom is already **PASS_EVIDENCE_AVAILABLE** from the historical run: 225,490,340 free
+against a +10-year projection of ~4.9 M additional files, roughly 46× headroom. Re-confirm it
+from §2's `df -i`.
+
+**Sustained under what load?** H7 asks for fd/RSS at concurrency 8 and 16. This runbook is
+read-only and must not generate that load against production, so **H7's sustained half stays
+`NOT_ADJUDICATED`** until the `p5_shadow` profile can run it against a shadow copy. Sampling an
+idle process for five minutes and calling it a sustained-load result would be the same category
+error as the withdrawn P5-S6 measurements.
+
+Judge growth on the **plateau**, not against the first sample: a worker pool sizing itself once
+is not a leak, and the local S7 harness reported exactly that as growth before it was corrected.
 
 ## 4. H7 — inode headroom and fd / RSS across ALL workers
 
@@ -460,9 +518,14 @@ first, roster = current()
 if not first:
     raise SystemExit("NO-GO: PM2 reports no pid for the app; there is nothing to sample")
 art = os.environ.get("ART") or ""
-if art:                                  # the pid roster IS evidence; persist it, not just fds
-    with open(os.path.join(art, "pm2_jlist.json"), "w") as fh:
-        json.dump(roster, fh)
+run_id = os.environ.get("RUN_ID", "")
+if not (art and run_id):
+    raise SystemExit("NO-GO: ART and RUN_ID must be set; run the art-root block first")
+with open(os.path.join(art, "pm2_jlist.json"), "w") as fh:   # the roster IS evidence
+    json.dump({"run_id": run_id, "roster": roster}, fh)
+series = os.path.join(art, "h7_fd_rss_timeseries.txt")
+with open(series, "w") as fh:
+    fh.write(f"# run_id={run_id} pids={sorted(first)} samples={samples}\n")
 print(f"# pids={sorted(first)}")
 for _ in range(samples):
     now, _ = current()                   # refreshed EVERY sample, not once at the start
@@ -479,9 +542,8 @@ for _ in range(samples):
             raise SystemExit(f"NO-GO: pid {pid} vanished mid-sample; the service restarted")
     line = f"{int(time.time())} {len(first)} {fds} {rss}"
     print(line)
-    if art:
-        with open(os.path.join(art, "h7_fd_rss_timeseries.txt"), "a") as fh:
-            fh.write(line + "\n")
+    with open(series, "a") as fh:
+        fh.write(line + "\n")
     time.sleep(interval)
 PYEOF
 ```
@@ -518,12 +580,14 @@ def boom(err):
 t0 = time.perf_counter(); files = dirs = 0
 for _, d, f in os.walk(os.environ["G"], onerror=boom):   # fail closed on ANY traversal error
     dirs += len(d); files += len(f)
-line = f"{files} files, {dirs} dirs, {time.perf_counter() - t0:.1f} s"
+root = os.environ["G"]
+line = (f"root={root} files={files} dirs={dirs} "
+        f"wall_s={time.perf_counter() - t0:.3f}")
 # The block writes its OWN artifact and fsyncs it. Asking the operator to `tee` in prose left
 # the assembler requiring a file nothing produced.
 path = os.path.join(os.environ["ART"], "g16_metadata_scan.txt")
 with open(path, "w") as fh:
-    fh.write(line + "\n")
+    fh.write(f"# run_id={os.environ['RUN_ID']}\n{line}\n")
     fh.flush(); os.fsync(fh.fileno())
 print(line)
 PYEOF
@@ -627,7 +691,8 @@ with open(os.path.join(anchor, "domain.json")) as fh:
     domain_id = json.load(fh).get("domain_id") or ""
 if not domain_id:
     nogo("the anchor's domain.json declares no domain_id")
-record = {"segments": len(store.segment_paths), "generation": store.generation,
+record = {"run_id": os.environ["RUN_ID"],
+          "segments": len(store.segment_paths), "generation": store.generation,
           "wal_root": os.path.join(shadow, "p5_repairs"), "anchor_root": anchor,
           "anchor_domain_id": domain_id, "measurement_taken": False}
 with open(os.path.join(art, "shadow_verification.json"), "w") as fh:
@@ -667,6 +732,8 @@ test compares this table against the generator so neither side can drift.
 
 | artifact | profile | content |
 |---|---|---|
+| `run.json` | both | the run marker: `run_id` and creation time, written by `art-root` into a **fresh** directory |
+| `g4_request.json` | `legacy_baseline` | the validated request: span, URL, probe row count and the planned sample count the series is checked against |
 | `preflight.json` | both | every field in §9, with `not_applicable_with_reason` for those the profile cannot answer |
 | `wal_state.json` | both | `wal_repairs_pending`, or the not-applicable record under `legacy_baseline` |
 | `df_h.txt`, `df_i.txt`, `findmnt.txt` | `legacy_baseline` | capacity and filesystem identity |
@@ -676,6 +743,16 @@ test compares this table against the generator so neither side can drift.
 | `g16_metadata_scan.txt` | `legacy_baseline` | file/dir counts and wall time |
 | `shadow_verification.json` | `p5_shadow` | segments, generation, WAL and anchor state — and `measurement_taken: false` |
 | `p5s8_readonly.json` | both | the assembled report, written only if every artifact above validates |
+
+**Every artifact is bound to the run.** JSON records carry `run_id`; the three series carry a
+`# run_id=... ` header. The assembler checks each against `run.json` and against the directory
+name, so a file left behind by an earlier interrupted run — real content, wrong run — is refused
+rather than adopted. `art-root` refuses to start in a directory that already exists, which is
+where that reuse came from.
+
+The series are **parsed, not sized**. `_check_nonempty` survives only for the human-readable
+`df`/`findmnt` copies, which have no schema; it once let the single line `lol` pass as thirty
+latency samples.
 
 Every record carries `label: VM24_PRODUCTION_READ_ONLY` and the `profile` it was collected
 under. Local synthetic numbers are **never** merged into these files, and no number here may be
