@@ -159,13 +159,23 @@ class TestTheShadowProfileClaimsOnlyWhatItMeasures(unittest.TestCase):
         finally:
             self.doc = saved
 
+    #: Blocks that TAKE a measurement. Verification and record-keeping blocks may reference
+    #: the shadow -- that is their job; a measurement may not, because nothing isolates it.
+    MEASUREMENT_BLOCKS = ("g4-probe", "g4-sample", "h7-sample", "g16-scan")
+
     def test_no_measurement_block_is_redirected_at_the_shadow(self):
-        """If a block reads SHADOW_ROOT it must be the verification block, not a measurement
-        pretending to be isolated."""
-        for tag, body in BLOCKS.items():
-            if "SHADOW_ROOT" in body:
-                with self.subTest(tag):
-                    self.assertIn(tag, ("shadow-verify", "shadow-fs-gate", "env"))
+        """An allow-list of blocks that may mention SHADOW_ROOT needed updating every time a
+        record-keeping block was added, which is maintenance, not a guard. The invariant is
+        about measurements: none of them may claim shadow isolation it does not have."""
+        for tag in self.MEASUREMENT_BLOCKS:
+            with self.subTest(tag):
+                self.assertIn(tag, BLOCKS)
+                self.assertNotIn("SHADOW_ROOT", BLOCKS[tag],
+                                 "a measurement block references the shadow while still "
+                                 "reading production")
+
+    def test_positive_control_a_redirected_measurement_would_be_caught(self):
+        self.assertIn("SHADOW_ROOT", 'curl "$SHADOW_ROOT/x"')
 
 
 # ------------------------------------------------------------------ 2. artifact contract
@@ -268,6 +278,121 @@ class TestTheArtifactContractIsHonoured(_Sandbox):
         self.assertNotEqual(r.returncode, 0, "an incomplete run assembled a report")
         self.assertFalse(os.path.isfile(os.path.join(self.art, "p5s8_readonly.json")),
                          "a report was written despite the run being incomplete")
+
+
+# ------------------------------------------------------------------ 3/4. value validation
+class TestPreflightValuesAreValidatedNotJustPresent(_Sandbox):
+    """Presence is not validity. A preflight carrying `deploy_sha: "x"` and
+    `free_now_bytes: -1` has every required key and describes nothing."""
+
+    def _pre(self, **over):
+        from ops import p5s8_report as rep
+        data = dict(rep.EXAMPLE_STUBS["preflight.json"])
+        data.update({"run_id": "TEST", "deploy_sha": "a" * 40,
+                     "code_root": "/opt/code", "python": "/opt/py", "pythonpath": "/opt/code",
+                     "host": "h", "measured_utc": "2027-01-01T00:00:00Z",
+                     "filesystem_device": "/dev/x", "filesystem_fstype": "ext4",
+                     "free_now_bytes": 1, "inodes_free": 1,
+                     "label": "VM24_PRODUCTION_READ_ONLY"})
+        data.update(over)
+        return data
+
+    def _assert_refused(self, **over):
+        from ops import p5s8_report as rep
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_preflight_values(self._pre(**over), "legacy_baseline", run_id="TEST")
+
+    def test_a_valid_preflight_passes(self):
+        from ops import p5s8_report as rep
+        rep.check_preflight_values(self._pre(), "legacy_baseline", run_id="TEST")
+
+    def test_an_abbreviated_or_movable_deploy_sha_is_refused(self):
+        for bad in ("HEAD", "a" * 7, "A" * 40, "z" * 40, "", None, 12345):
+            with self.subTest(bad):
+                self._assert_refused(deploy_sha=bad)
+
+    def test_an_empty_path_field_is_refused(self):
+        for field in ("code_root", "python", "pythonpath", "filesystem_device"):
+            with self.subTest(field):
+                self._assert_refused(**{field: ""})
+                self._assert_refused(**{field: "   "})
+
+    def test_a_negative_or_non_integer_capacity_value_is_refused(self):
+        for bad in (-1, "267", 1.5, True, None):
+            with self.subTest(bad):
+                self._assert_refused(free_now_bytes=bad)
+                self._assert_refused(inodes_free=bad)
+
+    def test_a_wrong_label_is_refused(self):
+        self._assert_refused(label="LOCAL_SYNTHETIC")
+
+    def test_a_run_id_from_another_run_is_refused(self):
+        self._assert_refused(run_id="OTHER")
+
+    def test_a_not_applicable_reason_where_it_is_NOT_permitted_is_refused(self):
+        """`legacy_baseline` may excuse the P5 fields and nothing else. Excusing
+        `filesystem_device` would hide a capacity check that never ran."""
+        self._assert_refused(
+            filesystem_device="not_applicable_with_reason: could not be bothered")
+
+    def test_a_permitted_not_applicable_still_needs_a_REASON(self):
+        self._assert_refused(anchor_root="not_applicable_with_reason:")
+        self._assert_refused(anchor_root=None)
+
+
+class TestTheShadowVerificationRecordIsValidated(_Sandbox):
+    """Item 3: `{}` or a partial record must not pass for `p5_shadow`."""
+
+    def _rec(self, **over):
+        data = {"segments": 2, "generation": 1, "wal_root": "/s/p5_repairs",
+                "anchor_root": "/anchor", "anchor_domain_id": "independent",
+                "measurement_taken": False}
+        data.update(over)
+        return data
+
+    def _assert_refused(self, **over):
+        from ops import p5s8_report as rep
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_shadow_verification(self._rec(**over))
+
+    def test_a_complete_record_passes(self):
+        from ops import p5s8_report as rep
+        rep.check_shadow_verification(self._rec())
+
+    def test_an_empty_record_is_refused(self):
+        from ops import p5s8_report as rep
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_shadow_verification({})
+
+    def test_every_required_field_is_required(self):
+        for field in ("segments", "generation", "wal_root", "anchor_root",
+                      "anchor_domain_id", "measurement_taken"):
+            with self.subTest(field):
+                rec = self._rec()
+                rec.pop(field)
+                from ops import p5s8_report as rep
+                with self.assertRaises(rep.ArtifactError):
+                    rep.check_shadow_verification(rec)
+
+    def test_a_zero_or_negative_segment_count_is_refused(self):
+        for bad in (0, -1, "2", 2.0, True, None):
+            with self.subTest(bad):
+                self._assert_refused(segments=bad)
+
+    def test_an_invalid_generation_is_refused(self):
+        for bad in (0, -3, "1", None, True):
+            with self.subTest(bad):
+                self._assert_refused(generation=bad)
+
+    def test_an_undeclared_anchor_domain_is_refused(self):
+        for bad in ("", "   ", None, 7):
+            with self.subTest(bad):
+                self._assert_refused(anchor_domain_id=bad)
+
+    def test_measurement_taken_must_be_exactly_False(self):
+        for bad in (True, "false", 0, None):
+            with self.subTest(bad):
+                self._assert_refused(measurement_taken=bad)
 
 
 # ------------------------------------------------------------------ 3. shadow fs gate

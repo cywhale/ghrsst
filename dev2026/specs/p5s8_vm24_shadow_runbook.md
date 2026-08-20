@@ -145,41 +145,6 @@ CANON="$(cd "$CODE_ROOT/.." && git rev-parse --verify "${DEPLOY_SHA}^{commit}" 2
 echo "identity preflight OK: $CANON"
 ```
 
-The preflight is also **recorded**, with every field the profile requires and an explicit
-`not_applicable_with_reason` for every field it does not. `ops/p5s8_report.py` refuses a
-preflight that merely omits one — absence reads as clean.
-
-```bash
-# block: preflight-record
-# Run on: VM24
-set -euo pipefail
-: "${PYTHON:?set PYTHON}"; : "${CODE_ROOT:?set CODE_ROOT}"; : "${ART:?}"; : "${PROFILE:?}"
-PYTHONPATH="$CODE_ROOT" "$PYTHON" - <<'PYEOF'
-import json, os, socket, subprocess, sys, datetime as dt
-sys.path.insert(0, os.environ["CODE_ROOT"])
-from ops.p5_roadmap import S8_PREFLIGHT_FIELDS, S8_PROFILES
-profile = os.environ["PROFILE"]; art = os.environ["ART"]
-na = S8_PROFILES[profile]["not_applicable"]
-
-def measured(field):
-    if field == "run_id":          return os.environ.get("RUN_ID", "")
-    if field == "host":            return socket.gethostname()
-    if field == "measured_utc":    return dt.datetime.now(dt.timezone.utc).isoformat()
-    if field == "label":           return "VM24_PRODUCTION_READ_ONLY"
-    return os.environ.get(field.upper(), "")
-
-out = {}
-for f in S8_PREFLIGHT_FIELDS:
-    out[f] = (f"not_applicable_with_reason: {na[f]}" if f in na else measured(f))
-blank = [f for f, v in out.items() if v == ""]
-if blank:
-    raise SystemExit(f"NO-GO: preflight fields not populated: {blank}")
-with open(os.path.join(art, "preflight.json"), "w") as fh:
-    json.dump(out, fh, indent=2, sort_keys=True)
-print(f"preflight recorded: {len(out)} fields")
-PYEOF
-```
-
 **Reachability from the workstation** is a separate check on a separate machine:
 
 ```bash
@@ -189,37 +154,47 @@ set -euo pipefail
 ssh -o BatchMode=yes vm24 'date -Is; hostname' || { echo "NO-GO: host unreachable"; exit 1; }
 ```
 
-### 1a. P5 identity — `p5_shadow` profile only
+### 1a. WAL state — recorded per profile
 
-**Run on: VM24.** Skipped entirely under `legacy_baseline`, where these are recorded as
-`not_applicable_with_reason`.
+**Run on: VM24.** Under `legacy_baseline` there is no P5 WAL, and a `0` would assert a clean WAL
+that does not exist. The record says so explicitly instead, and `ops/p5s8_report.py` refuses a
+bare `null` with no reason.
 
 ```bash
-if [ "$PROFILE" = "p5_shadow" ]; then
-  export ANCHOR_ROOT=${ANCHOR_ROOT:?set ANCHOR_ROOT to an INDEPENDENT rollback domain (§7.5a-2)}
-  export WAL_ROOT=$SHADOW_ROOT/p5_repairs
-  export MANIFEST_ROOT=$SHADOW_ROOT/p5_blocks
-  # ASSERT, do not print: anchor_domain_id() returns None for an undeclared root and exits 0,
-  # so `print(...) || NO-GO` would accept exactly what it was written to reject.
-  PYTHONPATH=$CODE_ROOT "$PYTHON" -c "
-from store import repair_wal as rw
-dom = rw.anchor_domain_id('$ANCHOR_ROOT')
-assert dom is not None, 'anchor root declares no rollback domain'
-print('anchor_domain_id', dom)
-print('anchor_root', rw.resolve_anchor_root('$ANCHOR_ROOT'))
-" || { echo "NO-GO: anchor domain undeclared or same-filesystem"; exit 1; }
-  PYTHONPATH=$CODE_ROOT "$PYTHON" -c "
-import json
-from store import repair_wal as rw
-print(json.dumps({'wal_repairs_pending': rw.pending_state('$WAL_ROOT')}, sort_keys=True))
-" > "$ART/wal_state.json"
-else
-  cat > "$ART/wal_state.json" <<'JSON'
-{"wal_repairs_pending": null,
- "not_applicable_with_reason": "legacy_baseline profile: no P5 repair WAL is deployed on this host, so neither a count nor zero is meaningful. A 0 here would assert a clean WAL that does not exist."}
-JSON
-fi
+# block: wal-record
+# Run on: VM24
+set -euo pipefail
+: "${PYTHON:?set PYTHON}"; : "${CODE_ROOT:?set CODE_ROOT}"; : "${ART:?}"; : "${PROFILE:?}"
+PYTHONPATH="$CODE_ROOT" "$PYTHON" - <<'PYEOF'
+import json, os, sys
+sys.path.insert(0, os.environ["CODE_ROOT"])
+profile, art = os.environ["PROFILE"], os.environ["ART"]
+if profile == "legacy_baseline":
+    rec = {"wal_repairs_pending": None,
+           "not_applicable_with_reason": ("legacy_baseline: no P5 repair WAL is deployed on "
+                                          "this host, so neither a count nor zero is "
+                                          "meaningful")}
+else:
+    from store.repair_wal import read_wal
+    wal_root = os.path.join(os.environ["SHADOW_ROOT"], "p5_repairs")
+    # `blocked_days` is the operationally meaningful count: days an unresolved repair keeps
+    # from being pruned. It is read, never resolved -- closing an open intent is an ops
+    # decision and never a step in a read-only runbook.
+    state = read_wal(wal_root)
+    pending = len(state.blocked_days)
+    if isinstance(pending, bool) or not isinstance(pending, int):
+        raise SystemExit(f"NO-GO: WAL pending state is not an integer count: {pending!r}")
+    rec = {"wal_repairs_pending": pending, "wal_root": wal_root,
+           "blocked_days": sorted(state.blocked_days)}
+with open(os.path.join(art, "wal_state.json"), "w") as fh:
+    json.dump(rec, fh, indent=2, sort_keys=True)
+print(json.dumps(rec, sort_keys=True))
+PYEOF
 ```
+
+The anchor is verified inside `shadow-verify` (§6b), which records its declared domain — so the
+`p5_shadow` preflight derives `anchor_root` and `anchor_domain_id` from that record rather than
+from an environment variable nobody set.
 
 **What the anchor preflight can and cannot prove**, carried forward verbatim from P4-S10
 because it is still exactly true: *`anchor_root` preflight verifies the configured path, the
@@ -228,12 +203,37 @@ VM's snapshot/rollback domain.*
 
 ## 2. Capacity preflight (G18)
 
-**Run on: VM24.**
+**Run on: VM24.** The human-readable `df` output is kept for the operator; the *numbers* the
+preflight uses come from `statvfs` and `findmnt` directly. Parsing `267G` out of `df -h` throws
+away the precision and unit information a gate then depends on.
 
 ```bash
-df -h  /home/odbadmin/Data > "$ART/df_h.txt"
-df -i  /home/odbadmin/Data > "$ART/df_i.txt"
-findmnt -no SOURCE,FSTYPE,TARGET /home/odbadmin/Data > "$ART/findmnt.txt"
+# block: capacity
+# Run on: VM24
+set -euo pipefail
+: "${G:?set G}"; : "${PYTHON:?set PYTHON}"; : "${ART:?run the art-root block first}"
+df -h "$G" > "$ART/df_h.txt"
+df -i "$G" > "$ART/df_i.txt"
+findmnt -no SOURCE,FSTYPE,TARGET --target "$G" > "$ART/findmnt.txt"
+[ -s "$ART/findmnt.txt" ] || { echo "NO-GO: findmnt produced no output for $G"; exit 1; }
+"$PYTHON" - "$G" "$ART" <<'PYEOF'
+import json, os, sys
+g, art = sys.argv[1], sys.argv[2]
+st = os.statvfs(g)
+with open(os.path.join(art, "findmnt.txt")) as fh:
+    parts = fh.read().split()
+if len(parts) < 2:
+    raise SystemExit(f"NO-GO: findmnt output is not SOURCE FSTYPE TARGET: {parts!r}")
+rec = {"filesystem_device": parts[0], "filesystem_fstype": parts[1],
+       "free_now_bytes": int(st.f_bavail) * int(st.f_frsize),
+       "inodes_free": int(st.f_favail)}
+for key, value in rec.items():
+    if value in ("", None):
+        raise SystemExit(f"NO-GO: capacity field {key} is empty")
+with open(os.path.join(art, "capacity.json"), "w") as fh:
+    json.dump(rec, fh, indent=2, sort_keys=True)
+print(json.dumps(rec, sort_keys=True))
+PYEOF
 ```
 
 Recorded baseline — **historical, 2026-08-19**: `/dev/sdc1`, ext4, 6.0 T total, **267 GiB
@@ -246,6 +246,83 @@ is **BLOCKED**, and this step is expected to report BLOCKED until the volume is 
 
 **`HARD_RESERVE` is not adjusted here, or anywhere.** Lowering it changes the verdict without
 changing one byte of free space.
+
+## 2a. Record the preflight — derived, not declared
+
+**Run on: VM24, after §1, §1a and §2** (and after §6 under `p5_shadow`). Every field is
+**derived from an artifact an earlier block actually wrote**. The first version read
+`FILESYSTEM_DEVICE`, `FREE_NOW_BYTES`, `ANCHOR_ROOT`, `MANIFEST_GENERATION` and the rest from
+environment variables the runbook never set, so running the sequence in order aborted on blank
+fields — and the only way it passed was to hand-write the artifact this block exists to produce.
+
+```bash
+# block: preflight-record
+# Run on: VM24
+set -euo pipefail
+: "${PYTHON:?set PYTHON}"; : "${CODE_ROOT:?set CODE_ROOT}"; : "${ART:?}"; : "${PROFILE:?}"
+: "${DEPLOY_SHA:?}"; : "${RUN_ID:?}"
+PYTHONPATH="$CODE_ROOT" "$PYTHON" - <<'PYEOF'
+import json, os, socket, sys, datetime as dt
+sys.path.insert(0, os.environ["CODE_ROOT"])
+from ops.p5_roadmap import S8_PREFLIGHT_FIELDS, S8_PROFILES
+
+profile, art = os.environ["PROFILE"], os.environ["ART"]
+na = S8_PROFILES[profile]["not_applicable"]
+
+def read(name, required):
+    """Load an artifact an earlier block wrote. Fail closed: a preflight assembled around a
+    missing input is a preflight describing a check that never ran."""
+    path = os.path.join(art, name)
+    if not os.path.isfile(path):
+        if required:
+            raise SystemExit(f"NO-GO: {name} is missing; run its block before this one")
+        return {}
+    with open(path) as fh:
+        return json.load(fh)
+
+capacity = read("capacity.json", True)          # both profiles record where they ran
+wal = read("wal_state.json", True)
+shadow = read("shadow_verification.json", profile == "p5_shadow")
+
+derived = {
+    "run_id": os.environ["RUN_ID"],
+    "host": socket.gethostname(),
+    "measured_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "deploy_sha": os.environ["DEPLOY_SHA"],
+    "code_root": os.environ["CODE_ROOT"],
+    "python": os.environ["PYTHON"],
+    "pythonpath": os.environ.get("PYTHONPATH", os.environ["CODE_ROOT"]),
+    "label": "VM24_PRODUCTION_READ_ONLY",
+}
+derived.update({k: capacity[k] for k in
+                ("filesystem_device", "filesystem_fstype", "free_now_bytes", "inodes_free")
+                if k in capacity})
+if profile == "p5_shadow":
+    if "wal_repairs_pending" not in wal:
+        raise SystemExit("NO-GO: wal_state.json carries no wal_repairs_pending")
+    derived.update({
+        "anchor_root": shadow["anchor_root"],
+        "anchor_domain_id": shadow["anchor_domain_id"],
+        "wal_root": shadow["wal_root"],
+        "wal_repairs_pending": wal["wal_repairs_pending"],
+        "manifest_root": os.path.join(os.environ["SHADOW_ROOT"], "p5_blocks"),
+        "manifest_generation": shadow["generation"],
+    })
+
+out = {}
+for field in S8_PREFLIGHT_FIELDS:
+    if field in derived:
+        out[field] = derived[field]
+    elif field in na:
+        out[field] = f"not_applicable_with_reason: {na[field]}"
+    else:
+        raise SystemExit(f"NO-GO: preflight field {field!r} was neither derived nor excusable "
+                         f"under {profile!r}; the sequence is incomplete")
+with open(os.path.join(art, "preflight.json"), "w") as fh:
+    json.dump(out, fh, indent=2, sort_keys=True)
+print(f"preflight recorded: {len(out)} fields, profile {profile}")
+PYEOF
+```
 
 ## 3. G4 — span latency, fail closed
 
@@ -293,6 +370,15 @@ assert isinstance(d[0], dict) and 'date' in d[0] and 'sst' in d[0], 'unexpected 
 print(len(d))
 ")" || { echo "NO-GO: probe body failed validation; discard the entire run"; exit 1; }
 [ "$ROWS" -eq 366 ] || { echo "NO-GO: expected row count 366, got $ROWS"; exit 1; }
+# Explicit handoff: the sampler runs in its OWN shell, so an inherited $URL would be unbound.
+# Writing the validated request means the sampler cannot time a request the probe never checked.
+"$PYTHON" - "$ART" "$S" "$E" "$URL" "$ROWS" <<'PYEOF'
+import json, os, sys
+art, start, end, url, rows = sys.argv[1:6]
+with open(os.path.join(art, "g4_request.json"), "w") as fh:
+    json.dump({"start": start, "end": end, "url": url, "probe_rows": int(rows),
+               "span_days": 366}, fh, indent=2, sort_keys=True)
+PYEOF
 echo "probe OK: $S..$E, $ROWS rows"
 ```
 
@@ -304,13 +390,22 @@ discards the run too:
 # Run on: VM24
 set -euo pipefail
 : "${ART:?run the art-root block first}"
+: "${PYTHON:?set PYTHON}"
+# The request comes from the probe's validated record, never from an inherited variable.
+[ -f "$ART/g4_request.json" ] || { echo "NO-GO: run g4-probe first"; exit 1; }
+URL="$("$PYTHON" -c "
+import json, sys
+rec = json.load(open(sys.argv[1]))
+assert rec['span_days'] == 366 and rec['probe_rows'] == 366, rec
+print(rec['url'])
+" "$ART/g4_request.json")" || { echo "NO-GO: g4_request.json is not a validated probe"; exit 1; }
 : > "$ART/g4_366d_seconds.txt"
-for i in $(seq 1 30); do
+for i in $(seq 1 "${G4_SAMPLES:-30}"); do
   OUT="$(curl -s -o /dev/null -w '%{http_code} %{time_total}' "$URL")"
   CODE="${OUT%% *}"; T="${OUT##* }"
   [ "$CODE" = "200" ] || { echo "NO-GO: HTTP $CODE during sampling; discard the run"; exit 1; }
   echo "$T" >> "$ART/g4_366d_seconds.txt"
-  sleep 0.3
+  sleep "${G4_SLEEP:-0.3}"
 done
 ```
 
@@ -423,12 +518,19 @@ def boom(err):
 t0 = time.perf_counter(); files = dirs = 0
 for _, d, f in os.walk(os.environ["G"], onerror=boom):   # fail closed on ANY traversal error
     dirs += len(d); files += len(f)
-print(f"{files} files, {dirs} dirs, {time.perf_counter() - t0:.1f} s")
+line = f"{files} files, {dirs} dirs, {time.perf_counter() - t0:.1f} s"
+# The block writes its OWN artifact and fsyncs it. Asking the operator to `tee` in prose left
+# the assembler requiring a file nothing produced.
+path = os.path.join(os.environ["ART"], "g16_metadata_scan.txt")
+with open(path, "w") as fh:
+    fh.write(line + "\n")
+    fh.flush(); os.fsync(fh.fileno())
+print(line)
 PYEOF
 ```
 
-On the host, run it under `ionice -c3` as well and tee to `"$ART/g16_metadata_scan.txt"`; with
-`pipefail` set, a failing scan cannot produce an accepted artifact through `tee`.
+On the host, add `ionice -c3`. The block writes and fsyncs `g16_metadata_scan.txt` itself, so a
+scan that aborts leaves no artifact rather than a truncated one.
 
 **Abort this step** if service p95 rises above twice its pre-scan value, or if load average
 exceeds 4. A walk of 5.4 T is the one step here with real service impact, which is why it is
@@ -519,8 +621,15 @@ if not os.path.isdir(anchor):
     nogo(f"anchor root missing: {anchor}")
 if not os.path.isfile(os.path.join(anchor, "domain.json")):
     nogo("the anchor root declares no rollback domain")
+# Recorded as the SOURCE the preflight derives from, so those fields trace to a check that
+# actually ran rather than to an environment variable somebody exported by hand.
+with open(os.path.join(anchor, "domain.json")) as fh:
+    domain_id = json.load(fh).get("domain_id") or ""
+if not domain_id:
+    nogo("the anchor's domain.json declares no domain_id")
 record = {"segments": len(store.segment_paths), "generation": store.generation,
-          "wal": True, "anchor_domain_declared": True, "measurement_taken": False}
+          "wal_root": os.path.join(shadow, "p5_repairs"), "anchor_root": anchor,
+          "anchor_domain_id": domain_id, "measurement_taken": False}
 with open(os.path.join(art, "shadow_verification.json"), "w") as fh:
     json.dump(record, fh, indent=2, sort_keys=True)
 print(f"shadow verified: {record['segments']} segment(s), generation {record['generation']}")

@@ -36,27 +36,52 @@ class ArtifactError(Exception):
 
 #: Artifacts every profile must produce. `wal_state.json` is included for BOTH profiles: under
 #: `legacy_baseline` it carries the not-applicable record, which is itself evidence.
-_COMMON = ("preflight.json", "wal_state.json", "df_h.txt", "df_i.txt", "findmnt.txt",
-           "g4_366d_seconds.txt", "pm2_jlist.json", "h7_fd_rss_timeseries.txt",
-           "g16_metadata_scan.txt")
+_COMMON = ("preflight.json", "wal_state.json", "capacity.json", "df_h.txt", "df_i.txt",
+           "findmnt.txt", "g4_366d_seconds.txt", "pm2_jlist.json",
+           "h7_fd_rss_timeseries.txt", "g16_metadata_scan.txt")
 
 #: The `p5_shadow` profile is verification-only (see `S8_PROFILES`), so it produces the
 #: provisioning record and the identity preflight, and none of the measurement series.
 _BY_PROFILE: Dict[str, tuple] = {
     "legacy_baseline": _COMMON,
-    "p5_shadow": ("preflight.json", "wal_state.json", "shadow_verification.json"),
+    "p5_shadow": ("preflight.json", "wal_state.json", "capacity.json", "df_h.txt", "df_i.txt",
+                  "findmnt.txt", "shadow_verification.json"),
 }
 
 #: Minimal well-formed contents, used by tests to build a complete run without re-encoding the
 #: schema in the test file. Keeping them here means the contract has exactly one definition.
+def _example_preflight(run_id="TEST"):
+    """A stub that PASSES `check_preflight_values`. It has to: a stub that would be rejected
+    makes every test built on it a test of the stub."""
+    na = S8_PROFILES["legacy_baseline"]["not_applicable"]
+    out = {}
+    for f in S8_PREFLIGHT_FIELDS:
+        if f in na:
+            out[f] = f"not_applicable_with_reason: {na[f]}"
+        elif f in _COUNT_FIELDS:
+            out[f] = 1
+        elif f == "deploy_sha":
+            out[f] = "0" * 40
+        elif f == "label":
+            out[f] = LABEL
+        elif f == "run_id":
+            out[f] = run_id
+        else:
+            out[f] = f"/stub/{f}"
+    return out
+
+
 EXAMPLE_STUBS = {
-    "preflight.json": {f: ("not_applicable_with_reason: legacy profile"
-                           if f in S8_PROFILES["legacy_baseline"]["not_applicable"] else "x")
-                       for f in S8_PREFLIGHT_FIELDS},
+    "preflight.json": None,          # filled below, once the validators exist
     "wal_state.json": {"wal_repairs_pending": None,
                        "not_applicable_with_reason": "legacy_baseline: no P5 WAL is deployed"},
     "pm2_jlist.json": [{"name": "ghrsst", "pid": 1, "pm2_env": {"status": "online"}}],
-    "shadow_verification.json": {"segments": 1, "wal": True, "anchor_domain_id": "independent"},
+    "capacity.json": {"filesystem_device": "/dev/stub", "filesystem_fstype": "ext4",
+                      "free_now_bytes": 1, "inodes_free": 1},
+    "shadow_verification.json": {"segments": 1, "generation": 1,
+                                 "wal_root": "/stub/p5_repairs", "anchor_root": "/stub/anchor",
+                                 "anchor_domain_id": "independent",
+                                 "measurement_taken": False},
 }
 
 
@@ -76,19 +101,115 @@ def _load_json(path: str, name: str):
         raise ArtifactError(f"{name} could not be read: {e}") from None
 
 
-def _check_preflight(data, profile: str) -> None:
+#: Fields whose value must be a non-empty path-ish string.
+_PATH_FIELDS = ("code_root", "python", "pythonpath", "filesystem_device", "filesystem_fstype")
+#: Fields whose value must be a raw non-negative int (bool excluded: `True` is not a count).
+_COUNT_FIELDS = ("free_now_bytes", "inodes_free")
+_NA = "not_applicable_with_reason"
+
+
+def _is_na(value) -> bool:
+    return isinstance(value, str) and value.startswith(_NA)
+
+
+def _na_reason(value) -> str:
+    return value[len(_NA):].lstrip(": ").strip() if _is_na(value) else ""
+
+
+def check_preflight_values(data, profile: str, *, run_id=None) -> None:
+    """Types and semantics, not merely presence.
+
+    A preflight carrying `deploy_sha: "x"` and `free_now_bytes: -1` has every required key and
+    describes nothing. Each rule below exists because the value it guards is one somebody would
+    otherwise read as evidence."""
     if not isinstance(data, dict):
         raise ArtifactError("preflight.json must be an object")
-    na = S8_PROFILES[profile]["not_applicable"]
+    na_allowed = S8_PROFILES[profile]["not_applicable"]
     missing = [f for f in S8_PREFLIGHT_FIELDS if f not in data]
     if missing:
         raise ArtifactError(f"preflight.json is missing required field(s): {missing}")
-    for field in na:
-        value = data[field]
-        if not (isinstance(value, str) and "not_applicable_with_reason" in value):
+
+    for field, value in data.items():
+        if not _is_na(value):
+            continue
+        if field not in na_allowed:
+            raise ArtifactError(
+                f"preflight.json excuses {field!r} as not-applicable, but {profile!r} requires "
+                f"it. Excusing a field is how a check that never ran stops being visible.")
+        if not _na_reason(value):
+            raise ArtifactError(
+                f"preflight.json field {field!r} is not-applicable without a reason; "
+                f"'no answer' and 'does not apply, because ...' are different states")
+    for field in na_allowed:
+        if not _is_na(data[field]):
             raise ArtifactError(
                 f"preflight.json field {field!r} does not apply under {profile!r} and must say "
-                f"so with a reason; got {value!r}. An absent or bare-null field reads as clean.")
+                f"so with a reason; got {data[field]!r}")
+
+    if run_id is not None and data["run_id"] != run_id:
+        raise ArtifactError(
+            f"preflight.json belongs to run {data['run_id']!r}, not {run_id!r}. An artifact "
+            f"carried over from an earlier run describes a different run in every figure.")
+
+    sha = data["deploy_sha"]
+    if not (isinstance(sha, str) and len(sha) == 40
+            and all(c in "0123456789abcdef" for c in sha)):
+        raise ArtifactError(
+            f"preflight.json deploy_sha must be a full 40-char lowercase hex commit id; got "
+            f"{sha!r}. An abbreviation or a movable ref does not pin anything.")
+
+    for field in _PATH_FIELDS:
+        value = data[field]
+        if _is_na(value):
+            continue
+        if not (isinstance(value, str) and value.strip()):
+            raise ArtifactError(f"preflight.json {field!r} must be a non-empty string; "
+                                f"got {value!r}")
+    for field in _COUNT_FIELDS:
+        value = data[field]
+        if _is_na(value):
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ArtifactError(
+                f"preflight.json {field!r} must be a non-negative integer; got {value!r}")
+
+    if data["label"] != LABEL:
+        raise ArtifactError(f"preflight.json label must be {LABEL!r}; got {data['label']!r}. "
+                            f"A local label on production evidence is a provenance error.")
+
+
+#: What a `p5_shadow` verification record must carry. The profile takes no measurement, so
+#: `measurement_taken` must be exactly `False` -- a `True` there is the profile widening its
+#: own scope, and a truthy string or 0 is a type confusion pretending to answer.
+_SHADOW_FIELDS = ("segments", "generation", "wal_root", "anchor_root", "anchor_domain_id",
+                  "measurement_taken")
+
+
+def check_shadow_verification(data) -> None:
+    if not isinstance(data, dict):
+        raise ArtifactError("shadow_verification.json must be an object")
+    missing = [f for f in _SHADOW_FIELDS if f not in data]
+    if missing:
+        raise ArtifactError(f"shadow_verification.json is missing field(s): {missing}; "
+                            f"a partial record is not a verification")
+    for field in ("segments", "generation"):
+        value = data[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ArtifactError(
+                f"shadow_verification.json {field!r} must be a positive integer; got {value!r}")
+    for field in ("wal_root", "anchor_root", "anchor_domain_id"):
+        value = data[field]
+        if not (isinstance(value, str) and value.strip()):
+            raise ArtifactError(
+                f"shadow_verification.json {field!r} must be a non-empty string; got {value!r}")
+    if data["measurement_taken"] is not False:
+        raise ArtifactError(
+            f"shadow_verification.json measurement_taken must be exactly False -- p5_shadow is "
+            f"verification only; got {data['measurement_taken']!r}")
+
+
+def _check_preflight(data, profile: str, run_id=None) -> None:
+    check_preflight_values(data, profile, run_id=run_id)
 
 
 def _check_wal(data, profile: str) -> None:
@@ -122,6 +243,12 @@ def _check_nonempty(path: str, name: str) -> int:
     return size
 
 
+def _run_id_from(art_dir: str):
+    """The run this directory belongs to, from its own name (`p5s8_<RUN_ID>`)."""
+    base = os.path.basename(os.path.normpath(art_dir))
+    return base[len("p5s8_"):] if base.startswith("p5s8_") else None
+
+
 def assemble(art_dir: str, *, profile: str) -> dict:
     """Validate every required artifact and return the assembled report.
 
@@ -138,9 +265,11 @@ def assemble(art_dir: str, *, profile: str) -> dict:
         if name.endswith(".json"):
             data = _load_json(path, name)
             if name == "preflight.json":
-                _check_preflight(data, profile)
+                _check_preflight(data, profile, run_id=_run_id_from(art_dir))
             elif name == "wal_state.json":
                 _check_wal(data, profile)
+            elif name == "shadow_verification.json":
+                check_shadow_verification(data)
             summary[name] = {"kind": "json", "ok": True}
         else:
             summary[name] = {"kind": "text", "bytes": _check_nonempty(path, name)}
@@ -167,6 +296,10 @@ def main(argv=None) -> int:
         json.dump(report, fh, indent=2, sort_keys=True)
     print(f"wrote {out}")
     return 0
+
+
+#: Filled here rather than at the literal, because it must pass the validators defined above.
+EXAMPLE_STUBS["preflight.json"] = _example_preflight()
 
 
 if __name__ == "__main__":

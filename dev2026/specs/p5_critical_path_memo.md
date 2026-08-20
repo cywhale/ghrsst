@@ -212,6 +212,28 @@ anyway (a corrupt `pm2_jlist.json` has no field checks); and the non-empty mount
 only mattered when **one** source was empty, since two empty sources compare equal and trip the
 device check for the wrong reason.
 
+## Review round 5 — the sequence runs, end to end
+
+| finding | correction |
+|---|---|
+| `preflight-record` read `ANCHOR_ROOT`, `WAL_ROOT`, `MANIFEST_ROOT`, `MANIFEST_GENERATION`, `FILESYSTEM_DEVICE`, `FILESYSTEM_FSTYPE`, `FREE_NOW_BYTES` and `INODES_FREE` from the environment, which nothing set | every field is now **derived from an artifact an earlier block wrote** — `capacity.json` from `statvfs`+`findmnt`, the P5 fields from `shadow_verification.json`, the WAL count from `wal_state.json`. Run in order the sequence aborted on blank fields; the only way it passed was to hand-write the artifact it exists to produce |
+| `g16-scan` printed to stdout while prose asked for a manual `tee`, and the assembler required the file | the block writes and fsyncs its own artifact. Prose is not a producer |
+| `shadow_verification.json` was unvalidated | exact fields, raw types, positive segment count and generation, non-empty WAL/anchor declarations, and `measurement_taken` exactly `False` |
+| the preflight was checked for presence only | full 40-char lowercase hex `deploy_sha`, non-empty paths, non-negative raw-int capacity and inode counts, the exact label, a `run_id` matching the artifact directory, and `not_applicable` **only** where the profile permits it — with a reason |
+| unit tests built `$ART` by hand | two end-to-end suites execute the **real blocks in the real order**, per profile, then assemble; missing, malformed, stale and empty producer outputs each prevent the report |
+
+`$URL` also could not survive from `g4-probe` to `g4-sample`: separate blocks are separate
+shells. The probe now writes a validated `g4_request.json` and the sampler reads it, so a
+timing run cannot use a request the probe never checked.
+
+Twelve mutations, serial from a git-clean tree: nine killed. Three are **true equivalents**,
+verified by re-running the suite under each — a redundant guard catches the same input
+(`g4-sample`'s missing-file check is backed by the reader failing; the empty-`findmnt` check by
+the parser refusing a short record; the missing-input check by the field-completeness check).
+One survivor was a real gap: the "neither derived nor excusable" branch is unreachable when an
+input is missing, because the required-input check fires first — so it needed its own case, a
+preflight field added with no derivation path, which must abort rather than be written blank.
+
 ## 4. Remaining blockers
 
 | blocker | state |
