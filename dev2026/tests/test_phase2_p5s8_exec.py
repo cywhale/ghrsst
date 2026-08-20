@@ -88,6 +88,9 @@ class _Sandbox(unittest.TestCase):
         self.ext = os.path.join(self.tmp, "external")
         for d in (self.bin, self.G, self.ext):
             os.makedirs(d, exist_ok=True)
+        # In a real run the `art-root` block creates this; blocks that write artifacts are
+        # exercised on their own here, so the sandbox provides it.
+        os.makedirs(os.path.join(self.ext, "p5s8_TEST"), exist_ok=True)
         self.env = dict(os.environ)
         self.env["PATH"] = self.bin + os.pathsep + self.env["PATH"]
         self.env["G"] = self.G
@@ -325,73 +328,11 @@ class TestG16WalkFailsClosed(_Sandbox):
 
 
 # --------------------------------------------------------------------- 5. shadow completeness
-class TestShadowProvisioningIsVerified(_Sandbox):
-    """[High] `rsync` of one delta is not a P5 shadow. The profile needs a manifest, blocks, a
-    WAL root and an anchor root, or every P5 measurement it claims to enable is impossible."""
-
-    def _shadow(self, *, manifest=True, blocks=True, wal=True, anchor=True):
-        s = os.path.join(self.tmp, "shadow")
-        os.makedirs(os.path.join(s, "p5_blocks"), exist_ok=True)
-        if manifest:
-            with open(os.path.join(s, "p5_blocks", "manifest.json"), "w") as fh:
-                json.dump({"generation": 1, "segments": [{"path": "b0.zarr"}]}, fh)
-        if blocks:
-            os.makedirs(os.path.join(s, "p5_blocks", "b0.zarr"), exist_ok=True)
-        if wal:
-            os.makedirs(os.path.join(s, "p5_repairs"), exist_ok=True)
-        anchor_dir = os.path.join(self.tmp, "anchor")
-        if anchor:
-            os.makedirs(anchor_dir, exist_ok=True)
-            with open(os.path.join(anchor_dir, "domain.json"), "w") as fh:
-                json.dump({"domain_id": "independent-1"}, fh)
-        return s, anchor_dir
-
-    def test_a_complete_shadow_passes(self):
-        s, a = self._shadow()
-        r = self.run_block("shadow-verify",
-                           extra_env={"SHADOW_ROOT": s, "ANCHOR_ROOT": a})
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-
-    def test_a_missing_manifest_aborts(self):
-        s, a = self._shadow(manifest=False)
-        r = self.run_block("shadow-verify", extra_env={"SHADOW_ROOT": s, "ANCHOR_ROOT": a})
-        self.assertNotEqual(r.returncode, 0, "a shadow with no manifest was accepted")
-
-    def test_a_manifest_whose_BLOCK_is_absent_aborts(self):
-        s, a = self._shadow(blocks=False)
-        r = self.run_block("shadow-verify", extra_env={"SHADOW_ROOT": s, "ANCHOR_ROOT": a})
-        self.assertNotEqual(r.returncode, 0, "a manifest pointing at a missing block passed")
-
-    def test_a_missing_WAL_root_aborts(self):
-        s, a = self._shadow(wal=False)
-        r = self.run_block("shadow-verify", extra_env={"SHADOW_ROOT": s, "ANCHOR_ROOT": a})
-        self.assertNotEqual(r.returncode, 0)
-
-    def test_a_missing_anchor_root_aborts(self):
-        s, a = self._shadow(anchor=False)
-        r = self.run_block("shadow-verify", extra_env={"SHADOW_ROOT": s, "ANCHOR_ROOT": a})
-        self.assertNotEqual(r.returncode, 0)
-
-    def test_an_anchor_that_DECLARES_NO_DOMAIN_aborts(self):
-        """A directory existing is not an anchor. Mutation testing found this gap: removing the
-        domain-declaration check broke nothing, because the only anchor test deleted the whole
-        directory — which a different line catches. An undeclared anchor is the exact
-        configuration `anchor_domain_id()` returns None for, and P4-S10 shipped a preflight that
-        accepted it."""
-        s, a = self._shadow()
-        os.remove(os.path.join(a, "domain.json"))
-        r = self.run_block("shadow-verify", extra_env={"SHADOW_ROOT": s, "ANCHOR_ROOT": a})
-        self.assertNotEqual(r.returncode, 0, "an anchor with no declared rollback domain passed")
-        self.assertIn("NO-GO", r.stdout + r.stderr)
-
-    def test_a_delta_only_copy_is_not_a_shadow(self):
-        """The exact previous behaviour: rsync one delta and call it provisioned."""
-        s = os.path.join(self.tmp, "delta_only")
-        os.makedirs(os.path.join(s, "mur_timecube.delta.zarr"), exist_ok=True)
-        r = self.run_block("shadow-verify",
-                           extra_env={"SHADOW_ROOT": s, "ANCHOR_ROOT": self.tmp})
-        self.assertNotEqual(r.returncode, 0, "a delta-only copy was accepted as a P5 shadow")
-
+#
+# Shadow provisioning moved to `test_phase2_p5s8_artifacts.py`, where it is checked through the
+# CANONICAL validator (`SegmentedCubeStore`) against a manifest built by the real publisher.
+# The hand-rolled `os.path` fixture that used to live here could not exercise absolute-path
+# refusal, `../` traversal or symlink escape -- the rules the shipped code already owns.
 
 if __name__ == "__main__":
     unittest.main()

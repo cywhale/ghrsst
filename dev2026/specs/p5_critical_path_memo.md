@@ -195,6 +195,23 @@ fixture put the path on the production device as well. The second needed a bind-
 a path inside `$G` reporting its own device — which is precisely the case containment exists to
 catch and the device check cannot.
 
+## Review round 4 — promises made executable
+
+| finding | correction |
+|---|---|
+| `p5_shadow` claimed downstream ran against the shadow, while G4 called `127.0.0.1:8080`, H7 read production PM2 and `/proc`, and G16 walked `$G` | the profile is **narrowed to verification only**. Building an isolated shadow service is out of scope for a read-only step, so rather than leave the ambiguity it now claims nothing: **G4, H7's sustained half and both halves of G16 stay `NOT_ADJUDICATED`** under it |
+| the artifact table listed files no block created | `ops/p5s8_report.py` is the single definition of what a run must produce; blocks write each one, and §8b **refuses to assemble** if any is missing, unparseable or incomplete. Nothing is written on refusal — a half-report is the most dangerous artifact of all, because every figure in it is real |
+| the shadow had no filesystem gate of its own | `shadow-fs-gate`: existence, realpath containment, findmnt success, non-empty sources, and a device that is not production's |
+| provisioning used hand-rolled `os.path` checks | replaced by **`SegmentedCubeStore`**, the canonical validator the read path already uses — which is what rejects absolute paths, `../` traversal and symlink escape |
+| the identity preflight was not executable | now a tagged, fail-closed block, with a companion that records `preflight.json` including `not_applicable_with_reason` for every field the profile cannot answer |
+
+Eleven mutations, serial from a git-clean tree: ten killed, one **true equivalent** verified by
+re-running the whole suite under it. Two survivors were real gaps, both closed — the JSON parse
+guard was only ever exercised through `preflight.json`, whose field checks caught the corruption
+anyway (a corrupt `pm2_jlist.json` has no field checks); and the non-empty mount-source guard
+only mattered when **one** source was empty, since two empty sources compare equal and trip the
+device check for the wrong reason.
+
 ## 4. Remaining blockers
 
 | blocker | state |

@@ -243,6 +243,7 @@ S8_PREFLIGHT_FIELDS = (
 S8_PROFILES = {
     "legacy_baseline": {
         "requires_p5_roots": False,
+        "scope": "measurement",
         "purpose": ("baseline evidence from the CURRENT monolith deployment: G4 span timing, "
                     "G16 metadata scan, G18 capacity, H7 inode headroom."),
         "required_fields": ("run_id", "host", "measured_utc", "deploy_sha", "code_root",
@@ -268,15 +269,28 @@ S8_PROFILES = {
     },
     "p5_shadow": {
         "requires_p5_roots": True,
-        "purpose": ("evidence from a P5 deployment on a SHADOW copy: everything the legacy "
-                    "profile cannot reach."),
+        #: VERIFICATION ONLY, and narrowed deliberately. The previous version said "everything
+        #: downstream runs against $SHADOW_ROOT" while G4 still called 127.0.0.1:8080, H7 still
+        #: read production PM2 and /proc, and G16 still walked $G -- so the claim was false and
+        #: the measurements were production ones wearing a shadow label. Isolating them needs a
+        #: real second service, which a read-only step does not build. Rather than leave the
+        #: ambiguity, the profile now claims only what it does: it PROVES a shadow is correctly
+        #: provisioned, and adjudicates nothing.
+        "scope": "verification_only",
+        "purpose": ("verify that a pre-provisioned P5 shadow is complete and safely placed: "
+                    "manifest, referenced blocks, WAL root, and an anchor declaring a rollback "
+                    "domain. It takes NO measurement."),
         "required_fields": tuple(S8_PREFLIGHT_FIELDS),
         "not_applicable": {},
         "may_adjudicate": [],
-        "may_not_adjudicate": ["G3_production_baseline"],
-        "may_not_adjudicate_reason": ("a shadow host is not the production service; its "
-                                      "latency is not the production baseline G3 compares "
-                                      "against."),
+        "may_not_adjudicate": ["G3_production_baseline", "G4", "H7_sustained_load",
+                               "G16_metadata_scan", "G16_snapshot_open"],
+        "may_not_adjudicate_reason": ("this profile runs no measurement. A shadow host is not "
+                                      "the production service, and nothing here redirects the "
+                                      "latency, fd/RSS or metadata-scan collection away from "
+                                      "production -- so none of those gates may be claimed "
+                                      "from it. They stay NOT_ADJUDICATED until an isolated "
+                                      "shadow service exists to measure."),
     },
 }
 

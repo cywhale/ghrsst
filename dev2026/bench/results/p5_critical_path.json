@@ -277,16 +277,21 @@
         "inodes_free",
         "label"
       ],
-      "requires_p5_roots": false
+      "requires_p5_roots": false,
+      "scope": "measurement"
     },
     "p5_shadow": {
       "may_adjudicate": [],
       "may_not_adjudicate": [
-        "G3_production_baseline"
+        "G3_production_baseline",
+        "G4",
+        "H7_sustained_load",
+        "G16_metadata_scan",
+        "G16_snapshot_open"
       ],
-      "may_not_adjudicate_reason": "a shadow host is not the production service; its latency is not the production baseline G3 compares against.",
+      "may_not_adjudicate_reason": "this profile runs no measurement. A shadow host is not the production service, and nothing here redirects the latency, fd/RSS or metadata-scan collection away from production -- so none of those gates may be claimed from it. They stay NOT_ADJUDICATED until an isolated shadow service exists to measure.",
       "not_applicable": {},
-      "purpose": "evidence from a P5 deployment on a SHADOW copy: everything the legacy profile cannot reach.",
+      "purpose": "verify that a pre-provisioned P5 shadow is complete and safely placed: manifest, referenced blocks, WAL root, and an anchor declaring a rollback domain. It takes NO measurement.",
       "required_fields": [
         "run_id",
         "host",
@@ -307,7 +312,8 @@
         "inodes_free",
         "label"
       ],
-      "requires_p5_roots": true
+      "requires_p5_roots": true,
+      "scope": "verification_only"
     }
   },
   "s8_required_sections": {

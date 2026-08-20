@@ -123,22 +123,61 @@ printed its result and returned 0, which accepted exactly the configuration it w
 reject.
 
 ```bash
-hostname; date -Is
+# block: identity-preflight
+# Run on: VM24
+set -euo pipefail
+: "${CODE_ROOT:?set CODE_ROOT}"
+: "${PYTHON:?set PYTHON}"
+: "${DEPLOY_SHA:?set DEPLOY_SHA to the exact commit under measurement}"
 test -d "$CODE_ROOT" || { echo "NO-GO: CODE_ROOT missing: $CODE_ROOT"; exit 1; }
 test -x "$PYTHON"    || { echo "NO-GO: PYTHON missing: $PYTHON"; exit 1; }
 # The modules this runbook calls must import FROM CODE_ROOT. A runbook that reads correctly and
 # cannot import is the failure the P4 rehearsal hit.
-PYTHONPATH=$CODE_ROOT "$PYTHON" -c "
-import store.block_manifest as bm, store.segmented_cube as sc
+PYTHONPATH="$CODE_ROOT" "$PYTHON" -c "
+import store.block_manifest as bm
 assert bm.__file__.startswith('$CODE_ROOT'), bm.__file__
-assert sc.__file__.startswith('$CODE_ROOT'), sc.__file__
 " || { echo "NO-GO: modules do not import from CODE_ROOT"; exit 1; }
-
 # Exact-SHA pin. `git rev-parse` resolves HEAD, a branch, a tag or an abbreviation, so the
 # canonical form must equal what was supplied -- otherwise a movable ref passes as a pin.
-cd "$CODE_ROOT/.." && \
-  CANON=$(git rev-parse --verify "${DEPLOY_SHA}^{commit}" 2>/dev/null) && \
-  [ "$CANON" = "$DEPLOY_SHA" ] || { echo "NO-GO: DEPLOY_SHA is not an exact commit id"; exit 1; }
+CANON="$(cd "$CODE_ROOT/.." && git rev-parse --verify "${DEPLOY_SHA}^{commit}" 2>/dev/null)" \
+  || { echo "NO-GO: DEPLOY_SHA does not resolve to a commit"; exit 1; }
+[ "$CANON" = "$DEPLOY_SHA" ] || { echo "NO-GO: DEPLOY_SHA is not an exact commit id"; exit 1; }
+echo "identity preflight OK: $CANON"
+```
+
+The preflight is also **recorded**, with every field the profile requires and an explicit
+`not_applicable_with_reason` for every field it does not. `ops/p5s8_report.py` refuses a
+preflight that merely omits one — absence reads as clean.
+
+```bash
+# block: preflight-record
+# Run on: VM24
+set -euo pipefail
+: "${PYTHON:?set PYTHON}"; : "${CODE_ROOT:?set CODE_ROOT}"; : "${ART:?}"; : "${PROFILE:?}"
+PYTHONPATH="$CODE_ROOT" "$PYTHON" - <<'PYEOF'
+import json, os, socket, subprocess, sys, datetime as dt
+sys.path.insert(0, os.environ["CODE_ROOT"])
+from ops.p5_roadmap import S8_PREFLIGHT_FIELDS, S8_PROFILES
+profile = os.environ["PROFILE"]; art = os.environ["ART"]
+na = S8_PROFILES[profile]["not_applicable"]
+
+def measured(field):
+    if field == "run_id":          return os.environ.get("RUN_ID", "")
+    if field == "host":            return socket.gethostname()
+    if field == "measured_utc":    return dt.datetime.now(dt.timezone.utc).isoformat()
+    if field == "label":           return "VM24_PRODUCTION_READ_ONLY"
+    return os.environ.get(field.upper(), "")
+
+out = {}
+for f in S8_PREFLIGHT_FIELDS:
+    out[f] = (f"not_applicable_with_reason: {na[f]}" if f in na else measured(f))
+blank = [f for f, v in out.items() if v == ""]
+if blank:
+    raise SystemExit(f"NO-GO: preflight fields not populated: {blank}")
+with open(os.path.join(art, "preflight.json"), "w") as fh:
+    json.dump(out, fh, indent=2, sort_keys=True)
+print(f"preflight recorded: {len(out)} fields")
+PYEOF
 ```
 
 **Reachability from the workstation** is a separate check on a separate machine:
@@ -311,6 +350,8 @@ proc = os.environ["PROC_ROOT"]
 samples = int(os.environ["SAMPLES"]); interval = float(os.environ["INTERVAL"])
 
 def current():
+    """One `pm2 jlist` per call -- the raw roster is returned with the pids so the artifact is
+    written from the SAME reading the guard used, not from an extra invocation."""
     out = subprocess.run(["pm2", "jlist"], capture_output=True, text=True)
     if out.returncode != 0:
         raise SystemExit("NO-GO: pm2 jlist failed; no artifact from this run is accepted")
@@ -318,14 +359,18 @@ def current():
         jlist = json.loads(out.stdout)
     except Exception as e:
         raise SystemExit(f"NO-GO: pm2 jlist is not JSON: {e}")
-    return set(worker_pids(jlist, "ghrsst"))
+    return set(worker_pids(jlist, "ghrsst")), jlist
 
-first = current()
+first, roster = current()
 if not first:
     raise SystemExit("NO-GO: PM2 reports no pid for the app; there is nothing to sample")
+art = os.environ.get("ART") or ""
+if art:                                  # the pid roster IS evidence; persist it, not just fds
+    with open(os.path.join(art, "pm2_jlist.json"), "w") as fh:
+        json.dump(roster, fh)
 print(f"# pids={sorted(first)}")
 for _ in range(samples):
-    now = current()                      # refreshed EVERY sample, not once at the start
+    now, _ = current()                   # refreshed EVERY sample, not once at the start
     if now != first:
         raise SystemExit(f"NO-GO: worker pid set changed mid-window: "
                          f"{sorted(first)} -> {sorted(now)}")
@@ -337,7 +382,11 @@ for _ in range(samples):
                 rss += next(int(l.split()[1]) for l in fh if l.startswith("VmRSS"))
         except FileNotFoundError:
             raise SystemExit(f"NO-GO: pid {pid} vanished mid-sample; the service restarted")
-    print(f"{int(time.time())} {len(first)} {fds} {rss}")
+    line = f"{int(time.time())} {len(first)} {fds} {rss}"
+    print(line)
+    if art:
+        with open(os.path.join(art, "h7_fd_rss_timeseries.txt"), "a") as fh:
+            fh.write(line + "\n")
     time.sleep(interval)
 PYEOF
 ```
@@ -390,58 +439,93 @@ nice'd, ionice'd and abortable.
 `NOT_ADJUDICATED`** on that half under `legacy_baseline`. Record the scan; do not synthesise the
 rest.
 
-## 6. Shadow provisioning — `p5_shadow` profile only
+## 6. Shadow provisioning — `p5_shadow` profile, VERIFICATION ONLY
 
-**Run on: VM24.** A shadow is not "a copy of the delta". The `p5_shadow` profile exists to
-measure things that need a **complete P5 deployment**: a published manifest, the blocks it
-references, a WAL root and an independent anchor root. `rsync`-ing one delta and proceeding
-would fail at the first measurement that needs any of them — or worse, quietly report a
-`legacy_baseline`-grade result under a `p5_shadow` label.
+**This profile takes no measurement.** It proves a pre-provisioned shadow is complete and safely
+placed, and adjudicates nothing. G4, H7's sustained half and both halves of G16 stay
+**`NOT_ADJUDICATED`** under it: nothing here redirects those collections away from production,
+and isolating them needs a real second service that a read-only step does not build. The earlier
+draft said "everything downstream runs against `$SHADOW_ROOT`" while G4 still called
+`127.0.0.1:8080`, H7 still read production PM2 and `/proc`, and G16 still walked `$G` — a false
+claim, and production measurements wearing a shadow label.
 
-The shadow must be **pre-provisioned by ops** and is then **verified**, not created, here:
+### 6a. Filesystem safety gate
+
+**Run on: VM24.** The same two properties as `$ART`, for the same reasons, checked on the
+shadow's own path.
+
+```bash
+# block: shadow-fs-gate
+# Run on: VM24
+set -euo pipefail
+: "${G:?set G}"
+: "${PYTHON:?set PYTHON}"
+: "${SHADOW_ROOT:?p5_shadow needs SHADOW_ROOT}"
+[ -d "$SHADOW_ROOT" ] || { echo "NO-GO: SHADOW_ROOT does not exist: $SHADOW_ROOT"; exit 1; }
+# realpath, so a symlink pointing back into $G cannot pass a string comparison.
+UNDER="$("$PYTHON" - "$SHADOW_ROOT" "$G" <<'PYEOF'
+import os, sys
+a = os.path.realpath(sys.argv[1]); g = os.path.realpath(sys.argv[2])
+print("yes" if a == g or a.startswith(g + os.sep) else "no")
+PYEOF
+)"
+[ "$UNDER" = "no" ] || { echo "NO-GO: SHADOW_ROOT resolves under \$G: $SHADOW_ROOT"; exit 1; }
+PROD_DEV="$(findmnt -no SOURCE --target "$G")"
+SHAD_DEV="$(findmnt -no SOURCE --target "$SHADOW_ROOT")"
+[ -n "$PROD_DEV" ] && [ -n "$SHAD_DEV" ] || { echo "NO-GO: could not resolve mount sources"; exit 1; }
+[ "$PROD_DEV" != "$SHAD_DEV" ] || { echo "NO-GO: SHADOW_ROOT is on the production device"; exit 1; }
+echo "shadow filesystem gate OK"
+```
+
+### 6b. Provisioning verification, through the canonical validator
+
+**Run on: VM24.** The shadow is **pre-provisioned by ops** and verified here, never created.
+Verification goes through **`SegmentedCubeStore`** — the same code the read path uses — rather
+than hand-rolled `os.path` checks. That is what rejects an absolute segment path, a `../`
+traversal and a symlink out of the block root; a second implementation in a runbook would drift
+from the one that actually serves data.
 
 ```bash
 # block: shadow-verify
 # Run on: VM24
 set -euo pipefail
 : "${PYTHON:?set PYTHON}"
+: "${CODE_ROOT:?set CODE_ROOT}"
 : "${SHADOW_ROOT:?p5_shadow needs SHADOW_ROOT}"
 : "${ANCHOR_ROOT:?p5_shadow needs an INDEPENDENT ANCHOR_ROOT}"
-"$PYTHON" - "$SHADOW_ROOT" "$ANCHOR_ROOT" <<'PYEOF'
+: "${ART:?run the art-root block first}"
+PYTHONPATH="$CODE_ROOT" "$PYTHON" - "$SHADOW_ROOT" "$ANCHOR_ROOT" "$ART" <<'PYEOF'
 import json, os, sys
-shadow, anchor = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.environ["CODE_ROOT"])
+from store.segmented_cube import SegmentedCubeStore
+
+shadow, anchor, art = sys.argv[1], sys.argv[2], sys.argv[3]
 
 def nogo(msg):
     raise SystemExit(f"NO-GO: {msg}")
 
 mroot = os.path.join(shadow, "p5_blocks")
-mpath = os.path.join(mroot, "manifest.json")
-if not os.path.isfile(mpath):
-    nogo(f"no published manifest at {mpath}; a delta copy is not a P5 shadow")
+if not os.path.isfile(os.path.join(mroot, "manifest.json")):
+    nogo(f"no published manifest under {mroot}; a delta copy is not a P5 shadow")
 try:
-    with open(mpath) as fh:
-        manifest = json.load(fh)
+    # Canonical validation: manifest schema, segment containment, absolute-path refusal,
+    # `..` and symlink escape, and every referenced block present on disk.
+    store = SegmentedCubeStore(mroot)
 except Exception as e:
-    nogo(f"manifest unreadable: {e}")
-segments = manifest.get("segments") or []
-if not segments:
-    nogo("the manifest declares no segments")
-for seg in segments:                       # every referenced block must actually be there
-    path = os.path.join(mroot, seg.get("path", ""))
-    if not os.path.isdir(path):
-        nogo(f"manifest segment missing on disk: {path}")
+    nogo(f"shadow manifest failed canonical validation: {e}")
 if not os.path.isdir(os.path.join(shadow, "p5_repairs")):
     nogo("no WAL root (p5_repairs) in the shadow")
 if not os.path.isdir(anchor):
     nogo(f"anchor root missing: {anchor}")
 if not os.path.isfile(os.path.join(anchor, "domain.json")):
     nogo("the anchor root declares no rollback domain")
-print(f"shadow provisioning verified: {len(segments)} segment(s), WAL and anchor present")
+record = {"segments": len(store.segment_paths), "generation": store.generation,
+          "wal": True, "anchor_domain_declared": True, "measurement_taken": False}
+with open(os.path.join(art, "shadow_verification.json"), "w") as fh:
+    json.dump(record, fh, indent=2, sort_keys=True)
+print(f"shadow verified: {record['segments']} segment(s), generation {record['generation']}")
 PYEOF
 ```
-
-The shadow volume must also not be the production device — the same check as §0, for the same
-reason. Everything downstream runs **against `$SHADOW_ROOT`**, never `$G`.
 
 ## 7. Abort conditions
 
@@ -466,21 +550,48 @@ Stop immediately, record what has been collected, and hand back. Do not "finish 
 ## 8. Artifacts and provenance
 
 Every file lands under **`$ART` = `$ART_ROOT/p5s8_$RUN_ID`** — operator-supplied, outside `$G`,
-and off the production filesystem.
+and off the production filesystem — and is copied back to the workstation in §8a.
 
-| artifact | content |
-|---|---|
-| `preflight.json` | every field in §9, per profile |
-| `wal_state.json` | `wal_repairs_pending`, or `not_applicable_with_reason` under `legacy_baseline` |
-| `df_h.txt`, `df_i.txt`, `findmnt.txt` | capacity and filesystem identity |
-| `g4_366d_seconds.txt` | per-sample timings, with the verified span and row count |
-| `pm2_jlist.json`, `h7_fd_rss_timeseries.txt` | worker pids, aggregate fd and RSS over time |
-| `g16_metadata_scan.txt` | file/dir counts and wall time |
-| `p5s8_readonly.json` | the assembled report, carrying `profile` |
+The list below is not a wish: `ops/p5s8_report.py::required_artifacts(profile)` is its single
+definition, §8b refuses to assemble a report if any is missing, unparseable or incomplete, and a
+test compares this table against the generator so neither side can drift.
+
+| artifact | profile | content |
+|---|---|---|
+| `preflight.json` | both | every field in §9, with `not_applicable_with_reason` for those the profile cannot answer |
+| `wal_state.json` | both | `wal_repairs_pending`, or the not-applicable record under `legacy_baseline` |
+| `df_h.txt`, `df_i.txt`, `findmnt.txt` | `legacy_baseline` | capacity and filesystem identity |
+| `g4_366d_seconds.txt` | `legacy_baseline` | per-sample timings, after a validated probe |
+| `pm2_jlist.json` | `legacy_baseline` | the worker roster the fd/RSS series was taken from |
+| `h7_fd_rss_timeseries.txt` | `legacy_baseline` | aggregate fd and RSS over time |
+| `g16_metadata_scan.txt` | `legacy_baseline` | file/dir counts and wall time |
+| `shadow_verification.json` | `p5_shadow` | segments, generation, WAL and anchor state — and `measurement_taken: false` |
+| `p5s8_readonly.json` | both | the assembled report, written only if every artifact above validates |
 
 Every record carries `label: VM24_PRODUCTION_READ_ONLY` and the `profile` it was collected
 under. Local synthetic numbers are **never** merged into these files, and no number here may be
 promoted into a local artifact.
+
+## 8b. Assemble the report — or refuse
+
+**Run on: VM24.** The artifact table is a contract, not a wish-list. This step validates every
+artifact the profile promised and **writes nothing** unless all of them are present, parseable
+and complete. A partially-collected run is the most dangerous artifact of all: every figure in
+it is real, and the reader cannot see that the measurement it was meant to support never ran.
+
+```bash
+# block: assemble
+# Run on: VM24
+set -euo pipefail
+: "${PYTHON:?set PYTHON}"
+: "${CODE_ROOT:?set CODE_ROOT}"
+: "${ART:?run the art-root block first}"
+: "${PROFILE:?set PROFILE}"
+PYTHONPATH="$CODE_ROOT" "$PYTHON" -m ops.p5s8_report --art "$ART" --profile "$PROFILE"
+```
+
+The generator is `ops/p5s8_report.py`; `required_artifacts(profile)` is the single definition of
+what a run must produce, and the table in §8 is checked against it by test.
 
 ## 8a. Artifact copy-back
 
