@@ -192,8 +192,12 @@ class TestArtifactLifecycleIsExecutable(_Sandbox):
 class TestG4ProbeFailsClosed(_Sandbox):
 
     def _curl(self, code="200", body='[{"date":"x","sst":1.0}]', rows=366):
+        # Rows anchored to the service's point_latest, not to today: the window authority is
+        # /healthz, and a stub keyed to the host clock could not model that.
         import datetime as _dt
-        _end = _dt.date.today()
+        _end = _dt.date.fromisoformat("2026-08-18")
+        healthz = json.dumps({"status": "ok", "point_latest": "2026-08-18",
+                              "point_day_count": 1326, "point_earliest": "2023-01-01"})
         payload = json.dumps([{"date": (_end - _dt.timedelta(days=rows - 1 - i)).isoformat(),
                                "sst": 1.0} for i in range(rows)]) \
             if rows is not None else body
@@ -201,6 +205,7 @@ class TestG4ProbeFailsClosed(_Sandbox):
         # The timing loop asks for `%{http_code} %{time_total}` and gets just those two.
         _stub(self.bin, "curl", f'''
 args="$*"
+if [[ "$args" == *"/healthz"* ]]; then printf '%s' '{healthz}'; printf '\\n200'; exit 0; fi
 if [[ "$args" == *"time_total"* ]]; then echo "{code} 0.012"; exit 0; fi
 cat <<'JSON'
 {payload}
@@ -233,10 +238,21 @@ if [[ "$args" == *"http_code"* ]]; then echo "{code}"; fi''')
         r = self.run_block("g4-probe")
         self.assertNotEqual(r.returncode, 0, "an error object was accepted as a row list")
 
-    def test_a_span_that_is_not_exactly_366_days_discards_the_run(self):
-        self._curl()
-        r = self.run_block("g4-probe", extra_env={"FORCE_SPAN_DAYS": "365"})
-        self.assertNotEqual(r.returncode, 0, "a 365-day span was accepted as 366")
+    def test_a_deployment_with_too_few_point_days_discards_the_run(self):
+        """The span can no longer be wrong by construction -- `g4_window` always yields 366 days
+        from `point_latest`. What CAN be wrong is a deployment that does not hold 366 point days,
+        and that is now the guard occupying this position."""
+        script = (
+            'args="$*"\n'
+            'if [[ "$args" == *"/healthz"* ]]; then\n'
+            "  printf '%s' '" + json.dumps({"status": "ok", "point_latest": "2026-08-18",
+                                            "point_day_count": 100}) + "'\n"
+            "  printf '\\n200'; exit 0\n"
+            'fi\n'
+            "printf '[]'; printf '\\n200'\n")
+        _stub(self.bin, "curl", script)
+        r = self.run_block("g4-probe")
+        self.assertNotEqual(r.returncode, 0, "a deployment with 100 point days was accepted")
 
 
 # --------------------------------------------------------------------- 4. H7 pid set

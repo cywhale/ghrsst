@@ -36,6 +36,14 @@ LABEL = "VM24_PRODUCTION_READ_ONLY"
 #: configurable: an arbitrary endpoint would need its own deployment binding to mean anything,
 #: and this run targets the deployed service.
 G4_ENDPOINT = "http://127.0.0.1:8035/api/ghrsst"
+#: The same service's health endpoint. It is the WINDOW AUTHORITY: how far the point history
+#: reaches is a property of the deployment, not of the clock on whatever host runs the runbook.
+#: The aborted 2026-08-20 run derived `end = date.today()` while `point_latest` was 2026-08-18,
+#: asked for two days that do not exist, and was refused for a window nothing should have built.
+HEALTHZ_URL = "http://127.0.0.1:8035/healthz"
+
+#: The G4 window length, in days, inclusive of both ends.
+G4_SPAN_DAYS = 366
 G4_REQUIRED_PARAMS = ("lon0", "lat0", "start", "end", "append")
 #: The canonical probe parameters. Pinned by VALUE, not merely required to exist: a request
 #: with a different coordinate or variable is a different measurement, and `span_days: 366`
@@ -103,7 +111,9 @@ EXAMPLE_STUBS = {
     "g4_request.json": {"run_id": "TEST", "start": "2026-01-01", "end": "2027-01-01",
                         "url": (G4_ENDPOINT + "?lon0=135&lat0=20"
                                 "&start=2026-01-01&end=2027-01-01&append=sst"),
-                        "span_days": 366, "probe_rows": 366, "g4_samples": 1},
+                        "span_days": 366, "probe_rows": 366, "g4_samples": 1,
+                        "healthz_url": HEALTHZ_URL, "point_latest": "2027-01-01",
+                        "point_day_count": 1326},
     "shadow_verification.json": {"segments": 1, "generation": 1,
                                  "wal_root": "/stub/p5_repairs", "anchor_root": "/stub/anchor",
                                  "anchor_domain_id": "independent",
@@ -412,6 +422,61 @@ IDENTITY_MODULES = {
 }
 
 
+def check_healthz(payload) -> dict:
+    """Validate a `/healthz` body and return the window authority it carries.
+
+    Reads **`point_latest`** explicitly. `latest` and `daily_latest` answer different questions
+    -- the daily staging window is 59 days, and a 366-day POINT request depends on none of it --
+    so a body carrying those but not `point_latest` fails closed rather than falling back."""
+    import datetime as _dt
+
+    if not isinstance(payload, dict):
+        raise ArtifactError(
+            f"/healthz body is {type(payload).__name__}, not an object")
+    if "point_latest" not in payload:
+        raise ArtifactError(
+            "/healthz carries no point_latest; `latest` and `daily_latest` are different "
+            "questions and must not stand in for it")
+    value = payload["point_latest"]
+    if not isinstance(value, str) or not value.strip():
+        raise ArtifactError(f"/healthz point_latest is not a string: {value!r}")
+    try:
+        parsed = _dt.date.fromisoformat(value)
+    except ValueError:
+        raise ArtifactError(
+            f"/healthz point_latest is not a canonical ISO date: {value!r}") from None
+    if parsed.isoformat() != value:
+        raise ArtifactError(f"/healthz point_latest is not canonical: {value!r}")
+
+    if "point_day_count" not in payload:
+        raise ArtifactError("/healthz carries no point_day_count")
+    count = payload["point_day_count"]
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ArtifactError(
+            f"/healthz point_day_count must be a positive integer; got {count!r}")
+    if count < G4_SPAN_DAYS:
+        raise ArtifactError(
+            f"/healthz reports {count} point days, fewer than the {G4_SPAN_DAYS} the window "
+            f"needs; the measurement cannot exist on this deployment")
+    return {"point_latest": value, "point_day_count": count}
+
+
+def g4_window(point_latest: str):
+    """`(start, end)` for the G4 window, anchored to the service's own `point_latest`."""
+    import datetime as _dt
+
+    if not isinstance(point_latest, str) or not point_latest.strip():
+        raise ArtifactError(f"g4_window needs a canonical ISO date; got {point_latest!r}")
+    try:
+        end = _dt.date.fromisoformat(point_latest)
+    except ValueError:
+        raise ArtifactError(f"g4_window anchor is not canonical ISO: {point_latest!r}") from None
+    if end.isoformat() != point_latest:
+        raise ArtifactError(f"g4_window anchor is not canonical: {point_latest!r}")
+    start = end - _dt.timedelta(days=G4_SPAN_DAYS - 1)
+    return start.isoformat(), end.isoformat()
+
+
 def g4_url(start: str, end: str) -> str:
     """The canonical G4 request URL — the ONE place it is built.
 
@@ -612,7 +677,8 @@ def check_g16_scan(path: str, name: str, *, run_id=None, expected_root=None) -> 
     return {"files": files, "dirs": dirs}
 
 
-_G4_REQUEST_FIELDS = ("run_id", "start", "end", "url", "span_days", "probe_rows", "g4_samples")
+_G4_REQUEST_FIELDS = ("run_id", "start", "end", "url", "span_days", "probe_rows", "g4_samples",
+                      "healthz_url", "point_latest", "point_day_count")
 
 
 def check_g4_request(data, *, run_id=None) -> dict:
@@ -680,6 +746,24 @@ def check_g4_request(data, *, run_id=None) -> dict:
             raise ArtifactError(
                 f"g4_request.json url has {field}={params[field]}, expected {[expected]}. "
                 f"A different coordinate or variable is a different measurement.")
+
+    # The window authority. `end` is not "today" -- it is what the service said its point
+    # history reaches, recorded at probe time and re-checked live before any timed sample.
+    if data["healthz_url"] != HEALTHZ_URL:
+        raise ArtifactError(
+            f"g4_request.json healthz_url is {data['healthz_url']!r}, expected {HEALTHZ_URL!r}")
+    check_healthz({"point_latest": data["point_latest"],
+                   "point_day_count": data["point_day_count"]})
+    if data["end"] != data["point_latest"]:
+        raise ArtifactError(
+            f"g4_request.json ends at {data['end']!r} but the service's point_latest was "
+            f"{data['point_latest']!r}. A window running past the data is the 364-row abort.")
+    expected_start, expected_end = g4_window(data["point_latest"])
+    if (data["start"], data["end"]) != (expected_start, expected_end):
+        raise ArtifactError(
+            f"g4_request.json window {data['start']}..{data['end']} is not the "
+            f"{G4_SPAN_DAYS}-day window ending at point_latest "
+            f"({expected_start}..{expected_end})")
     return data
 
 

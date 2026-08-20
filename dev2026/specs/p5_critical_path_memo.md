@@ -327,11 +327,42 @@ binding to mean anything, and this run targets the deployed service. A positive 
 asserts 8035 is accepted, a negative one asserts the stale 8080 is now refused, and a third
 asserts no second endpoint survives anywhere in the contract.
 
+## Round 11 — the service decides the window, not the clock
+
+The first authorized VM24 execution (2026-08-20, `f6088b2`) **aborted at `g4-probe`**:
+`end = date.today()` = 2026-08-20 while the service's `point_latest` was 2026-08-18, so the API
+returned **364 rows** and the probe refused. The refusal was right; the window was wrong. How far
+the point history reaches is a property of the deployment, not of the clock on whatever host runs
+the runbook.
+
+| change | |
+|---|---|
+| `HEALTHZ_URL` + `check_healthz()` | one shared read-only validator for the canonical service on 8035. Reads **`point_latest` explicitly** — a body carrying `latest`/`daily_latest` but not `point_latest` fails closed rather than falling back, because the daily staging window answers a different question |
+| `g4_window(point_latest)` | `end = point_latest`, `start = end − 365`, span exactly 366 |
+| probe | fetches `/healthz` first: HTTP 200, JSON object, canonical `point_latest`, strict `point_day_count` (and at least 366 point days, or the measurement cannot exist here) |
+| `g4_request.json` | now records `healthz_url`, `point_latest` and `point_day_count` beside the window it produced |
+| sampler | **re-reads `/healthz` live before the first timed sample** and refuses if `point_latest` has moved. An edited artifact cannot bypass it: the comparison is against the service, not against anything the file claims |
+| assembler | refuses a request whose `end` is not the recorded `point_latest`, or whose window is not the 366-day span ending there |
+
+The **366-day contract was not weakened** and the window was not shifted by hand — it is derived
+from the authority that knows.
+
+Nine mutations, serial from a git-clean tree: eight killed. One **true equivalent**, verified by
+re-running both suites under it: `g4_window(x)` always returns `end == x`, so "end ≠ point_latest"
+is subsumed by the window-equality check. It is kept for its clearer message, not for a distinct
+guarantee.
+
+The aborted run's artifacts are **retained as evidence** at
+`/tmp/p5s8-art/p5s8_20260820T080028Z/` on VM24 (`run.json`, `identity.json`, `capacity.json`,
+`df_h.txt`, `df_i.txt`, `findmnt.txt`, `wal_state.json`, `preflight.json`). Its fresh capacity
+reading — **264.4 GiB free against a 403.3 GiB minimum** — is the current G18 evidence and
+supersedes the 2026-08-19 figure.
+
 ## 4. Remaining blockers
 
 | blocker | state |
 |---|---|
-| **G18 capacity** | **BLOCKED** — 267 GiB free, 403.3 GiB minimum, 600 GiB recommended |
+| **G18 capacity** | **BLOCKED** — **264.4 GiB free** (measured 2026-08-20, run `20260820T080028Z`), 403.3 GiB minimum, 600 GiB recommended; shortfall ≈ 138.9 GiB |
 | **G3 / G4** | `NOT_ADJUDICATED` — production thresholds |
 | **G7** | `PARTIAL` — the gate's arithmetic is proven; a real fold's temp disk is not measured |
 | **H7 / G16** | production evidence incomplete |

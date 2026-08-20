@@ -124,7 +124,9 @@ class TestTheG4RequestDescribesTheRequestActuallyMade(_Tmp):
     def _req(self, **over):
         rec = {"run_id": RUN, "start": "2026-01-01", "end": "2027-01-01",
                "url": rep.g4_url("2026-01-01", "2027-01-01"),
-               "span_days": 366, "probe_rows": 366, "g4_samples": 2}
+               "span_days": 366, "probe_rows": 366, "g4_samples": 2,
+               "healthz_url": rep.HEALTHZ_URL, "point_latest": "2027-01-01",
+               "point_day_count": 1326}
         rec.update(over)
         return rec
 
@@ -185,7 +187,10 @@ class TestTheG4RequestDescribesTheRequestActuallyMade(_Tmp):
 
     def test_the_span_arithmetic_must_agree_with_span_days(self):
         """The blocking case: `span_days` stays 366 while the dates say something else."""
-        self._refuse(start="2026-06-01", url=rep.g4_url("2026-06-01", "2027-01-01"))
+        # end stays at point_latest so the window-authority rule cannot be what fires here;
+        # only the span arithmetic distinguishes this case.
+        self._refuse(start="2026-06-01", url=rep.g4_url("2026-06-01", "2027-01-01"),
+                     span_days=366)
 
     def test_the_url_must_be_the_expected_local_endpoint(self):
         for bad_host in ("http://vm24:8035/api/ghrsst", "https://127.0.0.1:8035/api/ghrsst",
@@ -206,7 +211,7 @@ class TestTheG4RequestDescribesTheRequestActuallyMade(_Tmp):
 
     def test_the_url_dates_must_match_the_recorded_dates(self):
         """A record whose URL asks for a different window than it claims to have measured."""
-        self._refuse(url=rep.g4_url("2026-06-01", "2026-06-30"))
+        self._refuse(url=rep.g4_url("2026-06-01", "2026-06-30"))  # url dates != record dates
 
     def test_span_days_and_probe_rows_stay_pinned_to_366(self):
         self._refuse(span_days=365)
@@ -238,6 +243,132 @@ class TestTheSamplerRejectsAnEditedRequest(_E2E):
     def test_the_unedited_request_still_samples(self):
         self.assert_all_ok(self.run_sequence("legacy_baseline"))
         self.assertTrue(os.path.isfile(os.path.join(self.art, "g4_366d_seconds.txt")))
+
+
+# ------------------------------------------------------------------ 2b. healthz window authority
+class TestHealthzIsTheWindowAuthority(_Tmp):
+    """The aborted VM24 run derived `end = date.today()` = 2026-08-20 while the service's
+    `point_latest` was 2026-08-18, so the API returned 364 rows and the probe refused — correctly,
+    but for a window nothing should have asked for. The host clock does not decide what data
+    exists; `/healthz.point_latest` does."""
+
+    def _hz(self, **over):
+        rec = {"status": "ok", "point_latest": "2026-08-18", "point_day_count": 1326,
+               "point_earliest": "2023-01-01", "latest": "2026-08-18",
+               "daily_latest": "2026-08-18"}
+        rec.update(over)
+        return rec
+
+    def _refuse(self, **over):
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_healthz(self._hz(**over))
+
+    def test_the_valid_control_passes(self):
+        out = rep.check_healthz(self._hz())
+        self.assertEqual(out["point_latest"], "2026-08-18")
+        self.assertEqual(out["point_day_count"], 1326)
+
+    def test_the_endpoint_is_the_canonical_service_on_8035(self):
+        self.assertEqual(rep.HEALTHZ_URL, "http://127.0.0.1:8035/healthz")
+
+    def test_a_non_object_body_is_refused(self):
+        for bad in ([], "ok", None, 7):
+            with self.subTest(bad):
+                with self.assertRaises(rep.ArtifactError):
+                    rep.check_healthz(bad)
+
+    def test_point_latest_must_be_present_and_canonical(self):
+        for bad in (None, "", "2026-8-18", "20260818", "2026-08-18T00:00:00", 20260818):
+            with self.subTest(bad):
+                self._refuse(point_latest=bad)
+        hz = self._hz(); hz.pop("point_latest")
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_healthz(hz)
+
+    def test_the_generic_latest_fields_are_NOT_used_as_the_authority(self):
+        """`latest` and `daily_latest` are different questions. Only `point_latest` states how
+        far the POINT history reaches, which is what a 366-day point request depends on."""
+        hz = self._hz(); hz.pop("point_latest")
+        hz["latest"] = "2026-08-20"; hz["daily_latest"] = "2026-08-20"
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_healthz(hz)
+
+    def test_point_day_count_is_required_and_strictly_validated(self):
+        for bad in (None, "1326", 1326.0, True, 0, -5):
+            with self.subTest(bad):
+                self._refuse(point_day_count=bad)
+        hz = self._hz(); hz.pop("point_day_count")
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_healthz(hz)
+
+    def test_a_day_count_too_small_for_the_window_is_refused(self):
+        """Fewer than 366 point days means the 366-day window cannot exist, whatever
+        `point_latest` says."""
+        self._refuse(point_day_count=100)
+
+
+class TestTheG4WindowComesFromHealthz(_Tmp):
+
+    def test_the_window_ends_at_point_latest_not_at_the_host_date(self):
+        start, end = rep.g4_window("2026-08-18")
+        self.assertEqual(end, "2026-08-18")
+        self.assertEqual(start, "2025-08-18")
+
+    def test_the_span_is_exactly_366_days(self):
+        import datetime as dt
+        start, end = rep.g4_window("2026-08-18")
+        span = (dt.date.fromisoformat(end) - dt.date.fromisoformat(start)).days + 1
+        self.assertEqual(span, 366)
+
+    def test_a_later_host_date_does_not_move_the_window(self):
+        """Whatever today is, the window is anchored to the service's own point_latest."""
+        for anchor in ("2026-08-18", "2025-01-01", "2030-06-30"):
+            with self.subTest(anchor):
+                self.assertEqual(rep.g4_window(anchor)[1], anchor)
+
+    def test_a_non_canonical_anchor_is_refused(self):
+        for bad in ("20260818", "2026-8-18", "", None):
+            with self.subTest(bad):
+                with self.assertRaises(rep.ArtifactError):
+                    rep.g4_window(bad)
+
+
+class TestTheRequestIsBoundToTheHealthzWindow(_Tmp):
+
+    def _req(self, **over):
+        rec = {"run_id": RUN, "start": "2025-08-18", "end": "2026-08-18",
+               "url": rep.g4_url("2025-08-18", "2026-08-18"),
+               "span_days": 366, "probe_rows": 366, "g4_samples": 2,
+               "healthz_url": rep.HEALTHZ_URL, "point_latest": "2026-08-18",
+               "point_day_count": 1326}
+        rec.update(over)
+        return rec
+
+    def _refuse(self, **over):
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_g4_request(self._req(**over), run_id=RUN)
+
+    def test_the_valid_control_passes(self):
+        rep.check_g4_request(self._req(), run_id=RUN)
+
+    def test_the_healthz_window_fields_are_required(self):
+        for field in ("healthz_url", "point_latest", "point_day_count"):
+            with self.subTest(field):
+                rec = self._req(); rec.pop(field)
+                with self.assertRaises(rep.ArtifactError):
+                    rep.check_g4_request(rec, run_id=RUN)
+
+    def test_the_end_date_must_equal_point_latest(self):
+        """The aborted run in one assertion: end=2026-08-20 against point_latest=2026-08-18."""
+        self._refuse(start="2025-08-20", end="2026-08-20",
+                     url=rep.g4_url("2025-08-20", "2026-08-20"))
+
+    def test_a_healthz_url_that_is_not_the_canonical_one_is_refused(self):
+        self._refuse(healthz_url="http://127.0.0.1:8080/healthz")
+
+    def test_an_edited_point_latest_alone_is_refused(self):
+        """Editing the recorded authority without the window it produced."""
+        self._refuse(point_latest="2026-08-20")
 
 
 # ------------------------------------------------------------------ 3. pm2 roster

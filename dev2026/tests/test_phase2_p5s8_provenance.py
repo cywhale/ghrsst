@@ -106,14 +106,18 @@ class TestTheSamplerRefusesADegradedResponseShape(_E2E):
         with open(state, "w") as fh:
             fh.write("0")
         import datetime as dt
-        end = dt.date.today()
+        from test_phase2_p5s8_e2e import POINT_LATEST
+        end = dt.date.fromisoformat(POINT_LATEST)
         good = json.dumps([{"date": (end - dt.timedelta(days=365 - i)).isoformat(),
                             "sst": 1.0} for i in range(366)])
+        healthz = json.dumps({"status": "ok", "point_latest": POINT_LATEST,
+                              "point_day_count": 1326})
         from test_phase2_p5s8_exec import _stub
         _stub(self.bin, "curl", f'''
+args="$*"
+if [[ "$args" == *"/healthz"* ]]; then printf '%s' '{healthz}'; printf '\\n200'; exit 0; fi
 n=$(cat {state}); echo $((n+1)) > {state}
 if [ "$n" -lt 1 ]; then BODY='{good}'; else BODY='{payload_after_probe}'; fi
-args="$*"
 printf '%s' "$BODY"
 if [[ "$args" == *"time_total"* ]]; then printf '\\n200 0.011';
 elif [[ "$args" == *"http_code"* ]]; then printf '\\n200'; fi''')
@@ -377,6 +381,111 @@ class TestTheModuleInventoryCoversEveryModuleTheRunUses(_E2E):
         self.assertFalse(os.path.isfile(os.path.join(self.art, "p5s8_readonly.json")))
 
     def test_the_positive_control_still_assembles(self):
+        self.assert_all_ok(self.run_sequence("legacy_baseline"))
+        self.assertEqual(self.assemble("legacy_baseline").returncode, 0)
+
+
+# ------------------------------------------------------------------ 6. window authority
+class TestTheWindowFollowsTheServiceNotTheClock(_E2E):
+    """The aborted VM24 run in test form: the host was at 2026-08-20, the service's point
+    history ended 2026-08-18, and a clock-derived window asked for two days that did not
+    exist."""
+
+    def _healthz_stub(self, point_latest, *, code="200", body=None):
+        from test_phase2_p5s8_exec import _stub
+        import datetime as dt
+        end = dt.date.fromisoformat("2026-08-18")
+        rows = json.dumps([{"date": (end - dt.timedelta(days=365 - i)).isoformat(),
+                            "sst": 1.0} for i in range(366)])
+        hz = body if body is not None else json.dumps(
+            {"status": "ok", "point_latest": point_latest, "point_day_count": 1326})
+        script = (
+            'args="$*"\n'
+            'if [[ "$args" == *"/healthz"* ]]; then\n'
+            "  printf '%s' '" + hz + "'\n"
+            "  printf '\\n" + code + "'; exit 0\n"
+            'fi\n'
+            "printf '%s' '" + rows + "'\n"
+            'if [[ "$args" == *"time_total"* ]]; then printf \'\\n200 0.011\';\n'
+            'elif [[ "$args" == *"http_code"* ]]; then printf \'\\n200\'; fi\n')
+        _stub(self.bin, "curl", script)
+
+    def _run_sampler(self):
+        env = dict(self.env)
+        env.update({"PROFILE": "legacy_baseline", "ART": self.art})
+        return subprocess.run(["bash", "-c", BLOCKS["g4-sample"]], env=env,
+                              capture_output=True, text=True, cwd=self.tmp)
+
+    def test_the_request_ends_at_point_latest_not_at_todays_date(self):
+        import datetime as dt
+        from test_phase2_p5s8_e2e import POINT_LATEST
+        self.assertNotEqual(POINT_LATEST, dt.date.today().isoformat(),
+                            "the fixture must differ from today or it proves nothing")
+        self.assert_all_ok(self.run_sequence("legacy_baseline", stop_after="g4-probe"))
+        with open(os.path.join(self.art, "g4_request.json")) as fh:
+            req = json.load(fh)
+        self.assertEqual(req["end"], POINT_LATEST)
+        self.assertEqual(req["point_latest"], POINT_LATEST)
+        self.assertEqual(req["span_days"], 366)
+        self.assertEqual(req["healthz_url"], rep.HEALTHZ_URL)
+        self.assertEqual(req["start"], rep.g4_window(POINT_LATEST)[0])
+
+    def test_the_2026_08_20_window_that_returned_364_rows_is_refused(self):
+        """The exact aborted request, as a record."""
+        from test_phase2_p5s8_e2e import POINT_LATEST
+        bad = {"run_id": RUN, "start": "2025-08-20", "end": "2026-08-20",
+               "url": rep.g4_url("2025-08-20", "2026-08-20"), "span_days": 366,
+               "probe_rows": 366, "g4_samples": 2, "healthz_url": rep.HEALTHZ_URL,
+               "point_latest": POINT_LATEST, "point_day_count": 1326}
+        with self.assertRaises(rep.ArtifactError):
+            rep.check_g4_request(bad, run_id=RUN)
+
+    def test_point_latest_moving_between_probe_and_sampling_refuses(self):
+        """A day landing mid-run. The sampler re-reads the authority live, so the series is
+        discarded BEFORE the first timed sample rather than after thirty."""
+        self.assert_all_ok(self.run_sequence("legacy_baseline", stop_after="g4-probe"))
+        self._healthz_stub("2026-08-19")            # the service moved on
+        r = self._run_sampler()
+        self.assertNotEqual(r.returncode, 0, "the sampler timed a stale window")
+        self.assertIn("point_latest moved", r.stdout + r.stderr)
+        self.assertFalse(os.path.isfile(os.path.join(self.art, "g4_366d_seconds.txt")))
+
+    def test_an_edited_request_cannot_bypass_the_live_recheck(self):
+        """Editing the artifact to agree with itself does not help: the sampler compares
+        against the SERVICE, not against anything the file claims."""
+        self.assert_all_ok(self.run_sequence("legacy_baseline", stop_after="g4-probe"))
+        path = os.path.join(self.art, "g4_request.json")
+        start, end = rep.g4_window("2026-08-19")
+        with open(path) as fh:
+            req = json.load(fh)
+        req.update({"start": start, "end": end, "point_latest": "2026-08-19",
+                    "url": rep.g4_url(start, end)})
+        with open(path, "w") as fh:
+            json.dump(req, fh)                      # internally consistent, but not the service
+        r = self._run_sampler()
+        self.assertNotEqual(r.returncode, 0, "a self-consistent edited request was sampled")
+
+    def test_a_non_200_healthz_refuses_before_any_request(self):
+        self._healthz_stub("2026-08-18", code="503")
+        res = self.run_sequence("legacy_baseline")
+        self.assertIn("g4-probe", [tag for tag, r in res if r.returncode != 0])
+
+    def test_a_malformed_healthz_body_refuses(self):
+        self._healthz_stub("2026-08-18", body="<html>gateway</html>")
+        res = self.run_sequence("legacy_baseline")
+        self.assertIn("g4-probe", [tag for tag, r in res if r.returncode != 0])
+
+    def test_a_healthz_without_point_latest_refuses(self):
+        """`latest` and `daily_latest` present, `point_latest` absent: the generic fields must
+        not stand in for the one that answers the question."""
+        self._healthz_stub("2026-08-18",
+                           body=json.dumps({"status": "ok", "latest": "2026-08-20",
+                                            "daily_latest": "2026-08-20",
+                                            "point_day_count": 1326}))
+        res = self.run_sequence("legacy_baseline")
+        self.assertIn("g4-probe", [tag for tag, r in res if r.returncode != 0])
+
+    def test_the_valid_control_still_completes_and_assembles(self):
         self.assert_all_ok(self.run_sequence("legacy_baseline"))
         self.assertEqual(self.assemble("legacy_baseline").returncode, 0)
 

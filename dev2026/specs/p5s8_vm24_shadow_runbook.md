@@ -393,13 +393,32 @@ set -euo pipefail
 PYTHONPATH="$CODE_ROOT" "$PYTHON" - <<'PYEOF'
 import datetime as dt, json, os, subprocess, sys
 sys.path.insert(0, os.environ["CODE_ROOT"])
-from ops.p5s8_report import check_g4_response, g4_url, ArtifactError   # one source of truth
+from ops.p5s8_report import (check_g4_response, check_healthz, g4_url, g4_window,
+                             HEALTHZ_URL, ArtifactError)      # one source of truth
 
 art, run_id = os.environ["ART"], os.environ["RUN_ID"]
-days = int(os.environ.get("FORCE_SPAN_DAYS", "366"))   # override exists so the guard is testable
 samples = int(os.environ.get("G4_SAMPLES", "30"))
 
-end = dt.date.today(); start = end - dt.timedelta(days=days - 1)
+# The WINDOW AUTHORITY is the service, not this host's clock. Deriving end=date.today() asked
+# for two days that did not exist and returned 364 rows -- a correct refusal for a window
+# nothing should have built.
+hz_out = subprocess.run(["curl", "-s", "-w", "\n%{http_code}", HEALTHZ_URL],
+                        capture_output=True, text=True)
+if hz_out.returncode != 0:
+    raise SystemExit(f"NO-GO: curl to /healthz failed with {hz_out.returncode}")
+hz_body, _, hz_code = hz_out.stdout.rstrip("\n").rpartition("\n")
+if hz_code.strip() != "200":
+    raise SystemExit(f"NO-GO: /healthz returned HTTP {hz_code.strip()}")
+try:
+    hz_payload = json.loads(hz_body)
+except Exception as e:
+    raise SystemExit(f"NO-GO: /healthz body is not JSON ({e})")
+try:
+    window = check_healthz(hz_payload)
+except ArtifactError as e:
+    raise SystemExit(f"NO-GO: {e}")
+start_s, end_s = g4_window(window["point_latest"])
+start, end = dt.date.fromisoformat(start_s), dt.date.fromisoformat(end_s)
 span = (end - start).days + 1
 if span != 366:
     raise SystemExit(f"NO-GO: span is {span} days, not exactly 366")
@@ -432,7 +451,10 @@ except ArtifactError as e:
 with open(os.path.join(art, "g4_request.json"), "w") as fh:
     json.dump({"run_id": run_id, "start": start.isoformat(), "end": end.isoformat(),
                "url": url, "span_days": span, "probe_rows": len(rows),
-               "g4_samples": samples}, fh, indent=2, sort_keys=True)
+               "g4_samples": samples, "healthz_url": HEALTHZ_URL,
+               "point_latest": window["point_latest"],
+               "point_day_count": window["point_day_count"]},
+              fh, indent=2, sort_keys=True)
 print(f"probe OK: {start}..{end}, {len(rows)} rows, {samples} samples planned")
 PYEOF
 ```
@@ -450,7 +472,8 @@ set -euo pipefail
 PYTHONPATH="$CODE_ROOT" "$PYTHON" - <<'PYEOF'
 import json, math, os, subprocess, sys, time
 sys.path.insert(0, os.environ["CODE_ROOT"])
-from ops.p5s8_report import check_g4_request, check_g4_response, ArtifactError
+from ops.p5s8_report import (check_g4_request, check_g4_response, check_healthz,
+                             HEALTHZ_URL, ArtifactError)
 
 art, run_id = os.environ["ART"], os.environ["RUN_ID"]
 sleep_s = float(os.environ.get("G4_SLEEP", "0.3"))
@@ -467,6 +490,25 @@ try:
     check_g4_request(req, run_id=run_id)
 except ArtifactError as e:
     raise SystemExit(f"NO-GO: {e}")
+
+# Re-read the window authority LIVE, before the first timed sample. A day can land between
+# probe and sampling, and an edited artifact cannot bypass this: the comparison is against the
+# service, not against anything the file claims.
+hz_out = subprocess.run(["curl", "-s", "-w", "\n%{http_code}", HEALTHZ_URL],
+                        capture_output=True, text=True)
+if hz_out.returncode != 0:
+    raise SystemExit(f"NO-GO: curl to /healthz failed with {hz_out.returncode}")
+hz_body, _, hz_code = hz_out.stdout.rstrip("\n").rpartition("\n")
+if hz_code.strip() != "200":
+    raise SystemExit(f"NO-GO: /healthz returned HTTP {hz_code.strip()} before sampling")
+try:
+    live = check_healthz(json.loads(hz_body))
+except Exception as e:
+    raise SystemExit(f"NO-GO: /healthz invalid before sampling ({e})")
+if live["point_latest"] != req["point_latest"]:
+    raise SystemExit(
+        f"NO-GO: point_latest moved from {req['point_latest']} to {live['point_latest']} "
+        f"between probe and sampling; discard the G4 series")
 
 url, want = req["url"], int(req["g4_samples"])
 seconds = []

@@ -40,6 +40,10 @@ from test_phase2_p5s7_http import _segment  # noqa: E402
 
 NY = NX = 16
 
+#: The service's point history end, fixed and NOT today: the G4 window must follow this, not
+#: the host clock. The aborted VM24 run failed precisely because it followed the clock.
+POINT_LATEST = "2026-08-18"
+
 #: The producer sequence, per profile, in the order an operator runs it. The order is part of
 #: the contract: `preflight-record` derives fields from artifacts earlier blocks wrote, so a
 #: sequence that runs it first cannot populate them.
@@ -167,16 +171,22 @@ class _E2E(unittest.TestCase):
         # Real dates spanning the window the probe asks for. Placeholder "d0" strings were
         # fine while only the row COUNT was checked; row-level validation makes a stub that
         # cannot pass a real check a stub that tests nothing.
+        # A FIXED point_latest, deliberately not today's date: it proves the window follows
+        # the service's own availability rather than the clock on the host running the runbook.
         import datetime as _dt
-        _end = _dt.date.today()
+        _end = _dt.date.fromisoformat(POINT_LATEST)
         body = json.dumps([{"date": (_end - _dt.timedelta(days=365 - i)).isoformat(),
                             "sst": 1.0} for i in range(366)])
+        healthz = json.dumps({"status": "ok", "point_latest": POINT_LATEST,
+                              "point_day_count": 1326, "point_earliest": "2023-01-01",
+                              "latest": POINT_LATEST, "daily_latest": POINT_LATEST})
         # Real `curl -w` writes the BODY and then the -w trailer. The old stub short-circuited
         # the timing call with only a status, which no longer models curl now that every sample
         # is validated -- and a stub that does not model the tool tests the stub.
         _stub(self.bin, "curl", f'''
 args="$*"
-printf '%s' '{body}'
+if [[ "$args" == *"/healthz"* ]]; then printf '%s' '{healthz}'
+else printf '%s' '{body}'; fi
 if [[ "$args" == *"time_total"* ]]; then printf '\n200 0.011';
 elif [[ "$args" == *"http_code"* ]]; then printf '\n200'; fi''')
 

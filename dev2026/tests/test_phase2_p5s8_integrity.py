@@ -255,14 +255,18 @@ class TestEverySampledResponseIsValidated(_E2E):
         with open(state, "w") as fh:
             fh.write("0")
         import datetime as _dt
-        _end = _dt.date.today()
+        from test_phase2_p5s8_e2e import POINT_LATEST
+        _end = _dt.date.fromisoformat(POINT_LATEST)
         good = json.dumps([{"date": (_end - _dt.timedelta(days=365 - i)).isoformat(),
                             "sst": 1.0} for i in range(366)])
         short = json.dumps([{"date": _end.isoformat(), "sst": 1.0}])
+        healthz = json.dumps({"status": "ok", "point_latest": POINT_LATEST,
+                              "point_day_count": 1326})
         _stub(self.bin, "curl", f'''
+args="$*"
+if [[ "$args" == *"/healthz"* ]]; then printf '%s' '{healthz}'; printf '\\n200'; exit 0; fi
 n=$(cat {state}); echo $((n+1)) > {state}
 if [ "$n" -lt {good_calls} ]; then BODY='{good}'; else BODY='{short}'; fi
-args="$*"
 printf '%s' "$BODY"
 if [[ "$args" == *"time_total"* ]]; then printf '\\n200 0.011';
 elif [[ "$args" == *"http_code"* ]]; then printf '\\n200'; fi''')
