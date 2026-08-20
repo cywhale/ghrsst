@@ -511,17 +511,21 @@ class TestIdentityPreflightIsAnExecutableBlock(_Sandbox):
         code = os.path.join(repo, "dev2026")
         os.makedirs(code, exist_ok=True)
         subprocess.run(["git", "init", "-q", repo], check=True)
+        # Everything is committed BEFORE the SHA is read: the identity block now requires a
+        # clean worktree, so files copied in afterwards would leave it dirty and the test would
+        # fail for a reason unrelated to what it checks.
+        with open(os.path.join(repo, ".gitignore"), "w") as fh:
+            fh.write("__pycache__/\n*.pyc\n")
         _touch(os.path.join(repo, "f"))
-        subprocess.run(["git", "-C", repo, "add", "."], check=True)
+        for pkg in ("store", "ops"):
+            shutil.copytree(os.path.join(_DEV, pkg), os.path.join(code, pkg),
+                            dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        subprocess.run(["git", "-C", repo, "add", "-A"], check=True, capture_output=True)
         subprocess.run(["git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t",
-                        "commit", "-qm", "x"], check=True)
+                        "commit", "-qm", "x"], check=True, capture_output=True)
         sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                              capture_output=True, text=True).stdout.strip()
-        for pkg in ("store",):
-            os.makedirs(os.path.join(code, pkg), exist_ok=True)
-            _touch(os.path.join(code, pkg, "__init__.py"))
-        shutil.copy(os.path.join(_DEV, "store", "block_manifest.py"),
-                    os.path.join(code, "store", "block_manifest.py"))
         return code, (sha if sha_ok else "HEAD")
 
     def test_it_is_a_tagged_block(self):

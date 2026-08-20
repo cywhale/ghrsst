@@ -139,7 +139,7 @@ reject.
 # block: identity-preflight
 # Run on: VM24
 set -euo pipefail
-: "${CODE_ROOT:?set CODE_ROOT}"
+: "${CODE_ROOT:?set CODE_ROOT}"; : "${PROFILE:?set PROFILE}"
 : "${ART:?run the art-root block first}"; : "${RUN_ID:?run the art-root block first}"
 : "${PYTHON:?set PYTHON}"
 : "${DEPLOY_SHA:?set DEPLOY_SHA to the exact commit under measurement}"
@@ -156,20 +156,34 @@ assert bm.__file__.startswith('$CODE_ROOT'), bm.__file__
 CANON="$(cd "$CODE_ROOT/.." && git rev-parse --verify "${DEPLOY_SHA}^{commit}" 2>/dev/null)" \
   || { echo "NO-GO: DEPLOY_SHA does not resolve to a commit"; exit 1; }
 [ "$CANON" = "$DEPLOY_SHA" ] || { echo "NO-GO: DEPLOY_SHA is not an exact commit id"; exit 1; }
+# `rev-parse --verify <sha>^{commit}` echoes ANY existing commit back, so the check above
+# proves the commit exists -- not that it is the one checked out. A valid ancestor passed it.
+HEAD_SHA="$(cd "$CODE_ROOT/.." && git rev-parse --verify HEAD)" || { echo "NO-GO: cannot resolve HEAD"; exit 1; }
+[ "$HEAD_SHA" = "$DEPLOY_SHA" ] || { echo "NO-GO: HEAD is $HEAD_SHA, not DEPLOY_SHA $DEPLOY_SHA"; exit 1; }
+# ... and the tree must match that commit. `--untracked-files=all` so a stray file counts:
+# uncommitted or untracked changes mean the running code is not the commit being pinned.
+DIRTY="$(cd "$CODE_ROOT/.." && git status --porcelain --untracked-files=all)"
+[ -z "$DIRTY" ] || { echo "NO-GO: worktree is dirty:"; echo "$DIRTY"; exit 1; }
 
 # Record WHAT WAS VERIFIED. A SHA in the preflight proves the preflight holds a SHA; only this
 # record says which commit was resolved, from which tree, and which module files were imported.
-PYTHONPATH="$CODE_ROOT" "$PYTHON" - "$CANON" <<'PYEOF'
+HEAD_SHA="$HEAD_SHA" PYTHONPATH="$CODE_ROOT" "$PYTHON" - "$CANON" <<'PYEOF'
 import hashlib, json, os, sys
 sys.path.insert(0, os.environ["CODE_ROOT"])
-import store.block_manifest as bm
+import importlib
+from ops.p5s8_report import identity_modules
+
 art, code_root = os.environ["ART"], os.environ["CODE_ROOT"]
+# Every module this profile imports or executes -- the validator and the profile declarations
+# included. One inventory, shared with the assembler, so neither side can drift.
 modules = {}
-for name, module in (("store.block_manifest", bm),):
+for name in identity_modules(os.environ["PROFILE"]):
+    module = importlib.import_module(name)
     path = os.path.realpath(module.__file__)
     with open(path, "rb") as fh:
         modules[name] = {"path": path, "sha256": hashlib.sha256(fh.read()).hexdigest()}
 rec = {"run_id": os.environ["RUN_ID"], "deploy_sha": sys.argv[1],
+       "head_sha": os.environ["HEAD_SHA"], "worktree_clean": True,
        "code_root": code_root, "python": os.environ["PYTHON"], "modules": modules}
 with open(os.path.join(art, "identity.json"), "w") as fh:
     json.dump(rec, fh, indent=2, sort_keys=True)

@@ -80,26 +80,44 @@ class _E2E(unittest.TestCase):
             "PROC_ROOT": os.path.join(self.tmp, "proc"),
             "SAMPLES": "2", "INTERVAL": "0", "G4_SAMPLES": "2", "G4_SLEEP": "0",
             "SHADOW_ROOT": self.shadow_root, "ANCHOR_ROOT": self.anchor,
+            # Keep the code tree byte-identical to its commit while blocks import from it.
+            "PYTHONDONTWRITEBYTECODE": "1",
         })
         self.art = os.path.join(self.ext, "p5s8_E2ETEST")
 
     # ---- fixtures ---------------------------------------------------
     def _repo(self):
+        """TWO commits, so a test can supply a valid ANCESTOR as DEPLOY_SHA.
+
+        One commit cannot distinguish "this SHA exists" from "HEAD is this SHA" — which was
+        exactly the hole: `git rev-parse --verify <ancestor>^{commit}` echoes the ancestor back,
+        so comparing it to DEPLOY_SHA passes while the checkout is something else entirely."""
         repo = os.path.join(self.tmp, "codetree")
         code = os.path.join(repo, "dev2026")
         os.makedirs(code, exist_ok=True)
         subprocess.run(["git", "init", "-q", repo], check=True)
-        for pkg in ("store", "ops"):
-            shutil.copytree(os.path.join(_DEV, pkg), os.path.join(code, pkg),
-                            dirs_exist_ok=True)
+        commit = ["git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t",
+                  "commit", "-qm", "x"]
+        # Byte-code caches must be ignored, or importing from this tree dirties it and the
+        # clean-worktree gate would fail for a reason that has nothing to do with the deployment.
+        with open(os.path.join(repo, ".gitignore"), "w") as fh:
+            fh.write("__pycache__/\n*.pyc\n")
         with open(os.path.join(repo, "marker"), "w") as fh:
             fh.write("x")
-        subprocess.run(["git", "-C", repo, "add", "-A"], check=True,
-                       capture_output=True)
-        subprocess.run(["git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t",
-                        "commit", "-qm", "x"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo, "add", "-A"], check=True, capture_output=True)
+        subprocess.run(commit, check=True, capture_output=True)
+        old_sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
+                                 capture_output=True, text=True).stdout.strip()
+
+        for pkg in ("store", "ops"):
+            shutil.copytree(os.path.join(_DEV, pkg), os.path.join(code, pkg),
+                            dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        subprocess.run(["git", "-C", repo, "add", "-A"], check=True, capture_output=True)
+        subprocess.run(commit, check=True, capture_output=True)
         sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                              capture_output=True, text=True).stdout.strip()
+        self.repo, self.old_sha = repo, old_sha
         return code, sha
 
     def _shadow(self):

@@ -294,6 +294,23 @@ Two stub corrections fell out, both the same lesson as earlier rounds: the `curl
 `date: "d0"` placeholders, which were fine while only the row count was checked and become a
 stub that cannot pass a real check the moment rows are validated.
 
+## Review round 9 — the checkout, not just a commit; every module, not just one
+
+| finding | correction |
+|---|---|
+| `git rev-parse --verify <sha>^{commit}` echoes **any existing commit** back, so comparing it to `DEPLOY_SHA` proved the commit exists — not that it is checked out. A valid ancestor passed, and so did a dirty tree | the identity block now requires `HEAD` to equal `DEPLOY_SHA` exactly **and** `git status --porcelain --untracked-files=all` to be empty, each failing closed with its own message. `identity.json` records `head_sha` and `worktree_clean`, and the assembler refuses a record that does not affirm both |
+| `identity.json` fingerprinted only `store.block_manifest`, while the run imports and executes `ops.p5s8_report`, `ops.p5_roadmap`, `ops.quiescence`, `store.repair_wal` and `store.segmented_cube` — so an unrecorded module could change the **validator itself** without changing identity evidence | one per-profile inventory (`IDENTITY_MODULES` / `identity_modules()`), shared by producer and assembler. The identity block imports each module, records its resolved realpath and sha256, and assembly rehashes every one and refuses a record whose module set does not match the profile |
+
+Eight mutations, serial from a git-clean tree: **all killed, no survivors** — including dropping
+the HEAD check, dropping the dirty-tree gate, narrowing `--untracked-files`, and editing
+`ops/p5s8_report.py` after identity was recorded.
+
+Two fixture corrections were needed first, both consequences of the new gates rather than
+defects in them: the test repositories gained a second commit (one commit cannot express "valid
+ancestor that is not HEAD") and a `.gitignore` for byte-code caches, since importing from a
+checked-out tree would otherwise dirty it and fail the clean-worktree gate for a reason having
+nothing to do with the deployment.
+
 ## 4. Remaining blockers
 
 | blocker | state |

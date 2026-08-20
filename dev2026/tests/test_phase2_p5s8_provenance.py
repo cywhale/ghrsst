@@ -171,8 +171,8 @@ class TestIdentityIsRecordedAndBound(unittest.TestCase):
         with open(mod, "w") as fh:
             fh.write("x = 1\n")
         digest = hashlib.sha256(b"x = 1\n").hexdigest()
-        rec = {"run_id": RUN, "deploy_sha": "a" * 40, "code_root": code,
-               "python": "/opt/py",
+        rec = {"run_id": RUN, "deploy_sha": "a" * 40, "head_sha": "a" * 40,
+               "worktree_clean": True, "code_root": code, "python": "/opt/py",
                "modules": {"store.block_manifest": {"path": mod, "sha256": digest}}}
         rec.update(over)
         return rec
@@ -253,6 +253,132 @@ class TestTheReportRequiresIdentityToAgree(_E2E):
         self.assert_all_ok(self.run_sequence("legacy_baseline"))
         os.remove(os.path.join(self.art, "identity.json"))
         self.assertNotEqual(self.assemble("legacy_baseline").returncode, 0)
+
+
+# ------------------------------------------------------------------ 4. HEAD and worktree
+class TestIdentityPinsTheCheckoutNotJustACommit(_E2E):
+    """[High] `git rev-parse --verify <sha>^{commit}` echoes any existing commit back, so
+    comparing it to DEPLOY_SHA proves the commit EXISTS — not that it is checked out. A valid
+    ancestor passed while the working tree held something else, and a dirty tree passed too."""
+
+    def _identity_block(self, **over):
+        env = dict(self.env)
+        env.update({"PROFILE": "legacy_baseline", "ART": self.art})
+        env.update(over)
+        os.makedirs(self.art, exist_ok=True)
+        return subprocess.run(["bash", "-c", BLOCKS["identity-preflight"]], env=env,
+                              capture_output=True, text=True, cwd=self.tmp)
+
+    def test_the_clean_exact_sha_control_passes(self):
+        r = self._identity_block()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_a_valid_ANCESTOR_as_deploy_sha_is_refused(self):
+        """The reported hole: a real commit, correctly formed, that is not what is checked out."""
+        self.assertNotEqual(self.old_sha, self.sha)
+        r = self._identity_block(DEPLOY_SHA=self.old_sha)
+        self.assertNotEqual(r.returncode, 0, "an ancestor passed as the deployed commit")
+        self.assertIn("HEAD", r.stdout + r.stderr)
+
+    def test_a_dirty_TRACKED_file_is_refused(self):
+        target = os.path.join(self.code, "store", "block_manifest.py")
+        with open(target, "a") as fh:
+            fh.write("\n# local edit\n")
+        r = self._identity_block()
+        self.assertNotEqual(r.returncode, 0, "a modified tracked file passed as a clean tree")
+        self.assertIn("NO-GO", r.stdout + r.stderr)
+
+    def test_an_UNTRACKED_file_is_refused(self):
+        with open(os.path.join(self.code, "store", "scratch.py"), "w") as fh:
+            fh.write("x = 1\n")
+        r = self._identity_block()
+        self.assertNotEqual(r.returncode, 0, "an untracked file passed as a clean tree")
+
+    def test_the_record_states_head_and_cleanliness(self):
+        self.assert_all_ok(self.run_sequence("legacy_baseline"))
+        with open(os.path.join(self.art, "identity.json")) as fh:
+            rec = json.load(fh)
+        self.assertEqual(rec["head_sha"], self.sha)
+        self.assertIs(rec["worktree_clean"], True)
+
+    def test_the_assembler_refuses_a_record_whose_head_is_not_the_deploy_sha(self):
+        self.assert_all_ok(self.run_sequence("legacy_baseline"))
+        path = os.path.join(self.art, "identity.json")
+        with open(path) as fh:
+            rec = json.load(fh)
+        rec["head_sha"] = self.old_sha
+        with open(path, "w") as fh:
+            json.dump(rec, fh)
+        self.assertNotEqual(self.assemble("legacy_baseline").returncode, 0)
+
+    def test_the_assembler_refuses_a_record_admitting_a_dirty_tree(self):
+        self.assert_all_ok(self.run_sequence("legacy_baseline"))
+        path = os.path.join(self.art, "identity.json")
+        with open(path) as fh:
+            rec = json.load(fh)
+        rec["worktree_clean"] = False
+        with open(path, "w") as fh:
+            json.dump(rec, fh)
+        self.assertNotEqual(self.assemble("legacy_baseline").returncode, 0)
+
+
+# ------------------------------------------------------------------ 5. module inventory
+class TestTheModuleInventoryCoversEveryModuleTheRunUses(_E2E):
+    """[High] Only `store.block_manifest` was fingerprinted, while the run imports and executes
+    `ops.p5s8_report`, `ops.p5_roadmap`, `ops.quiescence`, `store.repair_wal` and
+    `store.segmented_cube`. An unrecorded module could change the validator itself, or the
+    measured path, without changing a byte of identity evidence."""
+
+    def test_the_inventory_is_declared_per_profile(self):
+        for profile in ("legacy_baseline", "p5_shadow"):
+            with self.subTest(profile):
+                names = rep.identity_modules(profile)
+                self.assertIn("ops.p5s8_report", names)
+                self.assertIn("ops.p5_roadmap", names)
+                self.assertIn("store.block_manifest", names)
+        self.assertIn("ops.quiescence", rep.identity_modules("legacy_baseline"))
+        for name in ("store.repair_wal", "store.segmented_cube"):
+            self.assertIn(name, rep.identity_modules("p5_shadow"))
+
+    def test_the_record_fingerprints_every_module_in_the_inventory(self):
+        self.assert_all_ok(self.run_sequence("legacy_baseline"))
+        with open(os.path.join(self.art, "identity.json")) as fh:
+            rec = json.load(fh)
+        self.assertEqual(set(rec["modules"]),
+                         set(rep.identity_modules("legacy_baseline")))
+        for name, info in rec["modules"].items():
+            with self.subTest(name):
+                # realpath both sides: macOS resolves /var -> /private/var.
+                self.assertTrue(os.path.realpath(info["path"]).startswith(
+                    os.path.realpath(self.code)))
+                self.assertEqual(len(info["sha256"]), 64)
+
+    def test_a_record_missing_an_inventory_module_is_refused(self):
+        self.assert_all_ok(self.run_sequence("legacy_baseline"))
+        path = os.path.join(self.art, "identity.json")
+        with open(path) as fh:
+            rec = json.load(fh)
+        rec["modules"].pop("ops.p5s8_report")
+        with open(path, "w") as fh:
+            json.dump(rec, fh)
+        a = self.assemble("legacy_baseline")
+        self.assertNotEqual(a.returncode, 0, "an incomplete inventory was accepted")
+
+    def test_changing_an_UNRECORDED_consumer_after_identity_is_refused(self):
+        """The mutation the finding asks for: edit `ops/p5s8_report.py` — the validator itself —
+        after identity is recorded. Before the inventory existed this changed nothing visible."""
+        self.assert_all_ok(self.run_sequence("legacy_baseline"))
+        target = os.path.join(self.code, "ops", "p5s8_report.py")
+        with open(target, "a") as fh:
+            fh.write("\n# changed after identity was recorded\n")
+        a = self.assemble("legacy_baseline")
+        self.assertNotEqual(a.returncode, 0,
+                            "the validator was edited after identity and assembly accepted it")
+        self.assertFalse(os.path.isfile(os.path.join(self.art, "p5s8_readonly.json")))
+
+    def test_the_positive_control_still_assembles(self):
+        self.assert_all_ok(self.run_sequence("legacy_baseline"))
+        self.assertEqual(self.assemble("legacy_baseline").returncode, 0)
 
 
 if __name__ == "__main__":

@@ -396,6 +396,24 @@ def _parse_pid_list(token, name: str):
     return pids
 
 
+#: The modules each profile actually imports and executes. Fingerprinting only
+#: `store.block_manifest` left the validator itself (`ops.p5s8_report`), the profile
+#: declarations (`ops.p5_roadmap`) and the measured paths outside the identity evidence -- any
+#: of them could change without changing a byte of what identity recorded.
+IDENTITY_MODULES = {
+    "common": ("ops.p5s8_report", "ops.p5_roadmap", "store.block_manifest"),
+    "legacy_baseline": ("ops.quiescence",),
+    "p5_shadow": ("store.repair_wal", "store.segmented_cube"),
+}
+
+
+def identity_modules(profile: str):
+    """The inventory for `profile`, common modules first."""
+    if profile not in S8_PROFILES:
+        raise ArtifactError(f"unknown profile {profile!r}")
+    return tuple(IDENTITY_MODULES["common"]) + tuple(IDENTITY_MODULES[profile])
+
+
 #: Fields every G4 response row must carry.
 G4_ROW_FIELDS = ("date", "sst")
 
@@ -453,7 +471,7 @@ def check_g4_response(rows, *, start: str, end: str) -> dict:
     return {"rows": len(rows), "start": start, "end": end}
 
 
-def check_identity(data, *, run_id=None) -> dict:
+def check_identity(data, *, run_id=None, profile=None) -> dict:
     """What the identity block actually verified.
 
     A 40-character SHA in the preflight proves the preflight holds a SHA. It says nothing about
@@ -475,9 +493,29 @@ def check_identity(data, *, run_id=None) -> dict:
         value = data.get(field)
         if not (isinstance(value, str) and value.strip()):
             raise ArtifactError(f"identity.json {field} must be a non-empty string; got {value!r}")
+    head = data.get("head_sha")
+    if head != sha:
+        raise ArtifactError(
+            f"identity.json head_sha={head!r} is not the deployed commit {sha!r}. "
+            f"`git rev-parse --verify <sha>^{{commit}}` echoes any existing commit back, so a "
+            f"valid ANCESTOR passes that check while the checkout is something else.")
+    if data.get("worktree_clean") is not True:
+        raise ArtifactError(
+            "identity.json does not record a clean worktree; uncommitted or untracked changes "
+            "mean the running code is not the commit being pinned")
+
     modules = data.get("modules")
     if not isinstance(modules, dict) or not modules:
         raise ArtifactError("identity.json records no imported modules")
+    if profile is not None:
+        expected = set(identity_modules(profile))
+        if set(modules) != expected:
+            missing = sorted(expected - set(modules))
+            extra = sorted(set(modules) - expected)
+            raise ArtifactError(
+                f"identity.json module inventory does not match {profile!r}: "
+                f"missing {missing}, unexpected {extra}. An unrecorded module can change the "
+                f"validator or the measured path without changing identity evidence.")
     root = os.path.realpath(data["code_root"])
     for name, info in modules.items():
         if not isinstance(info, dict) or "path" not in info or "sha256" not in info:
@@ -652,7 +690,8 @@ def assemble(art_dir: str, *, profile: str) -> dict:
             f"{run_id!r}; the run this evidence belongs to is not the one being assembled")
 
     identity = check_identity(
-        _load_json(os.path.join(art_dir, "identity.json"), "identity.json"), run_id=run_id)
+        _load_json(os.path.join(art_dir, "identity.json"), "identity.json"),
+        run_id=run_id, profile=profile)
 
     roster_pids = None
     if "pm2_jlist.json" in names:
@@ -741,15 +780,22 @@ def main(argv=None) -> int:
 
 
 #: Filled here rather than at the literal, because it must pass the validators defined above.
-def _example_identity(run_id="TEST"):
+def _example_identity(run_id="TEST", profile="legacy_baseline"):
+    """A stub carrying the FULL inventory for `profile`, fingerprinted from the real files.
+
+    A stub with one module would be rejected by the inventory check, and every test built on it
+    would become a test of the stub."""
     import hashlib
+    import importlib
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(root, "store", "block_manifest.py")
-    with open(path, "rb") as fh:
-        digest = hashlib.sha256(fh.read()).hexdigest()
-    return {"run_id": run_id, "deploy_sha": "0" * 40, "code_root": root,
-            "python": "/stub/python",
-            "modules": {"store.block_manifest": {"path": path, "sha256": digest}}}
+    modules = {}
+    for name in identity_modules(profile):
+        path = os.path.realpath(importlib.import_module(name).__file__)
+        with open(path, "rb") as fh:
+            modules[name] = {"path": path, "sha256": hashlib.sha256(fh.read()).hexdigest()}
+    return {"run_id": run_id, "deploy_sha": "0" * 40, "head_sha": "0" * 40,
+            "worktree_clean": True, "code_root": root, "python": "/stub/python",
+            "modules": modules}
 
 
 EXAMPLE_STUBS["preflight.json"] = _example_preflight()
