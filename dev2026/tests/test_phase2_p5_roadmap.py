@@ -206,10 +206,13 @@ class TestTheS8RunbookCoversItsContract(unittest.TestCase):
 
     def test_the_runbook_promises_no_writes_and_names_the_shadow_exception(self):
         self.assertIn("**no** prune, swap, compaction, repair, hold deletion", self.flat)
-        self.assertIn("never a write to `$G`", self.flat)
-        # The shadow copy is the ONE thing that writes anywhere, so it must be called out
-        # rather than left as an unremarked exception to a "read-only" claim.
-        self.assertIn("shadow copy", self.flat.lower())
+        self.assertIn("not the production data volume", self.flat.replace("*", ""))
+        # The shadow is now VERIFIED, not created: ops pre-provisions it, so the runbook's
+        # complete write set is `$ART`. That is a stronger claim than the earlier draft's, and
+        # it has to be stated rather than left implicit.
+        plain0 = self.flat.replace("*", "")
+        self.assertIn("pre-provisioned by ops", plain0)
+        self.assertIn("nothing else writes anywhere", plain0.lower())
         # Markdown-insensitive: the doc emphasises the negation ("**not** the production
         # data volume"), so a literal match on the plain phrase silently fails.
         plain = self.flat.replace("*", "")

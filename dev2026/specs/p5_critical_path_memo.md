@@ -166,6 +166,35 @@ were killed. Two guards had to be corrected first: both matched **prose** rather
 command, so one flagged the sentence describing the old defect and another survived deletion of
 the check it was meant to protect.
 
+## Review round 3 — the command blocks are executed, not read
+
+Text guards prove a check is *written*; they cannot prove it *fires*. Round 3 replaced them with
+a suite that extracts each `# block:` fragment, runs it under `bash` against stubbed `findmnt`,
+`pm2`, `curl` and fake `/proc` trees, and asserts a **non-zero exit** when a failure is injected
+— plus a good path, so an always-failing block cannot pass as a working guard. Nothing contacts
+VM24.
+
+| finding | correction |
+|---|---|
+| `$ART` was created in a LOCAL block and written from VM24 blocks | two different machines; every later `> "$ART/..."` would have failed. Artifacts are now created **on VM24** and copied back with `scp` (§8a) |
+| blocks were not independently fail-closed | every tagged block starts `set -euo pipefail`, so a failing `python \| tee`, `pm2 jlist`, `findmnt`, `rsync` or scan cannot leave an accepted artifact |
+| the G4 probe timed whatever returned | validates **status, JSON shape, row count and span** before the first sample, and discards the run on any failure — including a non-200 *during* sampling |
+| H7 read the pid set once | PM2 `jlist` is refreshed **every sample** and the **pid set** is compared, not its size, so a replaced worker is caught even though the count is unchanged |
+| `p5_shadow` rsync'd one delta | the shadow is **pre-provisioned by ops** and *verified*: manifest, every referenced block, WAL root, and an anchor that declares a rollback domain |
+
+Fifteen mutations were run against the blocks. Twelve were killed outright; three are **true
+equivalents**, verified rather than assumed by re-running the whole suite under each mutation
+and confirming the block still refuses every bad input — a second guard catches the same case
+(JSON shape is also caught by the row-shape assertion, a failing `pm2` by the empty-pid-set
+check, a missing manifest by the unreadable-manifest handler).
+
+Two mutations exposed real coverage gaps rather than equivalents, and both are now closed:
+deleting the **anchor domain-declaration** check broke nothing, because the only anchor test
+removed the whole directory; and deleting the **containment** check broke nothing, because every
+fixture put the path on the production device as well. The second needed a bind-mount fixture —
+a path inside `$G` reporting its own device — which is precisely the case containment exists to
+catch and the device check cannot.
+
 ## 4. Remaining blockers
 
 | blocker | state |

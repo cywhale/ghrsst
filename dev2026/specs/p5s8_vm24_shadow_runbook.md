@@ -21,8 +21,10 @@ of this runbook put them in `$G/logs/...` and created them with `mkdir -p` and `
 to the production data root, in a document whose opening line promises none. Worse, it consumed
 the very free space G18 is blocked on. `$ART_ROOT` is operator-supplied and verified in §0.
 
-The only other thing that writes anywhere is the **shadow copy** in §7, into a scratch path the
-operator supplies. It is still never a write to `$G`.
+**Nothing else writes anywhere.** The shadow used by `p5_shadow` is **pre-provisioned by ops**,
+not created here — §6 only verifies it, and verification is a read. So the complete set of paths
+this runbook writes is `$ART` and nothing besides, on a volume that is **not the production data
+volume**.
 
 ## Execution host
 
@@ -56,38 +58,59 @@ The profile list is enforced from `ops/p5_roadmap.py::S8_PROFILES`.
 
 ## 0. Environment and the artifact root
 
-**Run on: LOCAL** — set up and verify before touching the host.
+**Artifacts are created ON VM24**, at an operator-supplied path outside `$G` and off the
+production filesystem, and are **copied back to the workstation at the end** (§9a). The previous
+draft created `$ART` in a LOCAL block and then wrote to it from VM24 blocks — two different
+machines, so every later `> "$ART/..."` would have failed on a path that does not exist there.
+
+**Run on: VM24** — everything in §0 through §7 runs on the host.
 
 ```bash
-export PROFILE=${PROFILE:?set PROFILE to legacy_baseline or p5_shadow}
-case "$PROFILE" in legacy_baseline|p5_shadow) ;; *) echo "NO-GO: unknown PROFILE"; exit 1;; esac
-export RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
-# Artifacts live OUTSIDE the production data root and its filesystem: the path must not be
-# under $G, because writing there breaks the read-only boundary; and it must not share the
-# volume, because a sibling directory still eats the free space G18 is blocked on.
-export ART_ROOT=${ART_ROOT:?supply an artifact path OUTSIDE the VM24 data volume}
-export ART="$ART_ROOT/p5s8_$RUN_ID"
-mkdir -p "$ART"
-```
-
-**Run on: VM24** — the host-side variables, and the artifact-root checks.
-
-```bash
+# block: env
+set -euo pipefail
 export G=/home/odbadmin/Data/ghrsst
 export CODE_ROOT=/home/odbadmin/python/ghrsst-p5s8/dev2026        # the P5 code under test
 export PYTHON=/home/odbadmin/python/ghrsst-dev2026-phase2/dev2026/.venv/bin/python
 export PYTHONPATH=$CODE_ROOT
+export PROFILE=${PROFILE:?set PROFILE to legacy_baseline or p5_shadow}
+case "$PROFILE" in legacy_baseline|p5_shadow) ;; *) echo "NO-GO: unknown PROFILE"; exit 1;; esac
 export DEPLOY_SHA=${DEPLOY_SHA:?set DEPLOY_SHA to the exact commit under measurement}
 export SHADOW_ROOT=${SHADOW_ROOT:-}                                # p5_shadow profile only
+```
 
-# The artifact root must not be under $G ...
-case "$(readlink -f "$ART")/" in
-  "$(readlink -f "$G")"/*) echo "NO-GO: ART resolves under \$G: $ART"; exit 1;; esac
-# ... and must not be on the production filesystem.
-PROD_DEV=$(findmnt -no SOURCE --target "$G")
-ART_DEV=$(findmnt -no SOURCE --target "$ART")
-[ "$PROD_DEV" != "$ART_DEV" ] || \
-  { echo "NO-GO: ART is on the production device ($PROD_DEV)"; exit 1; }
+**Run on: VM24** — the artifact root, verified before anything is written to it.
+
+```bash
+# block: art-root
+set -euo pipefail
+: "${G:?set G}"
+: "${PYTHON:?set PYTHON}"
+: "${ART_ROOT:?supply an artifact path OUTSIDE the VM24 data volume}"
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+ART="${ART:-$ART_ROOT/p5s8_$RUN_ID}"
+[ -n "$ART" ] || ART="$ART_ROOT/p5s8_$RUN_ID"
+
+# (1) the artifact root must not be under $G. Resolved with realpath semantics, so a symlink
+# or a `..` cannot smuggle it back inside.
+UNDER=$("$PYTHON" - "$ART_ROOT" "$G" <<'PYEOF'
+import os, sys
+a = os.path.realpath(sys.argv[1]); g = os.path.realpath(sys.argv[2])
+print("yes" if a == g or a.startswith(g + os.sep) else "no")
+PYEOF
+)
+[ "$UNDER" = "no" ] || { echo "NO-GO: ART_ROOT is under \$G: $ART_ROOT"; exit 1; }
+
+mkdir -p "$ART"
+
+# (2) ... and must not share the production device. A sibling volume-mate still competes for
+# the free space G18 is blocked on. `set -e` makes a FAILED findmnt an abort, not two empty
+# strings comparing equal -- which is how this check would otherwise pass while proving nothing.
+PROD_DEV="$(findmnt -no SOURCE --target "$G")"
+ART_DEV="$(findmnt -no SOURCE --target "$ART")"
+[ -n "$PROD_DEV" ] && [ -n "$ART_DEV" ] || { echo "NO-GO: could not resolve mount sources"; exit 1; }
+[ "$PROD_DEV" != "$ART_DEV" ] || { echo "NO-GO: ART is on the production device ($PROD_DEV)"; exit 1; }
+export RUN_ID ART
+echo "ART=$ART"
 ```
 
 If the operator cannot supply an external path, **stop**. Do not fall back to `$G`.
@@ -121,7 +144,9 @@ cd "$CODE_ROOT/.." && \
 **Reachability from the workstation** is a separate check on a separate machine:
 
 ```bash
+# block: reachability
 # Run on: LOCAL
+set -euo pipefail
 ssh -o BatchMode=yes vm24 'date -Is; hostname' || { echo "NO-GO: host unreachable"; exit 1; }
 ```
 
@@ -187,28 +212,64 @@ changing one byte of free space.
 
 **Run on: VM24.** A timing sample taken from a 500 is not a latency sample:
 `curl -o /dev/null -w '%{time_total}'` times an error page just as happily as an answer. And a
-"366-day" measurement over a shorter span is a different measurement wearing the same name.
+"366-day" measurement over a shorter span is a different measurement wearing the same name. The
+probe therefore validates **status, JSON shape, row count and span** before a single timing
+sample is kept, and any failure discards the whole run.
 
 ```bash
-S=$(date -u -d '365 days ago' +%F); E=$(date -u +%F)
-# Verify the span is EXACTLY 366 days inclusive before any sample is taken.
-DAYS=$(( ( $(date -u -d "$E" +%s) - $(date -u -d "$S" +%s) ) / 86400 + 1 ))
-[ "$DAYS" -eq 366 ] || { echo "NO-GO: span is $DAYS days, not exactly 366"; exit 1; }
+# block: g4-probe
+# Run on: VM24
+set -euo pipefail
+: "${PYTHON:?set PYTHON}"
+DAYS="${FORCE_SPAN_DAYS:-366}"          # override exists so the guard itself can be tested
+read -r S E <<<"$("$PYTHON" - "$DAYS" <<'PYEOF'
+import datetime as dt, sys
+n = int(sys.argv[1])
+e = dt.date.today(); s = e - dt.timedelta(days=n - 1)
+print(s.isoformat(), e.isoformat())
+PYEOF
+)"
+# The span is measured from the request that will actually be sent, not from the intent.
+SPAN=$("$PYTHON" - "$S" "$E" <<'PYEOF'
+import datetime as dt, sys
+a = dt.date.fromisoformat(sys.argv[1]); b = dt.date.fromisoformat(sys.argv[2])
+print((b - a).days + 1)
+PYEOF
+)
+[ "$SPAN" -eq 366 ] || { echo "NO-GO: span is $SPAN days, not exactly 366"; exit 1; }
 
 URL="http://127.0.0.1:8080/api/ghrsst?lon0=135&lat0=20&start=$S&end=$E&append=sst"
-# One probe request: the row count must match the span, or the endpoint is not answering the
-# question we think we asked.
-ROWS=$(curl -s "$URL" | "$PYTHON" -c 'import json,sys; print(len(json.load(sys.stdin)))')
-[ "$ROWS" -eq 366 ] || { echo "NO-GO: expected row count 366, got $ROWS"; exit 1; }
+RESP="$(curl -s -w '\n%{http_code}' "$URL")"
+CODE="$(printf '%s' "$RESP" | tail -n 1)"
+BODY="$(printf '%s' "$RESP" | sed '$d')"
+[ "$CODE" = "200" ] || { echo "NO-GO: probe returned HTTP $CODE; discard the entire run"; exit 1; }
 
+# Shape before count: an HTML error page and a `{"detail": ...}` both have a length.
+ROWS="$(printf '%s' "$BODY" | "$PYTHON" -c "
+import json, sys
+d = json.load(sys.stdin)
+assert isinstance(d, list), 'response is not a list of rows'
+assert d, 'response is an empty list'
+assert isinstance(d[0], dict) and 'date' in d[0] and 'sst' in d[0], 'unexpected row shape'
+print(len(d))
+")" || { echo "NO-GO: probe body failed validation; discard the entire run"; exit 1; }
+[ "$ROWS" -eq 366 ] || { echo "NO-GO: expected row count 366, got $ROWS"; exit 1; }
+echo "probe OK: $S..$E, $ROWS rows"
+```
+
+Only once that probe passes are timing samples taken, and any non-200 **during** sampling
+discards the run too:
+
+```bash
+# block: g4-sample
+# Run on: VM24
+set -euo pipefail
+: "${ART:?run the art-root block first}"
 : > "$ART/g4_366d_seconds.txt"
 for i in $(seq 1 30); do
-  OUT=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' "$URL")
-  CODE=${OUT%% *}; T=${OUT##* }
-  if [ "$CODE" != "200" ]; then
-    echo "NO-GO: HTTP $CODE during sampling; discard the run" | tee -a "$ART/g4_errors.txt"
-    exit 1
-  fi
+  OUT="$(curl -s -o /dev/null -w '%{http_code} %{time_total}' "$URL")"
+  CODE="${OUT%% *}"; T="${OUT##* }"
+  [ "$CODE" = "200" ] || { echo "NO-GO: HTTP $CODE during sampling; discard the run"; exit 1; }
   echo "$T" >> "$ART/g4_366d_seconds.txt"
   sleep 0.3
 done
@@ -227,34 +288,58 @@ done
 
 **Run on: VM24.** `pgrep -f 'uvicorn|ghrsst' | head -1` picks an arbitrary match — possibly the
 `pgrep` itself, possibly the supervisor, possibly one worker of several — and then reports its
-fd count as though it were the service's. PM2 knows the pids; ask PM2, and **aggregate** across
-every worker.
+fd count as though it were the service's. PM2 knows the pids; ask PM2, **aggregate** across
+every worker, and **re-ask on every sample**.
+
+A restart mid-window is the case that matters: a fd/RSS series spanning two different sets of
+processes is not a series. Comparing counts is not enough either — a worker replaced by another
+keeps the count identical, so the **pid set** is compared, not its size.
 
 ```bash
-pm2 jlist > "$ART/pm2_jlist.json"
-PYTHONPATH=$CODE_ROOT "$PYTHON" - "$ART" <<'PY' | tee "$ART/h7_fd_rss_timeseries.txt"
-import json, os, sys, time
+# block: h7-sample
+# Run on: VM24
+set -euo pipefail
+: "${PYTHON:?set PYTHON}"
+: "${CODE_ROOT:?set CODE_ROOT}"
+PROC_ROOT="${PROC_ROOT:-/proc}" SAMPLES="${SAMPLES:-60}" INTERVAL="${INTERVAL:-5}" \
+"$PYTHON" - <<'PYEOF'
+import json, os, subprocess, sys, time
 sys.path.insert(0, os.environ["CODE_ROOT"])
-from ops.quiescence import worker_pids          # the shipped helper: EVERY pid PM2 knows
-art = sys.argv[1]
-with open(os.path.join(art, "pm2_jlist.json")) as fh:
-    jlist = json.load(fh)
-pids = worker_pids(jlist, "ghrsst")
-if not pids:
-    raise SystemExit("NO-GO: PM2 reports no pid for the app; nothing to sample")
-print(f"# pids={pids}")
-for _ in range(60):
+from ops.quiescence import worker_pids        # the shipped helper: EVERY pid PM2 knows
+
+proc = os.environ["PROC_ROOT"]
+samples = int(os.environ["SAMPLES"]); interval = float(os.environ["INTERVAL"])
+
+def current():
+    out = subprocess.run(["pm2", "jlist"], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise SystemExit("NO-GO: pm2 jlist failed; no artifact from this run is accepted")
+    try:
+        jlist = json.loads(out.stdout)
+    except Exception as e:
+        raise SystemExit(f"NO-GO: pm2 jlist is not JSON: {e}")
+    return set(worker_pids(jlist, "ghrsst"))
+
+first = current()
+if not first:
+    raise SystemExit("NO-GO: PM2 reports no pid for the app; there is nothing to sample")
+print(f"# pids={sorted(first)}")
+for _ in range(samples):
+    now = current()                      # refreshed EVERY sample, not once at the start
+    if now != first:
+        raise SystemExit(f"NO-GO: worker pid set changed mid-window: "
+                         f"{sorted(first)} -> {sorted(now)}")
     fds = rss = 0
-    for pid in pids:                            # aggregate, not one arbitrary worker
+    for pid in sorted(first):
         try:
-            fds += len(os.listdir(f"/proc/{pid}/fd"))
-            with open(f"/proc/{pid}/status") as fh:
+            fds += len(os.listdir(f"{proc}/{pid}/fd"))
+            with open(f"{proc}/{pid}/status") as fh:
                 rss += next(int(l.split()[1]) for l in fh if l.startswith("VmRSS"))
         except FileNotFoundError:
             raise SystemExit(f"NO-GO: pid {pid} vanished mid-sample; the service restarted")
-    print(f"{int(time.time())} {len(pids)} {fds} {rss}")
-    time.sleep(5)
-PY
+    print(f"{int(time.time())} {len(first)} {fds} {rss}")
+    time.sleep(interval)
+PYEOF
 ```
 
 Inode headroom is already **PASS_EVIDENCE_AVAILABLE** from the historical run: 225,490,340 free
@@ -273,20 +358,28 @@ is not a leak, and the local S7 harness reported exactly that as growth before i
 ## 5. G16 — metadata scan, fail closed
 
 **Run on: VM24.** `os.walk` swallows every `OSError` by default, so a permission-denied subtree
-silently shrinks the count and the scan reports a smaller, faster tree than exists.
+silently shrinks the count and the scan reports a smaller, faster tree than exists — an
+under-report that looks like good news.
 
 ```bash
-/usr/bin/time -v nice -n 19 ionice -c3 \
-  "$PYTHON" -c "
-import os, sys, time
+# block: g16-scan
+# Run on: VM24
+set -euo pipefail
+: "${G:?set G}"
+: "${PYTHON:?set PYTHON}"
+nice -n 19 "$PYTHON" - <<'PYEOF'
+import os, time
 def boom(err):
-    raise SystemExit(f'NO-GO: traversal error at {err.filename}: {err}')
+    raise SystemExit(f"NO-GO: traversal error at {err.filename}: {err}")
 t0 = time.perf_counter(); files = dirs = 0
-for _, d, f in os.walk('$G', onerror=boom):   # fail closed on ANY traversal error
+for _, d, f in os.walk(os.environ["G"], onerror=boom):   # fail closed on ANY traversal error
     dirs += len(d); files += len(f)
-print(f'{files} files, {dirs} dirs, {time.perf_counter()-t0:.1f} s')
-" 2>&1 | tee "$ART/g16_metadata_scan.txt"
+print(f"{files} files, {dirs} dirs, {time.perf_counter() - t0:.1f} s")
+PYEOF
 ```
+
+On the host, run it under `ionice -c3` as well and tee to `"$ART/g16_metadata_scan.txt"`; with
+`pipefail` set, a failing scan cannot produce an accepted artifact through `tee`.
 
 **Abort this step** if service p95 rises above twice its pre-scan value, or if load average
 exceeds 4. A walk of 5.4 T is the one step here with real service impact, which is why it is
@@ -297,23 +390,58 @@ nice'd, ionice'd and abortable.
 `NOT_ADJUDICATED`** on that half under `legacy_baseline`. Record the scan; do not synthesise the
 rest.
 
-## 6. Shadow copy — `p5_shadow` profile only
+## 6. Shadow provisioning — `p5_shadow` profile only
 
-**Run on: VM24.** Only if the operator supplies `SHADOW_ROOT` on a volume that is **not** the
-production data volume:
+**Run on: VM24.** A shadow is not "a copy of the delta". The `p5_shadow` profile exists to
+measure things that need a **complete P5 deployment**: a published manifest, the blocks it
+references, a WAL root and an independent anchor root. `rsync`-ing one delta and proceeding
+would fail at the first measurement that needs any of them — or worse, quietly report a
+`legacy_baseline`-grade result under a `p5_shadow` label.
+
+The shadow must be **pre-provisioned by ops** and is then **verified**, not created, here:
 
 ```bash
-if [ "$PROFILE" = "p5_shadow" ]; then
-  test -n "$SHADOW_ROOT" || { echo "NO-GO: p5_shadow needs SHADOW_ROOT"; exit 1; }
-  PROD_DEV=$(findmnt -no SOURCE --target "$G")
-  SHAD_DEV=$(findmnt -no SOURCE --target "$SHADOW_ROOT")
-  [ "$PROD_DEV" != "$SHAD_DEV" ] || \
-    { echo "NO-GO: SHADOW_ROOT is on the production device"; exit 1; }
-  rsync -a --info=progress2 "$G/mur_timecube_s8_t90_sh128.delta.zarr" "$SHADOW_ROOT/"
-fi
+# block: shadow-verify
+# Run on: VM24
+set -euo pipefail
+: "${PYTHON:?set PYTHON}"
+: "${SHADOW_ROOT:?p5_shadow needs SHADOW_ROOT}"
+: "${ANCHOR_ROOT:?p5_shadow needs an INDEPENDENT ANCHOR_ROOT}"
+"$PYTHON" - "$SHADOW_ROOT" "$ANCHOR_ROOT" <<'PYEOF'
+import json, os, sys
+shadow, anchor = sys.argv[1], sys.argv[2]
+
+def nogo(msg):
+    raise SystemExit(f"NO-GO: {msg}")
+
+mroot = os.path.join(shadow, "p5_blocks")
+mpath = os.path.join(mroot, "manifest.json")
+if not os.path.isfile(mpath):
+    nogo(f"no published manifest at {mpath}; a delta copy is not a P5 shadow")
+try:
+    with open(mpath) as fh:
+        manifest = json.load(fh)
+except Exception as e:
+    nogo(f"manifest unreadable: {e}")
+segments = manifest.get("segments") or []
+if not segments:
+    nogo("the manifest declares no segments")
+for seg in segments:                       # every referenced block must actually be there
+    path = os.path.join(mroot, seg.get("path", ""))
+    if not os.path.isdir(path):
+        nogo(f"manifest segment missing on disk: {path}")
+if not os.path.isdir(os.path.join(shadow, "p5_repairs")):
+    nogo("no WAL root (p5_repairs) in the shadow")
+if not os.path.isdir(anchor):
+    nogo(f"anchor root missing: {anchor}")
+if not os.path.isfile(os.path.join(anchor, "domain.json")):
+    nogo("the anchor root declares no rollback domain")
+print(f"shadow provisioning verified: {len(segments)} segment(s), WAL and anchor present")
+PYEOF
 ```
 
-Everything downstream of this point runs **against `$SHADOW_ROOT`**, never `$G`.
+The shadow volume must also not be the production device — the same check as §0, for the same
+reason. Everything downstream runs **against `$SHADOW_ROOT`**, never `$G`.
 
 ## 7. Abort conditions
 
@@ -353,6 +481,22 @@ and off the production filesystem.
 Every record carries `label: VM24_PRODUCTION_READ_ONLY` and the `profile` it was collected
 under. Local synthetic numbers are **never** merged into these files, and no number here may be
 promoted into a local artifact.
+
+## 8a. Artifact copy-back
+
+**Run on: LOCAL.** The artifacts were created on VM24, outside `$G`. Bring them to the
+workstation for review; nothing is deleted from the host by this runbook.
+
+```bash
+# block: copy-back
+# Run on: LOCAL
+set -euo pipefail
+: "${ART:?the ART path reported by the art-root block on VM24}"
+DEST="${DEST:-./p5s8_artifacts}"
+mkdir -p "$DEST"
+scp -r "vm24:$ART" "$DEST/"
+echo "copy-back complete: $DEST"
+```
 
 ## 9. Required preflight fields
 
