@@ -114,8 +114,8 @@
     {
       "actor": "human",
       "gate": null,
-      "name": "Fresh VM24 read-only / shadow approval",
-      "note": "not implied by the roadmap exception",
+      "name": "Fresh VM24 approval for the S9 read-only / shadow collection",
+      "note": "not implied by the roadmap exception, and not carried over from the S8 legacy_baseline approval, which was granted, used and is spent",
       "status": "NOT_REQUESTED",
       "step": 4
     },
@@ -168,12 +168,21 @@
       "step": 10
     }
   ],
+  "g18_current": "BLOCKED \u2014 295.7 GiB free against a 403.3 GiB minimum (shortfall 107.6 GiB), measured 2026-08-20 in run 20260820T110036Z",
   "hard_reserve_is_fixed": true,
   "label": "LOCAL_ONLY_PLANNING_DOCUMENT",
   "next_approval_required": {
+    "already_executed_under_a_spent_approval": [
+      "legacy_baseline"
+    ],
     "blocking_step": 3,
     "not_implied_by": "the P5-EX-1 roadmap exception",
-    "what": "IT capacity expansion (option A) or an approved staging-volume design (option B), then a fresh VM24 read-only / shadow approval"
+    "per_stage": {
+      "legacy_baseline": "COMPLETED",
+      "p5_shadow": "NOT_STARTED",
+      "s9_shadow_execution": "NOT_STARTED"
+    },
+    "what": "IT capacity expansion (option A) or an approved staging-volume design (option B), then a fresh VM24 approval for the collections that have NOT run"
   },
   "policy_predicate": {
     "enforced": false,
@@ -181,7 +190,7 @@
   },
   "production_dependent_gates": {
     "G16": "metadata-scan wall time and snapshot-open cost on the production tree",
-    "G18": "free disk on /dev/sdc1; BLOCKED at 267 GiB against a 403.3 GiB minimum",
+    "G18": "free disk on /dev/sdc1 against the 403.3 GiB minimum; only the host can report it",
     "G3": "point p95 vs the CURRENT production TieredCube baseline on VM24",
     "G4": "366-day p95 at production geometry (17999 x 36000)",
     "H7": "fd/RSS under sustained load on the production process, plus inode headroom"

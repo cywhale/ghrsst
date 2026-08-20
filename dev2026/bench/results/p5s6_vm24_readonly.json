@@ -64,8 +64,11 @@
       "verdict": "NOT_ADJUDICATED"
     },
     "G18_capacity": {
+      "as_of": "2026-08-19",
       "audit_note": "Rev 3: currently reclaimable is 0.0 GiB, not 96.3. Minimum free needed 403.3 GiB, recommended 600 GiB. audit_only, no deletion performed, G18 BLOCKED.",
       "reason": "projected_free_after 113.7 GB < HARD_RESERVE 250 GB; shortfall 136.3 GB. 403.3 GB free would be needed. Blocked even with temp and growth set to zero.",
+      "status": "historical",
+      "superseded_by": "run 20260820T110036Z -- free 295.7 GiB, shortfall 107.6 GiB; see capacity_gate in this file and bench/results/p5s8_vm24_readonly.json. The figures in this entry's `reason` and `audit_note` are the 2026-08-19 arithmetic and are NOT the current state. The verdict is unchanged.",
       "verdict": "BLOCKED"
     },
     "G3": {

@@ -152,7 +152,10 @@ so a gate built on it would report PASS while being incapable of failing.
 What is **not** measured is G7's actual threshold: the temp disk a real production-geometry fold
 consumes ("≈ one block + margin; never a second full base"). The gate's arithmetic is verified;
 the quantity it gates is not. Local free space also says nothing about VM24, where **G18 remains
-BLOCKED (267 GiB available against a 403.3 GiB minimum)**.
+BLOCKED**. The figure this section originally quoted — 267 GiB, read 2026-08-19 — is
+**historical**; the current reading is **295.7 GiB free, measured 2026-08-20 in run
+`20260820T110036Z`** (`bench/results/p5s8_vm24_readonly.json`, and
+`specs/p5_critical_path_memo.md` §2). The verdict is unchanged; the number is not.
 
 ## A green run is not a clean run
 
@@ -205,7 +208,7 @@ by the disk-gate tests, so the two directions are both covered.
 | **G3**, **G4** | production thresholds; need the VM24 baseline (S8 read-only) |
 | **G7** | PARTIAL — real fold temp-disk unmeasured |
 | **H7**, **G16** | inode/metadata scale at the +10-year horizon; VM24 `df -i` |
-| **G18** | **BLOCKED** — 267 GiB < 403.3 GiB minimum. No local result changes this |
+| **G18** | **BLOCKED** — free disk < 403.3 GiB minimum. No local result changes this. This document's 2026-08-19 reading is historical; for the current figure see the memo §2 |
 
 None of these may be closed by a local synthetic run, and none is closed here.
 

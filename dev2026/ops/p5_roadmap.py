@@ -42,8 +42,21 @@ PRODUCTION_DEPENDENT_GATES = {
     "G4": "366-day p95 at production geometry (17999 x 36000)",
     "H7": "fd/RSS under sustained load on the production process, plus inode headroom",
     "G16": "metadata-scan wall time and snapshot-open cost on the production tree",
-    "G18": "free disk on /dev/sdc1; BLOCKED at 267 GiB against a 403.3 GiB minimum",
+    #: WHY this gate is production-dependent -- never WHAT it currently reads. A measured
+    #: figure in a static rationale is a claim that ages: this entry still said 267 GiB after
+    #: two later runs had superseded it. The current value lives in `CAPACITY`, which is read
+    #: from the generated evidence, and `g18_summary()` renders it from there.
+    "G18": "free disk on /dev/sdc1 against the 403.3 GiB minimum; only the host can report it",
 }
+
+
+def g18_summary() -> str:
+    """The CURRENT G18 one-liner, derived from the measured evidence."""
+    cap = CAPACITY
+    return (f"{cap['verdict']} — {cap['free_now_gib']} GiB free against a "
+            f"{cap['minimum_free_gib']} GiB minimum (shortfall {cap['shortfall_gib']} GiB), "
+            f"measured {cap['as_of']} in run {cap['run_id']}")
+
 
 #: Actions the exception explicitly does NOT authorize. `authorizes()` refuses every one.
 FORBIDDEN_UNDER_EXCEPTION = (
@@ -187,9 +200,14 @@ CRITICAL_PATH: List[Dict] = [
     {"step": 3, "name": "IT capacity expansion, or an approved staging-volume design",
      "status": "BLOCKED_ON_OPS", "actor": "IT / ops", "gate": "G18",
      "note": "option A or option B; HARD_RESERVE is not lowered either way"},
-    {"step": 4, "name": "Fresh VM24 read-only / shadow approval",
+    #: Scoped to the S9 shadow, deliberately. A VM24 read-only approval WAS requested, granted
+    #: and consumed for the S8 `legacy_baseline` collection on 2026-08-20 -- an unqualified
+    #: "NOT_REQUESTED" here would read as though no VM24 approval had ever been sought. Approval
+    #: does not carry over between stages, which is exactly why this step still stands.
+    {"step": 4, "name": "Fresh VM24 approval for the S9 read-only / shadow collection",
      "status": "NOT_REQUESTED", "actor": "human", "gate": None,
-     "note": "not implied by the roadmap exception"},
+     "note": ("not implied by the roadmap exception, and not carried over from the S8 "
+              "legacy_baseline approval, which was granted, used and is spent")},
     {"step": 5, "name": "Execute S9 read-only evidence collection",
      "status": "NOT_STARTED", "actor": "Codex / ops", "gate": None,
      "note": "read-only throughout; shadow copies only"},
@@ -373,6 +391,9 @@ def report() -> dict:
         "s7_gate": dict(S7_GATE),
         "roadmap_exception": dict(ROADMAP_EXCEPTION),
         "production_dependent_gates": dict(PRODUCTION_DEPENDENT_GATES),
+        #: The current reading, derived -- kept separate from the static rationale above so a
+        #: measured number can never harden into prose that outlives its measurement.
+        "g18_current": g18_summary(),
         "capacity": dict(CAPACITY),
         "hard_reserve_is_fixed": HARD_RESERVE_IS_FIXED,
         "capacity_options": [dict(o) for o in CAPACITY_OPTIONS],
@@ -389,9 +410,16 @@ def report() -> dict:
                              "note": POLICY_PREDICATE_NOTE},
         "next_approval_required": {
             "what": "IT capacity expansion (option A) or an approved staging-volume design "
-                    "(option B), then a fresh VM24 read-only / shadow approval",
+                    "(option B), then a fresh VM24 approval for the collections that have NOT "
+                    "run",
             "blocking_step": 3,
             "not_implied_by": "the P5-EX-1 roadmap exception",
+            #: Which stage needs what. Without this the sentence above reads as though every
+            #: S8/S9 command were still waiting on approval -- S8 legacy_baseline is not: it
+            #: was approved, executed on 2026-08-20, and its approval is spent.
+            "per_stage": {k: v["status"] for k, v in S8_EXECUTION.items()},
+            "already_executed_under_a_spent_approval": [
+                k for k, v in S8_EXECUTION.items() if v["status"] == "COMPLETED"],
         },
     }
 

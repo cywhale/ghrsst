@@ -2038,7 +2038,10 @@ condition. Steps S0–S7 are **local-only**; S8–S10 are the VM24 boundary (§1
 
 P5-S7's "Stop if" says S8 is not authored until G1–G12 are green simultaneously. They are not:
 G1/G2/G5/G6/G8–G12 pass locally, **G3 and G4 are `NOT_ADJUDICATED`**, **G7 is `PARTIAL`**, and
-**G18 is `BLOCKED`** (267 GiB free against a 403.3 GiB minimum). Every one of those is
+**G18 is `BLOCKED`** against a 403.3 GiB minimum. The free-space figure this paragraph once
+carried — 267 GiB — was the 2026-08-19 reading and is **historical**; the current one is
+**295.7 GiB free, measured 2026-08-20 in run `20260820T110036Z`**
+(`bench/results/p5s8_vm24_readonly.json`). Every one of those is
 production-dependent — and the S8 runbook is the instrument that collects the evidence to settle
 them, so waiting for them before authoring it is circular.
 

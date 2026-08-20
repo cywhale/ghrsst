@@ -132,6 +132,17 @@ class TestTheSupersededFigureCannotSurvive(unittest.TestCase):
         self.assertEqual(fs["as_of"], "2026-08-19")
         self.assertIn(RUN_ID, fs["superseded_by"])
 
+    def test_the_superseded_gate_entry_is_marked_too(self):
+        """`capacity_gate` is regenerated, but `gates.G18_capacity` restates the verdict in prose
+        carrying `projected_free_after 113.7` and `shortfall 136.3` -- both computed from
+        267 GiB. Regenerating one and leaving the other is how the figure survived last time."""
+        gate = _load(S6_ARTIFACT)["gates"]["G18_capacity"]
+        self.assertEqual(gate["status"], "historical")
+        self.assertEqual(gate["as_of"], "2026-08-19")
+        self.assertIn(RUN_ID, gate["superseded_by"])
+        self.assertIn("295.7", gate["superseded_by"])
+        self.assertEqual(gate["verdict"], "BLOCKED", "the verdict did not change; only the figure")
+
     def test_the_derived_gate_fields_were_recomputed_not_carried_over(self):
         """`projected_free_after_gb` and `gate_ok` were computed from 267 GiB. A merge that
         updates free space and leaves them behind is silently self-contradictory."""
@@ -368,6 +379,218 @@ class TestNoDuplicateOrUnmarkedCurrentStateSections(unittest.TestCase):
         window = self.flat[max(0, idx - 300):idx + 300].lower()
         self.assertIn("superseded", window)
         self.assertNotIn("is the current g18 evidence", window)
+
+
+class TestNoP5DocumentQuotesASupersededFigureAsCurrent(unittest.TestCase):
+    """The memo was fixed twice while three other P5 documents went on stating 267 GiB as the
+    live G18 reading. Scoping the guard to the document that was reported is how the same defect
+    keeps reappearing next door, so this sweeps every P5 spec."""
+
+    SPECS = os.path.join(_DEV, "specs")
+    #: Superseded readings. Bare "267" is excluded -- it is the 1267 hold count elsewhere -- but
+    #: "267.0" and "264.4" are, because a unitless table cell is exactly where one hid.
+    SUPERSEDED = ("267 GiB", "267.0 GiB", "267 GB", "267.0", "264.4 GiB", "264.4")
+    #: Deliberately narrow. "withdrawn" and "was wrong" were tried and dropped: `p5s6_sizing`
+    #: withdraws a DIFFERENT claim two paragraphs above its capacity table, and that word alone
+    #: was enough to certify an unmarked 267 GB as history. A marker has to be about the figure.
+    HISTORY_MARKERS = ("historical", "superseded", "supersedes", "aborted")
+    #: Close enough that the marker belongs to this figure -- roughly a table row plus its
+    #: caption. A section banner four paragraphs up does not mark the number in a cell.
+    WINDOW = 300
+
+    def _p5_docs(self):
+        for name in sorted(os.listdir(self.SPECS)):
+            if name.startswith("p5") and name.endswith(".md"):
+                yield name, " ".join(_read(os.path.join(self.SPECS, name)).split())
+
+    @classmethod
+    def _unmarked(cls, flat):
+        """Every superseded figure in `flat` that no nearby marker calls history.
+
+        The control below runs through THIS function, not through a re-implementation of it:
+        a positive control that reproduces the logic it is guarding proves only that the copy
+        agrees with itself."""
+        found, checked = [], 0
+        for token in cls.SUPERSEDED:
+            for m in re.finditer(re.escape(token), flat):
+                checked += 1
+                window = flat[max(0, m.start() - cls.WINDOW):m.end() + cls.WINDOW].lower()
+                if not any(k in window for k in cls.HISTORY_MARKERS):
+                    found.append((token, m.start()))
+        return found, checked
+
+    def test_every_occurrence_sits_in_a_window_that_marks_it_history(self):
+        total = 0
+        for name, flat in self._p5_docs():
+            unmarked, checked = self._unmarked(flat)
+            total += checked
+            with self.subTest(doc=name):
+                self.assertEqual(unmarked, [], f"{name}: reads as the current state")
+        self.assertGreater(total, 0, "no occurrence was examined -- the sweep found nothing "
+                                     "to check, so it proves nothing")
+
+    def test_positive_control_an_unmarked_occurrence_is_caught(self):
+        unmarked, checked = self._unmarked(
+            "G18 is BLOCKED: 267 GiB free against a 403.3 GiB minimum on the host today.")
+        self.assertEqual(checked, 1)
+        self.assertEqual(unmarked, [("267 GiB", 16)])
+
+    def test_negative_control_a_marked_occurrence_is_accepted(self):
+        """The sweep must not simply reject the digits -- the historical record has to survive."""
+        unmarked, checked = self._unmarked(
+            "The 2026-08-19 reading of 267 GiB is historical; the current figure is 295.7 GiB.")
+        self.assertEqual(checked, 1)
+        self.assertEqual(unmarked, [])
+
+
+class TestTheG18AuthorityHoldsNoMeasuredFigure(unittest.TestCase):
+    """`PRODUCTION_DEPENDENT_GATES['G18']` read "BLOCKED at 267 GiB" for two runs after 267 GiB
+    stopped being true, and `p5_critical_path.json` published it.
+
+    The rule that stops it recurring is structural, not vigilance: that dict says WHY a gate is
+    production-dependent, so the only number it may carry is the fixed threshold. Readings are
+    measured, and measured things are derived from the evidence."""
+
+    ROADMAP_ARTIFACT = os.path.join(_DEV, "bench", "results", "p5_critical_path.json")
+    #: Written with the unit. A bare "267" would match the 1267 daily holds, which is a count of
+    #: directories and has nothing to do with free space.
+    SUPERSEDED = ("267 GiB", "267.0 GiB", "267 GB", "264.4 GiB", "113.7 GiB", "138.9 GiB")
+    #: The only quantity that belongs in a static rationale: policy, not measurement.
+    ALLOWED_NUMBERS = {"403.3"}
+
+    #: Only quantities count -- a number carrying a size unit. Every digit in the string would
+    #: also flag the `1` in `/dev/sdc1`, which names the device the gate is about and is not a
+    #: measurement of anything.
+    QUANTITY = re.compile(r"(\d+(?:\.\d+)?)\s*(?:[KMGT]i?B|bytes)\b")
+
+    @classmethod
+    def _numbers(cls, text):
+        return set(cls.QUANTITY.findall(text))
+
+    def test_the_static_rationale_carries_no_reading_only_the_threshold(self):
+        g18 = rm.PRODUCTION_DEPENDENT_GATES["G18"]
+        self.assertEqual(self._numbers(g18) - self.ALLOWED_NUMBERS, set(),
+                         f"a measured figure is hardcoded in the G18 rationale: {g18!r}")
+
+    def test_no_gate_rationale_quotes_a_superseded_figure(self):
+        for gate, text in rm.PRODUCTION_DEPENDENT_GATES.items():
+            for token in self.SUPERSEDED:
+                with self.subTest(gate=gate, token=token):
+                    self.assertNotIn(token, text)
+
+    def test_the_published_artifact_says_the_same_thing(self):
+        published = _load(self.ROADMAP_ARTIFACT)["production_dependent_gates"]
+        self.assertEqual(published, dict(rm.PRODUCTION_DEPENDENT_GATES),
+                         "the committed roadmap artifact and the module authority disagree")
+
+    def test_positive_control_the_previous_rationale_would_be_rejected(self):
+        stale = "free disk on /dev/sdc1; BLOCKED at 267 GiB against a 403.3 GiB minimum"
+        self.assertNotEqual(self._numbers(stale) - self.ALLOWED_NUMBERS, set(),
+                            "the guard would have passed the very text it exists to reject")
+
+
+class TestTheCurrentG18SummaryIsDerivedAndBound(unittest.TestCase):
+    """The current reading has to exist somewhere, and it has to be traceable to the run that
+    produced it -- otherwise removing it from the rationale just loses the fact."""
+
+    ROADMAP_ARTIFACT = os.path.join(_DEV, "bench", "results", "p5_critical_path.json")
+
+    def test_it_names_the_run_and_the_measured_values(self):
+        summary = rm.g18_summary()
+        for token in ("BLOCKED", "295.7", "403.3", "107.6", RUN_ID, "2026-08-20"):
+            with self.subTest(token):
+                self.assertIn(token, summary)
+
+    def test_the_artifact_publishes_it(self):
+        self.assertEqual(_load(self.ROADMAP_ARTIFACT)["g18_current"], rm.g18_summary())
+
+    def test_it_agrees_with_the_generated_evidence(self):
+        cap = _load(S8_ARTIFACT)["capacity"]
+        summary = rm.g18_summary()
+        self.assertIn(str(cap["free_now_gib"]), summary)
+        self.assertIn(str(cap["shortfall_gib"]), summary)
+        self.assertIn(cap["verdict"], summary)
+
+    def test_it_follows_the_evidence_rather_than_repeating_a_constant(self):
+        """Substitute a different measurement; a derived summary moves with it."""
+        original = rm.CAPACITY
+        try:
+            rm.CAPACITY = {**original, "free_now_gib": 812.5, "shortfall_gib": 0.0,
+                           "verdict": "NOT_BLOCKED"}
+            moved = rm.g18_summary()
+        finally:
+            rm.CAPACITY = original
+        self.assertIn("812.5", moved)
+        self.assertIn("NOT_BLOCKED", moved)
+        self.assertNotIn("295.7", moved)
+
+
+class TestTheNextApprovalSectionMatchesWhatHasRun(unittest.TestCase):
+    """Section 5 asked for approval "before any S8 or S9 command runs against the host" after S8
+    `legacy_baseline` had already run. An approval request that misstates what is blocked wastes
+    the one thing it is trying to obtain."""
+
+    def setUp(self):
+        self.memo = _read(MEMO)
+        self.flat = " ".join(self.memo.split())
+        start = self.memo.index(ev.APPROVALS_START)
+        self.section = self.memo[start:self.memo.index(ev.APPROVALS_END) + len(ev.APPROVALS_END)]
+
+    def test_it_is_generated_not_hand_written(self):
+        self.assertIn("Generated by ops/p5s8_evidence.py", self.section)
+        self.assertIn("Do not edit by hand", self.section)
+
+    def test_it_matches_a_fresh_render(self):
+        self.assertEqual(self.section, ev.render_approvals(ev.derive(RUN)))
+
+    def test_it_records_the_completed_S8_run_as_completed(self):
+        flat = " ".join(self.section.split())
+        self.assertIn("S8 `legacy_baseline` | **COMPLETED**", flat)
+        self.assertIn(RUN_ID, flat)
+        self.assertIn("nothing — it already ran", flat)
+
+    def test_it_still_requires_separate_approval_for_what_has_not_run(self):
+        flat = " ".join(self.section.split())
+        for stage in ("S8 `p5_shadow`", "S9 / shadow execution", "S10 rollout"):
+            with self.subTest(stage):
+                self.assertIn(stage, flat)
+        self.assertIn("NOT_STARTED", flat)
+        self.assertIn("separate human approval", flat)
+        self.assertIn("fresh written approval", flat)
+
+    #: Wordings that describe a completed stage as future work. Each is anchored on S8 so that
+    #: the same sentence about S9 -- which HAS not run -- stays legal.
+    FUTURE_TENSE_S8 = (r"before any S8", r"before an S8 command", r"S8 execution \| not approved",
+                       r"before any S8 or S9 command")
+
+    def test_no_wording_puts_the_completed_S8_run_in_the_future(self):
+        for pattern in self.FUTURE_TENSE_S8:
+            with self.subTest(pattern):
+                self.assertIsNone(re.search(pattern, self.flat, re.I),
+                                  "the memo describes the completed S8 run as pending")
+
+    def test_positive_control_the_previous_wording_would_be_rejected(self):
+        old = ("It is not implied by the P5-EX-1 exception, and it is separate from the fresh "
+               "VM24 read-only / shadow approval that step 4 needs before any S8 or S9 command "
+               "runs against the host.")
+        hits = [p for p in self.FUTURE_TENSE_S8 if re.search(p, old, re.I)]
+        self.assertTrue(hits, "the guard would not catch the wording it was written for")
+
+    def test_the_published_roadmap_states_approval_per_stage(self):
+        """The memo table and the artifact must not disagree about which stage is waiting."""
+        need = _load(os.path.join(_DEV, "bench", "results", "p5_critical_path.json"))
+        need = need["next_approval_required"]
+        self.assertEqual(need["per_stage"], {k: v["status"] for k, v in rm.S8_EXECUTION.items()})
+        self.assertEqual(need["already_executed_under_a_spent_approval"], ["legacy_baseline"])
+        self.assertNotIn("before any S8", need["what"])
+
+    def test_the_critical_path_step_4_does_not_deny_the_S8_approval_happened(self):
+        """A VM24 approval WAS requested and used. Step 4 is still NOT_REQUESTED, but only
+        because approval does not carry between stages -- it must say which one it means."""
+        step = next(s for s in rm.CRITICAL_PATH if s["step"] == 4)
+        self.assertEqual(step["status"], "NOT_REQUESTED")
+        self.assertIn("S9", step["name"])
+        self.assertIn("legacy_baseline", step["note"])
 
 
 if __name__ == "__main__":

@@ -354,13 +354,18 @@ delta span, and the delta span is what this measurement shows dominating read la
 
 ### Capacity gate (§7.1c / G18) — **BLOCKED**
 
+> **The `free_now` figure below is the 2026-08-19 VM24 reading and is HISTORICAL.** The
+> current measurement is **295.7 GiB free (2026-08-20, run `20260820T110036Z`)** —
+> `bench/results/p5s8_vm24_readonly.json` and `specs/p5_critical_path_memo.md` §2 are the
+> authority. The G18 verdict is BLOCKED under either reading; only the arithmetic moves.
+
 **The earlier claim in this document that "141 GB fits with margin" was wrong, and is
 withdrawn.** It compared the block size alone against free space. The gate is
 `projected_free_after ≥ HARD_RESERVE`, and `additional` is never the block alone:
 
 | term | value | source |
 |---|---|---|
-| `free_now` | 267 GB | `df` avail, measured |
+| `free_now` | 267 GB — **2026-08-19, historical** | `df` avail, measured; superseded by run `20260820T110036Z` (295.7 GiB) |
 | `new_block` (S=90 × 1.62 GB/day) | 145.8 GB | measured base rate |
 | `temp` / checkpoint / artifacts | 2 GB | estimate |
 | `growth_during_build` (2.74 GB/day × 2 d) | 5.5 GB | measured ingest rate, **assumed** duration |
@@ -438,11 +443,16 @@ classifier default.
 
 #### Capacity — G18 remains BLOCKED
 
+> **The `free_now` figure below is the 2026-08-19 VM24 reading and is HISTORICAL.** The
+> current measurement is **295.7 GiB free (2026-08-20, run `20260820T110036Z`)** —
+> `bench/results/p5s8_vm24_readonly.json` and `specs/p5_critical_path_memo.md` §2 are the
+> authority. The G18 verdict is BLOCKED under either reading; only the arithmetic moves.
+
 | | GiB |
 |---|---|
 | `currently_reclaimable` | **0.0** |
 | withheld pending operator policy | 2388.2 |
-| `free_now` | 267.0 |
+| `free_now` — **2026-08-19, historical**; superseded by run `20260820T110036Z` (295.7) | 267.0 |
 | **`minimum_free`** (HARD_RESERVE 250 + additional 153.3) | **403.3** |
 | **`recommended_free`** (a **target**, not a solution — nothing added, nothing reclaimed) | **600.0** |
 | shortfall against minimum | 136.3 |
