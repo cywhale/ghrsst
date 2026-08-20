@@ -44,14 +44,23 @@ runbook is the instrument, not the conclusion.
 - It **expires** when G3/G4/H7/G16 are adjudicated from production evidence and G18 is
   unblocked. At that point S7 is re-adjudicated on its merits.
 
-`ops/p5_roadmap.py::authorizes()` is the enforcement point and **fails closed**: anything not on
-the permitted list is refused, so a mutating verb added later is denied by default rather than by
-someone remembering to list it. A test asserts every forbidden action is refused and that
-`s7_is_pass()` is false.
+`ops/p5_roadmap.py::policy_permits()` states the policy in executable form and **fails closed**:
+anything not on the permitted list answers `False`, so a mutating verb added later is refused by
+default rather than by someone remembering to list it.
+
+**It is a policy predicate, not a control.** Nothing calls it before an `ssh`, a prune or a
+deployment, and it **does not prevent S9 or S10 from being executed manually**. What actually
+stops those is the approval gate and the runbook's own NO-GO preflights; the predicate exists so
+tests can check the written policy for self-consistency. `POLICY_PREDICATE_IS_ENFORCED` is
+`False` in the module, and a test asserts no document claims otherwise.
 
 ## 2. Capacity unlock — the decision
 
-Recorded from the VM24 read-only run of 2026-08-19 (`bench/results/p5s6_vm24_readonly.json`):
+**These figures are historical and provisional.** They come from the VM24 read-only run of
+**2026-08-19** (`bench/results/p5s6_vm24_readonly.json`) — the newest evidence that exists, and
+also a one-day snapshot of a volume that has been filling since. **A current read-only scan log
+must be available before any go/no-go rests on them**, and when it is, every dependent artifact
+is regenerated from that evidence rather than edited by hand.
 `/dev/sdc1`, ext4, mounted at `/home/odbadmin/Data`, 6.0 T total, 96 % used, **267 GiB free**.
 The gate needs **403.3 GiB** (`HARD_RESERVE` 250 + additional 153.3); **600 GiB** is the
 recommended operational target — the minimum plus roughly 200 GiB of growth margin, which at the
@@ -116,8 +125,17 @@ Deletion additionally requires:
 
 **Step 8's posture is not negotiable and not paraphrasable:**
 
-> ingest lock → PM2 stop/quiesce → build → publish → verify → **prune/swap only after
-> verification** → PM2 start → API verification
+> **compaction lock** → ingest lock → staleness/prechecks → quiesce →
+> build/publish/verify as applicable → **prune/swap only after verification** →
+> restart/API verification
+
+The **compaction lock comes first and is held across the whole critical section**, released only
+after restart/API verification. The ingest lock fences ingest; only the compaction reservation
+(§7.1b) fences a second compaction, so a build that takes the ingest lock first is unfenced
+against exactly the writer that can invalidate it. Releasing it after the build would leave
+publish, verify and prune — the half that mutates the served view — open to a second compactor.
+Staleness and prechecks run **inside** both locks: checked before them, they describe a state
+another writer may already have changed.
 
 Even if H4 passes, the first production publication uses the existing quiesced posture. Dropping
 quiescence is a separate, later, evidence-backed change (§16-Q5) — the S8a lesson is that
@@ -128,6 +146,25 @@ a reason to delete the hold.
 
 **Step 10 is `df`, not arithmetic.** Theoretical reclaim is not capacity evidence. The figure
 that counts is measured free space after the fact.
+
+## Review round 2 — what the first draft got wrong
+
+| finding | correction |
+|---|---|
+| the runbook wrote its artifacts to `$G/logs/...` with `mkdir -p` and `tee` | a **write under the production data root**, in a document promising none, consuming the space G18 is blocked on. `$ART_ROOT` is now operator-supplied and verified to be outside `$G` **and** off the production device |
+| it demanded `ANCHOR_ROOT`, WAL state and a manifest generation before *legacy* baselines | the host has **no P5 roots**, so the runbook was unrunnable there. Split into `legacy_baseline` and `p5_shadow`; pre-P5 fields are `not_applicable_with_reason`, never omitted |
+| the posture started at the ingest lock | corrected to open with the **compaction lock**, held across the whole critical section. The ingest lock fences ingest; only the compaction reservation fences a second compactor |
+| commands mixed local shell, `ssh`, VM24 paths and `localhost` calls | every block is marked **Run on: LOCAL** or **Run on: VM24** |
+| G4 timed whatever came back | fails closed on any non-200, verifies the span is **exactly 366 days**, and checks the row count before sampling |
+| `pgrep -f … \| head -1` | PM2 `jlist` via the shipped `ops.quiescence.worker_pids`, **aggregated across every worker** |
+| `os.walk` swallowed `OSError` | `onerror=` raises, so a permission-denied subtree cannot silently shrink the tree |
+| capacity figures read as current | labelled **historical/provisional, 2026-08-19**; a current scan must precede any go/no-go |
+| `authorizes()` implied a control | renamed `policy_permits()`, documented as advisory; it does **not** prevent manual S9/S10 execution |
+
+Thirteen isolated mutations — one per guard — were run serially from a git-clean tree and all
+were killed. Two guards had to be corrected first: both matched **prose** rather than the
+command, so one flagged the sentence describing the old defect and another survived deletion of
+the check it was meant to protect.
 
 ## 4. Remaining blockers
 

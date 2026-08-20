@@ -78,6 +78,16 @@ ROADMAP_EXCEPTION = {
 #: From the VM24 read-only measurement (2026-08-19), `bench/results/p5s6_vm24_readonly.json`.
 CAPACITY = {
     "label": "VM24_PRODUCTION_READ_ONLY",
+    #: The newest evidence that exists, and also a snapshot of a filling volume taken on one
+    #: day. Both are true, so it is used AND labelled. Refreshing it means a new read-only scan,
+    #: not an edit here.
+    "status": "historical/provisional",
+    "as_of": "2026-08-19",
+    "must_refresh_before_use": True,
+    "refresh_requirement": ("a current VM24 read-only scan log must be available before these "
+                            "figures are relied on for a go/no-go; when it is, regenerate every "
+                            "dependent artifact from that evidence rather than editing these "
+                            "values by hand."),
     "measured_utc": "2026-08-19T07:40:00Z",
     "device": "/dev/sdc1", "fstype": "ext4", "mount": "/home/odbadmin/Data",
     "free_now_gib": 267.0,
@@ -183,8 +193,26 @@ CRITICAL_PATH: List[Dict] = [
 ]
 
 #: The compaction posture, spelled out so step 8 cannot be paraphrased into something shorter.
-COMPACTION_POSTURE = ("ingest lock", "pm2 stop/quiesce", "build", "publish", "verify",
-                      "prune/swap only after verification", "pm2 start", "api verification")
+#:
+#: Corrected in review round 2: it now opens with the **compaction lock**, not the ingest lock.
+#: The ingest lock fences ingest; only the compaction reservation (§7.1b) fences a second
+#: compaction, and a build that takes the ingest lock first is unfenced against exactly the
+#: writer that can invalidate it. Staleness/precheck runs INSIDE both locks -- checked before
+#: them, it describes a state another writer may already have changed.
+COMPACTION_POSTURE = ("compaction lock", "ingest lock", "staleness/prechecks", "quiesce",
+                      "build/publish/verify as applicable",
+                      "prune/swap only after verification", "restart/API verification")
+
+#: The lock is not a step that completes; it is a scope. Releasing it after "build" would leave
+#: publish, verify and prune unfenced -- which is the window §7.1b exists to close.
+COMPACTION_LOCK_SCOPE = {
+    "held_from": "compaction lock acquisition, before the ingest lock",
+    "held_until": "after restart/API verification completes",
+    "held_across_critical_section": True,
+    "why": ("a compaction reservation released early fences the cheap half of the operation "
+            "and leaves publish, verify and prune -- the half that mutates the served view -- "
+            "open to a second compactor."),
+}
 
 # --------------------------------------------------------------------------- S8 contract
 #: Sections the S8 runbook must carry. The test suite checks the document against THIS list, so
@@ -209,12 +237,74 @@ S8_PREFLIGHT_FIELDS = (
 )
 
 
-def authorizes(action: str) -> bool:
-    """Does the roadmap exception authorize `action`?
+#: Two profiles, because the host as it stands has NO P5 roots (`p5_roots_present: false` in
+#: the recorded evidence). Demanding ANCHOR_ROOT, WAL state and a manifest generation before
+#: collecting *legacy* G4/G16 baselines makes the runbook unrunnable on the only host it has.
+S8_PROFILES = {
+    "legacy_baseline": {
+        "requires_p5_roots": False,
+        "purpose": ("baseline evidence from the CURRENT monolith deployment: G4 span timing, "
+                    "G16 metadata scan, G18 capacity, H7 inode headroom."),
+        "required_fields": ("run_id", "host", "measured_utc", "deploy_sha", "code_root",
+                            "python", "pythonpath", "filesystem_device", "filesystem_fstype",
+                            "free_now_bytes", "inodes_free", "label"),
+        #: Recorded as `not_applicable_with_reason`, never omitted. An absent field reads as
+        #: clean; "does not apply, because ..." reads as what it is.
+        "not_applicable": {
+            "anchor_root": "no P5 repair WAL is deployed, so there is no anchor to resolve",
+            "anchor_domain_id": "follows anchor_root",
+            "wal_root": "p5_repairs does not exist on the host",
+            "wal_repairs_pending": ("no WAL, so neither a count nor zero is meaningful; zero "
+                                    "here would assert a clean WAL that does not exist"),
+            "manifest_root": "p5_blocks does not exist on the host",
+            "manifest_generation": "no manifest is published, so there is no generation",
+        },
+        "may_adjudicate": [],
+        "may_not_adjudicate": ["G3", "G16_snapshot_open", "H7_sustained_load"],
+        "may_not_adjudicate_reason": ("no segmented base is deployed, so there is no segmented "
+                                      "arm for G3 and nothing to snapshot-open for G16; H7's "
+                                      "sustained half needs load this profile must not generate "
+                                      "against production."),
+    },
+    "p5_shadow": {
+        "requires_p5_roots": True,
+        "purpose": ("evidence from a P5 deployment on a SHADOW copy: everything the legacy "
+                    "profile cannot reach."),
+        "required_fields": tuple(S8_PREFLIGHT_FIELDS),
+        "not_applicable": {},
+        "may_adjudicate": [],
+        "may_not_adjudicate": ["G3_production_baseline"],
+        "may_not_adjudicate_reason": ("a shadow host is not the production service; its "
+                                      "latency is not the production baseline G3 compares "
+                                      "against."),
+    },
+}
 
-    Fails closed: anything not explicitly permitted is refused, so a new mutating verb added
-    later is denied by default rather than by remembering to list it."""
+#: `policy_permits` is a POLICY predicate, not a control. Nothing calls it before an ssh, a
+#: prune or a deployment, and saying otherwise would misrepresent what stops an operator.
+POLICY_PREDICATE_IS_ENFORCED = False
+POLICY_PREDICATE_NOTE = ("advisory only: not wired into any execution wrapper. It answers what "
+                         "the roadmap exception permits; it cannot stop a command anyone "
+                         "chooses to type. The controls that actually stop things are the "
+                         "approval gates and the runbook's own NO-GO preflights.")
+
+
+def policy_permits(action: str) -> bool:
+    """Does the roadmap exception PERMIT `action`? Advisory; enforces nothing at runtime.
+
+    This **does not** prevent S9 or S10 from being executed manually, and nothing calls it on
+    the path to an ssh, a prune or a deployment. It is the written policy in executable form,
+    so tests can check the policy for self-consistency -- not a control.
+
+    Fails closed: anything not explicitly permitted answers False, so a mutating verb added
+    later is refused by default rather than by someone remembering to list it."""
     return action in PERMITTED_UNDER_EXCEPTION
+
+
+def authorizes(action: str) -> bool:
+    """Deprecated alias for `policy_permits`. The old name implied a control that does not
+    exist -- nothing consults it before an operation runs."""
+    return policy_permits(action)
 
 
 def s7_is_pass() -> bool:
@@ -239,6 +329,12 @@ def report() -> dict:
         "compaction_posture": list(COMPACTION_POSTURE),
         "s8_required_sections": dict(S8_REQUIRED_SECTIONS),
         "s8_preflight_fields": list(S8_PREFLIGHT_FIELDS),
+        "s8_profiles": {k: {kk: (dict(vv) if isinstance(vv, dict) else
+                                 (list(vv) if isinstance(vv, tuple) else vv))
+                            for kk, vv in v.items()} for k, v in S8_PROFILES.items()},
+        "compaction_lock_scope": dict(COMPACTION_LOCK_SCOPE),
+        "policy_predicate": {"enforced": POLICY_PREDICATE_IS_ENFORCED,
+                             "note": POLICY_PREDICATE_NOTE},
         "next_approval_required": {
             "what": "IT capacity expansion (option A) or an approved staging-volume design "
                     "(option B), then a fresh VM24 read-only / shadow approval",

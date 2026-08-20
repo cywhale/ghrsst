@@ -147,14 +147,17 @@ class TestTheCriticalPath(unittest.TestCase):
 
     def test_the_compaction_posture_is_recorded_in_full(self):
         """Step 8 is the one that touches production. Paraphrasing it is how prune-before-verify
-        gets introduced."""
+        gets introduced. The ORDER is asserted in detail by the S8 runbook suite; this checks
+        the memo's step 8 still quotes the full posture rather than a shortened version."""
         p = rm.COMPACTION_POSTURE
-        self.assertEqual(p[0], "ingest lock")
-        self.assertIn("pm2 stop/quiesce", p)
-        self.assertLess(p.index("build"), p.index("publish"))
-        self.assertLess(p.index("publish"), p.index("verify"))
-        self.assertLess(p.index("verify"), p.index("prune/swap only after verification"))
-        self.assertEqual(p[-1], "api verification")
+        self.assertEqual(p[0], "compaction lock")
+        self.assertLess(p.index("build/publish/verify as applicable"),
+                        p.index("prune/swap only after verification"))
+        self.assertEqual(p[-1], "restart/API verification")
+        memo = " ".join(_read(MEMO).split())
+        for stage in p:
+            with self.subTest(stage):
+                self.assertIn(stage, memo)
 
     def test_deletion_never_runs_on_day_membership_alone(self):
         step9 = rm.CRITICAL_PATH[8]
@@ -176,10 +179,10 @@ class TestTheS8RunbookCoversItsContract(unittest.TestCase):
 
     def test_every_required_section_is_covered(self):
         needles = {
-            "G3_G4_latency": "G3 / G4",
+            "G3_G4_latency": "G4 — span latency",
             "H7_inodes": "inode headroom",
-            "G16_metadata": "metadata scan",
-            "G18_capacity": "Capacity preflight",
+            "G16_metadata": "metadata scan, fail closed",
+            "G18_capacity": "Capacity preflight (G18)",
             "identity_preflight": "Identity preflight",
             "abort_conditions": "Abort conditions",
             "artifacts": "Artifacts and provenance",
@@ -202,12 +205,15 @@ class TestTheS8RunbookCoversItsContract(unittest.TestCase):
         self.assertIn("separate human approval", self.flat)
 
     def test_the_runbook_promises_no_writes_and_names_the_shadow_exception(self):
-        self.assertIn("no** prune, swap, compaction, repair, hold deletion", self.flat)
+        self.assertIn("**no** prune, swap, compaction, repair, hold deletion", self.flat)
         self.assertIn("never a write to `$G`", self.flat)
         # The shadow copy is the ONE thing that writes anywhere, so it must be called out
         # rather than left as an unremarked exception to a "read-only" claim.
         self.assertIn("shadow copy", self.flat.lower())
-        self.assertIn("not the\nproduction data volume".replace("\n", " "), self.flat)
+        # Markdown-insensitive: the doc emphasises the negation ("**not** the production
+        # data volume"), so a literal match on the plain phrase silently fails.
+        plain = self.flat.replace("*", "")
+        self.assertIn("not the production data volume", plain)
 
     def test_the_runbook_does_not_claim_it_settles_G3_or_the_S7_gate(self):
         self.assertIn("No S8 result marks the S7 gate PASS", self.flat)
