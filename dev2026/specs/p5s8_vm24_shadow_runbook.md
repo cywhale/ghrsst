@@ -407,9 +407,11 @@ way**. Checking the status alone would time a service that has degraded to a sho
 # Run on: VM24
 set -euo pipefail
 : "${PYTHON:?set PYTHON}"; : "${ART:?run the art-root block first}"
-: "${RUN_ID:?run the art-root block first}"
-"$PYTHON" - <<'PYEOF'
-import json, math, os, subprocess, time
+: "${RUN_ID:?run the art-root block first}"; : "${CODE_ROOT:?set CODE_ROOT}"
+PYTHONPATH="$CODE_ROOT" "$PYTHON" - <<'PYEOF'
+import json, math, os, subprocess, sys, time
+sys.path.insert(0, os.environ["CODE_ROOT"])
+from ops.p5s8_report import check_g4_request, ArtifactError   # one validator, both sides
 
 art, run_id = os.environ["ART"], os.environ["RUN_ID"]
 sleep_s = float(os.environ.get("G4_SLEEP", "0.3"))
@@ -419,10 +421,13 @@ if not os.path.isfile(req_path):
     raise SystemExit("NO-GO: g4_request.json is missing; run g4-probe first")
 with open(req_path) as fh:                     # context-managed: no handle left to the GC
     req = json.load(fh)
-if req.get("run_id") != run_id:
-    raise SystemExit(f"NO-GO: g4_request.json belongs to run {req.get('run_id')!r}")
-if req.get("span_days") != 366 or req.get("probe_rows") != 366:
-    raise SystemExit(f"NO-GO: g4_request.json is not a validated 366-day probe: {req}")
+# The SAME validation the assembler applies, run BEFORE any production request. Catching an
+# edited request only at assembly time means thirty requests have already been made against
+# the service on the strength of a record nobody checked.
+try:
+    check_g4_request(req, run_id=run_id)
+except ArtifactError as e:
+    raise SystemExit(f"NO-GO: {e}")
 
 url, want = req["url"], int(req["g4_samples"])
 seconds = []
@@ -525,7 +530,9 @@ with open(os.path.join(art, "pm2_jlist.json"), "w") as fh:   # the roster IS evi
     json.dump({"run_id": run_id, "roster": roster}, fh)
 series = os.path.join(art, "h7_fd_rss_timeseries.txt")
 with open(series, "w") as fh:
-    fh.write(f"# run_id={run_id} pids={sorted(first)} samples={samples}\n")
+    # No spaces: the header is whitespace-tokenised, so `[4101, 4102]` would split in two.
+    pid_list = "[" + ",".join(str(p) for p in sorted(first)) + "]"
+    fh.write(f"# run_id={run_id} pids={pid_list} samples={samples}\n")
 print(f"# pids={sorted(first)}")
 for _ in range(samples):
     now, _ = current()                   # refreshed EVERY sample, not once at the start

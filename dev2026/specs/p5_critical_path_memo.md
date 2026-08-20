@@ -257,6 +257,21 @@ The one remaining survivor is a **true equivalent**: dropping the required-field
 metadata-scan parser leaves a `KeyError` on the following line, so the scan still fails closed —
 by a worse message, not by a weaker guarantee.
 
+## Review round 7 — no coercion, and every fact bound to the request behind it
+
+| finding | correction |
+|---|---|
+| `int(float("2.5"))` is `2` — worker, file and directory counts were silently truncated into legal values | counts are parsed as **exact non-negative integer tokens**: digits only, no sign, decimal point, exponent, underscore, padding or boolean-like form. `wall_s` stays a float, because a duration legitimately is one — the rule is exactness where the value is a *count* |
+| `g4_request.json` was checked for non-empty strings, so a record could keep `span_days: 366` while its dates, endpoint, coordinates or `append` said otherwise | canonical ISO dates, span arithmetic cross-checked against `span_days`, the endpoint pinned to the local GHRSST service, every required query parameter present, the URL's dates matching the record's, and `lon0`/`lat0`/`append` pinned **by value** — a different coordinate is a different measurement |
+| the sampler would have spent thirty production requests on an edited record | it now calls **the same validator** the assembler uses, before the first request. One implementation, both sides |
+| `pm2_jlist.json` was written and never read | validated for shape, the `ghrsst` app, `online` status and raw positive unique pids; and **cross-checked** against the H7 header's pid list and the sampled worker count, so a series describing a different set of processes is refused |
+
+Fourteen mutations, serial from a git-clean tree: thirteen killed on the first pass. The
+survivor was, again, a neighbouring check doing the work — every malformed date raised inside
+`date.fromisoformat`, and the one compact form it accepts (`20260101`) was caught by the URL
+cross-check. Binding the canonicity rule needed a date that parses, agrees with the URL, and is
+still not canonical.
+
 ## 4. Remaining blockers
 
 | blocker | state |

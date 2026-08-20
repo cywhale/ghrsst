@@ -29,6 +29,15 @@ from ops.p5_roadmap import S8_PROFILES, S8_PREFLIGHT_FIELDS
 
 LABEL = "VM24_PRODUCTION_READ_ONLY"
 
+#: The endpoint every G4 request must use, and the parameters it must carry.
+G4_ENDPOINT = "http://127.0.0.1:8080/api/ghrsst"
+G4_REQUIRED_PARAMS = ("lon0", "lat0", "start", "end", "append")
+#: The canonical probe parameters. Pinned by VALUE, not merely required to exist: a request
+#: with a different coordinate or variable is a different measurement, and `span_days: 366`
+#: says nothing about which point was sampled. Changing these is an explicit edit here, which
+#: is the point -- it should not be possible by editing an artifact after the fact.
+G4_EXPECTED_PARAMS = {"lon0": "135", "lat0": "20", "append": "sst"}
+
 
 class ArtifactError(Exception):
     """A run whose evidence is incomplete or unreadable. Never downgraded to a warning."""
@@ -75,13 +84,18 @@ EXAMPLE_STUBS = {
     "preflight.json": None,          # filled below, once the validators exist
     "wal_state.json": {"wal_repairs_pending": None,
                        "not_applicable_with_reason": "legacy_baseline: no P5 WAL is deployed"},
-    "pm2_jlist.json": [{"name": "ghrsst", "pid": 1, "pm2_env": {"status": "online"}}],
+    "pm2_jlist.json": {"run_id": "TEST",
+                       "roster": [{"name": "ghrsst", "pid": 1,
+                                   "pm2_env": {"status": "online"}}]},
     "capacity.json": {"run_id": "TEST", "filesystem_device": "/dev/stub",
                       "filesystem_fstype": "ext4", "free_now_bytes": 1, "inodes_free": 1},
     "run.json": {"run_id": "TEST", "created_utc": "2027-01-01T00:00:00Z"},
+    #: A stub that PASSES `check_g4_request`, for the same reason the preflight stub must pass
+    #: its validator: a rejected stub makes every test built on it a test of the stub.
     "g4_request.json": {"run_id": "TEST", "start": "2026-01-01", "end": "2027-01-01",
-                        "url": "http://127.0.0.1:8080/api/ghrsst?x=1", "span_days": 366,
-                        "probe_rows": 366, "g4_samples": 1},
+                        "url": (G4_ENDPOINT + "?lon0=135&lat0=20"
+                                "&start=2026-01-01&end=2027-01-01&append=sst"),
+                        "span_days": 366, "probe_rows": 366, "g4_samples": 1},
     "shadow_verification.json": {"segments": 1, "generation": 1,
                                  "wal_root": "/stub/p5_repairs", "anchor_root": "/stub/anchor",
                                  "anchor_domain_id": "independent",
@@ -275,6 +289,26 @@ def _body_lines(path: str):
         return [ln.strip() for ln in fh.readlines()[1:] if ln.strip()]
 
 
+#: An exact non-negative integer token: digits only. No sign, no decimal point, no exponent,
+#: no underscores, no surrounding space, no `True`.
+_INT_TOKEN = __import__("re").compile(r"\A[0-9]+\Z")
+
+
+def _exact_nonneg_int(token, name: str, what: str) -> int:
+    """A COUNT, parsed without coercion.
+
+    `int(float("2.5"))` is `2`: a worker count of 2.5 becomes legal by being rounded, and the
+    parser loses the ability to report that anything was wrong. Counts are digits or they are
+    not counts."""
+    if isinstance(token, bool) or not isinstance(token, str):
+        raise ArtifactError(f"{name}: {what} must be an integer token; got {token!r}")
+    if not _INT_TOKEN.match(token):
+        raise ArtifactError(
+            f"{name}: {what} is not an exact non-negative integer: {token!r}. Fractional, "
+            f"signed, exponent and boolean-like forms are refused rather than coerced.")
+    return int(token)
+
+
 def _finite_nonneg(token: str, name: str, what: str) -> float:
     try:
         value = float(token)
@@ -305,7 +339,7 @@ def check_g4_series(path: str, name: str, *, run_id=None, expected=None) -> dict
     return {"samples": len(values)}
 
 
-def check_h7_series(path: str, name: str, *, run_id=None) -> dict:
+def check_h7_series(path: str, name: str, *, run_id=None, expected_pids=None) -> dict:
     """`ts npids fds rss` per line: numeric, non-negative, and a STABLE worker count."""
     head = _header(path, name, run_id)
     lines = _body_lines(path)
@@ -316,9 +350,11 @@ def check_h7_series(path: str, name: str, *, run_id=None) -> dict:
         parts = ln.split()
         if len(parts) != 4:
             raise ArtifactError(f"{name} line {i} has {len(parts)} columns, expected 4: {ln!r}")
-        for col, what in zip(parts, ("timestamp", "pid count", "fd count", "rss")):
-            _finite_nonneg(col, name, f"line {i} {what}")
-        npids = int(float(parts[1]))
+        # Every column is a count -- timestamp, workers, descriptors, kilobytes -- so every one
+        # is an exact integer. None of them has a meaningful fractional value.
+        values = [_exact_nonneg_int(col, name, f"line {i} {what}")
+                  for col, what in zip(parts, ("timestamp", "pid count", "fd count", "rss"))]
+        npids = values[1]
         if npids < 1:
             raise ArtifactError(f"{name} line {i} reports {npids} workers")
         counts.add(npids)
@@ -329,7 +365,64 @@ def check_h7_series(path: str, name: str, *, run_id=None) -> dict:
     declared = head.get("samples")
     if declared is not None and str(len(lines)) != declared:
         raise ArtifactError(f"{name} declares {declared} samples and carries {len(lines)}")
-    return {"samples": len(lines), "workers": counts.pop()}
+    workers = counts.pop()
+
+    if expected_pids is not None:
+        header_pids = _parse_pid_list(head.get("pids"), name)
+        if header_pids != set(expected_pids):
+            raise ArtifactError(
+                f"{name} header names workers {sorted(header_pids)} but the PM2 roster recorded "
+                f"{sorted(expected_pids)}; the series describes a different set of processes")
+        if workers != len(expected_pids):
+            raise ArtifactError(
+                f"{name} samples report {workers} workers while the roster names "
+                f"{len(expected_pids)}")
+    return {"samples": len(lines), "workers": workers}
+
+
+def _parse_pid_list(token, name: str):
+    """`[101,102]` -> `{101, 102}`. Refuses anything that is not exactly that."""
+    if not isinstance(token, str) or not (token.startswith("[") and token.endswith("]")):
+        raise ArtifactError(f"{name} header pid list is malformed: {token!r}")
+    inner = token[1:-1].strip()
+    if not inner:
+        raise ArtifactError(f"{name} header names no workers")
+    pids = {_exact_nonneg_int(part.strip(), name, "header pid") for part in inner.split(",")}
+    if 0 in pids:
+        raise ArtifactError(f"{name} header names pid 0")
+    return pids
+
+
+def check_pm2_roster(data, *, run_id=None):
+    """The roster that names which processes the fd/RSS series describes.
+
+    It was written and never read, so the series' own claim about *whose* descriptors it counted
+    went unchecked. Returns the pid set, which `check_h7_series` cross-checks."""
+    if not isinstance(data, dict):
+        raise ArtifactError("pm2_jlist.json must be an object with run_id and roster")
+    if run_id is not None and data.get("run_id") != run_id:
+        raise ArtifactError(f"pm2_jlist.json belongs to run {data.get('run_id')!r}")
+    roster = data.get("roster")
+    if not isinstance(roster, list) or not roster:
+        raise ArtifactError(f"pm2_jlist.json roster must be a non-empty list; got {roster!r}")
+    pids = []
+    for proc in roster:
+        if not isinstance(proc, dict) or proc.get("name") != "ghrsst":
+            continue
+        status = (proc.get("pm2_env") or {}).get("status")
+        if status != "online":
+            raise ArtifactError(
+                f"pm2_jlist.json records the ghrsst app as {status!r}; a series sampled while "
+                f"the service was not online describes something else")
+        pid = proc.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
+            raise ArtifactError(f"pm2_jlist.json pid must be a positive integer; got {pid!r}")
+        pids.append(pid)
+    if not pids:
+        raise ArtifactError("pm2_jlist.json names no ghrsst worker")
+    if len(set(pids)) != len(pids):
+        raise ArtifactError(f"pm2_jlist.json repeats a pid: {sorted(pids)}")
+    return set(pids)
 
 
 def check_g16_scan(path: str, name: str, *, run_id=None) -> dict:
@@ -348,9 +441,10 @@ def check_g16_scan(path: str, name: str, *, run_id=None) -> dict:
             raise ArtifactError(f"{name} is missing {required!r}: {lines[0]!r}")
     if not fields["root"].strip():
         raise ArtifactError(f"{name} records no scan root")
-    for numeric in ("files", "dirs", "wall_s"):
-        _finite_nonneg(fields[numeric], name, numeric)
-    return {"files": int(float(fields["files"])), "dirs": int(float(fields["dirs"]))}
+    files = _exact_nonneg_int(fields["files"], name, "files")   # counts, not measurements
+    dirs = _exact_nonneg_int(fields["dirs"], name, "dirs")
+    _finite_nonneg(fields["wall_s"], name, "wall_s")            # a duration; may be fractional
+    return {"files": files, "dirs": dirs}
 
 
 _G4_REQUEST_FIELDS = ("run_id", "start", "end", "url", "span_days", "probe_rows", "g4_samples")
@@ -377,6 +471,50 @@ def check_g4_request(data, *, run_id=None) -> dict:
     for field in ("start", "end", "url"):
         if not (isinstance(data[field], str) and data[field].strip()):
             raise ArtifactError(f"g4_request.json {field} must be a non-empty string")
+
+    # Non-empty is not "describes the request that was made". A record could keep
+    # span_days: 366 while its dates, endpoint, coordinates or `append` said something else --
+    # and the sampler would then spend thirty production requests on it.
+    import datetime as _dt
+    from urllib.parse import parse_qs, urlparse
+
+    dates = {}
+    for field in ("start", "end"):
+        value = data[field]
+        try:
+            parsed = _dt.date.fromisoformat(value)
+        except ValueError:
+            raise ArtifactError(
+                f"g4_request.json {field} is not a canonical ISO date: {value!r}") from None
+        if parsed.isoformat() != value:
+            raise ArtifactError(f"g4_request.json {field} is not canonical: {value!r}")
+        dates[field] = parsed
+    span = (dates["end"] - dates["start"]).days + 1
+    if span != data["span_days"]:
+        raise ArtifactError(
+            f"g4_request.json dates span {span} days but span_days says {data['span_days']}. "
+            f"Editing one without the other is how a shorter run gets reported as 366.")
+
+    url = urlparse(data["url"])
+    endpoint = f"{url.scheme}://{url.netloc}{url.path}"
+    if endpoint != G4_ENDPOINT:
+        raise ArtifactError(
+            f"g4_request.json endpoint is {endpoint!r}, expected {G4_ENDPOINT!r}. The G4 "
+            f"baseline is the local service; another host or path is another measurement.")
+    params = parse_qs(url.query)
+    missing_params = [p for p in G4_REQUIRED_PARAMS if p not in params]
+    if missing_params:
+        raise ArtifactError(f"g4_request.json url is missing parameter(s): {missing_params}")
+    for field in ("start", "end"):
+        if params[field] != [data[field]]:
+            raise ArtifactError(
+                f"g4_request.json url asks for {field}={params[field]} while the record says "
+                f"{data[field]!r}; the URL and the claim describe different windows")
+    for field, expected in G4_EXPECTED_PARAMS.items():
+        if params[field] != [expected]:
+            raise ArtifactError(
+                f"g4_request.json url has {field}={params[field]}, expected {[expected]}. "
+                f"A different coordinate or variable is a different measurement.")
     return data
 
 
@@ -403,6 +541,12 @@ def assemble(art_dir: str, *, profile: str) -> dict:
             f"run.json declares run {marker.get('run_id')!r} but the artifact directory is "
             f"{run_id!r}; the run this evidence belongs to is not the one being assembled")
 
+    roster_pids = None
+    if "pm2_jlist.json" in names:
+        roster_pids = check_pm2_roster(
+            _load_json(os.path.join(art_dir, "pm2_jlist.json"), "pm2_jlist.json"),
+            run_id=run_id)
+
     request = None
     if "g4_request.json" in names:
         request = check_g4_request(
@@ -413,7 +557,8 @@ def assemble(art_dir: str, *, profile: str) -> dict:
     parsers = {
         "g4_366d_seconds.txt": lambda p, n: check_g4_series(
             p, n, run_id=run_id, expected=(request or {}).get("g4_samples")),
-        "h7_fd_rss_timeseries.txt": lambda p, n: check_h7_series(p, n, run_id=run_id),
+        "h7_fd_rss_timeseries.txt": lambda p, n: check_h7_series(
+            p, n, run_id=run_id, expected_pids=roster_pids),
         "g16_metadata_scan.txt": lambda p, n: check_g16_scan(p, n, run_id=run_id),
     }
 

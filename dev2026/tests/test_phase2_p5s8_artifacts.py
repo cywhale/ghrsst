@@ -202,7 +202,7 @@ class TestTheArtifactContractIsHonoured(_Sandbox):
                 # placeholder body would make every test here a test of the placeholder.
                 bodies = {
                     "g4_366d_seconds.txt": "# run_id=TEST samples=1 validated_rows=366\n0.01\n",
-                    "h7_fd_rss_timeseries.txt": "# run_id=TEST pids=[1] samples=1\n1 1 3 2048\n",
+                    "h7_fd_rss_timeseries.txt": "# run_id=TEST pids=[1] samples=1\n1 1 3 2048\n",  # pid set matches the roster stub
                     "g16_metadata_scan.txt": ("# run_id=TEST\nroot=/stub files=2 dirs=1 "
                                               "wall_s=0.5\n"),
                 }
