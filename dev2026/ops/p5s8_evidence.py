@@ -601,12 +601,49 @@ def _atomic_write(path: str, text: str) -> None:
     os.replace(tmp, path)
 
 
-def publish(staged: Dict[str, str], root: str) -> None:
-    """Install the staged outputs, restoring every original if any write fails.
+class PublishRollbackError(ArtifactError):
+    """A publish failed AND the rollback could not put everything back.
 
-    Generation cannot leave a partial state any more -- `stage()` finishes before this runs.
-    This narrows what is left: each file is replaced in one step, and a failure part-way
-    through the set puts back the bytes that were there before."""
+    Distinct from the publish failure itself, because the consequences differ completely: a
+    clean rollback leaves a consistent old set and needs nothing from anyone, while this leaves
+    a MIXED set and needs a person. `unrestored` names the files still carrying the new
+    measurement, and the failure that started it is kept as `__cause__`."""
+
+    def __init__(self, message, *, unrestored, root):
+        super().__init__(message)
+        self.unrestored = tuple(unrestored)
+        self.root = root
+
+
+class RoadmapResyncError(ArtifactError):
+    """A regeneration failed AND the roadmap module could not be pointed back at disk.
+
+    Raised so a caller is never told the state was recovered when it was not. The original
+    failure is kept as `__cause__`; this only adds what recovery could not do."""
+
+
+def publish(staged: Dict[str, str], root: str) -> None:
+    """Install the staged outputs, ATTEMPTING to restore every original if any write fails.
+
+    Generation cannot leave a partial state -- `stage()` finishes before this runs. This
+    narrows what is left: each file is replaced in one step, and a failure part-way through the
+    set tries to put back the bytes that were there before.
+
+    ## What "rollback" does and does not promise
+
+    The rollback writes too, so it can fail the same way the publish did -- `ENOSPC` does not
+    politely stand aside for it. It is an ATTEMPT, not a guarantee. Every restore is tried, one
+    file's failure does not abandon the rest, and if any file cannot be put back the caller
+    gets `PublishRollbackError` naming exactly which ones. Those files carry the NEW measurement
+    while the others carry the old one: the set is MIXED and needs manual repair. Re-running the
+    regeneration once the underlying cause is fixed is normally that repair.
+
+    ## The boundary, stated rather than implied
+
+    This is NOT multi-file atomicity. A process crash BETWEEN two `os.replace` calls leaves the
+    set PARTIAL: the writes that landed stay, and the rollback never runs. Closing that needs a
+    journal or a single-directory swap, which is a larger change than has been asked for. The
+    limit is recorded here so nobody reads the rollback as more than it is."""
     originals = {}
     for rel in staged:
         path = os.path.join(root, rel)
@@ -621,14 +658,41 @@ def publish(staged: Dict[str, str], root: str) -> None:
         for rel, text in staged.items():
             _atomic_write(os.path.join(root, rel), text)
             written.append(rel)
-    except Exception:
+    except Exception as failure:
+        unrestored = []
         for rel in written:
             path = os.path.join(root, rel)
-            if originals[rel] is None:
-                os.remove(path)
-            else:
-                _atomic_write(path, originals[rel])
+            try:
+                if originals[rel] is None:
+                    os.remove(path)
+                else:
+                    _atomic_write(path, originals[rel])
+            except Exception:
+                # Keep going: one file that cannot be put back is no reason to abandon the
+                # others, and the report is only useful if it names ALL of them.
+                unrestored.append(rel)
+        if unrestored:
+            raise PublishRollbackError(
+                f"publish failed and the rollback could not restore {sorted(unrestored)}; "
+                f"those files carry the NEW measurement while the rest carry the old one. "
+                f"The set is MIXED and needs manual repair -- normally re-running the "
+                f"regeneration once the underlying cause is fixed",
+                unrestored=sorted(unrestored), root=root) from failure
         raise
+
+
+def _resync_roadmap(p5_roadmap, root: str):
+    """Point the roadmap module back at the evidence that is actually on disk.
+
+    Returns the exception if re-reading failed, and `None` if it succeeded. It does NOT raise:
+    it is called while another exception is propagating, and replacing that one would hide the
+    failure that actually started this. Swallowing it outright was worse -- the caller then had
+    no way to tell a recovered module from an unrecovered one, so it is handed back instead."""
+    try:
+        p5_roadmap.refresh(os.path.join(root, "bench", "results"))
+        return None
+    except Exception as exc:
+        return exc
 
 
 def main(argv=None) -> int:
@@ -646,14 +710,23 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     root = args.root
 
+    # ONE recovery path covering both halves. `publish()` used to sit outside this, so a
+    # rollback restored the files while the roadmap module went on reporting the staged
+    # measurement -- the disk said one thing and the process another, which is worse than
+    # either being wrong on its own. Staging hands the roadmap writer a scratch copy of the new
+    # evidence, so any failure after that point has to put the module back too.
     try:
         staged = stage(args.run, root)
-    except Exception:
-        # Staging touched nothing, but the roadmap module read the scratch evidence on its way
-        # through. Point it back at what is actually on disk.
-        p5_roadmap.refresh(os.path.join(root, "bench", "results"))
+        publish(staged, root)
+    except Exception as failure:
+        resync_failure = _resync_roadmap(p5_roadmap, root)
+        if resync_failure is not None:
+            raise RoadmapResyncError(
+                f"regeneration failed ({failure!r}) and the roadmap module could not be "
+                f"resynced from {root}: {resync_failure!r}. Its in-memory capacity may still "
+                f"describe a measurement that was never published -- do not trust it without "
+                f"re-importing") from failure
         raise
-    publish(staged, root)
 
     for rel in REGENERATED_OUTPUTS:
         print(f"wrote {os.path.join(root, rel)}")

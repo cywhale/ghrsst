@@ -984,6 +984,311 @@ class TestRegenerationUpdatesEveryDependentOutput(unittest.TestCase):
         self.assertEqual(self._snapshot(root), before,
                          "a partly-installed set was left behind")
 
+    def test_a_publish_failure_advances_neither_the_files_nor_the_module(self):
+        """Injected through the real `ev.main()`, not by calling `publish()` directly.
+
+        `publish()` sat outside the recovery path, so a rollback restored the four files while
+        the roadmap module went on reporting the staged, unpublished measurement: disk saying
+        one thing and the process another, which is worse than either being wrong alone.
+        Calling `publish()` directly could never have shown it -- the module is advanced by
+        `stage()`, one call earlier.
+
+        Every assertion runs BEFORE anything is restored. Snapshotting module state and putting
+        it back in `finally` is precisely how this hid: the test would have repaired the defect
+        it was meant to detect."""
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        results = os.path.join(root, "bench", "results")
+        before_files = self._snapshot(root)
+        before_capacity = json.loads(json.dumps(rm.CAPACITY))
+        before_options = json.loads(json.dumps(rm.CAPACITY_OPTIONS))
+
+        original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
+        original_write = ev._atomic_write
+        saved_capacity, saved_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
+        calls = []
+
+        def fail_part_way_through(path, text):
+            calls.append(path)
+            if len(calls) == 3:            # two files already replaced
+                raise OSError("no space left on device")
+            original_write(path, text)
+
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
+            ev._atomic_write = fail_part_way_through
+            with self.assertRaises(OSError):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ev.main(["--run", run, "--root", root])
+            self.assertGreaterEqual(len(calls), 3, "the injected failure never fired")
+
+            # 1. the files
+            after = self._snapshot(root)
+            for rel in ev.REGENERATED_OUTPUTS:
+                with self.subTest(rel):
+                    self.assertEqual(after[rel], before_files[rel],
+                                     f"{rel} survived a failed publish in its new form")
+
+            # 2. the module, against both its pre-run state and what is on disk NOW
+            self.assertEqual(rm.CAPACITY, before_capacity,
+                             "the module kept the staged measurement after a rollback")
+            self.assertEqual(rm.CAPACITY_OPTIONS, before_options)
+            self.assertEqual(rm.CAPACITY, rm._measured_capacity(results),
+                             "the module disagrees with the evidence on disk")
+
+            # 3. nothing of the staged run survives in module state
+            blob = json.dumps({"capacity": rm.CAPACITY, "options": rm.CAPACITY_OPTIONS})
+            self.assertNotIn(self.ALT_RUN_ID, blob)
+            self.assertNotIn(str(self.ALT_FREE_GIB), blob)
+            self.assertEqual(rm.CAPACITY["free_now_gib"], 295.7)
+            self.assertEqual(rm.CAPACITY["run_id"], RUN_ID)
+        finally:
+            ev._atomic_write = original_write
+            rm.S8_EXECUTION["legacy_baseline"] = original_exec
+            rm.CAPACITY, rm.CAPACITY_OPTIONS = saved_capacity, saved_options
+
+    def test_a_staging_failure_also_leaves_the_module_matching_disk(self):
+        """The other half of the same recovery path, asserted the same way.
+
+        The failure is injected AFTER the real roadmap writer has run -- its output is removed
+        from under it -- because that is the only staging failure that actually advances the
+        module. Stubbing the writer out instead makes the test pass whether or not the resync
+        exists: nothing ever moved the module, so nothing needs putting back. Mutation testing
+        showed exactly that, and this is the version that fails when the resync is deleted."""
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        results = os.path.join(root, "bench", "results")
+        before_files = self._snapshot(root)
+        original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
+        original_main = rm.main
+        saved_capacity, saved_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
+
+        def write_then_vanish(argv=None):
+            rc = original_main(argv)               # a real run: CAPACITY moves to the staged read
+            out = argv[argv.index("--out") + 1]
+            os.remove(os.path.join(out, "p5_critical_path.json"))
+            return rc
+
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
+            rm.main = write_then_vanish
+            with self.assertRaises(ArtifactError) as caught:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ev.main(["--run", run, "--root", root])
+            self.assertIn("nothing was published", str(caught.exception))
+            self.assertEqual(self._snapshot(root), before_files)
+            self.assertEqual(rm.CAPACITY, rm._measured_capacity(results),
+                             "the module kept the staged measurement after a staging failure")
+            self.assertEqual(rm.CAPACITY["free_now_gib"], 295.7)
+            self.assertNotIn(self.ALT_RUN_ID, json.dumps(rm.CAPACITY))
+        finally:
+            rm.main = original_main
+            rm.S8_EXECUTION["legacy_baseline"] = original_exec
+            rm.CAPACITY, rm.CAPACITY_OPTIONS = saved_capacity, saved_options
+
+    def test_the_resync_targets_the_root_being_regenerated(self):
+        """Not the module's default root.
+
+        Every other failure test uses a temp checkout copied from this one, so both trees hold
+        the same reading and resyncing to either produces the same answer -- swapping `root` for
+        `DEV_ROOT` survived mutation testing on that alone. Here the temp root's own baseline
+        evidence is set to a DIFFERENT measurement, so the two roots disagree and only the
+        correct one satisfies "matches the evidence on disk"."""
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        results = os.path.join(root, "bench", "results")
+        baseline_path = os.path.join(results, os.path.basename(ev.S8_REL))
+        baseline = _load(baseline_path)
+        baseline["capacity"]["free_now_gib"] = 310.0
+        baseline["capacity"]["free_now_bytes"] = int(310.0 * (1024 ** 3))
+        baseline["capacity"]["shortfall_gib"] = round(403.3 - 310.0, 1)
+        with open(baseline_path, "w") as fh:
+            json.dump(baseline, fh, indent=2, sort_keys=True)
+
+        before_files = self._snapshot(root)
+        original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
+        original_write = ev._atomic_write
+        saved_capacity, saved_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
+        calls = []
+
+        def fail_part_way_through(path, text):
+            calls.append(path)
+            if len(calls) == 3:
+                raise OSError("no space left on device")
+            original_write(path, text)
+
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
+            ev._atomic_write = fail_part_way_through
+            with self.assertRaises(OSError):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ev.main(["--run", run, "--root", root])
+            self.assertEqual(self._snapshot(root), before_files)
+            self.assertEqual(rm.CAPACITY["free_now_gib"], 310.0,
+                             "the module was resynced from the wrong tree")
+            self.assertEqual(rm.CAPACITY, rm._measured_capacity(results))
+        finally:
+            ev._atomic_write = original_write
+            rm.S8_EXECUTION["legacy_baseline"] = original_exec
+            rm.CAPACITY, rm.CAPACITY_OPTIONS = saved_capacity, saved_options
+
+    def test_a_successful_run_does_leave_the_module_on_the_new_measurement(self):
+        """The negative control. Resyncing on failure must not mean resyncing away a success."""
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
+        saved_capacity, saved_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
+            with contextlib.redirect_stdout(io.StringIO()):
+                ev.main(["--run", run, "--root", root])
+            self.assertEqual(rm.CAPACITY["free_now_gib"], self.ALT_FREE_GIB)
+            self.assertEqual(rm.CAPACITY["run_id"], self.ALT_RUN_ID)
+            self.assertEqual(rm.CAPACITY,
+                             rm._measured_capacity(os.path.join(root, "bench", "results")))
+        finally:
+            rm.S8_EXECUTION["legacy_baseline"] = original_exec
+            rm.CAPACITY, rm.CAPACITY_OPTIONS = saved_capacity, saved_options
+
+    def test_the_crash_boundary_stays_documented_and_unclaimed(self):
+        """`publish()` restores originals on a failed write, which is easy to read as full
+        multi-file atomicity. It is not: a crash between two `os.replace` calls leaves the set
+        partial. Pinned so a later edit cannot quietly upgrade the claim."""
+        doc = ev.publish.__doc__
+        self.assertIn("PARTIAL", doc)
+        self.assertIn("os.replace", doc)
+        self.assertIn("journal", doc)
+        self.assertNotIn("atomic across", doc)
+
+    def test_the_rollback_is_documented_as_an_attempt_not_a_guarantee(self):
+        """It said "restoring every original", which the rollback cannot promise -- it writes,
+        so it fails the same ways the publish did. ENOSPC does not stand aside for it."""
+        doc = ev.publish.__doc__
+        self.assertIn("ATTEMPTING", doc)
+        self.assertIn("not a guarantee", doc)
+        self.assertIn("manual repair", doc)
+        self.assertNotIn("restoring every original", doc)
+
+    def _publish_with_writes_failing_from(self, root, first_failure):
+        """Make `_atomic_write` fail from the Nth call onward -- rollback writes included."""
+        original_write = ev._atomic_write
+        calls = []
+
+        def fail_from_then_on(path, text):
+            calls.append(path)
+            if len(calls) >= first_failure:
+                raise OSError(28, "No space left on device")
+            original_write(path, text)
+
+        self.addCleanup(setattr, ev, "_atomic_write", original_write)
+        ev._atomic_write = fail_from_then_on
+        return calls
+
+    def test_a_rollback_that_also_fails_reports_exactly_what_was_left_behind(self):
+        """The rollback was assumed to succeed. It writes, so `ENOSPC` takes it down too, and
+        then the set is MIXED -- some files new, some old -- which is the one outcome a person
+        has to be told about. Fail closed: name the files, and keep the original as the cause."""
+        root, _run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        before = self._snapshot(root)
+        staged = {rel: f"NEW CONTENT for {rel}\n" for rel in ev.REGENERATED_OUTPUTS}
+        rels = list(staged)
+
+        self._publish_with_writes_failing_from(root, first_failure=3)
+        with self.assertRaises(ev.PublishRollbackError) as caught:
+            ev.publish(staged, root)
+        error = caught.exception
+
+        # The first two landed; the rollback could restore neither.
+        self.assertEqual(list(error.unrestored), sorted(rels[:2]))
+        self.assertEqual(error.root, root)
+        self.assertIsInstance(error.__cause__, OSError,
+                              "the failure that started it was not preserved")
+        self.assertEqual(error.__cause__.errno, 28)
+        for word in ("MIXED", "manual repair"):
+            with self.subTest(word):
+                self.assertIn(word, str(error))
+
+        # And the report is true of the disk: those files really do carry the new content.
+        after = self._snapshot(root)
+        for rel in rels[:2]:
+            with self.subTest(unrestored=rel):
+                self.assertEqual(after[rel].decode(), staged[rel])
+        for rel in rels[2:]:
+            with self.subTest(untouched=rel):
+                self.assertEqual(after[rel], before[rel])
+
+    def test_one_file_that_cannot_be_restored_does_not_abandon_the_others(self):
+        """A report naming some of the damage is worse than one naming all of it."""
+        root, _run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        before = self._snapshot(root)
+        staged = {rel: f"NEW CONTENT for {rel}\n" for rel in ev.REGENERATED_OUTPUTS}
+        rels = list(staged)
+        original_write = ev._atomic_write
+        calls = []
+
+        def fail_on_publish_three_and_the_first_restore(path, text):
+            calls.append(path)
+            failing = len(calls) == 3 or path.endswith(rels[0])
+            if failing and len(calls) >= 3:
+                raise OSError(28, "No space left on device")
+            original_write(path, text)
+
+        self.addCleanup(setattr, ev, "_atomic_write", original_write)
+        ev._atomic_write = fail_on_publish_three_and_the_first_restore
+        with self.assertRaises(ev.PublishRollbackError) as caught:
+            ev.publish(staged, root)
+
+        self.assertEqual(list(caught.exception.unrestored), [rels[0]])
+        after = self._snapshot(root)
+        self.assertEqual(after[rels[1]], before[rels[1]],
+                         "the second file was abandoned after the first failed to restore")
+
+    def test_a_failed_resync_is_reported_rather_than_swallowed(self):
+        """Swallowing it left the caller believing module state had been recovered. The
+        original failure stays as `__cause__`; this only adds what recovery could not do."""
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
+        original_refresh = rm.refresh
+        original_main = rm.main
+        saved_capacity, saved_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
+
+        def refresh_is_broken(results_dir=None):
+            raise OSError(5, "Input/output error")
+
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
+            rm.main = lambda argv=None: 3
+            rm.refresh = refresh_is_broken
+            with self.assertRaises(ev.RoadmapResyncError) as caught:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ev.main(["--run", run, "--root", root])
+        finally:
+            rm.refresh = original_refresh
+            rm.main = original_main
+            rm.S8_EXECUTION["legacy_baseline"] = original_exec
+            rm.CAPACITY, rm.CAPACITY_OPTIONS = saved_capacity, saved_options
+
+        error = caught.exception
+        self.assertIsInstance(error.__cause__, ArtifactError,
+                              "the original regeneration failure was replaced, not preserved")
+        self.assertIn("nothing was published", str(error.__cause__))
+        self.assertIn("could not be", str(error))
+        self.assertIn("do not trust it", str(error))
+
+    def test_a_successful_resync_does_not_raise_the_recovery_error(self):
+        """The control: recovery working must stay indistinguishable from the plain failure."""
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
+        original_main = rm.main
+        saved_capacity, saved_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
+            rm.main = lambda argv=None: 3
+            with self.assertRaises(ArtifactError) as caught:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ev.main(["--run", run, "--root", root])
+            self.assertNotIsInstance(caught.exception, ev.RoadmapResyncError)
+        finally:
+            rm.main = original_main
+            rm.S8_EXECUTION["legacy_baseline"] = original_exec
+            rm.CAPACITY, rm.CAPACITY_OPTIONS = saved_capacity, saved_options
+
     def test_refresh_rebuilds_everything_derived_from_the_reading(self):
         """Checked by identity, deliberately.
 
