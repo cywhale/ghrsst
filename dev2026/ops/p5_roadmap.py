@@ -42,11 +42,13 @@ PRODUCTION_DEPENDENT_GATES = {
     "G4": "366-day p95 at production geometry (17999 x 36000)",
     "H7": "fd/RSS under sustained load on the production process, plus inode headroom",
     "G16": "metadata-scan wall time and snapshot-open cost on the production tree",
-    #: WHY this gate is production-dependent -- never WHAT it currently reads. A measured
-    #: figure in a static rationale is a claim that ages: this entry still said 267 GiB after
-    #: two later runs had superseded it. The current value lives in `CAPACITY`, which is read
-    #: from the generated evidence, and `g18_summary()` renders it from there.
-    "G18": "free disk on /dev/sdc1 against the 403.3 GiB minimum; only the host can report it",
+    #: WHY this gate is production-dependent -- never WHAT it reads, and no longer the
+    #: threshold either. A measured figure in a static rationale is a claim that ages: this
+    #: entry still said 267 GiB after two later runs had superseded it. The threshold was kept
+    #: here as "policy", but it is DERIVED from the capacity model now, so it ages the same
+    #: way. Both live in `CAPACITY`; `g18_summary()` renders the current reading from there.
+    "G18": ("free disk on /dev/sdc1 against the minimum the capacity model sets; only the "
+            "host can report it"),
 }
 
 
@@ -157,7 +159,13 @@ def _capacity_options(cap):
             "requirement_gib": cap["minimum_free_gib"],
             "recommended_gib": cap["recommended_free_gib"],
             "proof_obligations": [
-                "df on the expanded volume shows free_now >= 403.3 GiB (600 GiB recommended)",
+                # Generated from the same reading as `requirement_gib` above. Written out,
+                # the prose and the numeric fields beside it drift apart the moment the
+                # capacity model changes -- the number in a sentence ages exactly like the
+                # number in a field, and is harder to notice.
+                (f"df on the expanded volume shows free_now >= "
+                 f"{cap['minimum_free_gib']} GiB "
+                 f"({int(cap['recommended_free_gib'])} GiB recommended)"),
                 "the expansion is on the SAME filesystem that holds $G, so publication stays a "
                 "same-filesystem os.replace",
             ],

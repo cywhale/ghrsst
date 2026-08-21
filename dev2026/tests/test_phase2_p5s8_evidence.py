@@ -582,6 +582,39 @@ class TestTheCapacityModelIsCanonicalNotInherited(unittest.TestCase):
         finally:
             ev.MINIMUM_FREE_GIB = original
 
+    def test_the_option_a_proof_text_follows_the_authoritative_values(self):
+        """The proof obligation said "free_now >= 403.3 GiB (600 GiB recommended)" in prose
+        while `requirement_gib` beside it was derived. A number in a sentence ages exactly like
+        a number in a field and is harder to spot, so both come from the same reading."""
+        altered = {**rm.CAPACITY, "minimum_free_gib": 512.5, "recommended_free_gib": 900.0}
+        options = rm._capacity_options(altered)
+        option_a = options[0]
+        self.assertEqual(option_a["option"], "A")
+        self.assertEqual(option_a["requirement_gib"], 512.5)
+        self.assertEqual(option_a["recommended_gib"], 900.0)
+
+        proof = " ".join(option_a["proof_obligations"])
+        self.assertIn("512.5", proof)
+        self.assertIn("900", proof)
+        for stale in ("403.3", "600"):
+            with self.subTest(stale):
+                self.assertNotIn(stale, proof,
+                                 "the proof text kept a threshold the reading no longer has")
+
+    def test_the_committed_proof_text_matches_the_committed_reading(self):
+        option_a = rm.CAPACITY_OPTIONS[0]
+        proof = " ".join(option_a["proof_obligations"])
+        self.assertIn(str(rm.CAPACITY["minimum_free_gib"]), proof)
+        self.assertIn(str(int(rm.CAPACITY["recommended_free_gib"])), proof)
+        self.assertEqual(option_a["requirement_gib"], ev.MINIMUM_FREE_GIB)
+
+    def test_the_gate_rationale_carries_no_quantity_at_all(self):
+        """Not even the threshold. It was kept as "policy", but it is DERIVED from the capacity
+        model now, so a model change ages it exactly like a reading."""
+        g18 = rm.PRODUCTION_DEPENDENT_GATES["G18"]
+        self.assertEqual(TestTheG18AuthorityHoldsNoMeasuredFigure._numbers(g18), set())
+        self.assertNotIn("403.3", g18)
+
     def test_the_committed_artifact_carries_the_canonical_model(self):
         gate = self.s6["capacity_gate"]
         for key, want in ev.capacity_model().items():
@@ -813,10 +846,85 @@ class TestRegenerationUpdatesEveryDependentOutput(unittest.TestCase):
         self.assertEqual(_load(os.path.join(results, "p5_critical_path.json"))
                          ["capacity"]["free_now_gib"], self.ALT_FREE_GIB)
 
-    def test_a_failing_roadmap_writer_stops_the_regeneration(self):
-        """Finishing quietly after the roadmap writer reports failure would leave three outputs
-        updated and the fourth stale -- precisely the shape of defect this entry point exists to
-        prevent, reintroduced at the last step."""
+    def _snapshot(self, root):
+        """The exact bytes of every regenerated output."""
+        out = {}
+        for rel in ev.REGENERATED_OUTPUTS:
+            path = os.path.join(root, rel)
+            with open(path, "rb") as fh:
+                out[rel] = fh.read()
+        return out
+
+    def _regeneration_must_not_touch_anything(self, root, run, break_writer):
+        """Inject a roadmap-writer failure and demand every original survives it byte for byte.
+
+        Asserting only that an exception is raised is not enough: the outputs were written one
+        at a time, so a failure at the last step left three files carrying the new measurement
+        and the fourth carrying the old one. The error reported that; it did not undo it."""
+        before = self._snapshot(root)
+        original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
+        original_main = rm.main
+        original_capacity, original_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
+            rm.main = break_writer
+            with self.assertRaises(ArtifactError) as caught:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ev.main(["--run", run, "--root", root])
+        finally:
+            rm.main = original_main
+            rm.S8_EXECUTION["legacy_baseline"] = original_exec
+            rm.CAPACITY, rm.CAPACITY_OPTIONS = original_capacity, original_options
+
+        after = self._snapshot(root)
+        for rel in ev.REGENERATED_OUTPUTS:
+            with self.subTest(rel):
+                self.assertEqual(after[rel], before[rel],
+                                 f"{rel} was modified by a regeneration that failed")
+        self.assertIn("nothing was published", str(caught.exception))
+        return str(caught.exception)
+
+    def test_a_failing_roadmap_writer_leaves_all_four_originals_untouched(self):
+        """The writer reports failure. Nothing may have moved."""
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        reason = self._regeneration_must_not_touch_anything(
+            root, run, lambda argv=None: 3)
+        self.assertIn("3", reason)
+
+    def test_a_raising_roadmap_writer_leaves_all_four_originals_untouched(self):
+        """And when it raises rather than returning, the same must hold."""
+        def explode(argv=None):
+            raise RuntimeError("disk went away")
+
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        before = self._snapshot(root)
+        original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
+        original_main = rm.main
+        original_capacity, original_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
+            rm.main = explode
+            with self.assertRaises(RuntimeError):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ev.main(["--run", run, "--root", root])
+        finally:
+            rm.main = original_main
+            rm.S8_EXECUTION["legacy_baseline"] = original_exec
+            rm.CAPACITY, rm.CAPACITY_OPTIONS = original_capacity, original_options
+        self.assertEqual(self._snapshot(root), before)
+
+    def test_a_writer_that_reports_success_without_writing_leaves_everything_untouched(self):
+        """A writer can return 0 and produce nothing -- a wrong path, a skipped branch, a stub.
+        The other three outputs would then be consistent with each other and with nothing."""
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        reason = self._regeneration_must_not_touch_anything(
+            root, run, lambda argv=None: 0)
+        self.assertIn("p5_critical_path.json", reason)
+        self.assertIn("did not write", reason)
+
+    def test_a_failure_leaves_the_roadmap_module_reading_what_is_on_disk(self):
+        """Staging hands the roadmap writer a scratch copy of the new evidence. If the run then
+        fails, the module must not be left describing a measurement that was never published."""
         root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
         original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
         original_main = rm.main
@@ -824,40 +932,57 @@ class TestRegenerationUpdatesEveryDependentOutput(unittest.TestCase):
         try:
             rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
             rm.main = lambda argv=None: 3
-            with self.assertRaises(ArtifactError) as caught:
+            with self.assertRaises(ArtifactError):
                 with contextlib.redirect_stdout(io.StringIO()):
                     ev.main(["--run", run, "--root", root])
-            self.assertIn("3", str(caught.exception))
-            self.assertIn("inconsistent", str(caught.exception))
+            self.assertEqual(rm.CAPACITY["free_now_gib"], 295.7,
+                             "the module kept the unpublished staged measurement")
         finally:
             rm.main = original_main
             rm.S8_EXECUTION["legacy_baseline"] = original_exec
             rm.CAPACITY, rm.CAPACITY_OPTIONS = original_capacity, original_options
 
-    def test_a_writer_that_reports_success_without_writing_is_caught(self):
-        """The post-condition, and why it is not redundant with the checks above.
-
-        A writer can return 0 and produce nothing -- a wrong output path, a skipped branch, a
-        stub left in place. Then every consistency check passes on the three files that WERE
-        written, and the fourth is simply absent. `REGENERATED_OUTPUTS` is checked on disk after
-        the fact so the entry point cannot report success over a missing output."""
+    def test_staging_produces_every_output_before_any_is_written(self):
+        """`stage()` returns the full contents of all four and writes none of them."""
         root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
-        os.remove(os.path.join(root, "bench", "results", "p5_critical_path.json"))
+        before = self._snapshot(root)
         original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
-        original_main = rm.main
         original_capacity, original_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
         try:
             rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
-            rm.main = lambda argv=None: 0          # succeeds, writes nothing
-            with self.assertRaises(ArtifactError) as caught:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    ev.main(["--run", run, "--root", root])
-            self.assertIn("p5_critical_path.json", str(caught.exception))
-            self.assertIn("did not write", str(caught.exception))
+            with contextlib.redirect_stdout(io.StringIO()):
+                staged = ev.stage(run, root)
         finally:
-            rm.main = original_main
             rm.S8_EXECUTION["legacy_baseline"] = original_exec
             rm.CAPACITY, rm.CAPACITY_OPTIONS = original_capacity, original_options
+        self.assertEqual(sorted(staged), sorted(ev.REGENERATED_OUTPUTS))
+        self.assertEqual(self._snapshot(root), before, "stage() wrote to the real tree")
+        self.assertEqual(json.loads(staged[ev.S8_REL])["capacity"]["free_now_gib"],
+                         self.ALT_FREE_GIB)
+
+    def test_publish_restores_the_originals_when_a_write_fails(self):
+        """The narrow window staging cannot close: a failure part-way through installing the
+        set. Every file already replaced goes back to the bytes it had."""
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        before = self._snapshot(root)
+        staged = {rel: "REPLACED\n" for rel in ev.REGENERATED_OUTPUTS}
+        original_write = ev._atomic_write
+        calls = []
+
+        def fail_on_the_third(path, text):
+            calls.append(path)
+            if len(calls) == 3:
+                raise OSError("no space left on device")
+            original_write(path, text)
+
+        try:
+            ev._atomic_write = fail_on_the_third
+            with self.assertRaises(OSError):
+                ev.publish(staged, root)
+        finally:
+            ev._atomic_write = original_write
+        self.assertEqual(self._snapshot(root), before,
+                         "a partly-installed set was left behind")
 
     def test_refresh_rebuilds_everything_derived_from_the_reading(self):
         """Checked by identity, deliberately.
@@ -960,8 +1085,9 @@ class TestTheG18AuthorityHoldsNoMeasuredFigure(unittest.TestCase):
     #: Written with the unit. A bare "267" would match the 1267 daily holds, which is a count of
     #: directories and has nothing to do with free space.
     SUPERSEDED = ("267 GiB", "267.0 GiB", "267 GB", "264.4 GiB", "113.7 GiB", "138.9 GiB")
-    #: The only quantity that belongs in a static rationale: policy, not measurement.
-    ALLOWED_NUMBERS = {"403.3"}
+    #: None. The threshold was allowed here as policy, but it is derived from the capacity
+    #: model, so it ages like any other figure -- a static rationale carries no quantity.
+    ALLOWED_NUMBERS = set()
 
     #: Only quantities count -- a number carrying a size unit. Every digit in the string would
     #: also flag the `1` in `/dev/sdc1`, which names the device the gate is about and is not a

@@ -199,7 +199,7 @@
   },
   "production_dependent_gates": {
     "G16": "metadata-scan wall time and snapshot-open cost on the production tree",
-    "G18": "free disk on /dev/sdc1 against the 403.3 GiB minimum; only the host can report it",
+    "G18": "free disk on /dev/sdc1 against the minimum the capacity model sets; only the host can report it",
     "G3": "point p95 vs the CURRENT production TieredCube baseline on VM24",
     "G4": "366-day p95 at production geometry (17999 x 36000)",
     "H7": "fd/RSS under sustained load on the production process, plus inode headroom"

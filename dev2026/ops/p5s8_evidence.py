@@ -336,7 +336,9 @@ def render_approvals(evidence: dict) -> str:
     host" — after S8 `legacy_baseline` had already run. Asking for an approval that was already
     given and acted on misstates what is actually blocked, so the stage table is derived from
     `S8_EXECUTION` and the threshold from the measured capacity."""
-    from ops.p5_roadmap import CAPACITY, ROADMAP_EXCEPTION
+    # NOT `CAPACITY`: the module constant is bound at import, and this renders BEFORE the
+    # roadmap refreshes. Every figure below comes from the evidence being reported.
+    from ops.p5_roadmap import ROADMAP_EXCEPTION
 
     S8_EXECUTION = execution_bound_to(evidence)
     cap = evidence["capacity"]
@@ -519,13 +521,122 @@ REGENERATED_OUTPUTS = (
 DEV_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def main(argv=None) -> int:
-    """THE regeneration entry point. Writes every output in `REGENERATED_OUTPUTS`.
+S8_REL = "bench/results/p5s8_vm24_readonly.json"
+S6_REL = "bench/results/p5s6_vm24_readonly.json"
+MEMO_REL = "specs/p5_critical_path_memo.md"
+ROADMAP_REL = "bench/results/p5_critical_path.json"
 
-    The roadmap artifact is written from here, by calling the roadmap's own writer -- not by a
-    second copy of its logic. `ops.p5_roadmap` remains the authority for what goes in it; this
-    is only the thing that makes sure it is written at the same time as everything else that
-    quotes the same measurement."""
+
+def stage(run: str, root: str) -> Dict[str, str]:
+    """Produce the FULL contents of every regenerated output, writing none of them.
+
+    The outputs were written one at a time as they were produced, with the roadmap artifact
+    last. A failure in the roadmap writer therefore left three files carrying the new
+    measurement and the fourth carrying the old one -- the exact inconsistency the entry point
+    exists to prevent, reached by the error path instead of by forgetting a command. Raising
+    afterwards reports the damage; it does not undo it.
+
+    So nothing is published until everything has been generated and checked. The roadmap step
+    needs the new evidence ON DISK to read, so it gets a throwaway directory of its own rather
+    than the real one."""
+    import contextlib
+    import io
+    import shutil
+    import tempfile
+    from ops import p5_roadmap
+
+    staged: Dict[str, str] = {}
+    evidence = derive(run, root=root)
+    staged[S8_REL] = json.dumps(evidence, indent=2, sort_keys=True)
+
+    with open(os.path.join(root, S6_REL)) as fh:
+        staged[S6_REL] = json.dumps(supersede_s6(json.load(fh), evidence),
+                                    indent=2, sort_keys=True)
+
+    with open(os.path.join(root, MEMO_REL)) as fh:
+        memo = fh.read()
+    for what, begin, finish, render in (
+            ("blockers table", BLOCKERS_START, BLOCKERS_END, render_blockers),
+            ("next-approval section", APPROVALS_START, APPROVALS_END, render_approvals)):
+        if begin in memo and finish in memo:
+            head, tail = memo[:memo.index(begin)], memo[memo.index(finish) + len(finish):]
+            memo = head + render(evidence) + tail
+        else:
+            print(f"NOTE: {MEMO_REL} has no markers for the {what}; not rewritten")
+    staged[MEMO_REL] = memo
+
+    # The roadmap writer reads the evidence file, so it needs one. It gets the STAGED evidence
+    # in a scratch tree: the real artifact must not change until every step has succeeded.
+    scratch = tempfile.mkdtemp(prefix="p5s8-stage-")
+    try:
+        scratch_results = os.path.join(scratch, "bench", "results")
+        os.makedirs(scratch_results)
+        with open(os.path.join(scratch_results, os.path.basename(S8_REL)), "w") as fh:
+            fh.write(staged[S8_REL])
+        # Its progress lines name the scratch directory, which is not where anything lands.
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = p5_roadmap.main(["--out", scratch_results])
+        if rc != 0:
+            raise ArtifactError(f"the roadmap writer failed with {rc}; nothing was published")
+        produced = os.path.join(scratch_results, os.path.basename(ROADMAP_REL))
+        if not os.path.exists(produced):
+            raise ArtifactError(f"the roadmap writer did not write {ROADMAP_REL}; "
+                                f"nothing was published")
+        with open(produced) as fh:
+            staged[ROADMAP_REL] = fh.read()
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    missing = [rel for rel in REGENERATED_OUTPUTS if rel not in staged]
+    if missing:
+        raise ArtifactError(f"staging did not produce {missing}; nothing was published")
+    return staged
+
+
+def _atomic_write(path: str, text: str) -> None:
+    """Replace one file's contents in a single step, so no reader sees a half-written file."""
+    tmp = f"{path}.regen-{os.getpid()}"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def publish(staged: Dict[str, str], root: str) -> None:
+    """Install the staged outputs, restoring every original if any write fails.
+
+    Generation cannot leave a partial state any more -- `stage()` finishes before this runs.
+    This narrows what is left: each file is replaced in one step, and a failure part-way
+    through the set puts back the bytes that were there before."""
+    originals = {}
+    for rel in staged:
+        path = os.path.join(root, rel)
+        if os.path.exists(path):
+            with open(path) as fh:
+                originals[rel] = fh.read()
+        else:
+            originals[rel] = None
+
+    written = []
+    try:
+        for rel, text in staged.items():
+            _atomic_write(os.path.join(root, rel), text)
+            written.append(rel)
+    except Exception:
+        for rel in written:
+            path = os.path.join(root, rel)
+            if originals[rel] is None:
+                os.remove(path)
+            else:
+                _atomic_write(path, originals[rel])
+        raise
+
+
+def main(argv=None) -> int:
+    """THE regeneration entry point. Writes every output in `REGENERATED_OUTPUTS`, or none.
+
+    The roadmap artifact is produced by the roadmap's own writer, not by a second copy of its
+    logic -- `ops.p5_roadmap` remains the authority for its contents. This is only the thing
+    that makes sure every output quoting one measurement is written together."""
     import argparse
     from ops import p5_roadmap
     ap = argparse.ArgumentParser()
@@ -533,51 +644,20 @@ def main(argv=None) -> int:
     ap.add_argument("--root", default=DEV_ROOT,
                     help="repository root to regenerate into; the default is this checkout")
     args = ap.parse_args(argv)
+    root = args.root
 
-    dev = args.root
-    results = os.path.join(dev, "bench", "results")
-    evidence = derive(args.run, root=dev)
+    try:
+        staged = stage(args.run, root)
+    except Exception:
+        # Staging touched nothing, but the roadmap module read the scratch evidence on its way
+        # through. Point it back at what is actually on disk.
+        p5_roadmap.refresh(os.path.join(root, "bench", "results"))
+        raise
+    publish(staged, root)
 
-    out = os.path.join(results, "p5s8_vm24_readonly.json")
-    with open(out, "w") as fh:
-        json.dump(evidence, fh, indent=2, sort_keys=True)
-    print(f"wrote {out}")
-
-    s6_path = os.path.join(results, "p5s6_vm24_readonly.json")
-    with open(s6_path) as fh:
-        s6 = supersede_s6(json.load(fh), evidence)
-    with open(s6_path, "w") as fh:
-        json.dump(s6, fh, indent=2, sort_keys=True)
-    print(f"updated {s6_path}")
-
-    memo_path = os.path.join(dev, "specs", "p5_critical_path_memo.md")
-    with open(memo_path) as fh:
-        memo = fh.read()
-    for what, start, end, render in (
-            ("blockers table", BLOCKERS_START, BLOCKERS_END, render_blockers),
-            ("next-approval section", APPROVALS_START, APPROVALS_END, render_approvals)):
-        if start in memo and end in memo:
-            head, tail = memo[:memo.index(start)], memo[memo.index(end) + len(end):]
-            memo = head + render(evidence) + tail
-            print(f"regenerated the {what} in {memo_path}")
-        else:
-            print(f"NOTE: {memo_path} has no markers for the {what}; not rewritten")
-    with open(memo_path, "w") as fh:
-        fh.write(memo)
-
-    # The roadmap artifact quotes this same measurement, so it is regenerated HERE rather than
-    # left to a second command someone has to remember. `p5_roadmap.main` re-reads the evidence
-    # file just written; its import-time CAPACITY is a measurement out of date by now.
-    rc = p5_roadmap.main(["--out", results])
-    if rc != 0:
-        raise ArtifactError(f"the roadmap writer failed with {rc}; outputs are inconsistent")
-
-    missing = [rel for rel in REGENERATED_OUTPUTS
-               if not os.path.exists(os.path.join(dev, rel))]
-    if missing:
-        raise ArtifactError(f"regeneration did not write {missing}")
-
-    cap = evidence["capacity"]
+    for rel in REGENERATED_OUTPUTS:
+        print(f"wrote {os.path.join(root, rel)}")
+    cap = json.loads(staged[S8_REL])["capacity"]
     print(f"  free_now {cap['free_now_gib']} GiB | minimum {cap['minimum_free_gib']} GiB | "
           f"shortfall {cap['shortfall_gib']} GiB | G18 {cap['verdict']}")
     return 0
