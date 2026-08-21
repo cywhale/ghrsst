@@ -1,0 +1,178 @@
+{
+  "adjudicated_on_host": true,
+  "adjudicated_on_host_note": "paths were stat-ed on the host that owns them",
+  "before_first_compaction": [
+    "identity",
+    "manifest",
+    "blocks",
+    "wal_anchor",
+    "failure_semantics",
+    "api_parity"
+  ],
+  "compaction_ready": false,
+  "label": "VM24_PRODUCTION_READ_ONLY",
+  "next_safe_step": "resolve the blocked requirement(s) ['identity', 'manifest', 'blocks', 'wal_anchor'] \u2014 provisioning an isolated P5 staging root is the reversible way to do it, and touches no live path",
+  "observed": {
+    "capacity": {
+      "filesystem_device": "/dev/sdc1",
+      "filesystem_fstype": "ext4",
+      "free_now_bytes": 1353637224448,
+      "free_now_gib": 1260.7,
+      "hard_reserve_gib": 250,
+      "inodes_free": 298147194,
+      "label": "VM24_PRODUCTION_READ_ONLY",
+      "measured_utc": "2026-08-21T13:04:22.000000+00:00",
+      "minimum_free_gib": 403.3,
+      "recommended_free_gib": 600.0,
+      "run_id": "20260821T130320Z"
+    },
+    "identity": {
+      "branch": "dev2026-phase2-tiled-append",
+      "dirty_paths": [
+        "ev2026/api/app.py",
+        "dev2026/store/hybrid_router.py",
+        "dev2026/store/store_access.py",
+        "dev2026/store/tiered_cube.py",
+        "dev2026/store/time_cube.py"
+      ],
+      "head_sha": "a9db4b76d87f68724a6c4c427c61eed64c905176",
+      "live_code_root": "/home/odbadmin/python/ghrsst-dev2026-phase2",
+      "reviewed_sha": "3223fba37da5d292ea6acb58ccef0da2b5138d31",
+      "worktree_clean": false
+    },
+    "p5_roots_present": {
+      "p5_blocks": false,
+      "p5_compaction.lock": false,
+      "p5_repairs": false
+    },
+    "service": {
+      "block_manifest_dir_set": false,
+      "cube_latest_in_sync": true,
+      "daily_latest": "2026-08-20",
+      "delta_day_count": 55,
+      "delta_latest": "2026-08-20",
+      "latest": "2026-08-20",
+      "pid": 1311567,
+      "point_latest": "2026-08-20",
+      "route": "tiered",
+      "rss_mb": 75.3,
+      "status": "ok"
+    },
+    "staging": {
+      "detached": true,
+      "head_sha": "3223fba37da5d292ea6acb58ccef0da2b5138d31",
+      "inside_G": false,
+      "modules": {
+        "api/app.py": "a943f0640a09d936ebf722bbcc623f7a718ac68bf6efef85c7cbca3009b1970e",
+        "ingest/build_block.py": "10a5b05b6f5b1e725980762a9fffeabb10d2a5a2050cb3a8e3867917dae18043",
+        "ingest/publish_manifest.py": "666ca1eeb974625fa8ac8612f62a995f21ac1a8cae4815b0438fcc352a025aa0",
+        "store/block_manifest.py": "f458627be33c60dcc0143bea565bd512470a7ff569fcbcc66c157db821929c1f",
+        "store/compaction_lock.py": "ad1c0383d7a8f8ae25c50a4957aa30a30b76b3d68878ad887b4f56fa0d1e4e58",
+        "store/repair_wal.py": "004f10587b0d17673053454b2222e0d13e95ac4af9cc89591183657afb936908"
+      },
+      "stage_root": "/home/odbadmin/p5readiness/20260821T130320Z/checkout",
+      "worktree_clean": true
+    }
+  },
+  "provenance": {
+    "collected_utc": "2026-08-21T13:04:22Z",
+    "host": "odb24",
+    "run_id": "20260821T130320Z",
+    "target_artifact": "../../artifacts/target_live.json"
+  },
+  "requirements": [
+    {
+      "evidence_kind": "preflight",
+      "id": "identity",
+      "reason": "HEAD 'a9db4b76d87f68724a6c4c427c61eed64c905176' is not the reviewed commit '3223fba37da5d292ea6acb58ccef0da2b5138d31'",
+      "title": "the reviewed commit, checked out clean and detached",
+      "verdict": "BLOCKED",
+      "why": "a compaction is run BY code. If the deployed tree is not exactly the reviewed commit, the review adjudicated something else."
+    },
+    {
+      "evidence_kind": "store",
+      "id": "manifest",
+      "reason": "no manifest root at '/home/odbadmin/Data/ghrsst/p5_blocks'",
+      "title": "a live segmented manifest the store would accept",
+      "verdict": "BLOCKED",
+      "why": "the manifest is the authority for what is served. Without one there is no segmented base to compact into, and `SegmentedCubeStore` has nothing to open."
+    },
+    {
+      "evidence_kind": "store",
+      "id": "blocks",
+      "reason": "cannot check blocks: no manifest root at '/home/odbadmin/Data/ghrsst/p5_blocks'",
+      "title": "every referenced block present and passing the strict contract",
+      "verdict": "BLOCKED",
+      "why": "a manifest referencing a block that is absent or malformed publishes a view nobody can read; the failure surfaces at request time, on the live service."
+    },
+    {
+      "evidence_kind": "store",
+      "id": "wal_anchor",
+      "reason": "no P5 WAL root at '/home/odbadmin/Data/ghrsst/p5_repairs'",
+      "title": "an initialized P5 WAL, an anchor outside the domain, and a declared rollback domain",
+      "verdict": "BLOCKED",
+      "why": "the WAL is how a half-finished compaction is recognised as half-finished. An anchor inside the domain it witnesses is lost with it, and an undeclared domain means no one has said what a rollback would restore."
+    },
+    {
+      "evidence_kind": "store",
+      "id": "locks",
+      "reason": "compaction=/home/odbadmin/Data/ghrsst/p5_compaction.lock; ingest=/home/odbadmin/Data/ghrsst/mur_delta.ingest.lock; order=compaction acquired before ingest",
+      "title": "canonical compaction and ingest lock paths, in the declared order",
+      "verdict": "READY",
+      "why": "compaction and ingest both mutate the served view. Two writers with no shared lock path are not excluded from each other at all."
+    },
+    {
+      "evidence_kind": "service",
+      "id": "api_parity",
+      "reason": "proving this needs a service serving the manifest. On VM24 that is either a live switchover or a second isolated service -- both are production changes and neither is authorized by a read-only preflight.",
+      "title": "the API serves the segmented base with values matching the current base",
+      "verdict": "NEEDS_HUMAN_APPROVAL",
+      "why": "routing and value parity can only be shown by a service actually serving the manifest -- which means switching the live deployment, or standing up an isolated second one."
+    },
+    {
+      "evidence_kind": "measurement",
+      "id": "capacity",
+      "reason": "free 1260.7 GiB against a 403.3 GiB minimum (run 20260821T130320Z)",
+      "title": "free space above the minimum, from a fresh measurement",
+      "verdict": "READY",
+      "why": "a block build needs the space before it starts. A figure with no run behind it is a number in a file."
+    },
+    {
+      "evidence_kind": "proven_locally",
+      "id": "failure_semantics",
+      "reason": "no suite was named as proving the refusal, rollback and partial-staging behaviour for this target",
+      "title": "fail-closed refusal, rollback and partial-staging behaviour",
+      "verdict": "NOT_ADJUDICATED",
+      "why": "the first compaction is the one most likely to be interrupted. What happens then has to be a property of the code, not a hope."
+    }
+  ],
+  "schema": "ghrsst.p5.readiness/1",
+  "summary": {
+    "BLOCKED": [
+      "identity",
+      "manifest",
+      "blocks",
+      "wal_anchor"
+    ],
+    "NEEDS_HUMAN_APPROVAL": [
+      "api_parity"
+    ],
+    "NOT_ADJUDICATED": [
+      "failure_semantics"
+    ],
+    "READY": [
+      "locks",
+      "capacity"
+    ]
+  },
+  "target": {
+    "anchor_root": null,
+    "locks": {
+      "compaction": "/home/odbadmin/Data/ghrsst/p5_compaction.lock",
+      "ingest": "/home/odbadmin/Data/ghrsst/mur_delta.ingest.lock"
+    },
+    "manifest_root": "/home/odbadmin/Data/ghrsst/p5_blocks",
+    "root": "/home/odbadmin/Data/ghrsst",
+    "wal_root": "/home/odbadmin/Data/ghrsst/p5_repairs"
+  }
+}
