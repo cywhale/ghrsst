@@ -34,10 +34,48 @@ RUNS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 #: The run this evidence is derived from.
 CURRENT_RUN = "p5s8_20260820T110036Z"
 
-#: G18's threshold, unchanged: HARD_RESERVE 250 + additional 153.3.
-MINIMUM_FREE_GIB = 403.3
-RECOMMENDED_FREE_GIB = 600.0
+#: `HARD_RESERVE` is policy, not a tuning knob, and is never lowered to make G18 pass.
 HARD_RESERVE_GIB = 250
+
+#: The G18 capacity model: the ONE source for every term in the gate's arithmetic.
+#:
+#: These terms used to be read back out of `p5s6_vm24_readonly.json` and trusted. That made the
+#: artifact an input to its own regeneration: editing `additional_gb` to 0 there produced
+#: `projected_free_after_gb = 295.7` and `gate_ok = True` on the next run -- a G18 pass created
+#: by editing a file, with free space unchanged. Nothing downstream may read a model term from
+#: an artifact; `capacity_model()` computes them all from here, and `_check_capacity_model()`
+#: refuses any artifact whose surviving copy disagrees.
+CAPACITY_MODEL = {
+    "s": 90,
+    "base_gb_per_day": 1.62,
+    "temp_checkpoint_artifacts_gb": 2.0,
+    "ingest_gb_per_day": 2.74,
+    "build_days_assumed": 2.0,
+    "formula": "projected_free_after = free_now - (new_block + temp + growth)",
+}
+
+
+def capacity_model() -> Dict:
+    """Every model term the G18 arithmetic needs, derived from `CAPACITY_MODEL`."""
+    m = CAPACITY_MODEL
+    new_block = round(m["s"] * m["base_gb_per_day"], 1)
+    growth = round(m["ingest_gb_per_day"] * m["build_days_assumed"], 1)
+    temp = float(m["temp_checkpoint_artifacts_gb"])
+    return {
+        "s": m["s"],
+        "new_block_gb": new_block,
+        "temp_checkpoint_artifacts_gb": temp,
+        "growth_during_build_gb": growth,
+        "build_days_assumed": float(m["build_days_assumed"]),
+        "additional_gb": round(new_block + temp + growth, 1),
+        "formula": m["formula"],
+    }
+
+
+#: G18's threshold. DERIVED -- `HARD_RESERVE` plus the model's `additional` -- so the threshold
+#: and the arithmetic behind it cannot drift apart. It comes to 403.3 GiB, unchanged.
+MINIMUM_FREE_GIB = round(HARD_RESERVE_GIB + capacity_model()["additional_gb"], 1)
+RECOMMENDED_FREE_GIB = 600.0
 
 GIB = 1024 ** 3
 
@@ -137,6 +175,9 @@ def derive(run: str = CURRENT_RUN) -> dict:
             "recommended_free_gib": RECOMMENDED_FREE_GIB,
             "shortfall_gib": round(MINIMUM_FREE_GIB - free_gib, 1),
             "verdict": "BLOCKED" if free_gib < MINIMUM_FREE_GIB else "NOT_BLOCKED",
+            #: Published so downstream readers take the model from the evidence instead of
+            #: keeping their own copy. `ops/p5_roadmap.py` held a second 153.3.
+            "model": capacity_model(),
             "change_attribution": dict(CAPACITY_CHANGE_ATTRIBUTION),
         },
         "g4": {
@@ -208,6 +249,26 @@ BLOCKERS_START = "<!-- generated:blockers:start -->"
 BLOCKERS_END = "<!-- generated:blockers:end -->"
 
 
+def execution_bound_to(evidence: dict):
+    """`S8_EXECUTION` as of this evidence, refusing a declaration about a different run.
+
+    Both renderers state a run's outcome using figures from `evidence` and a status from
+    `S8_EXECUTION`. Nothing tied the two together: regenerating from a NEW run while the
+    declaration still named the old one produced a table that reads as one coherent report and
+    is two, with the reader given no way to see the seam."""
+    from ops.p5_roadmap import S8_EXECUTION
+
+    legacy = S8_EXECUTION["legacy_baseline"]
+    run_id = evidence["provenance"]["run_id"]
+    if legacy["status"] == "COMPLETED" and legacy.get("run_id") != run_id:
+        raise ArtifactError(
+            f"S8_EXECUTION['legacy_baseline'] declares run {legacy.get('run_id')!r} COMPLETED, "
+            f"but this evidence is run {run_id!r}. Update the declaration to the run being "
+            f"reported -- a status and a measurement from different runs must not be rendered "
+            f"as one result")
+    return S8_EXECUTION
+
+
 def render_blockers(evidence: dict) -> str:
     """The `Remaining blockers` table, GENERATED.
 
@@ -215,7 +276,7 @@ def render_blockers(evidence: dict) -> str:
     capacity section that already said 295.7, and went on calling the S8 execution "not
     approved" after it had completed. A table that restates numbers held elsewhere has to be
     derived from them."""
-    from ops.p5_roadmap import S8_EXECUTION
+    S8_EXECUTION = execution_bound_to(evidence)
 
     cap = evidence["capacity"]
     run = evidence["provenance"]["run_id"]
@@ -271,8 +332,9 @@ def render_approvals(evidence: dict) -> str:
     host" — after S8 `legacy_baseline` had already run. Asking for an approval that was already
     given and acted on misstates what is actually blocked, so the stage table is derived from
     `S8_EXECUTION` and the threshold from the measured capacity."""
-    from ops.p5_roadmap import CAPACITY, ROADMAP_EXCEPTION, S8_EXECUTION
+    from ops.p5_roadmap import CAPACITY, ROADMAP_EXCEPTION
 
+    S8_EXECUTION = execution_bound_to(evidence)
     cap = evidence["capacity"]
     legacy = S8_EXECUTION["legacy_baseline"]
     rows = [
@@ -322,6 +384,45 @@ def _mark_superseded_gate(s6: dict, evidence: dict) -> None:
         f"verdict is unchanged.")
 
 
+def _check_capacity_model(old_gate: dict, canonical: Dict) -> None:
+    """Refuse an artifact whose surviving model terms disagree with the canonical model.
+
+    Recomputing alone is not enough. A silent overwrite turns an edited artifact into a correct
+    one and says nothing, so the edit is never noticed; the point is that a tampered or stale
+    input is LOUD. Raw types are checked before values, per the repository rule: `True` is an
+    `int` in Python and `"153.3"` compares unequal for the wrong reason."""
+    for key, want in canonical.items():
+        if key not in old_gate:
+            raise ArtifactError(
+                f"capacity_gate is missing {key!r}; the canonical model says {want!r}. A model "
+                f"term cannot be absent and then supplied by a default -- see CAPACITY_MODEL")
+        got = old_gate[key]
+        if type(got) is bool:
+            raise ArtifactError(
+                f"capacity_gate[{key!r}] is a bool ({got!r}); a model term must be "
+                f"{type(want).__name__}, and bool is an int in Python")
+        if type(got) is not type(want):
+            raise ArtifactError(
+                f"capacity_gate[{key!r}] is {type(got).__name__} ({got!r}); the canonical model "
+                f"says {type(want).__name__} ({want!r}). No coercion is applied")
+        if got != want:
+            raise ArtifactError(
+                f"capacity_gate[{key!r}] is {got!r}; the canonical model says {want!r}. The "
+                f"artifact is stale or was edited -- change CAPACITY_MODEL, never the artifact")
+
+
+def _check_thresholds(evidence: dict) -> None:
+    """The evidence's own thresholds must be the canonical ones, not whatever it was handed."""
+    cap = evidence["capacity"]
+    for key, want in (("hard_reserve_gib", HARD_RESERVE_GIB),
+                      ("minimum_free_gib", MINIMUM_FREE_GIB)):
+        got = cap.get(key)
+        if type(got) is bool or type(got) is not type(want) or got != want:
+            raise ArtifactError(
+                f"evidence capacity {key!r} is {got!r}; the canonical value is {want!r}. "
+                f"HARD_RESERVE and the G18 threshold are policy and are never adjusted here")
+
+
 def supersede_s6(s6: dict, evidence: dict) -> dict:
     """Apply every supersession the S6 artifact needs, and RETURN it.
 
@@ -342,16 +443,37 @@ def supersede_s6(s6: dict, evidence: dict) -> dict:
     # gate_ok, and a provenance string naming 2026-08-19 -- all computed from 267 GiB. A merge
     # leaves those behind, silently inconsistent with the free space beside them.
     old_gate = s6.get("capacity_gate", {})
-    additional = float(old_gate.get("additional_gb", 153.3))
+    canonical = capacity_model()
+    _check_thresholds(evidence)
+    _check_capacity_model(old_gate, canonical)
+
+    # Every model term is written from `canonical`, AFTER the check above -- so the surviving
+    # copy is both verified and replaced, and `free_now` is the only measured input.
+    additional = canonical["additional_gb"]
     projected = round(free_gib - additional, 1)
+    gate_ok = projected >= HARD_RESERVE_GIB
+    # free_now >= hard_reserve + additional is the same statement as projected >= hard_reserve.
+    # If the two ever disagree, the arithmetic has been reached around, and no artifact is
+    # written: a G18 pass is a measurement, never a rearrangement.
+    if gate_ok is not (free_gib >= MINIMUM_FREE_GIB):
+        raise ArtifactError(
+            f"gate_ok {gate_ok} contradicts free_now {free_gib} GiB against the "
+            f"{MINIMUM_FREE_GIB} GiB minimum")
+    if gate_ok and evidence["capacity"]["verdict"] != "NOT_BLOCKED":
+        raise ArtifactError(
+            f"gate_ok is True while the evidence verdict is "
+            f"{evidence['capacity']['verdict']!r}")
     s6["capacity_gate"] = {
-        **old_gate, **superseded_capacity_gate(evidence),
+        **old_gate, **superseded_capacity_gate(evidence), **canonical,
         "projected_free_after_gb": projected,
-        "gate_ok": projected >= evidence["capacity"]["hard_reserve_gib"],
+        "gate_ok": gate_ok,
         "inputs_provenance": {
             **old_gate.get("inputs_provenance", {}),
             "free_now_gb": (f"statvfs on {evidence['capacity']['filesystem_device']}, VM24 "
                             f"{evidence['provenance']['measured_utc'][:10]}, run {run_id}"),
+            "capacity_model": ("recomputed from ops/p5s8_evidence.py::CAPACITY_MODEL and "
+                               "checked against the surviving copy; never read from an "
+                               "artifact"),
         },
     }
     # The `filesystem` block is the 2026-08-19 snapshot -- size, used, avail, inode counts all

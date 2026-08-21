@@ -119,7 +119,11 @@ def _measured_capacity():
         "mount": "/home/odbadmin/Data",
         "free_now_gib": cap["free_now_gib"],
         "hard_reserve_gib": cap["hard_reserve_gib"],
-        "additional_gib": 153.3,
+        #: From the evidence's published model, not a second copy. This said 153.3 in its own
+        #: right, so a change to the capacity model would have moved the threshold here and
+        #: left this line behind.
+        "additional_gib": cap["model"]["additional_gb"],
+        "model": dict(cap["model"]),
         "minimum_free_gib": cap["minimum_free_gib"],
         "recommended_free_gib": cap["recommended_free_gib"],
         "shortfall_gib": cap["shortfall_gib"],

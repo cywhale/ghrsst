@@ -24,6 +24,7 @@
     "inputs_provenance": {
       "base_gb_per_day": "du -sh base / healthz day count, measured",
       "build_days_assumed": "2.0 -- an ASSUMPTION, not measured; the verdict does not depend on it",
+      "capacity_model": "recomputed from ops/p5s8_evidence.py::CAPACITY_MODEL and checked against the surviving copy; never read from an artifact",
       "free_now_gb": "statvfs on /dev/sdc1, VM24 2026-08-20, run 20260820T110036Z",
       "ingest_gb_per_day": "base 1.62 + delta 1.12, both measured"
     },

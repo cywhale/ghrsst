@@ -25,6 +25,10 @@ for p in (_DEV, HERE):
 
 from ops import p5s8_evidence as ev  # noqa: E402
 from ops import p5_roadmap as rm  # noqa: E402
+from ops.p5s8_report import ArtifactError  # noqa: E402
+
+#: Sentinel for "delete this key", so a test can distinguish an absent field from a `None` one.
+_MISSING = object()
 
 RUN = "p5s8_20260820T110036Z"
 RUN_ID = "20260820T110036Z"
@@ -409,6 +413,228 @@ class TestNoDuplicateOrUnmarkedCurrentStateSections(unittest.TestCase):
         window = self.flat[max(0, idx - 300):idx + 300].lower()
         self.assertIn("superseded", window)
         self.assertNotIn("is the current g18 evidence", window)
+
+
+class TestTheCapacityModelIsCanonicalNotInherited(unittest.TestCase):
+    """`supersede_s6` read `additional_gb` back out of the artifact it was regenerating.
+
+    Editing it to 0 there produced `projected_free_after_gb = 295.7` and `gate_ok = True` on the
+    next run: a G18 pass manufactured by editing a file, with free space unchanged. The artifact
+    was an input to its own regeneration. Every model term now comes from `CAPACITY_MODEL`, and
+    a surviving copy that disagrees is refused rather than corrected in silence."""
+
+    def setUp(self):
+        self.s6 = _load(S6_ARTIFACT)
+        self.evidence = ev.derive(RUN)
+
+    def _with(self, **fields):
+        s6 = json.loads(json.dumps(self.s6))
+        for key, value in fields.items():
+            if value is _MISSING:
+                s6["capacity_gate"].pop(key, None)
+            else:
+                s6["capacity_gate"][key] = value
+        return s6
+
+    def _refusal(self, **fields):
+        with self.assertRaises(ArtifactError) as caught:
+            ev.supersede_s6(self._with(**fields), self.evidence)
+        return str(caught.exception)
+
+    # ---------------------------------------------------------------- positive control
+    def test_the_canonical_model_is_accepted_and_recomputed(self):
+        gate = ev.supersede_s6(self.s6, self.evidence)["capacity_gate"]
+        canonical = ev.capacity_model()
+        for key, want in canonical.items():
+            with self.subTest(key):
+                self.assertEqual(gate[key], want)
+        self.assertEqual(gate["additional_gb"], 153.3)
+        self.assertEqual(gate["projected_free_after_gb"], 142.4)
+        self.assertIs(gate["gate_ok"], False)
+        self.assertEqual(gate["verdict"], "BLOCKED")
+
+    def test_the_model_terms_are_derived_from_their_inputs(self):
+        """145.8 is S x the base rate and 5.5 is the ingest rate x the build days -- neither is
+        a number typed beside the thing it is supposed to follow from."""
+        m, canonical = ev.CAPACITY_MODEL, ev.capacity_model()
+        self.assertEqual(canonical["new_block_gb"], round(m["s"] * m["base_gb_per_day"], 1))
+        self.assertEqual(canonical["growth_during_build_gb"],
+                         round(m["ingest_gb_per_day"] * m["build_days_assumed"], 1))
+        self.assertEqual(canonical["additional_gb"],
+                         round(canonical["new_block_gb"]
+                               + canonical["temp_checkpoint_artifacts_gb"]
+                               + canonical["growth_during_build_gb"], 1))
+
+    def test_the_threshold_is_the_reserve_plus_the_model_and_is_unchanged(self):
+        self.assertEqual(ev.HARD_RESERVE_GIB, 250)
+        self.assertEqual(ev.MINIMUM_FREE_GIB, 403.3)
+        self.assertEqual(ev.MINIMUM_FREE_GIB,
+                         round(ev.HARD_RESERVE_GIB + ev.capacity_model()["additional_gb"], 1))
+
+    # ---------------------------------------------------------------- negative controls
+    def test_additional_gb_zero_is_refused(self):
+        """The reported reproduction, in both spellings a hand edit produces."""
+        self.assertIn("additional_gb", self._refusal(additional_gb=0))
+        reason = self._refusal(additional_gb=0.0)
+        self.assertIn("additional_gb", reason)
+        self.assertIn("153.3", reason)
+
+    def test_a_negative_additional_gb_is_refused(self):
+        reason = self._refusal(additional_gb=-153.3)
+        self.assertIn("-153.3", reason)
+        self.assertIn("canonical model", reason)
+
+    def test_a_string_additional_gb_is_refused_without_coercion(self):
+        reason = self._refusal(additional_gb="153.3")
+        self.assertIn("str", reason)
+        self.assertIn("No coercion", reason)
+
+    def test_a_bool_additional_gb_is_refused_as_a_bool(self):
+        """`True` is an `int` in Python, so a numeric check alone would let it through.
+
+        The reason has to name that, not just report a type difference: mutation testing showed
+        that deleting the dedicated bool guard survived a check that only asserted "bool" was
+        somewhere in the message, because the generic type mismatch happens to print it too."""
+        reason = self._refusal(additional_gb=True)
+        self.assertIn("is a bool", reason)
+        self.assertIn("bool is an int in Python", reason)
+
+    def test_the_canonical_value_is_used_even_if_the_validator_is_bypassed(self):
+        """Defence in depth, tested separately on purpose.
+
+        With the validator stubbed out, an edited artifact must STILL not move the arithmetic.
+        Restoring the old `float(old_gate.get("additional_gb", 153.3))` survived every other
+        test in this class, because the validator refused the doctored input before that line
+        ran. The guarantee then rests entirely on one check, and narrowing it silently restores
+        the defect. The value used is canonical whether or not anything objected."""
+        original = ev._check_capacity_model
+        try:
+            ev._check_capacity_model = lambda *a, **k: None
+            gate = ev.supersede_s6(self._with(additional_gb=0.0),
+                                   self.evidence)["capacity_gate"]
+        finally:
+            ev._check_capacity_model = original
+        self.assertEqual(gate["additional_gb"], 153.3)
+        self.assertEqual(gate["projected_free_after_gb"], 142.4)
+        self.assertIs(gate["gate_ok"], False)
+
+    def test_an_int_additional_gb_is_refused_as_the_wrong_raw_type(self):
+        reason = self._refusal(additional_gb=153)
+        self.assertIn("int", reason)
+        self.assertIn("float", reason)
+
+    def test_a_missing_additional_gb_is_refused_not_defaulted(self):
+        """The old code fell back to a literal 153.3, so deleting the field looked like health."""
+        reason = self._refusal(additional_gb=_MISSING)
+        self.assertIn("missing", reason)
+        self.assertIn("default", reason)
+
+    def test_each_component_term_is_checked_too(self):
+        """`additional` alone is not the model: the terms it is built from survive as well."""
+        for key, bad in (("new_block_gb", 0.0), ("temp_checkpoint_artifacts_gb", 0.0),
+                         ("growth_during_build_gb", 0.0), ("build_days_assumed", 0.0),
+                         ("s", 30), ("formula", "projected_free_after = free_now")):
+            with self.subTest(key):
+                self.assertIn(key, self._refusal(**{key: bad}))
+        for key in ("new_block_gb", "temp_checkpoint_artifacts_gb", "growth_during_build_gb",
+                    "build_days_assumed", "s", "formula"):
+            with self.subTest(missing=key):
+                self.assertIn("missing", self._refusal(**{key: _MISSING}))
+
+    def test_gate_ok_cannot_become_true_at_the_measured_free_space(self):
+        """The whole point. Every edit that made `gate_ok` True is refused, and the one path
+        that could still write it -- an evidence record with a lowered threshold -- is refused
+        by `_check_thresholds` rather than believed."""
+        for fields in ({"additional_gb": 0.0}, {"additional_gb": 0}, {"additional_gb": -153.3},
+                       {"new_block_gb": 0.0}, {"growth_during_build_gb": 0.0},
+                       {"temp_checkpoint_artifacts_gb": 0.0}, {"additional_gb": _MISSING}):
+            with self.subTest(**{k: repr(v) for k, v in fields.items()}):
+                with self.assertRaises(ArtifactError):
+                    ev.supersede_s6(self._with(**fields), self.evidence)
+
+        for key, bad in (("hard_reserve_gib", 100), ("minimum_free_gib", 200.0)):
+            doctored = json.loads(json.dumps(self.evidence))
+            doctored["capacity"][key] = bad
+            with self.subTest(threshold=key):
+                with self.assertRaises(ArtifactError) as caught:
+                    ev.supersede_s6(self.s6, doctored)
+                self.assertIn(key, str(caught.exception))
+
+        gate = ev.supersede_s6(self.s6, self.evidence)["capacity_gate"]
+        self.assertIs(gate["gate_ok"], False, "295.7 GiB is below the 403.3 GiB minimum")
+
+    def test_a_threshold_that_drifts_from_the_model_is_refused(self):
+        """The reserve and the minimum are two statements of one fact: `projected >= reserve`
+        and `free_now >= minimum` must agree. Desynchronise them -- the way hardcoding the
+        minimum back to a literal would -- and no artifact is written."""
+        original = ev.MINIMUM_FREE_GIB
+        doctored = json.loads(json.dumps(self.evidence))
+        doctored["capacity"]["minimum_free_gib"] = 200.0
+        try:
+            ev.MINIMUM_FREE_GIB = 200.0
+            with self.assertRaises(ArtifactError) as caught:
+                ev.supersede_s6(self.s6, doctored)
+            self.assertIn("contradicts", str(caught.exception))
+        finally:
+            ev.MINIMUM_FREE_GIB = original
+
+    def test_the_committed_artifact_carries_the_canonical_model(self):
+        gate = self.s6["capacity_gate"]
+        for key, want in ev.capacity_model().items():
+            with self.subTest(key):
+                self.assertEqual(gate[key], want)
+        self.assertEqual(self.evidence["capacity"]["model"], ev.capacity_model())
+        self.assertEqual(rm.CAPACITY["additional_gib"], ev.capacity_model()["additional_gb"])
+
+
+class TestTheRenderedReportIsBoundToTheEvidenceRun(unittest.TestCase):
+    """Both renderers state a run's outcome with figures from the evidence and a status from
+    `S8_EXECUTION`. Nothing tied the two together, so regenerating from a NEW run while the
+    declaration still named the old one produced one coherent-looking table built from two."""
+
+    def setUp(self):
+        self.evidence = ev.derive(RUN)
+
+    def _evidence_for_run(self, run_id):
+        other = json.loads(json.dumps(self.evidence))
+        other["provenance"]["run_id"] = run_id
+        return other
+
+    def test_valid_control_the_matching_run_renders(self):
+        self.assertEqual(ev.execution_bound_to(self.evidence)["legacy_baseline"]["run_id"],
+                         RUN_ID)
+        for render in (ev.render_blockers, ev.render_approvals):
+            with self.subTest(render.__name__):
+                self.assertIn(RUN_ID, render(self.evidence))
+
+    def test_a_later_run_against_the_old_declaration_is_refused(self):
+        newer = self._evidence_for_run("20260901T090000Z")
+        for render in (ev.render_blockers, ev.render_approvals, ev.execution_bound_to):
+            with self.subTest(render.__name__):
+                with self.assertRaises(ArtifactError) as caught:
+                    render(newer)
+                reason = str(caught.exception)
+                self.assertIn(RUN_ID, reason)
+                self.assertIn("20260901T090000Z", reason)
+
+    def test_a_declaration_with_no_run_id_is_refused(self):
+        original = dict(rm.S8_EXECUTION["legacy_baseline"])
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {k: v for k, v in original.items()
+                                                  if k != "run_id"}
+            with self.assertRaises(ArtifactError):
+                ev.execution_bound_to(self.evidence)
+        finally:
+            rm.S8_EXECUTION["legacy_baseline"] = original
+
+    def test_an_uncompleted_declaration_is_not_bound_to_a_run(self):
+        """A profile that has not run has no run to agree with; only COMPLETED is checked."""
+        original = dict(rm.S8_EXECUTION["legacy_baseline"])
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original, "status": "NOT_STARTED"}
+            ev.execution_bound_to(self._evidence_for_run("20260901T090000Z"))
+        finally:
+            rm.S8_EXECUTION["legacy_baseline"] = original
 
 
 class TestNoP5DocumentQuotesASupersededFigureAsCurrent(unittest.TestCase):

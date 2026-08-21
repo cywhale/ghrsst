@@ -20,6 +20,15 @@
     "hard_reserve_gib": 250,
     "inodes_free": 231074856,
     "minimum_free_gib": 403.3,
+    "model": {
+      "additional_gb": 153.3,
+      "build_days_assumed": 2.0,
+      "formula": "projected_free_after = free_now - (new_block + temp + growth)",
+      "growth_during_build_gb": 5.5,
+      "new_block_gb": 145.8,
+      "s": 90,
+      "temp_checkpoint_artifacts_gb": 2.0
+    },
     "recommended_free_gib": 600.0,
     "shortfall_gib": 107.6,
     "verdict": "BLOCKED"
