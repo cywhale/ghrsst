@@ -101,6 +101,43 @@ class TestIsolationIsRefusedNotAdvised(_ProvisionBase):
         with self.assertRaises(pv.ProvisionRefused):
             self.provision()
 
+    def test_an_existing_EMPTY_stage_root_is_refused_too(self):
+        """The dangerous half, and the one that was allowed.
+
+        Only a NON-empty directory was refused, so an empty one was adopted -- and `rollback()`
+        removes the whole root. That handed rollback the authority to delete a directory this
+        run did not create, on the strength of it having been empty at the time. Empty is a
+        statement about contents; ownership is a different statement."""
+        os.makedirs(self.stage_root, exist_ok=True)
+        with self.assertRaises(pv.ProvisionRefused) as caught:
+            self.provision()
+        self.assertIn("existing", str(caught.exception).lower())
+        self.assertTrue(os.path.isdir(self.stage_root),
+                        "the pre-existing directory was disturbed by a refused provision")
+
+    def test_the_refusal_does_not_depend_on_the_directory_being_empty(self):
+        """Both spellings refuse, and for the same stated reason."""
+        os.makedirs(self.stage_root, exist_ok=True)
+        with self.assertRaises(pv.ProvisionRefused) as empty:
+            self.provision()
+        shutil.rmtree(self.stage_root)
+        os.makedirs(self.stage_root, exist_ok=True)
+        with open(os.path.join(self.stage_root, "f"), "w") as fh:
+            fh.write("x")
+        with self.assertRaises(pv.ProvisionRefused) as nonempty:
+            self.provision()
+        self.assertEqual(str(empty.exception), str(nonempty.exception))
+
+    def test_a_provisioned_root_records_a_real_lock_acquisition(self):
+        """The provisioner takes the compaction lock in its own root and lets it go, so the
+        readiness `locks` requirement rests on an acquisition rather than an assumption."""
+        out = self.provision()
+        probe = out["locks"]["acquire_probe"]
+        self.assertIs(probe["acquired"], True)
+        self.assertIs(probe["released"], True)
+        status = os.path.join(out["stage_root"], "p5_compaction.lock.status")
+        self.assertFalse(os.path.exists(status))
+
 
 class TestWhatIsProvisioned(_ProvisionBase):
 

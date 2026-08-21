@@ -41,14 +41,25 @@ from store import repair_wal as rw  # noqa: E402
 ANCHOR = "2026-06-27"
 S = 90
 NY = NX = 16
+_APPROVED = rd.REVIEWED_DEPLOY_SHAS[0]
 
 
-def _fresh_capacity(free_gib=1263.8, run_id="20260821T000000Z"):
+def _now_iso():
+    """A just-taken timestamp. The fixture stands for a collection that happened now, because a
+    capacity reading is only believable inside its freshness window."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+FIXTURE_RUN = "FIXTURE_RUN"
+
+
+def _fresh_capacity(free_gib=1263.8, run_id=FIXTURE_RUN, measured_utc=None):
     """A capacity reading shaped like the generated evidence, not a constant in this file."""
     return {
         "label": "VM24_PRODUCTION_READ_ONLY",
         "run_id": run_id,
-        "measured_utc": "2026-08-21T00:00:00.000000+00:00",
+        "measured_utc": measured_utc or _now_iso(),
         "free_now_gib": free_gib,
         "minimum_free_gib": 403.3,
         "recommended_free_gib": 600.0,
@@ -60,6 +71,7 @@ class _TargetBase(unittest.TestCase):
     """A real, isolated P5 root: block, manifest, WAL, anchor on a separate root."""
 
     def setUp(self):
+        self.collected_utc = _now_iso()
         self.tmp = tempfile.mkdtemp(prefix="p5-readiness-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.root = os.path.join(self.tmp, "data")
@@ -109,12 +121,17 @@ class _TargetBase(unittest.TestCase):
             "manifest_root": self.manifest_root,
             "wal_root": self.wal_root,
             "anchor_root": self.anchor_root,
-            "identity": {"reviewed_sha": "a" * 40, "head_sha": "a" * 40,
+            # An APPROVED sha with the fingerprints the assessor recomputes for it, so the
+            # well-formed fixture is one that genuinely satisfies the identity gate.
+            "identity": {"reviewed_sha": _APPROVED, "head_sha": _APPROVED,
                          "worktree_clean": True,
-                         "modules": {"store/block_manifest.py": "0" * 64}},
-            "capacity": _fresh_capacity(),
+                         "modules": rd.expected_module_digests(_APPROVED)},
+            "run_id": FIXTURE_RUN,
+            "collected_utc": self.collected_utc,
+            "capacity": _fresh_capacity(measured_utc=self.collected_utc),
             "locks": {"compaction": os.path.join(self.root, "p5_compaction.lock"),
-                      "ingest": os.path.join(self.root, "ingest.lock")},
+                      "ingest": os.path.join(self.root, "ingest.lock"),
+                      "acquire_probe": {"acquired": True, "released": True}},
             "api_parity": {"checked": True, "route": "segmented", "mismatches": 0,
                            "samples": 32},
         }
@@ -309,8 +326,9 @@ class TestTheStoreRequirementsInspectTheTarget(_TargetBase):
         """The filter must not swallow the thing it is filtering around."""
         verdict, reason = rd._check_wal_anchor(self.target())
         self.assertEqual(verdict, rd.READY, reason)
-        self.assertEqual(rd._real_days({"", "2026-06-27"}), {"2026-06-27"})
-        self.assertEqual(rd._real_days({""}), set())
+        state = rw.read_wal(self.wal_root, anchor_root=self.anchor_root)
+        self.assertEqual(rd._real_days({"", "2026-06-27"}, state), {"2026-06-27"})
+        self.assertEqual(rd._real_days({""}, state), set())
 
     def test_the_checkers_use_the_shipped_modules_rather_than_a_second_truth(self):
         """A readiness module that re-implements manifest validation would pass a manifest the
@@ -483,3 +501,259 @@ class TestTheCommittedRunAndItsDocument(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIdentityIsBoundToAnApprovedShaNotAClaimedOne(_TargetBase):
+    """`reviewed_sha == head_sha` compares the target against itself.
+
+    Both fields come from the same collected JSON, so anything that can write that file can
+    declare its own commit reviewed. The approved set has to live where review governs it --
+    in this module, changed only by a reviewed change -- and the module fingerprints have to be
+    recomputed by the assessor from the approved commit, not accepted as reported."""
+
+    def test_a_sha_outside_the_approved_set_is_blocked(self):
+        ident = {"reviewed_sha": "c" * 40, "head_sha": "c" * 40,
+                 "worktree_clean": True, "modules": {}}
+        by_id = {r["id"]: r for r in rd.assess(self.target(identity=ident))["requirements"]}
+        self.assertEqual(by_id["identity"]["verdict"], rd.BLOCKED)
+        self.assertIn("approved", by_id["identity"]["reason"].lower())
+
+    def test_the_approved_set_is_declared_in_the_module_not_the_target(self):
+        self.assertTrue(rd.REVIEWED_DEPLOY_SHAS)
+        for sha in rd.REVIEWED_DEPLOY_SHAS:
+            with self.subTest(sha):
+                self.assertEqual(len(sha), 40)
+
+    def test_reported_module_hashes_are_recomputed_from_the_approved_commit(self):
+        """A target reporting the right SHA and wrong bytes must not pass."""
+        approved = rd.REVIEWED_DEPLOY_SHAS[0]
+        expected = rd.expected_module_digests(approved)
+        self.assertTrue(expected, "no digests could be recomputed; the check would be vacuous")
+        tampered = {k: "0" * 64 for k in expected}
+        ident = {"reviewed_sha": approved, "head_sha": approved,
+                 "worktree_clean": True, "modules": tampered}
+        by_id = {r["id"]: r for r in rd.assess(self.target(identity=ident))["requirements"]}
+        self.assertEqual(by_id["identity"]["verdict"], rd.BLOCKED)
+        self.assertIn("fingerprint", by_id["identity"]["reason"].lower())
+
+    def test_a_faithful_inventory_at_the_approved_sha_is_ready(self):
+        approved = rd.REVIEWED_DEPLOY_SHAS[0]
+        ident = {"reviewed_sha": approved, "head_sha": approved,
+                 "worktree_clean": True, "modules": rd.expected_module_digests(approved)}
+        by_id = {r["id"]: r for r in rd.assess(self.target(identity=ident))["requirements"]}
+        self.assertEqual(by_id["identity"]["verdict"], rd.READY, by_id["identity"]["reason"])
+
+    def test_a_missing_module_is_blocked_not_skipped(self):
+        approved = rd.REVIEWED_DEPLOY_SHAS[0]
+        expected = dict(rd.expected_module_digests(approved))
+        expected.pop(sorted(expected)[0])
+        ident = {"reviewed_sha": approved, "head_sha": approved,
+                 "worktree_clean": True, "modules": expected}
+        by_id = {r["id"]: r for r in rd.assess(self.target(identity=ident))["requirements"]}
+        self.assertEqual(by_id["identity"]["verdict"], rd.BLOCKED)
+
+
+class TestCapacityEvidenceMustBeFreshAndBound(_TargetBase):
+    """A free-space reading is true of a moment. Carrying one across a schedule tick, a restart
+    or an overnight pause is the same error as quoting a superseded figure -- it just takes
+    longer to become wrong."""
+
+    NOW = "2026-08-21T13:10:00Z"
+
+    def _cap(self, **over):
+        cap = _fresh_capacity()
+        cap.update(measured_utc="2026-08-21T13:04:22Z", run_id="R1")
+        cap.update(over)
+        return cap
+
+    def _assess(self, *, now=NOW, **over):
+        t = self.target(run_id="R1", collected_utc="2026-08-21T13:04:22Z", **over)
+        return {r["id"]: r for r in rd.assess(t, now=now)["requirements"]}
+
+    def test_a_fresh_bound_reading_is_ready(self):
+        by_id = self._assess(capacity=self._cap())
+        self.assertEqual(by_id["capacity"]["verdict"], rd.READY, by_id["capacity"]["reason"])
+
+    def test_a_reading_older_than_the_window_is_not_adjudicated(self):
+        by_id = self._assess(capacity=self._cap(), now="2026-08-22T09:00:00Z")
+        self.assertEqual(by_id["capacity"]["verdict"], rd.NOT_ADJUDICATED)
+        self.assertIn("expired", by_id["capacity"]["reason"].lower())
+
+    def test_a_reading_from_a_different_run_is_not_adjudicated(self):
+        by_id = self._assess(capacity=self._cap(run_id="SOME_OTHER_RUN"))
+        self.assertEqual(by_id["capacity"]["verdict"], rd.NOT_ADJUDICATED)
+        self.assertIn("run", by_id["capacity"]["reason"].lower())
+
+    def test_a_reading_taken_far_from_the_collection_is_not_adjudicated(self):
+        """Chosen to be FRESH but distant: 12:00Z is 70 minutes before `now`, inside the 2h
+        expiry window, and 64 minutes from the 13:04Z collection, outside the skew window. An
+        older timestamp would expire first and the skew check would never run -- which is
+        exactly how deleting it survived a mutation round."""
+        by_id = self._assess(capacity=self._cap(measured_utc="2026-08-21T12:00:00Z"))
+        self.assertEqual(by_id["capacity"]["verdict"], rd.NOT_ADJUDICATED)
+        reason = by_id["capacity"]["reason"]
+        self.assertIn("from the collection that carries it", reason)
+        self.assertNotIn("expired", reason, "the expiry check fired, not the skew check")
+
+    def test_the_report_states_when_the_reading_expires(self):
+        t = self.target(run_id="R1", collected_utc="2026-08-21T13:04:22Z",
+                        capacity=self._cap())
+        report = rd.assess(t, now=self.NOW)
+        self.assertIn("capacity_expires_utc", report)
+        self.assertTrue(report["capacity_expires_utc"])
+        self.assertIn("MAX_CAPACITY_AGE_S", str(rd.MAX_CAPACITY_AGE_S)
+                      and "MAX_CAPACITY_AGE_S")
+
+    def test_the_window_is_short_enough_to_be_meaningful(self):
+        """Long enough for one working session, short enough that a schedule tick invalidates
+        it. A day-long window would let a reading survive every ingest window there is."""
+        self.assertLessEqual(rd.MAX_CAPACITY_AGE_S, 3 * 3600)
+
+
+class TestLocksAreNotAssumedAcquirable(_TargetBase):
+
+    def test_an_absent_compaction_lock_with_no_probe_is_not_adjudicated(self):
+        """`$G/p5_compaction.lock` does not exist on VM24. "The directory exists" is not
+        evidence that a lock can be taken in it.
+
+        The base fixture carries a successful probe, so it is removed here -- otherwise this
+        would be testing the fixture rather than the checker."""
+        locks = {k: v for k, v in self.target()["locks"].items() if k != "acquire_probe"}
+        by_id = {r["id"]: r for r in rd.assess(self.target(locks=locks))["requirements"]}
+        self.assertEqual(by_id["locks"]["verdict"], rd.NOT_ADJUDICATED)
+        self.assertIn("probe", by_id["locks"]["reason"].lower())
+
+    def test_a_recorded_successful_probe_is_ready(self):
+        locks = dict(self.target()["locks"],
+                     acquire_probe={"acquired": True, "released": True,
+                                    "path": os.path.join(self.root, "p5_compaction.lock")})
+        by_id = {r["id"]: r for r in rd.assess(self.target(locks=locks))["requirements"]}
+        self.assertEqual(by_id["locks"]["verdict"], rd.READY, by_id["locks"]["reason"])
+
+    def test_a_failed_probe_is_blocked(self):
+        locks = dict(self.target()["locks"],
+                     acquire_probe={"acquired": False, "released": False,
+                                    "error": "Permission denied"})
+        by_id = {r["id"]: r for r in rd.assess(self.target(locks=locks))["requirements"]}
+        self.assertEqual(by_id["locks"]["verdict"], rd.BLOCKED)
+
+    def test_two_paths_resolving_to_the_same_file_are_blocked(self):
+        """Distinct strings are not distinct locks. A symlink makes them the same file, and two
+        writers holding one lock each are excluded from nothing."""
+        real = os.path.join(self.root, "one.lock")
+        with open(real, "w") as fh:
+            fh.write("")
+        alias = os.path.join(self.root, "alias.lock")
+        os.symlink(real, alias)
+        locks = {"compaction": real, "ingest": alias,
+                 "acquire_probe": {"acquired": True, "released": True}}
+        by_id = {r["id"]: r for r in rd.assess(self.target(locks=locks))["requirements"]}
+        self.assertEqual(by_id["locks"]["verdict"], rd.BLOCKED)
+        self.assertIn("same file", by_id["locks"]["reason"].lower())
+
+    def test_an_unwritable_lock_directory_is_blocked(self):
+        ro = os.path.join(self.tmp, "readonly")
+        os.makedirs(ro, exist_ok=True)
+        os.chmod(ro, 0o500)
+        self.addCleanup(os.chmod, ro, 0o700)
+        locks = {"compaction": os.path.join(ro, "p5_compaction.lock"),
+                 "ingest": os.path.join(self.root, "ingest.lock"),
+                 "acquire_probe": {"acquired": True, "released": True}}
+        by_id = {r["id"]: r for r in rd.assess(self.target(locks=locks))["requirements"]}
+        self.assertEqual(by_id["locks"]["verdict"], rd.BLOCKED)
+
+
+class TestFailureSemanticsMustBeBoundToWhatProvedIt(_TargetBase):
+
+    def test_a_bare_string_claim_is_not_adjudicated(self):
+        """"proven by the local suites" is a sentence, not evidence."""
+        by_id = {r["id"]: r for r in rd.assess(self.target(
+            failure_semantics_proven_by="the local suites"))["requirements"]}
+        self.assertEqual(by_id["failure_semantics"]["verdict"], rd.NOT_ADJUDICATED)
+
+    def test_a_claim_naming_an_unapproved_sha_is_blocked(self):
+        by_id = {r["id"]: r for r in rd.assess(self.target(
+            failure_semantics_proven_by={"suite": "tests.test_x", "deploy_sha": "d" * 40,
+                                         "digest": "e" * 64}))["requirements"]}
+        self.assertEqual(by_id["failure_semantics"]["verdict"], rd.BLOCKED)
+        self.assertIn("approved", by_id["failure_semantics"]["reason"].lower())
+
+    def test_a_claim_bound_to_the_approved_sha_with_a_digest_is_ready(self):
+        by_id = {r["id"]: r for r in rd.assess(self.target(
+            failure_semantics_proven_by={"suite": "tests.test_phase2_p5s8_evidence",
+                                         "deploy_sha": rd.REVIEWED_DEPLOY_SHAS[0],
+                                         "digest": "f" * 64}))["requirements"]}
+        self.assertEqual(by_id["failure_semantics"]["verdict"], rd.READY)
+
+    def test_a_claim_missing_its_digest_is_not_adjudicated(self):
+        by_id = {r["id"]: r for r in rd.assess(self.target(
+            failure_semantics_proven_by={"suite": "s",
+                                         "deploy_sha": rd.REVIEWED_DEPLOY_SHAS[0]}
+        ))["requirements"]}
+        self.assertEqual(by_id["failure_semantics"]["verdict"], rd.NOT_ADJUDICATED)
+
+
+class TestOnlyTheInitializationRecordMayBeIgnored(_TargetBase):
+    """`_real_days` dropped EVERY empty-string day. That is broader than the wart it works
+    around, and "no real day is affected today" is an observation, not a guarantee."""
+
+    def test_the_initialization_record_is_the_only_thing_forgiven(self):
+        state = rw.read_wal(self.wal_root, anchor_root=self.anchor_root)
+        self.assertEqual(rd.ignorable_days(state), {""})
+
+    def test_an_empty_day_from_anything_else_is_not_forgiven(self):
+        """Fabricate a state whose empty day is not attributable to initialization."""
+        class _S:
+            records = ({"record": "repair_committed", "day": "", "repair_id": "x", "seq": 2},)
+        self.assertEqual(rd.ignorable_days(_S()), set())
+
+    def test_a_poisoned_real_day_still_blocks(self):
+        class _S:
+            records = ({"record": "wal_initialized", "day": "", "repair_id": "", "seq": 1},)
+        self.assertEqual(rd.ignorable_days(_S()), {""})
+        self.assertNotIn("2026-06-27", rd.ignorable_days(_S()))
+
+
+class TestTheStoredCollectionDeclaresItsOwnExpiry(unittest.TestCase):
+    """A readiness artifact is true of a moment. The last several rounds were all one defect --
+    a figure outliving its measurement -- so this one states when it stops applying, and the
+    document's timestamp is COMPUTED from the artifact rather than typed beside it."""
+
+    TARGET = os.path.join(_DEV, "bench", "results", "p5_readiness_runs",
+                          "20260821T130320Z", "target_live.json")
+    DOC = os.path.join(_DEV, "specs", "p5_deployment_readiness.md")
+
+    def setUp(self):
+        self.target = rd.load_target(self.TARGET)
+        with open(self.DOC) as fh:
+            self.flat = " ".join(fh.read().split())
+
+    def test_the_document_states_the_computed_expiry(self):
+        expires = rd.capacity_expires_utc(self.target)
+        self.assertTrue(expires)
+        self.assertIn(expires, self.flat,
+                      "the document's expiry is not the one the artifact implies")
+
+    def test_the_document_requires_re_collection_before_acting(self):
+        for phrase in ("Re-collect", "expires", "not evidence that authorizes a compaction"):
+            with self.subTest(phrase):
+                self.assertIn(phrase, self.flat)
+
+    def test_the_stored_reading_cannot_be_lifted_into_another_run(self):
+        """Run binding, exercised on the real collection rather than a fixture."""
+        borrowed = json.loads(json.dumps(self.target))
+        borrowed["run_id"] = "A_LATER_RUN"
+        by_id = {r["id"]: r for r in rd.assess(borrowed)["requirements"]}
+        self.assertEqual(by_id["capacity"]["verdict"], rd.NOT_ADJUDICATED)
+        self.assertIn("different moments", by_id["capacity"]["reason"])
+
+    def test_the_stored_reading_expires_against_a_later_clock(self):
+        by_id = {r["id"]: r for r in rd.assess(self.target,
+                                               now="2026-08-22T09:00:00Z")["requirements"]}
+        self.assertEqual(by_id["capacity"]["verdict"], rd.NOT_ADJUDICATED)
+        self.assertIn("expired", by_id["capacity"]["reason"])
+
+    def test_the_stored_collection_is_not_ready_under_the_current_rules(self):
+        report = rd.assess(self.target, now="2026-08-22T09:00:00Z")
+        self.assertIs(report["compaction_ready"], False)
+        self.assertEqual(report["summary"][rd.READY], [])

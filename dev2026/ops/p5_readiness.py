@@ -59,6 +59,31 @@ NON_QUALIFYING_LABELS = (
 #: deployment, read-only.
 QUALIFYING_LABEL = "VM24_PRODUCTION_READ_ONLY"
 
+#: Commits that have completed review and may be deployed. Declared HERE, where a reviewed
+#: change is needed to alter it -- never taken from the target.
+#:
+#: `reviewed_sha == head_sha` compared the target against itself: both fields come from one
+#: collected JSON, so anything that could write that file could declare its own commit
+#: reviewed. An approved set is only worth anything if the thing being approved cannot edit it.
+REVIEWED_DEPLOY_SHAS = (
+    "3223fba37da5d292ea6acb58ccef0da2b5138d31",
+)
+
+#: Modules whose bytes are fingerprinted and re-verified against the approved commit.
+INVENTORY_MODULES = (
+    "store/block_manifest.py", "store/repair_wal.py", "store/compaction_lock.py",
+    "ingest/build_block.py", "ingest/publish_manifest.py", "api/app.py",
+)
+
+#: How long a free-space reading may be believed. Free space is true of a moment: an ingest
+#: window, a restart or an overnight pause can all move it, and none of them announce
+#: themselves in the artifact. Short enough that a schedule tick invalidates the reading.
+MAX_CAPACITY_AGE_S = 2 * 3600
+
+#: How far a capacity reading may sit from the collection that carries it. They are supposed to
+#: be the same act; a large gap means one of them was reused.
+MAX_CAPACITY_SKEW_S = 300
+
 REQUIREMENTS: List[Dict] = [
     {"id": "identity", "evidence_kind": "preflight",
      "title": "the reviewed commit, checked out clean and detached",
@@ -110,19 +135,56 @@ def _reason(**kw) -> str:
     return "; ".join(f"{k}={v}" for k, v in kw.items())
 
 
+def expected_module_digests(sha: str) -> Dict[str, str]:
+    """sha256 of each inventory module AT `sha`, read from git by the assessor.
+
+    The target reports what it found on the host. This is what the approved commit actually
+    contains. Comparing the two is the only version of the check that a target cannot satisfy
+    by describing itself."""
+    import hashlib
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    prefix = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    out = {}
+    for rel in INVENTORY_MODULES:
+        proc = subprocess.run(["git", "show", f"{sha}:{prefix}/{rel}"], cwd=repo,
+                              capture_output=True)
+        if proc.returncode == 0:
+            out[rel] = hashlib.sha256(proc.stdout).hexdigest()
+    return out
+
+
 def _check_identity(t: Dict) -> tuple:
     ident = t.get("identity") or {}
     reviewed, head = ident.get("reviewed_sha"), ident.get("head_sha")
     if not reviewed or not head:
         return NOT_ADJUDICATED, "no identity preflight was collected from the target"
+    if reviewed not in REVIEWED_DEPLOY_SHAS:
+        return BLOCKED, (f"{reviewed!r} is not in the approved deploy set; a target cannot "
+                         f"declare its own commit reviewed")
     if reviewed != head:
         return BLOCKED, f"HEAD {head!r} is not the reviewed commit {reviewed!r}"
     if ident.get("worktree_clean") is not True:
         return BLOCKED, "the checkout is not clean; the deployed tree is not the reviewed tree"
-    if not ident.get("modules"):
+    reported = ident.get("modules")
+    if not reported:
         return NOT_ADJUDICATED, ("no module inventory was fingerprinted, so a matching SHA "
                                  "proves only what git says, not what is on disk")
-    return READY, f"clean checkout at {head}, {len(ident['modules'])} modules fingerprinted"
+    expected = expected_module_digests(reviewed)
+    if not expected:
+        return NOT_ADJUDICATED, (f"could not recompute the module fingerprints for {reviewed} "
+                                 f"here, so the reported ones cannot be checked against "
+                                 f"anything")
+    missing = sorted(set(expected) - set(reported))
+    if missing:
+        return BLOCKED, (f"the inventory does not cover {missing}; an absent module reads as "
+                         f"clean and is the easiest thing to leave out")
+    wrong = sorted(k for k, v in expected.items() if reported.get(k) != v)
+    if wrong:
+        return BLOCKED, (f"module fingerprint mismatch against {reviewed[:7]}: {wrong}. The "
+                         f"deployed bytes are not the approved bytes")
+    return READY, (f"clean checkout at {head[:7]}, {len(expected)} module fingerprints "
+                   f"recomputed from the approved commit and matched")
 
 
 def _live_manifest(manifest_root: str):
@@ -177,20 +239,31 @@ def _check_blocks(t: Dict) -> tuple:
     return READY, _reason(segments_verified=len(checked), ids=",".join(checked))
 
 
-def _real_days(days) -> set:
-    """Day sets from the WAL, minus the empty placeholder.
+def ignorable_days(state) -> set:
+    """Days poisoned SOLELY by the log's own initialization record.
 
     `repair_wal._replay` classifies any non-INTENT record with no matching intent as a terminal
-    orphan and poisons its `day`. The log's own `wal_initialized` record carries `day == ""`,
-    so EVERY freshly initialized WAL reports `poisoned_days == {""}`. It harms nothing there --
-    no real day is named, and the guard at the prune site is keyed by real day -- but a
-    health check reading "poisoned_days is non-empty" as unhealthy calls every correct WAL
-    broken. Reported upstream rather than fixed here: changing the replay would change
-    signed-off P5-S5 WAL semantics, which is not this phase's call to make.
+    orphan and poisons its `day`. The log's own `wal_initialized` record carries `day == ""`, so
+    every freshly initialized WAL reports `poisoned_days == {""}` while being entirely healthy.
 
-    `test_the_initialization_record_poisons_the_empty_day` pins the behaviour, so if the
-    replay is ever corrected this filter is flagged as no longer needed."""
-    return {d for d in days if d}
+    The first version of this dropped every empty-string day, which is broader than the wart it
+    works around: "no real day is empty today" is an observation about current data, not a
+    property of the format, and a filter justified by an observation outlives it. So the days
+    forgiven are computed from the records -- a day is ignorable only if every record carrying
+    it is a `wal_initialized`.
+
+    Reported upstream rather than fixed at the source: correcting the replay changes signed-off
+    P5-S5 WAL semantics, which is not this phase's call to make."""
+    from collections import defaultdict
+    kinds = defaultdict(set)
+    for rec in getattr(state, "records", ()) or ():
+        kinds[rec.get("day")].add(rec.get("record"))
+    return {day for day, seen in kinds.items() if seen == {"wal_initialized"}}
+
+
+def _real_days(days, state) -> set:
+    """The poisoned/blocked days that actually name something, given this log's records."""
+    return set(days) - ignorable_days(state)
 
 
 def _check_wal_anchor(t: Dict) -> tuple:
@@ -219,10 +292,10 @@ def _check_wal_anchor(t: Dict) -> tuple:
         return BLOCKED, ("the WAL has never been initialized: no wal_initialized record binds "
                          "it to a manifest authority")
     bound = state.authority.get("authority") or state.authority
-    blocked = _real_days(state.blocked_days)
+    blocked = _real_days(state.blocked_days, state)
     if blocked:
         return BLOCKED, f"{len(blocked)} day(s) have an OPEN repair intent: {sorted(blocked)}"
-    poisoned = _real_days(state.poisoned_days)
+    poisoned = _real_days(state.poisoned_days, state)
     if poisoned:
         return BLOCKED, (f"{len(poisoned)} day(s) carry untrustworthy repair evidence: "
                          f"{sorted(poisoned)}")
@@ -241,28 +314,91 @@ def _check_locks(t: Dict) -> tuple:
     missing = [k for k in ("compaction", "ingest") if not locks.get(k)]
     if missing:
         return BLOCKED, f"no canonical path declared for lock(s): {missing}"
-    same = os.path.abspath(locks["compaction"]) == os.path.abspath(locks["ingest"])
-    if same:
-        return BLOCKED, ("the compaction and ingest locks are the same path; one lock cannot "
-                         "express the ordering between two writers")
-    # Existence is NOT required: the lock files are created on acquisition. What must be true is
-    # that both paths are declared, distinct, and their directories are writable by the operator
-    # -- a lock that cannot be created is a lock that is never held.
+    # Distinct STRINGS are not distinct locks. A symlink or a bind mount makes two paths one
+    # file, and two writers each holding "their" lock are excluded from nothing.
+    if os.path.realpath(locks["compaction"]) == os.path.realpath(locks["ingest"]):
+        return BLOCKED, ("the compaction and ingest lock paths resolve to the same file; one "
+                         "lock cannot express the ordering between two writers")
     for kind in ("compaction", "ingest"):
         parent = os.path.dirname(os.path.abspath(locks[kind])) or "."
         if not os.path.isdir(parent):
             return BLOCKED, f"the {kind} lock directory does not exist: {parent}"
+        if not os.access(parent, os.W_OK | os.X_OK):
+            return BLOCKED, (f"the {kind} lock directory is not writable: {parent}. A lock "
+                             f"that cannot be created is a lock that is never held")
+    # "The directory exists" is not evidence that a lock can be taken in it, and
+    # `p5_compaction.lock` does not exist on the target at all. Only a controlled acquisition
+    # says whether the fencing this whole posture rests on actually works.
+    probe = locks.get("acquire_probe")
+    if not probe:
+        return NOT_ADJUDICATED, (f"no lock acquisition probe was recorded. The paths are "
+                                 f"declared and distinct, but nothing has taken "
+                                 f"{locks['compaction']!r} and released it, so acquirability "
+                                 f"is assumed rather than shown")
+    if probe.get("acquired") is not True or probe.get("released") is not True:
+        return BLOCKED, (f"the lock acquisition probe did not complete: {probe}. A lock that "
+                         f"cannot be taken, or cannot be let go, fences nothing")
     return READY, _reason(compaction=locks["compaction"], ingest=locks["ingest"],
+                          probe="acquired and released",
                           order="compaction acquired before ingest")
 
 
-def _check_capacity(t: Dict) -> tuple:
+def _parse_utc(text):
+    """An ISO timestamp, or None. `Z` is not a timezone Python parses without help."""
+    from datetime import datetime
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def capacity_expires_utc(t: Dict):
+    """When this target's capacity reading stops being believable."""
+    from datetime import timedelta
+    measured = _parse_utc((t.get("capacity") or {}).get("measured_utc"))
+    if measured is None:
+        return None
+    return (measured + timedelta(seconds=MAX_CAPACITY_AGE_S)).isoformat()
+
+
+def _check_capacity(t: Dict, now=None) -> tuple:
     cap = t.get("capacity") or {}
     if not cap:
         return NOT_ADJUDICATED, "no capacity evidence was supplied"
     if not cap.get("run_id") or not cap.get("measured_utc"):
         return NOT_ADJUDICATED, ("the capacity figure carries no run_id/measured_utc, so it is "
                                  "a number in a file rather than a measurement")
+    # Bound to the collection that carries it. A reading from another run, or taken hours from
+    # the rest of the preflight, is a different moment wearing this one's label.
+    target_run = t.get("run_id")
+    if target_run and cap["run_id"] != target_run:
+        return NOT_ADJUDICATED, (f"the capacity reading is from run {cap['run_id']!r} while the "
+                                 f"collection is run {target_run!r}: different moments")
+    measured = _parse_utc(cap["measured_utc"])
+    if measured is None:
+        return NOT_ADJUDICATED, f"measured_utc {cap['measured_utc']!r} is not a timestamp"
+    collected = _parse_utc(t.get("collected_utc"))
+    if collected is not None:
+        skew = abs((measured - collected).total_seconds())
+        if skew > MAX_CAPACITY_SKEW_S:
+            return NOT_ADJUDICATED, (f"the capacity reading sits {int(skew)}s from the "
+                                     f"collection that carries it; they are meant to be one "
+                                     f"act, so one of them was reused")
+    # Free space is true of a moment. An ingest window, a restart or an overnight pause moves
+    # it, and none of them announce themselves in the artifact.
+    if now is None:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+    elif isinstance(now, str):
+        now = _parse_utc(now)
+    age = (now - measured).total_seconds()
+    if age > MAX_CAPACITY_AGE_S:
+        return NOT_ADJUDICATED, (f"the capacity reading has expired: measured "
+                                 f"{cap['measured_utc']}, {int(age)}s ago, against a "
+                                 f"{MAX_CAPACITY_AGE_S}s window. Re-collect before relying "
+                                 f"on it")
     free, minimum = cap.get("free_now_gib"), cap.get("minimum_free_gib")
     if free is None or minimum is None:
         return NOT_ADJUDICATED, "the capacity evidence is missing free_now_gib/minimum_free_gib"
@@ -279,7 +415,20 @@ def _check_failure_semantics(t: Dict) -> tuple:
     if not proven:
         return NOT_ADJUDICATED, ("no suite was named as proving the refusal, rollback and "
                                  "partial-staging behaviour for this target")
-    return READY, f"proven by {proven}"
+    # A sentence is not evidence. Naming a suite says nothing about WHICH code it ran against
+    # or whether that run happened, so the claim has to carry the commit and a digest of the
+    # run that produced it.
+    if not isinstance(proven, dict):
+        return NOT_ADJUDICATED, (f"the claim {proven!r} is a sentence, not a bound result: it "
+                                 f"names no commit and no run digest")
+    sha, digest = proven.get("deploy_sha"), proven.get("digest")
+    if not sha or not digest:
+        return NOT_ADJUDICATED, (f"the claim is missing {'deploy_sha' if not sha else 'digest'}"
+                                 f"; without both it cannot be tied to a run of known code")
+    if sha not in REVIEWED_DEPLOY_SHAS:
+        return BLOCKED, (f"the behaviour was proven against {sha[:7]}, which is not in the "
+                         f"approved deploy set")
+    return READY, _reason(suite=proven.get("suite", "?"), deploy_sha=sha[:7], digest=digest[:12])
 
 
 #: Requirements whose verdict comes from stat-ing paths. They mean nothing off the host that
@@ -318,8 +467,10 @@ CHECKERS = {
 }
 
 
-def assess(target: Dict) -> Dict:
-    """Adjudicate one deployment target and return a machine-readable report."""
+def assess(target: Dict, now=None) -> Dict:
+    """Adjudicate one deployment target and return a machine-readable report.
+
+    `now` is injectable so freshness is testable, and defaults to the wall clock."""
     label = target.get("label") or "UNLABELLED"
     disqualified = label in NON_QUALIFYING_LABELS or label != QUALIFYING_LABEL
     on_host, host_reason = _on_host(target)
@@ -331,6 +482,8 @@ def assess(target: Dict) -> Dict:
             verdict, reason = NEEDS_APPROVAL, APPROVAL_REQUIRED[rid]
         elif rid in FILESYSTEM_BACKED and not on_host:
             verdict, reason = NOT_ADJUDICATED, host_reason
+        elif rid == "capacity":
+            verdict, reason = _check_capacity(target, now=now)
         else:
             verdict, reason = CHECKERS[rid](target)
         if verdict == READY and disqualified:
@@ -357,6 +510,12 @@ def assess(target: Dict) -> Dict:
         "requirements": results,
         "summary": summary,
         "compaction_ready": ready,
+        #: Stated, not implied: this report describes one collection. Past this timestamp the
+        #: capacity reading it rests on must be taken again -- a schedule tick, a restart or an
+        #: overnight pause all move free space without announcing it here.
+        "capacity_expires_utc": capacity_expires_utc(target),
+        "max_capacity_age_s": MAX_CAPACITY_AGE_S,
+        "re_collect_before_acting": True,
         "before_first_compaction": outstanding,
         "next_safe_step": _next_step(summary),
     }

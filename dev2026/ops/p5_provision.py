@@ -40,7 +40,7 @@ import shutil
 from typing import Dict, Optional, Sequence
 
 from ingest.build_block import build_block
-from store import block_manifest, repair_wal
+from store import block_manifest, compaction_lock, repair_wal
 
 #: Written into a provisioned root, and the only thing `rollback()` will delete a root for.
 MARKER_NAME = ".p5_provision.json"
@@ -85,10 +85,14 @@ def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: st
     already exists — provisioning into a directory holding someone else's files makes rollback
     a guess about which of them were ours."""
     _refuse_if_not_isolated(stage_root, live_root)
-    if os.path.exists(stage_root) and os.listdir(stage_root):
+    # ANY existing path, empty or not. An empty directory someone else made is still theirs,
+    # and `rollback()` removes the whole root -- so accepting an existing empty directory hands
+    # rollback the authority to delete something this run did not create. "It was empty" is not
+    # a claim about ownership.
+    if os.path.exists(stage_root):
         raise ProvisionRefused(
-            f"refusing to provision into the non-empty {stage_root!r}: rollback could not then "
-            f"tell what this run created from what was already there")
+            f"refusing to provision into the existing {stage_root!r}: rollback removes the "
+            f"whole root, so it must create it and own it. Empty is not the same as ours")
 
     manifest_root = os.path.join(stage_root, "p5_blocks")
     wal_root = os.path.join(stage_root, "p5_repairs")
@@ -96,6 +100,9 @@ def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: st
     # and a witness stored in the domain it witnesses is lost with it.
     anchor_root = os.path.join(stage_root, "p5_anchor")
     artifacts = os.path.join(stage_root, "artifacts")
+    # `makedirs` without exist_ok on the root: if it appeared between the check above and
+    # here, this refuses rather than adopting it.
+    os.makedirs(stage_root)
     for d in (manifest_root, wal_root, anchor_root, artifacts):
         os.makedirs(d, exist_ok=True)
 
@@ -136,13 +143,26 @@ def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: st
     repair_wal.initialize_wal(wal_root, manifest_root=manifest_root, at_utc=at_utc,
                               operator=operator, anchor_root=anchor_root)
 
+    # Take the compaction lock and let it go, in this root only. "The directory exists" is not
+    # evidence that a lock can be acquired there, and the fencing the whole compaction posture
+    # rests on is worth one real acquisition rather than an assumption. Isolated and instant:
+    # the lock lives under the staging root and is released before this returns.
+    probe = {"path": os.path.join(stage_root, "p5_compaction.lock")}
+    try:
+        with compaction_lock.CompactionLock(probe["path"], holder=f"p5_provision/{operator}"):
+            probe["acquired"] = True
+        probe["released"] = True
+    except Exception as exc:                                  # noqa: BLE001
+        probe.update(acquired=False, released=False, error=repr(exc))
+
     result = {
         "label": STAGING_LABEL,
         "stage_root": stage_root, "live_root": live_root,
         "manifest_root": manifest_root, "wal_root": wal_root, "anchor_root": anchor_root,
         "artifacts": artifacts, "block_path": block_path,
-        "locks": {"compaction": os.path.join(stage_root, "p5_compaction.lock"),
-                  "ingest": os.path.join(stage_root, "ingest.lock")},
+        "locks": {"compaction": probe["path"],
+                  "ingest": os.path.join(stage_root, "ingest.lock"),
+                  "acquire_probe": probe},
         "provisioned_utc": at_utc, "operator": operator,
         "days": list(days), "start_day": start_day, "end_day": end_day,
         "marker": f"{STAGING_LABEL}:{at_utc}:{operator}",
