@@ -90,7 +90,7 @@ ROADMAP_EXCEPTION = {
 
 # --------------------------------------------------------------------------- capacity
 #: From the VM24 read-only measurement (2026-08-19), `bench/results/p5s6_vm24_readonly.json`.
-def _measured_capacity():
+def _measured_capacity(results_dir=None):
     """Read the capacity evidence GENERATED from the collected VM24 run.
 
     These figures were hardcoded, and the 2026-08-20 run's numbers reached a report as prose
@@ -98,8 +98,10 @@ def _measured_capacity():
     evidence. Loaded from `bench/results/p5s8_vm24_readonly.json`, which
     `ops/p5s8_evidence.py` derives from the run artifacts and never by hand."""
     import json
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(here, "bench", "results", "p5s8_vm24_readonly.json")
+    if results_dir is None:
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        results_dir = os.path.join(here, "bench", "results")
+    path = os.path.join(results_dir, "p5s8_vm24_readonly.json")
     with open(path) as fh:
         ev = json.load(fh)
     cap, prov = ev["capacity"], ev["provenance"]
@@ -143,39 +145,68 @@ CAPACITY = _measured_capacity()
 #: without changing a single byte of free space.
 HARD_RESERVE_IS_FIXED = True
 
-CAPACITY_OPTIONS = [
-    {
-        "option": "A", "name": "Expand the data volume", "preferred": True,
-        "requirement_gib": CAPACITY["minimum_free_gib"],
-        "recommended_gib": CAPACITY["recommended_free_gib"],
-        "proof_obligations": [
-            "df on the expanded volume shows free_now >= 403.3 GiB (600 GiB recommended)",
-            "the expansion is on the SAME filesystem that holds $G, so publication stays a "
-            "same-filesystem os.replace",
-        ],
-        "why_preferred": ("nothing about the storage topology changes, so every path semantic "
-                          "the manifest authority relies on is already proven."),
-    },
-    {
-        "option": "B", "name": "External staging / compaction volume", "preferred": False,
-        "proof_obligations": [
-            "required free space on the staging volume, measured not assumed",
-            "mount persistence across reboot (fstab/systemd unit) and the correct filesystem "
-            "type; flock is unreliable on NFS (S16-Q15)",
-            "atomic publication semantics: os.replace is atomic only WITHIN a filesystem, so a "
-            "cross-device rename is not a commit point and must not be treated as one",
-            "rollback and backup coverage for the staging volume, including whether a whole-VM "
-            "snapshot covers it -- the WAL anchor domain question in another form",
-            "no unsafe cross-filesystem rename assumptions anywhere in the build or publish "
-            "path",
-            "the FINAL block location remains under the manifest root, so segment paths still "
-            "resolve inside it and the containment guard still holds",
-        ],
-        "why_not_preferred": ("it introduces a second filesystem into a design whose commit "
-                              "point is a same-filesystem rename. Every obligation above is a "
-                              "way that assumption can silently fail."),
-    },
-]
+def _capacity_options(cap):
+    """The two unlock options, for a GIVEN capacity reading.
+
+    A function, not a literal, because option A's targets are quoted FROM the reading. As a
+    module-level literal it was computed once at import, so regenerating the evidence in the
+    same process left it describing the previous measurement."""
+    return [
+        {
+            "option": "A", "name": "Expand the data volume", "preferred": True,
+            "requirement_gib": cap["minimum_free_gib"],
+            "recommended_gib": cap["recommended_free_gib"],
+            "proof_obligations": [
+                "df on the expanded volume shows free_now >= 403.3 GiB (600 GiB recommended)",
+                "the expansion is on the SAME filesystem that holds $G, so publication stays a "
+                "same-filesystem os.replace",
+            ],
+            "why_preferred": ("nothing about the storage topology changes, so every path semantic "
+                              "the manifest authority relies on is already proven."),
+        },
+        {
+            "option": "B", "name": "External staging / compaction volume", "preferred": False,
+            "proof_obligations": [
+                "required free space on the staging volume, measured not assumed",
+                "mount persistence across reboot (fstab/systemd unit) and the correct filesystem "
+                "type; flock is unreliable on NFS (S16-Q15)",
+                "atomic publication semantics: os.replace is atomic only WITHIN a "
+                "filesystem, so a cross-device rename is not a commit point and must not "
+                "be treated as one",
+                "rollback and backup coverage for the staging volume, including whether a "
+                "whole-VM snapshot covers it -- the WAL anchor domain question in another "
+                "form",
+                "no unsafe cross-filesystem rename assumptions anywhere in the build or publish "
+                "path",
+                "the FINAL block location remains under the manifest root, so segment paths still "
+                "resolve inside it and the containment guard still holds",
+            ],
+            "why_not_preferred": ("it introduces a second filesystem into a design whose commit "
+                                  "point is a same-filesystem rename. Every obligation above is a "
+                                  "way that assumption can silently fail."),
+        },
+    ]
+
+
+CAPACITY_OPTIONS = _capacity_options(CAPACITY)
+
+
+def refresh(results_dir=None) -> Dict:
+    """Re-read the generated evidence and rebuild everything derived from it.
+
+    `CAPACITY` is read once, at import. That is right for a reader, and wrong for the writer:
+    regenerating the evidence and then writing this artifact in the same process published the
+    PREVIOUS measurement, because the constant had been bound before the new file existed. The
+    critical-path artifact was not written by the evidence command at all, so the staleness had
+    nowhere to show up -- both halves of that are fixed, and this is the half that makes a
+    same-process regeneration read what was just written.
+
+    Everything computed FROM `CAPACITY` at import time has to be rebuilt here, not just
+    `CAPACITY` itself; `_capacity_options` exists as a function for that reason."""
+    global CAPACITY, CAPACITY_OPTIONS
+    CAPACITY = _measured_capacity(results_dir)
+    CAPACITY_OPTIONS = _capacity_options(CAPACITY)
+    return CAPACITY
 
 #: The distinction that has to survive into the runbook: space unblocks the BUILD, and nothing
 #: else. Reclaiming the holds is a separate decision with a separate evidence bar.
@@ -439,6 +470,9 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "bench", "results"))
     args = ap.parse_args(argv)
+    # Re-read first, from the SAME directory being written. Called after a regeneration in
+    # the same process, the import-time constant is one measurement out of date.
+    refresh(args.out)
     os.makedirs(args.out, exist_ok=True)
     path = os.path.join(args.out, "p5_critical_path.json")
     with open(path, "w") as fh:

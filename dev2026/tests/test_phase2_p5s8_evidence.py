@@ -11,10 +11,14 @@ state. A number that lives only in a message is not evidence.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -635,6 +639,251 @@ class TestTheRenderedReportIsBoundToTheEvidenceRun(unittest.TestCase):
             ev.execution_bound_to(self._evidence_for_run("20260901T090000Z"))
         finally:
             rm.S8_EXECUTION["legacy_baseline"] = original
+
+
+class TestRegenerationUpdatesEveryDependentOutput(unittest.TestCase):
+    """One command must leave every output describing the SAME measurement.
+
+    It did not. `python -m ops.p5s8_evidence` wrote the S8 evidence, the S6 supersession and the
+    memo; `p5_critical_path.json` was written only by `ops.p5_roadmap`, so a new evidence run
+    updated three outputs and left the fourth quoting the previous one. Asserting the committed
+    295.7 could never have caught that -- every output already said 295.7. So this builds an
+    ALTERNATE run with different free space, runs the real entry point into a temporary
+    checkout, and demands all four move together."""
+
+    #: Above the 403.3 GiB minimum on purpose. A pipeline that only ever sees a blocked reading
+    #: cannot show whether "BLOCKED" is derived or written down -- and it was written down.
+    ALT_RUN_ID = "20260901T090000Z"
+    ALT_FREE_BYTES = 420 * (1024 ** 3)
+    ALT_FREE_GIB = 420.0
+    #: Below the minimum, and different from the committed figure.
+    BLOCKED_RUN_ID = "20260902T090000Z"
+    BLOCKED_FREE_BYTES = int(320.0 * (1024 ** 3))
+    BLOCKED_FREE_GIB = 320.0
+
+    def _checkout(self, run_id, free_bytes):
+        """A temporary repository root holding an alternate run, ready to regenerate into."""
+        root = tempfile.mkdtemp(prefix="p5s8-regen-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        results = os.path.join(root, "bench", "results")
+        os.makedirs(os.path.join(root, "specs"))
+        os.makedirs(results)
+        for name in ("p5s8_vm24_readonly.json", "p5s6_vm24_readonly.json",
+                     "p5_critical_path.json"):
+            shutil.copy(os.path.join(_DEV, "bench", "results", name),
+                        os.path.join(results, name))
+        shutil.copy(MEMO, os.path.join(root, "specs", "p5_critical_path_memo.md"))
+
+        # The run directory is the real collected one with its stamps rewritten, so every
+        # shipped parser still has to accept it -- a hand-built stub would prove nothing.
+        src = os.path.join(_DEV, "bench", "results", "p5s8_runs", RUN)
+        alt = os.path.join(results, "p5s8_runs", f"p5s8_{run_id}")
+        shutil.copytree(src, alt)
+        for name in sorted(os.listdir(alt)):
+            path = os.path.join(alt, name)
+            with open(path) as fh:
+                text = fh.read()
+            text = text.replace(RUN_ID, run_id)
+            if name == "capacity.json":
+                blob = json.loads(text)
+                blob["free_now_bytes"] = free_bytes
+                text = json.dumps(blob, indent=2, sort_keys=True)
+            with open(path, "w") as fh:
+                fh.write(text)
+        return root, f"p5s8_{run_id}"
+
+    def _regenerate(self, run_id, free_bytes):
+        """Run the real entry point against the alternate run, then read back all four outputs.
+
+        `S8_EXECUTION` is repointed at the alternate run because `execution_bound_to` refuses a
+        COMPLETED declaration naming a different run -- that guard working, not a workaround."""
+        root, run = self._checkout(run_id, free_bytes)
+        original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
+        original_capacity = rm.CAPACITY
+        original_options = rm.CAPACITY_OPTIONS
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": run_id}
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = ev.main(["--run", run, "--root", root])
+        finally:
+            rm.S8_EXECUTION["legacy_baseline"] = original_exec
+            rm.CAPACITY = original_capacity
+            rm.CAPACITY_OPTIONS = original_options
+        self.assertEqual(rc, 0)
+        results = os.path.join(root, "bench", "results")
+        return {
+            "root": root,
+            "s8": _load(os.path.join(results, "p5s8_vm24_readonly.json")),
+            "s6": _load(os.path.join(results, "p5s6_vm24_readonly.json")),
+            "roadmap": _load(os.path.join(results, "p5_critical_path.json")),
+            "memo": _read(os.path.join(root, "specs", "p5_critical_path_memo.md")),
+        }
+
+    def test_the_entry_point_writes_every_declared_output(self):
+        out = self._regenerate(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        for rel in ev.REGENERATED_OUTPUTS:
+            with self.subTest(rel):
+                self.assertTrue(os.path.exists(os.path.join(out["root"], rel)))
+        self.assertIn("bench/results/p5_critical_path.json", ev.REGENERATED_OUTPUTS)
+
+    def test_all_four_outputs_carry_the_new_measurement(self):
+        """The regression itself: the roadmap artifact must move with the other three."""
+        out = self._regenerate(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+
+        self.assertEqual(out["s8"]["capacity"]["free_now_gib"], self.ALT_FREE_GIB)
+        self.assertEqual(out["s8"]["provenance"]["run_id"], self.ALT_RUN_ID)
+        self.assertEqual(out["s6"]["capacity_gate"]["free_now_gb"], self.ALT_FREE_GIB)
+        self.assertEqual(out["s6"]["capacity_gate"]["run_id"], self.ALT_RUN_ID)
+
+        roadmap = out["roadmap"]
+        self.assertEqual(roadmap["capacity"]["free_now_gib"], self.ALT_FREE_GIB,
+                         "p5_critical_path.json still quotes the previous measurement")
+        self.assertEqual(roadmap["capacity"]["run_id"], self.ALT_RUN_ID)
+        self.assertIn(str(self.ALT_FREE_GIB), roadmap["g18_current"])
+        self.assertIn(self.ALT_RUN_ID, roadmap["g18_current"])
+
+        flat = " ".join(out["memo"].split())
+        self.assertIn(str(self.ALT_FREE_GIB), flat)
+        self.assertIn(self.ALT_RUN_ID, flat)
+
+        for name, blob in (("s8", out["s8"]), ("roadmap", roadmap)):
+            with self.subTest(stale=name):
+                self.assertNotIn("295.7", json.dumps(blob),
+                                 "the committed measurement survived a regeneration")
+
+    def test_the_verdict_is_derived_and_agrees_across_every_output(self):
+        """420 GiB is above the minimum, so the verdict must flip everywhere at once. A literal
+        verdict written beside a derived figure shows up here and nowhere else."""
+        out = self._regenerate(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        self.assertEqual(out["s8"]["capacity"]["verdict"], "NOT_BLOCKED")
+        self.assertEqual(out["s8"]["gates"]["G18"], "NOT_BLOCKED")
+        self.assertEqual(out["s6"]["capacity_gate"]["verdict"], "NOT_BLOCKED")
+        self.assertIs(out["s6"]["capacity_gate"]["gate_ok"], True)
+        self.assertEqual(out["roadmap"]["capacity"]["verdict"], "NOT_BLOCKED")
+        self.assertTrue(out["roadmap"]["g18_current"].startswith("NOT_BLOCKED"))
+
+        blockers = out["memo"][out["memo"].index(ev.BLOCKERS_START):
+                               out["memo"].index(ev.BLOCKERS_END)]
+        row = next(ln for ln in blockers.split("\n") if "G18 capacity" in ln)
+        self.assertIn("NOT_BLOCKED", row)
+        self.assertNotIn("**BLOCKED**", row, "the verdict is a literal, not the measurement")
+
+    def test_a_different_blocked_reading_also_propagates(self):
+        """Not only the flip: a different figure on the same side of the threshold moves too."""
+        out = self._regenerate(self.BLOCKED_RUN_ID, self.BLOCKED_FREE_BYTES)
+        shortfall = round(403.3 - self.BLOCKED_FREE_GIB, 1)
+        self.assertEqual(out["s8"]["capacity"]["verdict"], "BLOCKED")
+        self.assertEqual(out["s8"]["capacity"]["shortfall_gib"], shortfall)
+        self.assertEqual(out["roadmap"]["capacity"]["free_now_gib"], self.BLOCKED_FREE_GIB)
+        self.assertEqual(out["roadmap"]["capacity"]["shortfall_gib"], shortfall)
+        self.assertIn(str(shortfall), out["roadmap"]["g18_current"])
+        self.assertIn(str(self.BLOCKED_FREE_GIB), " ".join(out["memo"].split()))
+
+    def test_the_threshold_and_reserve_never_move_with_the_reading(self):
+        """Whatever free space says, HARD_RESERVE and the minimum are policy."""
+        for run_id, free_bytes in ((self.ALT_RUN_ID, self.ALT_FREE_BYTES),
+                                   (self.BLOCKED_RUN_ID, self.BLOCKED_FREE_BYTES)):
+            out = self._regenerate(run_id, free_bytes)
+            with self.subTest(run_id):
+                for blob in (out["s8"]["capacity"], out["roadmap"]["capacity"]):
+                    self.assertEqual(blob["hard_reserve_gib"], 250)
+                    self.assertEqual(blob["minimum_free_gib"], 403.3)
+                self.assertEqual(out["s6"]["capacity_gate"]["hard_reserve_gb"], 250)
+
+    def test_the_roadmap_reads_the_file_just_written_not_its_import_time_copy(self):
+        """`refresh()` is the reason the roadmap artifact is not one measurement behind."""
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        results = os.path.join(root, "bench", "results")
+        original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
+        original_capacity, original_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
+            with contextlib.redirect_stdout(io.StringIO()):
+                ev.main(["--run", run, "--root", root])
+            # After the entry point, the module state reflects the run just regenerated.
+            self.assertEqual(rm.CAPACITY["free_now_gib"], self.ALT_FREE_GIB)
+            self.assertEqual(rm.CAPACITY_OPTIONS[0]["requirement_gib"], 403.3)
+            # And refreshing back against the real checkout restores the committed reading,
+            # so the refresh follows the evidence rather than latching.
+            self.assertEqual(
+                rm.refresh(os.path.join(_DEV, "bench", "results"))["free_now_gib"], 295.7)
+        finally:
+            rm.S8_EXECUTION["legacy_baseline"] = original_exec
+            rm.CAPACITY, rm.CAPACITY_OPTIONS = original_capacity, original_options
+        self.assertEqual(_load(os.path.join(results, "p5_critical_path.json"))
+                         ["capacity"]["free_now_gib"], self.ALT_FREE_GIB)
+
+    def test_a_failing_roadmap_writer_stops_the_regeneration(self):
+        """Finishing quietly after the roadmap writer reports failure would leave three outputs
+        updated and the fourth stale -- precisely the shape of defect this entry point exists to
+        prevent, reintroduced at the last step."""
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
+        original_main = rm.main
+        original_capacity, original_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
+            rm.main = lambda argv=None: 3
+            with self.assertRaises(ArtifactError) as caught:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ev.main(["--run", run, "--root", root])
+            self.assertIn("3", str(caught.exception))
+            self.assertIn("inconsistent", str(caught.exception))
+        finally:
+            rm.main = original_main
+            rm.S8_EXECUTION["legacy_baseline"] = original_exec
+            rm.CAPACITY, rm.CAPACITY_OPTIONS = original_capacity, original_options
+
+    def test_a_writer_that_reports_success_without_writing_is_caught(self):
+        """The post-condition, and why it is not redundant with the checks above.
+
+        A writer can return 0 and produce nothing -- a wrong output path, a skipped branch, a
+        stub left in place. Then every consistency check passes on the three files that WERE
+        written, and the fourth is simply absent. `REGENERATED_OUTPUTS` is checked on disk after
+        the fact so the entry point cannot report success over a missing output."""
+        root, run = self._checkout(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        os.remove(os.path.join(root, "bench", "results", "p5_critical_path.json"))
+        original_exec = dict(rm.S8_EXECUTION["legacy_baseline"])
+        original_main = rm.main
+        original_capacity, original_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
+        try:
+            rm.S8_EXECUTION["legacy_baseline"] = {**original_exec, "run_id": self.ALT_RUN_ID}
+            rm.main = lambda argv=None: 0          # succeeds, writes nothing
+            with self.assertRaises(ArtifactError) as caught:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ev.main(["--run", run, "--root", root])
+            self.assertIn("p5_critical_path.json", str(caught.exception))
+            self.assertIn("did not write", str(caught.exception))
+        finally:
+            rm.main = original_main
+            rm.S8_EXECUTION["legacy_baseline"] = original_exec
+            rm.CAPACITY, rm.CAPACITY_OPTIONS = original_capacity, original_options
+
+    def test_refresh_rebuilds_everything_derived_from_the_reading(self):
+        """Checked by identity, deliberately.
+
+        `CAPACITY_OPTIONS` quotes the THRESHOLD, which is policy and does not move with free
+        space. So a by-value assertion passes whether or not it was rebuilt -- refreshing
+        `CAPACITY` alone survived mutation testing for exactly that reason. The invariant is
+        that nothing derived from a reading survives into the next one; the day an option
+        quotes the reading itself, a value check would notice one release too late."""
+        before_capacity, before_options = rm.CAPACITY, rm.CAPACITY_OPTIONS
+        try:
+            rm.refresh(os.path.join(_DEV, "bench", "results"))
+            self.assertIsNot(rm.CAPACITY, before_capacity)
+            self.assertIsNot(rm.CAPACITY_OPTIONS, before_options,
+                             "a structure derived from the reading was not rebuilt")
+            self.assertEqual(rm.CAPACITY_OPTIONS, rm._capacity_options(rm.CAPACITY))
+        finally:
+            rm.CAPACITY, rm.CAPACITY_OPTIONS = before_capacity, before_options
+
+    def test_the_committed_checkout_is_untouched_by_these_regenerations(self):
+        """Every regeneration above targets a temp root; the real artifacts must not move."""
+        before = _load(S8_ARTIFACT)
+        self._regenerate(self.ALT_RUN_ID, self.ALT_FREE_BYTES)
+        self.assertEqual(_load(S8_ARTIFACT), before)
+        self.assertEqual(before["capacity"]["free_now_gib"], 295.7)
+        self.assertEqual(before["capacity"]["verdict"], "BLOCKED")
 
 
 class TestNoP5DocumentQuotesASupersededFigureAsCurrent(unittest.TestCase):

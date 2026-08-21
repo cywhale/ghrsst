@@ -106,21 +106,22 @@ def _text(run_dir: str, name: str) -> str:
         return fh.read()
 
 
-def run_dir(run: str = CURRENT_RUN) -> str:
-    path = os.path.join(RUNS_DIR, run)
+def run_dir(run: str = CURRENT_RUN, root=None) -> str:
+    runs = RUNS_DIR if root is None else os.path.join(root, "bench", "results", "p5s8_runs")
+    path = os.path.join(runs, run)
     if not os.path.isdir(path):
         raise ArtifactError(f"no collected run at {path}")
     return path
 
 
-def derive(run: str = CURRENT_RUN) -> dict:
+def derive(run: str = CURRENT_RUN, root=None) -> dict:
     """Validate a collected run through the shipped parsers and derive the evidence record.
 
     Identity's module fingerprints are **not** re-hashed here: they name absolute paths on the
     host that produced them, and re-hashing off-host would fail for a reason that has nothing to
     do with the evidence. Assembly already ran that check on VM24, where it means something.
     """
-    path = run_dir(run)
+    path = run_dir(run, root=root)
     run_id = _run_id_from(path)
 
     marker = _load(path, "run.json")
@@ -282,8 +283,11 @@ def render_blockers(evidence: dict) -> str:
     run = evidence["provenance"]["run_id"]
     legacy = S8_EXECUTION["legacy_baseline"]
     rows = [
+        # The verdict comes from the evidence, not from a literal beside the figure. Written
+        # out, it would keep saying BLOCKED against a free-space number that had risen past
+        # the minimum -- the same defect as a measured figure hardcoded in prose.
         ("**G18 capacity**",
-         f"**BLOCKED** — **{cap['free_now_gib']} GiB free** (measured "
+         f"**{cap['verdict']}** — **{cap['free_now_gib']} GiB free** (measured "
          f"{evidence['provenance']['measured_utc'][:10]}, run `{run}`), "
          f"{cap['minimum_free_gib']} GiB minimum, {int(cap['recommended_free_gib'])} GiB "
          f"recommended; shortfall ≈ {cap['shortfall_gib']} GiB"),
@@ -501,15 +505,38 @@ def supersede_s6(s6: dict, evidence: dict) -> dict:
     return s6
 
 
+#: Every output a regeneration must leave consistent. Named here so the entry point cannot
+#: quietly cover three of them: `p5_critical_path.json` was written only by `ops.p5_roadmap`,
+#: so a new evidence run updated the other three and left it describing the previous one.
+REGENERATED_OUTPUTS = (
+    "bench/results/p5s8_vm24_readonly.json",
+    "bench/results/p5s6_vm24_readonly.json",
+    "specs/p5_critical_path_memo.md",
+    "bench/results/p5_critical_path.json",
+)
+
+#: The repository root this module writes into, unless a caller names another.
+DEV_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def main(argv=None) -> int:
+    """THE regeneration entry point. Writes every output in `REGENERATED_OUTPUTS`.
+
+    The roadmap artifact is written from here, by calling the roadmap's own writer -- not by a
+    second copy of its logic. `ops.p5_roadmap` remains the authority for what goes in it; this
+    is only the thing that makes sure it is written at the same time as everything else that
+    quotes the same measurement."""
     import argparse
+    from ops import p5_roadmap
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default=CURRENT_RUN)
+    ap.add_argument("--root", default=DEV_ROOT,
+                    help="repository root to regenerate into; the default is this checkout")
     args = ap.parse_args(argv)
 
-    evidence = derive(args.run)
-    dev = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    dev = args.root
     results = os.path.join(dev, "bench", "results")
+    evidence = derive(args.run, root=dev)
 
     out = os.path.join(results, "p5s8_vm24_readonly.json")
     with open(out, "w") as fh:
@@ -537,6 +564,18 @@ def main(argv=None) -> int:
             print(f"NOTE: {memo_path} has no markers for the {what}; not rewritten")
     with open(memo_path, "w") as fh:
         fh.write(memo)
+
+    # The roadmap artifact quotes this same measurement, so it is regenerated HERE rather than
+    # left to a second command someone has to remember. `p5_roadmap.main` re-reads the evidence
+    # file just written; its import-time CAPACITY is a measurement out of date by now.
+    rc = p5_roadmap.main(["--out", results])
+    if rc != 0:
+        raise ArtifactError(f"the roadmap writer failed with {rc}; outputs are inconsistent")
+
+    missing = [rel for rel in REGENERATED_OUTPUTS
+               if not os.path.exists(os.path.join(dev, rel))]
+    if missing:
+        raise ArtifactError(f"regeneration did not write {missing}")
 
     cap = evidence["capacity"]
     print(f"  free_now {cap['free_now_gib']} GiB | minimum {cap['minimum_free_gib']} GiB | "
