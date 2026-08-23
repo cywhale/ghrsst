@@ -84,6 +84,26 @@ MAX_CAPACITY_AGE_S = 2 * 3600
 #: be the same act; a large gap means one of them was reused.
 MAX_CAPACITY_SKEW_S = 300
 
+#: Clocks are not synchronised to the second. A reading a little ahead of the assessor is
+#: skew; one materially ahead cannot be aged at all, and an unaged reading never expires.
+MAX_CLOCK_LEAD_S = 60
+
+#: How far a lock acquisition probe may sit from the collection that carries it. Same reason as
+#: the capacity skew: a probe from another sitting is evidence about another moment.
+MAX_PROBE_SKEW_S = 900
+
+_SHA256 = None
+
+
+def _is_sha256(value) -> bool:
+    """Exactly 64 lowercase hex characters. Shape is not identity, but the wrong shape is not
+    a digest at all, and 'non-empty' was the only test it previously had to pass."""
+    global _SHA256
+    if _SHA256 is None:
+        import re
+        _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+    return isinstance(value, str) and bool(_SHA256.match(value))
+
 REQUIREMENTS: List[Dict] = [
     {"id": "identity", "evidence_kind": "preflight",
      "title": "the reviewed commit, checked out clean and detached",
@@ -152,6 +172,26 @@ def expected_module_digests(sha: str) -> Dict[str, str]:
         if proc.returncode == 0:
             out[rel] = hashlib.sha256(proc.stdout).hexdigest()
     return out
+
+
+def _git_blob(sha: str, rel: str):
+    """The bytes of one repository path at one commit, or None if it is not there."""
+    import subprocess
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo, prefix = os.path.dirname(here), os.path.basename(here)
+    proc = subprocess.run(["git", "show", f"{sha}:{prefix}/{rel}"], cwd=repo,
+                          capture_output=True)
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def expected_suite_digest(suite: str, sha: str):
+    """sha256 of a test module AT `sha`, recomputed by the assessor.
+
+    A digest that matches nothing certifies nothing. This is what the approved commit actually
+    contains, so a claim can be checked against the suite it names rather than believed."""
+    import hashlib
+    blob = _git_blob(sha, suite.replace(".", "/") + ".py")
+    return hashlib.sha256(blob).hexdigest() if blob is not None else None
 
 
 def _check_identity(t: Dict) -> tuple:
@@ -309,7 +349,7 @@ def _check_wal_anchor(t: Dict) -> tuple:
                           open_repairs=0)
 
 
-def _check_locks(t: Dict) -> tuple:
+def _check_locks(t: Dict) -> tuple:      # noqa: C901 -- one binding per branch, by design
     locks = t.get("locks") or {}
     missing = [k for k in ("compaction", "ingest") if not locks.get(k)]
     if missing:
@@ -335,11 +375,37 @@ def _check_locks(t: Dict) -> tuple:
                                  f"declared and distinct, but nothing has taken "
                                  f"{locks['compaction']!r} and released it, so acquirability "
                                  f"is assumed rather than shown")
+    # An unbound probe claims some lock somewhere was taken once. The declared compaction lock
+    # is the one the whole posture fences with, and a probe from another path, host, run or
+    # sitting is evidence about a different event. Each binding is checked separately so no
+    # missing field is covered by another field being present.
+    for field in ("path", "run_id", "host", "at_utc", "actor"):
+        if not probe.get(field):
+            return (NOT_ADJUDICATED if field == "actor" else BLOCKED), (
+                f"the lock probe declares no {field}, so it cannot be attributed to this "
+                f"lock, this host and this collection")
+    if os.path.realpath(probe["path"]) != os.path.realpath(locks["compaction"]):
+        return BLOCKED, (f"the probe took {probe['path']!r}, which is a different file from "
+                         f"the declared compaction lock {locks['compaction']!r}")
+    if probe["run_id"] != t.get("run_id"):
+        return BLOCKED, (f"the probe is from run {probe['run_id']!r}, not the collection's "
+                         f"{t.get('run_id')!r}")
+    if str(probe["host"]).split(".")[0] != str(t.get("host") or "").split(".")[0]:
+        return BLOCKED, (f"the probe was taken on host {probe['host']!r}, not the target's "
+                         f"{t.get('host')!r}")
+    probed_at, collected = _parse_utc(probe["at_utc"]), _parse_utc(t.get("collected_utc"))
+    if probed_at is None or collected is None:
+        return NOT_ADJUDICATED, ("the probe or the collection carries no usable timestamp, so "
+                                 "the probe cannot be placed in this collection")
+    drift = abs((probed_at - collected).total_seconds())
+    if drift > MAX_PROBE_SKEW_S:
+        return BLOCKED, (f"the probe was taken {int(drift)}s from the collection that reports "
+                         f"it; that is a different sitting, and lock state does not carry")
     if probe.get("acquired") is not True or probe.get("released") is not True:
         return BLOCKED, (f"the lock acquisition probe did not complete: {probe}. A lock that "
                          f"cannot be taken, or cannot be let go, fences nothing")
     return READY, _reason(compaction=locks["compaction"], ingest=locks["ingest"],
-                          probe="acquired and released",
+                          probe=f"acquired and released by {probe['actor']}",
                           order="compaction acquired before ingest")
 
 
@@ -370,22 +436,28 @@ def _check_capacity(t: Dict, now=None) -> tuple:
     if not cap.get("run_id") or not cap.get("measured_utc"):
         return NOT_ADJUDICATED, ("the capacity figure carries no run_id/measured_utc, so it is "
                                  "a number in a file rather than a measurement")
-    # Bound to the collection that carries it. A reading from another run, or taken hours from
-    # the rest of the preflight, is a different moment wearing this one's label.
+    # Bound to the collection that carries it -- and the collection has to say who it is.
+    # `if target_run and ...` skipped the binding when the field was absent, which made
+    # omitting it safer than getting it wrong. An absent field must never be the easy path.
     target_run = t.get("run_id")
-    if target_run and cap["run_id"] != target_run:
+    if not target_run:
+        return NOT_ADJUDICATED, ("the target declares no run_id, so the capacity reading cannot "
+                                 "be bound to the collection that carries it")
+    if cap["run_id"] != target_run:
         return NOT_ADJUDICATED, (f"the capacity reading is from run {cap['run_id']!r} while the "
                                  f"collection is run {target_run!r}: different moments")
     measured = _parse_utc(cap["measured_utc"])
     if measured is None:
         return NOT_ADJUDICATED, f"measured_utc {cap['measured_utc']!r} is not a timestamp"
     collected = _parse_utc(t.get("collected_utc"))
-    if collected is not None:
-        skew = abs((measured - collected).total_seconds())
-        if skew > MAX_CAPACITY_SKEW_S:
-            return NOT_ADJUDICATED, (f"the capacity reading sits {int(skew)}s from the "
-                                     f"collection that carries it; they are meant to be one "
-                                     f"act, so one of them was reused")
+    if collected is None:
+        return NOT_ADJUDICATED, ("the target declares no usable collected_utc, so the reading "
+                                 "cannot be placed against the collection")
+    skew = abs((measured - collected).total_seconds())
+    if skew > MAX_CAPACITY_SKEW_S:
+        return NOT_ADJUDICATED, (f"the capacity reading sits {int(skew)}s from the collection "
+                                 f"that carries it; they are meant to be one act, so one of "
+                                 f"them was reused")
     # Free space is true of a moment. An ingest window, a restart or an overnight pause moves
     # it, and none of them announce themselves in the artifact.
     if now is None:
@@ -394,6 +466,12 @@ def _check_capacity(t: Dict, now=None) -> tuple:
     elif isinstance(now, str):
         now = _parse_utc(now)
     age = (now - measured).total_seconds()
+    # A reading ahead of the clock is a clock problem or a fabricated one. Either way it cannot
+    # be aged, and an unaged reading never expires -- so it would be believed forever.
+    if age < -MAX_CLOCK_LEAD_S:
+        return NOT_ADJUDICATED, (f"the capacity reading is {int(-age)}s in the future against "
+                                 f"the assessing clock; a reading that cannot be aged cannot "
+                                 f"expire")
     if age > MAX_CAPACITY_AGE_S:
         return NOT_ADJUDICATED, (f"the capacity reading has expired: measured "
                                  f"{cap['measured_utc']}, {int(age)}s ago, against a "
@@ -422,13 +500,27 @@ def _check_failure_semantics(t: Dict) -> tuple:
         return NOT_ADJUDICATED, (f"the claim {proven!r} is a sentence, not a bound result: it "
                                  f"names no commit and no run digest")
     sha, digest = proven.get("deploy_sha"), proven.get("digest")
-    if not sha or not digest:
-        return NOT_ADJUDICATED, (f"the claim is missing {'deploy_sha' if not sha else 'digest'}"
-                                 f"; without both it cannot be tied to a run of known code")
+    suite = proven.get("suite")
+    if not sha or not digest or not suite:
+        missing = [k for k in ("suite", "deploy_sha", "digest") if not proven.get(k)]
+        return NOT_ADJUDICATED, (f"the claim is missing {missing}; without all three it cannot "
+                                 f"be tied to a run of known code")
+    if not _is_sha256(digest):
+        return NOT_ADJUDICATED, (f"digest {digest!r} is not a SHA-256: 64 lowercase hex "
+                                 f"characters. Any non-empty value used to pass here")
     if sha not in REVIEWED_DEPLOY_SHAS:
         return BLOCKED, (f"the behaviour was proven against {sha[:7]}, which is not in the "
                          f"approved deploy set")
-    return READY, _reason(suite=proven.get("suite", "?"), deploy_sha=sha[:7], digest=digest[:12])
+    # The digest has to be OF something. Recomputed from the suite at the approved commit, so
+    # a well-formed digest of nothing in particular is refused like any other mismatch.
+    expected = expected_suite_digest(suite, sha)
+    if expected is None:
+        return BLOCKED, (f"{suite!r} is not present at {sha[:7]}, so no run of it could have "
+                         f"proven anything about that commit")
+    if digest != expected:
+        return BLOCKED, (f"the digest does not match {suite} at {sha[:7]}: the claim is about "
+                         f"a different file than the one it names")
+    return READY, _reason(suite=suite, deploy_sha=sha[:7], digest=digest[:12])
 
 
 #: Requirements whose verdict comes from stat-ing paths. They mean nothing off the host that

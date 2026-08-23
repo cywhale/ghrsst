@@ -21,6 +21,7 @@ Written before the module, and failing against an empty checkout.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -159,6 +160,9 @@ class TestWhatIsProvisioned(_ProvisionBase):
         out = self.provision()
         target = {
             "label": rd.QUALIFYING_LABEL, "host": socket.gethostname(),
+            # The provisioner stamps its probe with the run marker, so the target that quotes
+            # it must declare the same run and sitting -- the binding working, not a bypass.
+            "run_id": out["marker"], "collected_utc": out["provisioned_utc"],
             "root": out["stage_root"], "manifest_root": out["manifest_root"],
             "wal_root": out["wal_root"], "anchor_root": out["anchor_root"],
             "locks": out["locks"],
@@ -271,3 +275,121 @@ class TestItCreatesNoProductionState(_ProvisionBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPartialStagingLeavesNoUnownedData(_ProvisionBase):
+    """The marker was written LAST, so a failure anywhere before it left a populated staging
+    root that `rollback()` would refuse to touch -- it carries no marker, so as far as rollback
+    is concerned nobody made it. Unowned data, needing a human to delete a directory by hand
+    from memory of which one was safe.
+
+    Ownership has to be established before anything is created, and a failed provision has to
+    clean up after itself or hand back something that can be.
+    """
+
+    STEPS = ("build_block", "publish", "declare_anchor_domain", "initialize_wal")
+
+    def _break(self, step):
+        """Make one provisioning step fail. Returns the restore callable.
+
+        Deliberately NOT `addCleanup` + `doCleanups()`: `doCleanups` runs EVERY registered
+        cleanup, including setUp's removal of the whole temp fixture, so a loop that used it
+        destroyed its own fixture after the first iteration and the later cases failed for a
+        reason that had nothing to do with the code."""
+
+        def explode(*a, **kw):
+            raise RuntimeError(f"injected failure in {step}")
+
+        if step == "build_block":
+            original, target, attr = pv.build_block, pv, "build_block"
+        elif step == "publish":
+            original, target, attr = pv.block_manifest.publish, pv.block_manifest, "publish"
+        else:
+            original, target, attr = getattr(pv.repair_wal, step), pv.repair_wal, step
+        setattr(target, attr, explode)
+        restore = lambda: setattr(target, attr, original)          # noqa: E731
+        self.addCleanup(restore)
+        return restore
+
+    def test_a_failure_at_any_step_removes_the_staging_root(self):
+        for step in self.STEPS:
+            with self.subTest(step):
+                restore = self._break(step)
+                try:
+                    with self.assertRaises(Exception) as caught:
+                        self.provision()
+                    self.assertIn(step, str(caught.exception))
+                    self.assertFalse(os.path.exists(self.stage_root),
+                                     f"a failure in {step} left the staging root behind")
+                finally:
+                    restore()
+
+    def test_the_live_root_is_untouched_by_a_failed_provision(self):
+        for step in self.STEPS:
+            with self.subTest(step):
+                before = sorted(os.listdir(self.live_root))
+                restore = self._break(step)
+                try:
+                    with self.assertRaises(Exception):
+                        self.provision()
+                    self.assertEqual(sorted(os.listdir(self.live_root)), before)
+                finally:
+                    restore()
+
+    def test_what_is_kept_for_diagnosis_is_owned_and_rollbackable(self):
+        """Cleanup can be declined -- a failed build is worth looking at. What is left must
+        still carry its marker, so a person can roll it back with the same call rather than a
+        remembered path and a manual delete."""
+        self._break("publish")
+        with self.assertRaises(Exception):
+            self.provision(cleanup_on_failure=False)
+        self.assertTrue(os.path.isdir(self.stage_root))
+        marker_path = os.path.join(self.stage_root, pv.MARKER_NAME)
+        self.assertTrue(os.path.isfile(marker_path), "the kept root is unowned")
+
+        with open(marker_path) as fh:
+            marker = json.load(fh)
+        self.assertIs(marker["complete"], False,
+                      "a partial root must not look like a finished one")
+        self.assertIn("publish", marker.get("failed_step", ""))
+        pv.rollback(marker)
+        self.assertFalse(os.path.exists(self.stage_root))
+
+    def test_the_marker_exists_before_any_content_is_written(self):
+        """The ownership stamp must precede the first thing worth owning."""
+        seen = {}
+        original = pv.build_block
+
+        def note_then_build(*a, **kw):
+            seen["marker_present"] = os.path.isfile(
+                os.path.join(self.stage_root, pv.MARKER_NAME))
+            return original(*a, **kw)
+
+        self.addCleanup(setattr, pv, "build_block", original)
+        pv.build_block = note_then_build
+        self.provision()
+        self.assertIs(seen["marker_present"], True,
+                      "the block was built before the root was marked as ours")
+
+    def test_a_completed_provision_marks_itself_complete(self):
+        out = self.provision()
+        with open(os.path.join(out["stage_root"], pv.MARKER_NAME)) as fh:
+            marker = json.load(fh)
+        self.assertIs(marker["complete"], True)
+        self.assertIsNone(marker.get("failed_step"))
+
+    def test_cleanup_failure_is_reported_rather_than_hidden(self):
+        """If the rollback of a failed provision itself fails, the caller must be told the root
+        is still there -- reporting only the build error would leave data nobody knows about."""
+        self._break("publish")
+        original_rollback = pv.rollback
+
+        def refuse(*a, **kw):
+            raise pv.ProvisionRefused("injected rollback failure")
+
+        self.addCleanup(setattr, pv, "rollback", original_rollback)
+        pv.rollback = refuse
+        with self.assertRaises(pv.ProvisionCleanupError) as caught:
+            self.provision()
+        self.assertIn(self.stage_root, str(caught.exception))
+        self.assertIsNotNone(caught.exception.__cause__)

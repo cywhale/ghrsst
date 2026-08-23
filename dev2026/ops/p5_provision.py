@@ -53,6 +53,14 @@ class ProvisionRefused(Exception):
     """A provisioning or rollback request that would touch something it must not."""
 
 
+class ProvisionCleanupError(Exception):
+    """A provision failed AND the cleanup of its partial staging root failed.
+
+    Distinct from the provisioning failure, because the consequence differs: a cleaned-up
+    failure leaves nothing, and this leaves a populated directory that someone has to deal
+    with. The path is in the message and the original failure is the `__cause__`."""
+
+
 def _inside(path: str, root: str) -> bool:
     """Is `path` inside `root`? By path components, never by string prefix.
 
@@ -78,12 +86,24 @@ def _refuse_if_not_isolated(stage_root: str, live_root: str) -> None:
 def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: str,
               end_day: str, days: Sequence[str], operator: str, at_utc: str,
               grid: Dict, block_name: str = "block_v1.zarr",
-              domain_id: Optional[str] = None) -> Dict:
+              domain_id: Optional[str] = None, cleanup_on_failure: bool = True) -> Dict:
     """Create a complete, isolated P5 staging root and return what was made.
 
     Refuses before creating anything if the location is not isolated, or if the staging root
     already exists — provisioning into a directory holding someone else's files makes rollback
-    a guess about which of them were ours."""
+    a guess about which of them were ours.
+
+    ## Partial staging
+
+    The marker was written last, so a failure in the build, the publish, the anchor or the WAL
+    left a populated root that `rollback()` would refuse: no marker, so as far as rollback was
+    concerned nobody made it. That is unowned data — a directory a person has to identify and
+    delete by hand, from memory of which one was safe.
+
+    Ownership is established BEFORE anything is created. A failure then rolls the root back and
+    re-raises, or, with `cleanup_on_failure=False`, leaves it in place still marked as ours and
+    flagged incomplete, so the same `rollback()` call disposes of it once it has been looked
+    at. Either way nothing unowned survives."""
     _refuse_if_not_isolated(stage_root, live_root)
     # ANY existing path, empty or not. An empty directory someone else made is still theirs,
     # and `rollback()` removes the whole root -- so accepting an existing empty directory hands
@@ -103,6 +123,48 @@ def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: st
     # `makedirs` without exist_ok on the root: if it appeared between the check above and
     # here, this refuses rather than adopting it.
     os.makedirs(stage_root)
+    marker = f"{STAGING_LABEL}:{at_utc}:{operator}"
+    # The ownership stamp precedes the first thing worth owning. Everything below can fail;
+    # from here on, whatever exists is attributable to this run.
+    _write_marker(stage_root, {"label": STAGING_LABEL, "stage_root": stage_root,
+                               "live_root": live_root, "marker": marker,
+                               "provisioned_utc": at_utc, "operator": operator,
+                               "complete": False, "failed_step": None})
+    try:
+        result = _provision_contents(
+            stage_root=stage_root, live_root=live_root, manifest_root=manifest_root,
+            wal_root=wal_root, anchor_root=anchor_root, artifacts=artifacts,
+            delta_path=delta_path, start_day=start_day, end_day=end_day, days=days,
+            operator=operator, at_utc=at_utc, grid=grid, block_name=block_name,
+            domain_id=domain_id, marker=marker)
+    except Exception as failure:
+        partial = {"stage_root": stage_root, "live_root": live_root, "marker": marker,
+                   "complete": False, "failed_step": repr(failure)}
+        _write_marker(stage_root, partial)
+        if not cleanup_on_failure:
+            raise
+        try:
+            rollback(partial)
+        except Exception as cleanup_failure:
+            raise ProvisionCleanupError(
+                f"provisioning failed ({failure!r}) and the partial staging root "
+                f"{stage_root!r} could not be removed ({cleanup_failure!r}). It is marked as "
+                f"ours and incomplete: roll it back once the cause is understood"
+            ) from failure
+        raise
+    _write_marker(stage_root, result)
+    return result
+
+
+def _write_marker(stage_root: str, payload: Dict) -> None:
+    with open(os.path.join(stage_root, MARKER_NAME), "w") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+
+
+def _provision_contents(*, stage_root, live_root, manifest_root, wal_root, anchor_root,
+                        artifacts, delta_path, start_day, end_day, days, operator, at_utc,
+                        grid, block_name, domain_id, marker) -> Dict:
+    """Everything after the root is marked. Any failure here is the caller's to clean up."""
     for d in (manifest_root, wal_root, anchor_root, artifacts):
         os.makedirs(d, exist_ok=True)
 
@@ -147,7 +209,12 @@ def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: st
     # evidence that a lock can be acquired there, and the fencing the whole compaction posture
     # rests on is worth one real acquisition rather than an assumption. Isolated and instant:
     # the lock lives under the staging root and is released before this returns.
-    probe = {"path": os.path.join(stage_root, "p5_compaction.lock")}
+    import socket
+    # Bound to this lock, this host, this run and this operator. An unbound probe is a claim
+    # that some lock somewhere was taken once, which is evidence about a different event.
+    probe = {"path": os.path.join(stage_root, "p5_compaction.lock"),
+             "run_id": marker, "host": socket.gethostname(), "at_utc": at_utc,
+             "actor": f"ops/p5_provision.py ({operator})"}
     try:
         with compaction_lock.CompactionLock(probe["path"], holder=f"p5_provision/{operator}"):
             probe["acquired"] = True
@@ -165,13 +232,12 @@ def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: st
                   "acquire_probe": probe},
         "provisioned_utc": at_utc, "operator": operator,
         "days": list(days), "start_day": start_day, "end_day": end_day,
-        "marker": f"{STAGING_LABEL}:{at_utc}:{operator}",
+        "marker": marker,
+        "complete": True, "failed_step": None,
         "is_production_state": False,
         "note": ("an isolated staging root. It proves the provisioning recipe; it does not make "
                  "any deployment ready, and its label cannot settle a compaction requirement."),
     }
-    with open(os.path.join(stage_root, MARKER_NAME), "w") as fh:
-        json.dump(result, fh, indent=2, sort_keys=True)
     return result
 
 

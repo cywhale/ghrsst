@@ -131,7 +131,14 @@ class _TargetBase(unittest.TestCase):
             "capacity": _fresh_capacity(measured_utc=self.collected_utc),
             "locks": {"compaction": os.path.join(self.root, "p5_compaction.lock"),
                       "ingest": os.path.join(self.root, "ingest.lock"),
-                      "acquire_probe": {"acquired": True, "released": True}},
+                      # Fully bound: path, run, host, time and actor. A probe missing any of
+                      # them is refused, so a fixture carrying a bare one would silently make
+                      # every other test in this file assert against a NOT_ADJUDICATED lock.
+                      "acquire_probe": {
+                          "acquired": True, "released": True,
+                          "path": os.path.join(self.root, "p5_compaction.lock"),
+                          "run_id": FIXTURE_RUN, "host": socket.gethostname(),
+                          "at_utc": self.collected_utc, "actor": "tests"}},
             "api_parity": {"checked": True, "route": "segmented", "mismatches": 0,
                            "samples": 32},
         }
@@ -624,16 +631,13 @@ class TestLocksAreNotAssumedAcquirable(_TargetBase):
         self.assertIn("probe", by_id["locks"]["reason"].lower())
 
     def test_a_recorded_successful_probe_is_ready(self):
-        locks = dict(self.target()["locks"],
-                     acquire_probe={"acquired": True, "released": True,
-                                    "path": os.path.join(self.root, "p5_compaction.lock")})
-        by_id = {r["id"]: r for r in rd.assess(self.target(locks=locks))["requirements"]}
+        by_id = {r["id"]: r for r in rd.assess(self.target())["requirements"]}
         self.assertEqual(by_id["locks"]["verdict"], rd.READY, by_id["locks"]["reason"])
 
     def test_a_failed_probe_is_blocked(self):
-        locks = dict(self.target()["locks"],
-                     acquire_probe={"acquired": False, "released": False,
-                                    "error": "Permission denied"})
+        probe = dict(self.target()["locks"]["acquire_probe"],
+                     acquired=False, released=False, error="Permission denied")
+        locks = dict(self.target()["locks"], acquire_probe=probe)
         by_id = {r["id"]: r for r in rd.assess(self.target(locks=locks))["requirements"]}
         self.assertEqual(by_id["locks"]["verdict"], rd.BLOCKED)
 
@@ -646,7 +650,7 @@ class TestLocksAreNotAssumedAcquirable(_TargetBase):
         alias = os.path.join(self.root, "alias.lock")
         os.symlink(real, alias)
         locks = {"compaction": real, "ingest": alias,
-                 "acquire_probe": {"acquired": True, "released": True}}
+                 "acquire_probe": dict(self.target()["locks"]["acquire_probe"], path=real)}
         by_id = {r["id"]: r for r in rd.assess(self.target(locks=locks))["requirements"]}
         self.assertEqual(by_id["locks"]["verdict"], rd.BLOCKED)
         self.assertIn("same file", by_id["locks"]["reason"].lower())
@@ -658,7 +662,8 @@ class TestLocksAreNotAssumedAcquirable(_TargetBase):
         self.addCleanup(os.chmod, ro, 0o700)
         locks = {"compaction": os.path.join(ro, "p5_compaction.lock"),
                  "ingest": os.path.join(self.root, "ingest.lock"),
-                 "acquire_probe": {"acquired": True, "released": True}}
+                 "acquire_probe": dict(self.target()["locks"]["acquire_probe"],
+                                       path=os.path.join(ro, "p5_compaction.lock"))}
         by_id = {r["id"]: r for r in rd.assess(self.target(locks=locks))["requirements"]}
         self.assertEqual(by_id["locks"]["verdict"], rd.BLOCKED)
 
@@ -673,17 +678,21 @@ class TestFailureSemanticsMustBeBoundToWhatProvedIt(_TargetBase):
 
     def test_a_claim_naming_an_unapproved_sha_is_blocked(self):
         by_id = {r["id"]: r for r in rd.assess(self.target(
-            failure_semantics_proven_by={"suite": "tests.test_x", "deploy_sha": "d" * 40,
+            failure_semantics_proven_by={"suite": "tests.test_phase2_p5s8_evidence",
+                                         "deploy_sha": "d" * 40,
                                          "digest": "e" * 64}))["requirements"]}
         self.assertEqual(by_id["failure_semantics"]["verdict"], rd.BLOCKED)
         self.assertIn("approved", by_id["failure_semantics"]["reason"].lower())
 
     def test_a_claim_bound_to_the_approved_sha_with_a_digest_is_ready(self):
+        suite = "tests.test_phase2_p5s8_evidence"
         by_id = {r["id"]: r for r in rd.assess(self.target(
-            failure_semantics_proven_by={"suite": "tests.test_phase2_p5s8_evidence",
-                                         "deploy_sha": rd.REVIEWED_DEPLOY_SHAS[0],
-                                         "digest": "f" * 64}))["requirements"]}
-        self.assertEqual(by_id["failure_semantics"]["verdict"], rd.READY)
+            failure_semantics_proven_by={
+                "suite": suite, "deploy_sha": rd.REVIEWED_DEPLOY_SHAS[0],
+                "digest": rd.expected_suite_digest(suite, rd.REVIEWED_DEPLOY_SHAS[0]),
+            }))["requirements"]}
+        self.assertEqual(by_id["failure_semantics"]["verdict"], rd.READY,
+                         by_id["failure_semantics"]["reason"])
 
     def test_a_claim_missing_its_digest_is_not_adjudicated(self):
         by_id = {r["id"]: r for r in rd.assess(self.target(
@@ -757,3 +766,234 @@ class TestTheStoredCollectionDeclaresItsOwnExpiry(unittest.TestCase):
         report = rd.assess(self.target, now="2026-08-22T09:00:00Z")
         self.assertIs(report["compaction_ready"], False)
         self.assertEqual(report["summary"][rd.READY], [])
+
+
+class TestTheLockProbeMustBeAboutTheDeclaredLock(_TargetBase):
+    """A probe is a claim that *this* lock was taken, on *this* host, during *this* collection.
+
+    Unbound, it is a claim that some lock somewhere was taken once. The declared compaction
+    lock is the one the compaction posture fences with; a successful probe of anything else is
+    evidence about a different file."""
+
+    def _probe(self, **over):
+        p = {"acquired": True, "released": True,
+             "path": os.path.join(self.root, "p5_compaction.lock"),
+             "run_id": FIXTURE_RUN, "host": socket.gethostname(),
+             "at_utc": self.collected_utc, "actor": "ops/p5_provision.py"}
+        p.update(over)
+        return p
+
+    def _locks(self, **over):
+        return {"compaction": os.path.join(self.root, "p5_compaction.lock"),
+                "ingest": os.path.join(self.root, "ingest.lock"),
+                "acquire_probe": self._probe(**over)}
+
+    def _verdict(self, **over):
+        by_id = {r["id"]: r for r in
+                 rd.assess(self.target(locks=self._locks(**over)))["requirements"]}
+        return by_id["locks"]["verdict"], by_id["locks"]["reason"]
+
+    def test_a_fully_bound_probe_is_ready(self):
+        verdict, reason = self._verdict()
+        self.assertEqual(verdict, rd.READY, reason)
+
+    def test_a_probe_of_another_path_is_blocked(self):
+        other = os.path.join(self.root, "some_other.lock")
+        verdict, reason = self._verdict(path=other)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("different", reason.lower())
+
+    def test_a_probe_bound_by_realpath_not_by_string(self):
+        """A symlink to the declared lock IS the declared lock; a different file is not."""
+        real = os.path.join(self.root, "p5_compaction.lock")
+        with open(real, "w") as fh:
+            fh.write("")
+        alias = os.path.join(self.root, "alias_to_compaction.lock")
+        os.symlink(real, alias)
+        verdict, reason = self._verdict(path=alias)
+        self.assertEqual(verdict, rd.READY, reason)
+
+    def test_a_probe_from_another_run_is_blocked(self):
+        verdict, reason = self._verdict(run_id="A_DIFFERENT_RUN")
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("run", reason.lower())
+
+    def test_a_probe_from_another_host_is_blocked(self):
+        verdict, reason = self._verdict(host="somewhere-else")
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("host", reason.lower())
+
+    def test_a_probe_taken_long_before_the_collection_is_blocked(self):
+        verdict, reason = self._verdict(at_utc="2026-08-21T09:00:00Z")
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("collection", reason.lower())
+
+    def test_a_probe_naming_no_actor_is_not_adjudicated(self):
+        verdict, reason = self._verdict(actor="")
+        self.assertEqual(verdict, rd.NOT_ADJUDICATED)
+        self.assertIn("actor", reason.lower())
+
+    def test_each_missing_binding_field_is_refused_on_its_own(self):
+        """One at a time, so no field's absence is covered by another's presence."""
+        for field in ("path", "run_id", "host", "at_utc", "actor"):
+            with self.subTest(field):
+                probe = self._probe()
+                probe.pop(field)
+                by_id = {r["id"]: r for r in rd.assess(self.target(
+                    locks={"compaction": os.path.join(self.root, "p5_compaction.lock"),
+                           "ingest": os.path.join(self.root, "ingest.lock"),
+                           "acquire_probe": probe}))["requirements"]}
+                self.assertNotEqual(by_id["locks"]["verdict"], rd.READY,
+                                    f"a probe with no {field} still read READY")
+                self.assertIn(field, by_id["locks"]["reason"])
+
+
+class TestCapacityRequiresItsCollectionFields(_TargetBase):
+    """`if target_run and ...` skipped the binding when `run_id` was absent, so omitting a field
+    was safer than getting it wrong. An absent field must never be the easy path."""
+
+    def _verdict(self, **over):
+        by_id = {r["id"]: r for r in rd.assess(self.target(**over))["requirements"]}
+        return by_id["capacity"]["verdict"], by_id["capacity"]["reason"]
+
+    def test_a_target_without_run_id_is_not_adjudicated(self):
+        t = self.target()
+        t.pop("run_id")
+        by_id = {r["id"]: r for r in rd.assess(t)["requirements"]}
+        self.assertEqual(by_id["capacity"]["verdict"], rd.NOT_ADJUDICATED)
+        self.assertIn("run_id", by_id["capacity"]["reason"])
+
+    def test_a_target_without_collected_utc_is_not_adjudicated(self):
+        t = self.target()
+        t.pop("collected_utc")
+        by_id = {r["id"]: r for r in rd.assess(t)["requirements"]}
+        self.assertEqual(by_id["capacity"]["verdict"], rd.NOT_ADJUDICATED)
+        self.assertIn("collected_utc", by_id["capacity"]["reason"])
+
+    def test_a_measurement_from_the_future_is_not_adjudicated(self):
+        """A reading ahead of the clock is a clock problem or a fabricated one. Either way it
+        cannot be aged, and an unaged reading never expires."""
+        future = "2026-08-21T14:00:00Z"
+        t = self.target(run_id="R", collected_utc=future,
+                        capacity=_fresh_capacity(run_id="R", measured_utc=future))
+        by_id = {r["id"]: r for r in rd.assess(t, now="2026-08-21T13:00:00Z")["requirements"]}
+        self.assertEqual(by_id["capacity"]["verdict"], rd.NOT_ADJUDICATED)
+        self.assertIn("future", by_id["capacity"]["reason"].lower())
+
+    def test_the_two_hour_expiry_still_applies(self):
+        """Guarding the guard: the future check must not have replaced the expiry."""
+        t = self.target(run_id="R", collected_utc="2026-08-21T13:00:00Z",
+                        capacity=_fresh_capacity(run_id="R",
+                                                 measured_utc="2026-08-21T13:00:00Z"))
+        by_id = {r["id"]: r for r in rd.assess(t, now="2026-08-21T16:00:00Z")["requirements"]}
+        self.assertEqual(by_id["capacity"]["verdict"], rd.NOT_ADJUDICATED)
+        self.assertIn("expired", by_id["capacity"]["reason"])
+
+    def test_a_reading_a_few_seconds_ahead_is_tolerated(self):
+        """Clocks are not synchronised to the second; the guard is against a real gap."""
+        t = self.target(run_id="R", collected_utc="2026-08-21T13:00:00Z",
+                        capacity=_fresh_capacity(run_id="R",
+                                                 measured_utc="2026-08-21T13:00:02Z"))
+        by_id = {r["id"]: r for r in rd.assess(t, now="2026-08-21T13:00:00Z")["requirements"]}
+        self.assertEqual(by_id["capacity"]["verdict"], rd.READY, by_id["capacity"]["reason"])
+
+
+class TestTheFailureSemanticsDigestIsBoundToTheSuite(_TargetBase):
+    """`digest` was any non-empty value. A digest that matches nothing certifies nothing: it
+    has to be the sha256 of the suite that is claimed to have proven the behaviour, at the
+    approved commit, recomputed by the assessor."""
+
+    SUITE = "tests.test_phase2_p5s8_evidence"
+
+    def _claim(self, **over):
+        c = {"suite": self.SUITE, "deploy_sha": _APPROVED,
+             "digest": rd.expected_suite_digest(self.SUITE, _APPROVED)}
+        c.update(over)
+        return c
+
+    def _verdict(self, **over):
+        by_id = {r["id"]: r for r in rd.assess(self.target(
+            failure_semantics_proven_by=self._claim(**over)))["requirements"]}
+        return by_id["failure_semantics"]["verdict"], by_id["failure_semantics"]["reason"]
+
+    def test_the_expected_digest_is_computable_at_all(self):
+        digest = rd.expected_suite_digest(self.SUITE, _APPROVED)
+        self.assertTrue(digest, "the suite digest could not be recomputed; tests are vacuous")
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+    def test_a_matching_digest_is_ready(self):
+        verdict, reason = self._verdict()
+        self.assertEqual(verdict, rd.READY, reason)
+
+    def test_a_wrong_but_well_formed_digest_is_blocked(self):
+        """64 hex characters that are not the suite's. Shape is not identity."""
+        verdict, reason = self._verdict(digest="a" * 64)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("does not match", reason.lower())
+
+    def test_a_digest_that_is_not_a_sha256_is_not_adjudicated(self):
+        for bad in ("deadbeef", "x" * 64, "A" * 64, 12345, rd.expected_suite_digest(
+                self.SUITE, _APPROVED) + "0"):
+            with self.subTest(repr(bad)):
+                verdict, reason = self._verdict(digest=bad)
+                self.assertEqual(verdict, rd.NOT_ADJUDICATED)
+                self.assertIn("sha-256", reason.lower())
+
+    def test_a_suite_that_does_not_exist_at_the_approved_commit_is_blocked(self):
+        verdict, reason = self._verdict(suite="tests.test_nothing_like_this",
+                                        digest="b" * 64)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("not present", reason.lower())
+
+    def test_the_digest_check_is_isolated_from_the_sha_check(self):
+        """A correct digest with an unapproved commit must still be refused, and vice versa --
+        so neither check can be passing on the other's behalf."""
+        verdict, _ = self._verdict(deploy_sha="c" * 40)
+        self.assertEqual(verdict, rd.BLOCKED)
+        verdict, _ = self._verdict(digest="d" * 64)
+        self.assertEqual(verdict, rd.BLOCKED)
+
+
+class TestTheFreshnessPolicyIsDocumentedAndEnforced(unittest.TestCase):
+    """The window is a number in code and a rule for a person. Both have to say the same thing,
+    and the document's figure is read back out of the module rather than typed beside it."""
+
+    DOC = os.path.join(_DEV, "specs", "p5_deployment_readiness.md")
+
+    def setUp(self):
+        with open(self.DOC) as fh:
+            self.flat = " ".join(fh.read().split())
+
+    def test_the_documented_window_is_the_one_the_code_enforces(self):
+        hours = rd.MAX_CAPACITY_AGE_S / 3600
+        self.assertEqual(hours, int(hours), "the window is no longer a whole number of hours")
+        self.assertIn(f"valid for **{int(hours)} hours from `measured_utc`**", self.flat)
+        self.assertIn("MAX_CAPACITY_AGE_S", self.flat)
+
+    def test_the_policy_names_what_invalidates_a_collection_early(self):
+        for event in ("append", "restart", "mount", "write under"):
+            with self.subTest(event):
+                self.assertIn(event, self.flat)
+
+    def test_the_policy_requires_one_short_window_for_everything(self):
+        self.assertIn("in one short window", self.flat)
+        for item in ("capacity", "healthz", "locks", "identity", "manifest", "WAL/anchor",
+                     "quiescence"):
+            with self.subTest(item):
+                self.assertIn(item, self.flat)
+
+    def test_the_document_lists_the_enforced_bindings(self):
+        for enforced in ("must equal the collection", "within 300s", "ahead of the assessing "
+                         "clock", "bound to the declared lock by realpath"):
+            with self.subTest(enforced):
+                self.assertIn(enforced, self.flat)
+
+    def test_the_window_is_shorter_than_the_shortest_ingest_gap(self):
+        """05:05, 07:30, 09:40, 18:05, 20:30 local. The shortest gap is 2h05m, so a window
+        longer than that could hide a schedule tick -- the event that invalidates a reading."""
+        windows = [(5, 5), (7, 30), (9, 40), (18, 5), (20, 30)]
+        minutes = [h * 60 + m for h, m in windows]
+        gaps = [b - a for a, b in zip(minutes, minutes[1:])]
+        gaps.append(24 * 60 - minutes[-1] + minutes[0])
+        self.assertLessEqual(rd.MAX_CAPACITY_AGE_S, min(gaps) * 60,
+                             "a reading could survive an ingest window")
