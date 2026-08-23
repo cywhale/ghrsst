@@ -124,12 +124,17 @@ def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: st
     # here, this refuses rather than adopting it.
     os.makedirs(stage_root)
     marker = f"{STAGING_LABEL}:{at_utc}:{operator}"
-    # The ownership stamp precedes the first thing worth owning. Everything below can fail;
-    # from here on, whatever exists is attributable to this run.
-    _write_marker(stage_root, {"label": STAGING_LABEL, "stage_root": stage_root,
-                               "live_root": live_root, "marker": marker,
-                               "provisioned_utc": at_utc, "operator": operator,
-                               "complete": False, "failed_step": None})
+    stamp = {"label": STAGING_LABEL, "stage_root": stage_root, "live_root": live_root,
+             "marker": marker, "provisioned_utc": at_utc, "operator": operator,
+             "complete": False, "failed_step": None}
+    try:
+        # The ownership stamp precedes the first thing worth owning -- and is itself a write,
+        # which can fail. Outside the transaction, a failed stamp left the directory created
+        # and unowned: precisely the state the marker exists to prevent.
+        _write_marker(stage_root, stamp)
+    except Exception as failure:
+        _discard_unowned(stage_root, failure)
+        raise
     try:
         result = _provision_contents(
             stage_root=stage_root, live_root=live_root, manifest_root=manifest_root,
@@ -138,9 +143,15 @@ def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: st
             operator=operator, at_utc=at_utc, grid=grid, block_name=block_name,
             domain_id=domain_id, marker=marker)
     except Exception as failure:
-        partial = {"stage_root": stage_root, "live_root": live_root, "marker": marker,
-                   "complete": False, "failed_step": repr(failure)}
-        _write_marker(stage_root, partial)
+        partial = {**stamp, "failed_step": repr(failure)}
+        try:
+            # Recording the failure is a write too. If it fails, the root must still go:
+            # reporting the first error and leaving a directory behind is the worst outcome
+            # of the three.
+            _write_marker(stage_root, partial)
+        except Exception:                                     # noqa: BLE001
+            _discard_unowned(stage_root, failure)
+            raise failure
         if not cleanup_on_failure:
             raise
         try:
@@ -159,6 +170,21 @@ def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: st
 def _write_marker(stage_root: str, payload: Dict) -> None:
     with open(os.path.join(stage_root, MARKER_NAME), "w") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
+
+
+def _discard_unowned(stage_root: str, failure: Exception) -> None:
+    """Remove a root this run created but could not stamp.
+
+    `rollback()` cannot be used: it requires a marker, and the missing marker is the problem.
+    Safe only because it runs on a path this call created moments earlier and nothing else has
+    been told about."""
+    try:
+        shutil.rmtree(stage_root)
+    except Exception as cleanup_failure:                      # noqa: BLE001
+        raise ProvisionCleanupError(
+            f"provisioning failed ({failure!r}) and the unowned root {stage_root!r} could not "
+            f"be removed ({cleanup_failure!r}); it carries no marker, so `rollback()` will "
+            f"refuse it and it must be removed by hand") from failure
 
 
 def _provision_contents(*, stage_root, live_root, manifest_root, wal_root, anchor_root,
@@ -221,6 +247,13 @@ def _provision_contents(*, stage_root, live_root, manifest_root, wal_root, ancho
         probe["released"] = True
     except Exception as exc:                                  # noqa: BLE001
         probe.update(acquired=False, released=False, error=repr(exc))
+        # Recorded and carried on, this returned `complete: True` for a root whose compaction
+        # lock cannot be taken -- a root that does not work, asserting in its own marker that
+        # it does. It is a provisioning failure, so it goes down the cleanup path like any
+        # other.
+        raise ProvisionRefused(
+            f"the compaction lock {probe['path']!r} could not be acquired and released: "
+            f"{exc!r}. A staging root whose lock does not work is not provisioned") from exc
 
     result = {
         "label": STAGING_LABEL,
@@ -263,8 +296,27 @@ def rollback(provisioned: Dict) -> None:
             f"not create it")
     with open(marker_path) as fh:
         marker = json.load(fh)
+    # A marker matched on ONE string, so a copy of it dropped into another directory authorized
+    # deleting that directory. A marker is a claim about one root, on one side of one live
+    # root, from one run -- and all three have to agree with the request being made.
     if marker.get("marker") != provisioned.get("marker"):
         raise ProvisionRefused(
             f"refusing to remove {stage_root!r}: its marker {marker.get('marker')!r} is not "
             f"the one being rolled back ({provisioned.get('marker')!r})")
-    shutil.rmtree(stage_root)
+    recorded_root = marker.get("stage_root")
+    if not recorded_root or os.path.realpath(recorded_root) != os.path.realpath(stage_root):
+        raise ProvisionRefused(
+            f"refusing to remove {stage_root!r}: its marker records stage_root "
+            f"{recorded_root!r}, a different directory. A copied marker does not transfer "
+            f"ownership of wherever it was copied to")
+    recorded_live = marker.get("live_root")
+    if os.path.realpath(recorded_live or "") != os.path.realpath(live_root or ""):
+        raise ProvisionRefused(
+            f"refusing to remove {stage_root!r}: its marker records live_root "
+            f"{recorded_live!r}, not the {live_root!r} of this request. The isolation it was "
+            f"created under is not the one being asserted now")
+    # Remove the CANONICAL root, not the string handed in. A caller may legitimately name it
+    # through a symlink -- the identity checks above have just confirmed it is the same
+    # directory -- and `rmtree` refuses a symlink outright, so resolving is both correct and
+    # the only thing that works.
+    shutil.rmtree(os.path.realpath(stage_root))

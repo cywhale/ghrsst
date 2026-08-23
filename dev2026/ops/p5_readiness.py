@@ -256,27 +256,32 @@ def _check_manifest(t: Dict) -> tuple:
 
 
 def _check_blocks(t: Dict) -> tuple:
+    """Open the manifest the way the deployment opens it, then add what the store does not ask.
+
+    This joined the segment path to the root and asked whether it existed, which a `../` or a
+    symlink out of the block root satisfies -- and those are exactly what
+    `SegmentedCubeStore._resolve_segment_path` refuses: a block may not point at the delta, at
+    another store, or through a symlink. Two path authorities disagreeing is worse than one
+    being strict, because the readiness check certifies a manifest the deployment then refuses
+    to open. So the store IS the authority here: constructing it applies containment, the
+    absolute-path refusal, the legacy allow-list and the layout contract in one go."""
     manifest, why = _live_manifest(t.get("manifest_root"))
     if manifest is None:
         return BLOCKED, f"cannot check blocks: {why}"
-    root = t["manifest_root"]
-    checked = []
+    from store.segmented_cube import SegmentedCubeStore
+    try:
+        store = SegmentedCubeStore(t["manifest_root"],
+                                   allowed_legacy_paths=t.get("allowed_legacy_paths"))
+    except Exception as exc:                                  # noqa: BLE001
+        return BLOCKED, f"the deployment could not open this manifest: {exc}"
+    # `build_provenance` is optional in the schema and the store does not require it, so it is
+    # checked here -- the one thing this adds rather than delegates.
     for seg in manifest["segments"]:
-        path = seg["path"]
-        if not os.path.isabs(path):
-            path = os.path.join(root, path)
-        if not os.path.exists(path):
-            return BLOCKED, f"segment {seg['segment_id']!r} references a missing store: {path}"
-        try:
-            # The strict contract the store itself applies -- not a lighter copy of it.
-            block_manifest.inspect_store_contract(path)
-        except Exception as exc:                              # noqa: BLE001
-            return BLOCKED, f"segment {seg['segment_id']!r} fails the store contract: {exc!r}"
         if not seg.get("build_provenance"):
             return BLOCKED, (f"segment {seg['segment_id']!r} carries no build_provenance, so "
                              f"nothing records which sources produced its bytes")
-        checked.append(seg["segment_id"])
-    return READY, _reason(segments_verified=len(checked), ids=",".join(checked))
+    return READY, _reason(segments_verified=len(store.segment_paths),
+                          ids=",".join(s["segment_id"] for s in manifest["segments"]))
 
 
 def ignorable_days(state) -> set:
@@ -477,6 +482,31 @@ def _check_capacity(t: Dict, now=None) -> tuple:
                                  f"{cap['measured_utc']}, {int(age)}s ago, against a "
                                  f"{MAX_CAPACITY_AGE_S}s window. Re-collect before relying "
                                  f"on it")
+    # A free-space reading is a fact about a DEVICE. Nothing tied it to the one holding the
+    # target root, so a roomy unrelated volume would have produced READY while the volume that
+    # matters was full.
+    on_host, host_reason = _on_host(t)
+    if not on_host:
+        return NOT_ADJUDICATED, (f"the reading cannot be tied to the device holding "
+                                 f"{t.get('root')!r}: {host_reason}")
+    if cap.get("filesystem_dev") is None:
+        return NOT_ADJUDICATED, ("the reading records no filesystem_dev, so it names no "
+                                 "device and cannot be matched to the target root")
+    declared_root = cap.get("data_root")
+    if not declared_root:
+        return NOT_ADJUDICATED, "the reading records no data_root, so it measured no named path"
+    root = t.get("root")
+    if not root or os.path.realpath(declared_root) != os.path.realpath(root):
+        return BLOCKED, (f"the reading measured data_root {declared_root!r}, not the target "
+                         f"root {root!r}")
+    try:
+        actual_dev = os.stat(root).st_dev
+    except OSError as exc:
+        return NOT_ADJUDICATED, f"cannot stat the target root {root!r}: {exc}"
+    if actual_dev != cap["filesystem_dev"]:
+        return BLOCKED, (f"the reading is of device {cap['filesystem_dev']}, but {root!r} is "
+                         f"on device {actual_dev}: free space was measured somewhere else")
+
     free, minimum = cap.get("free_now_gib"), cap.get("minimum_free_gib")
     if free is None or minimum is None:
         return NOT_ADJUDICATED, "the capacity evidence is missing free_now_gib/minimum_free_gib"
@@ -488,6 +518,28 @@ def _check_capacity(t: Dict, now=None) -> tuple:
     return READY, f"free {free} GiB against a {minimum} GiB minimum (run {cap['run_id']}){note}"
 
 
+#: Fields an executed-result artifact must carry. A source digest says which bytes exist; it
+#: says nothing about whether anything ran them. These say what ran, against which commit, with
+#: what result, and when.
+EXECUTION_FIELDS = ("suite", "deploy_sha", "command", "exit_code", "tests_run", "ran_utc",
+                    "source_digest")
+
+#: Where executed-result artifacts are committed.
+EXECUTIONS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "bench", "results", "p5_failure_semantics")
+
+
+def load_execution(path: str) -> Dict:
+    """An executed-result artifact, read from the repository rather than from the target.
+
+    The claim used to travel inside the collected JSON, so whatever wrote that file wrote the
+    evidence too. Reading it from a committed path means the artifact is reviewable on its own,
+    and a target can only point at one."""
+    import json
+    with open(path) as fh:
+        return json.load(fh)
+
+
 def _check_failure_semantics(t: Dict) -> tuple:
     proven = t.get("failure_semantics_proven_by")
     if not proven:
@@ -496,31 +548,49 @@ def _check_failure_semantics(t: Dict) -> tuple:
     # A sentence is not evidence. Naming a suite says nothing about WHICH code it ran against
     # or whether that run happened, so the claim has to carry the commit and a digest of the
     # run that produced it.
-    if not isinstance(proven, dict):
-        return NOT_ADJUDICATED, (f"the claim {proven!r} is a sentence, not a bound result: it "
-                                 f"names no commit and no run digest")
-    sha, digest = proven.get("deploy_sha"), proven.get("digest")
-    suite = proven.get("suite")
-    if not sha or not digest or not suite:
-        missing = [k for k in ("suite", "deploy_sha", "digest") if not proven.get(k)]
-        return NOT_ADJUDICATED, (f"the claim is missing {missing}; without all three it cannot "
-                                 f"be tied to a run of known code")
+    if not isinstance(proven, str):
+        return NOT_ADJUDICATED, (f"the claim {proven!r} is not a path to an executed-result "
+                                 f"artifact. A source digest says which bytes exist; it says "
+                                 f"nothing about whether anything ran them")
+    path = proven if os.path.isabs(proven) else os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), proven)
+    try:
+        run = load_execution(path)
+    except Exception as exc:                                  # noqa: BLE001
+        return NOT_ADJUDICATED, f"no executed-result artifact at {proven!r}: {exc}"
+    missing = [k for k in EXECUTION_FIELDS if run.get(k) in (None, "")]
+    if missing:
+        return NOT_ADJUDICATED, (f"the executed-result artifact is missing {missing}; without "
+                                 f"them it records no run of anything in particular")
+    sha, suite, digest = run["deploy_sha"], run["suite"], run["source_digest"]
     if not _is_sha256(digest):
-        return NOT_ADJUDICATED, (f"digest {digest!r} is not a SHA-256: 64 lowercase hex "
-                                 f"characters. Any non-empty value used to pass here")
+        return NOT_ADJUDICATED, (f"source_digest {digest!r} is not a SHA-256: 64 lowercase hex "
+                                 f"characters")
     if sha not in REVIEWED_DEPLOY_SHAS:
-        return BLOCKED, (f"the behaviour was proven against {sha[:7]}, which is not in the "
-                         f"approved deploy set")
-    # The digest has to be OF something. Recomputed from the suite at the approved commit, so
-    # a well-formed digest of nothing in particular is refused like any other mismatch.
+        return BLOCKED, (f"the run was against {sha[:7]}, which is not in the approved deploy "
+                         f"set")
+    if type(run["exit_code"]) is not int or run["exit_code"] != 0:
+        return BLOCKED, (f"the recorded run exited {run['exit_code']!r}: a failing or unknown "
+                         f"run proves nothing about fail-closed behaviour")
+    if type(run["tests_run"]) is not int or run["tests_run"] <= 0:
+        return BLOCKED, (f"the run reports {run['tests_run']!r} tests; a green run of nothing "
+                         f"is the easiest green there is")
+    if _parse_utc(run["ran_utc"]) is None:
+        return NOT_ADJUDICATED, f"ran_utc {run['ran_utc']!r} is not a timestamp"
+    if suite not in str(run["command"]):
+        return BLOCKED, (f"the recorded command {run['command']!r} does not name the suite "
+                         f"{suite!r} it claims to have run")
+    # And the suite it names has to BE the one at the approved commit -- a run of a file that
+    # has since changed is a result about different code.
     expected = expected_suite_digest(suite, sha)
     if expected is None:
         return BLOCKED, (f"{suite!r} is not present at {sha[:7]}, so no run of it could have "
                          f"proven anything about that commit")
     if digest != expected:
-        return BLOCKED, (f"the digest does not match {suite} at {sha[:7]}: the claim is about "
-                         f"a different file than the one it names")
-    return READY, _reason(suite=suite, deploy_sha=sha[:7], digest=digest[:12])
+        return BLOCKED, (f"source_digest does not match {suite} at {sha[:7]}: the run was of a "
+                         f"different file than the one it names")
+    return READY, _reason(suite=suite, deploy_sha=sha[:7], exit_code=0,
+                          tests_run=run["tests_run"], ran_utc=run["ran_utc"])
 
 
 #: Requirements whose verdict comes from stat-ing paths. They mean nothing off the host that

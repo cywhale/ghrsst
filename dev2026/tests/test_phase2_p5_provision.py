@@ -393,3 +393,158 @@ class TestPartialStagingLeavesNoUnownedData(_ProvisionBase):
             self.provision()
         self.assertIn(self.stage_root, str(caught.exception))
         self.assertIsNotNone(caught.exception.__cause__)
+
+
+class TestLockProbeFailureFailsTheProvision(_ProvisionBase):
+    """The probe result was recorded and provisioning carried on. A root whose compaction lock
+    cannot be taken is not a working staging root -- and it returned `complete: True`, so the
+    marker asserted otherwise and `rollback()` was never reached."""
+
+    def _break_lock(self):
+        original = pv.compaction_lock.CompactionLock
+
+        class Refuses:
+            def __init__(self, *a, **kw):
+                pass
+
+            def __enter__(self):
+                raise OSError(13, "Permission denied")
+
+            def __exit__(self, *exc):
+                return False
+
+        self.addCleanup(setattr, pv.compaction_lock, "CompactionLock", original)
+        pv.compaction_lock.CompactionLock = Refuses
+
+    def test_a_probe_that_cannot_acquire_fails_the_provision(self):
+        self._break_lock()
+        with self.assertRaises(Exception) as caught:
+            self.provision()
+        self.assertIn("lock", str(caught.exception).lower())
+
+    def test_it_never_returns_a_complete_root(self):
+        self._break_lock()
+        with self.assertRaises(Exception):
+            self.provision()
+        self.assertFalse(os.path.exists(self.stage_root),
+                         "a root whose lock could not be taken survived as if it worked")
+
+    def test_a_kept_failed_root_is_marked_incomplete(self):
+        self._break_lock()
+        with self.assertRaises(Exception):
+            self.provision(cleanup_on_failure=False)
+        with open(os.path.join(self.stage_root, pv.MARKER_NAME)) as fh:
+            marker = json.load(fh)
+        self.assertIs(marker["complete"], False)
+        self.assertIn("lock", marker["failed_step"].lower())
+
+
+class TestMarkerWriteFailuresAreInsideTheTransaction(_ProvisionBase):
+    """The ownership stamp is itself a write, and writes fail. If the FIRST marker write fails
+    the root exists and is unowned -- the very state the marker was introduced to prevent."""
+
+    def _break_marker(self, on_call):
+        original = pv._write_marker
+        calls = {"n": 0}
+
+        def maybe_explode(stage_root, payload):
+            calls["n"] += 1
+            if calls["n"] == on_call:
+                raise OSError(28, "No space left on device")
+            return original(stage_root, payload)
+
+        self.addCleanup(setattr, pv, "_write_marker", original)
+        pv._write_marker = maybe_explode
+        return calls
+
+    def test_a_failed_initial_marker_write_leaves_no_directory(self):
+        self._break_marker(on_call=1)
+        with self.assertRaises(Exception):
+            self.provision()
+        self.assertFalse(os.path.exists(self.stage_root),
+                         "the root was created and left unowned when its stamp failed")
+
+    def test_a_failed_partial_marker_write_still_cleans_up(self):
+        """The second write is the one recording the failure. If it fails too, the root must
+        still go -- reporting the first error and leaving the directory is the worst outcome."""
+        original_build = pv.build_block
+
+        def explode(*a, **kw):
+            raise RuntimeError("injected failure in build_block")
+
+        self.addCleanup(setattr, pv, "build_block", original_build)
+        pv.build_block = explode
+        self._break_marker(on_call=2)
+        with self.assertRaises(Exception):
+            self.provision()
+        self.assertFalse(os.path.exists(self.stage_root))
+
+    def test_the_live_root_is_untouched_by_either_marker_failure(self):
+        """Restores explicitly rather than via `doCleanups()`, which runs EVERY cleanup --
+        including setUp's removal of the temp fixture -- and so destroys its own fixture after
+        the first iteration."""
+        original_write, original_build = pv._write_marker, pv.build_block
+        for call in (1, 2):
+            with self.subTest(marker_write=call):
+                before = sorted(os.listdir(self.live_root))
+                try:
+                    if call == 2:
+                        def explode(*a, **kw):
+                            raise RuntimeError("injected failure in build_block")
+                        pv.build_block = explode
+                    self._break_marker(on_call=call)
+                    with self.assertRaises(Exception):
+                        self.provision()
+                    self.assertEqual(sorted(os.listdir(self.live_root)), before)
+                finally:
+                    pv._write_marker, pv.build_block = original_write, original_build
+
+
+class TestRollbackOwnershipIsCanonical(_ProvisionBase):
+    """The marker matched on one string, so a COPY of it authorized deleting whatever directory
+    it was dropped into. A marker is a claim about one root, on one side of one live root, from
+    one run -- and all three have to agree with the request."""
+
+    def test_a_copied_marker_elsewhere_does_not_authorize_deletion(self):
+        out = self.provision()
+        victim = os.path.join(self.tmp, "someone_elses_dir")
+        os.makedirs(victim, exist_ok=True)
+        with open(os.path.join(victim, "precious.txt"), "w") as fh:
+            fh.write("not ours")
+        shutil.copy(os.path.join(out["stage_root"], pv.MARKER_NAME),
+                    os.path.join(victim, pv.MARKER_NAME))
+
+        with self.assertRaises(pv.ProvisionRefused) as caught:
+            pv.rollback(dict(out, stage_root=victim))
+        self.assertIn("stage_root", str(caught.exception))
+        self.assertTrue(os.path.isfile(os.path.join(victim, "precious.txt")))
+
+    def test_a_marker_naming_another_live_root_is_refused(self):
+        out = self.provision()
+        with open(os.path.join(out["stage_root"], pv.MARKER_NAME)) as fh:
+            marker = json.load(fh)
+        marker["live_root"] = os.path.join(self.tmp, "a_different_live_root")
+        with open(os.path.join(out["stage_root"], pv.MARKER_NAME), "w") as fh:
+            json.dump(marker, fh)
+        with self.assertRaises(pv.ProvisionRefused) as caught:
+            pv.rollback(out)
+        self.assertIn("live_root", str(caught.exception))
+        self.assertTrue(os.path.isdir(out["stage_root"]))
+
+    def test_the_paths_are_compared_canonically_not_as_strings(self):
+        """A request naming the same root through a symlink is the same root."""
+        out = self.provision()
+        link = os.path.join(self.tmp, "link_to_stage")
+        os.symlink(out["stage_root"], link)
+        pv.rollback(dict(out, stage_root=link))
+        self.assertFalse(os.path.exists(out["stage_root"]))
+
+    def test_each_identity_field_is_checked_on_its_own(self):
+        out = self.provision()
+        for field, wrong in (("marker", "P5_ISOLATED_STAGING:other:tests"),
+                             ("live_root", os.path.join(self.tmp, "elsewhere"))):
+            with self.subTest(field):
+                with self.assertRaises(pv.ProvisionRefused) as caught:
+                    pv.rollback(dict(out, **{field: wrong}))
+                self.assertIn(field, str(caught.exception))
+                self.assertTrue(os.path.isdir(out["stage_root"]))
