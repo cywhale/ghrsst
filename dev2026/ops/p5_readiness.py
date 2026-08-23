@@ -69,6 +69,29 @@ REVIEWED_DEPLOY_SHAS = (
     "3223fba37da5d292ea6acb58ccef0da2b5138d31",
 )
 
+#: Where the assessor's repository lives, and the directory prefix inside it. Module-level so
+#: tests can point the whole git-backed path at a purpose-built repository instead of stubbing
+#: the checks out.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DEV_PREFIX = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+#: The ONE committed directory an executed-result artifact may live in, relative to the dev
+#: directory. A path is not a provenance: `/tmp/x.json` and `../../x.json` are paths too.
+EXECUTIONS_REL = os.path.join("bench", "results", "p5_failure_semantics")
+
+#: The commit an artifact is READ FROM. `None` means the approved commit that the artifact
+#: itself claims to be about, which is the normal case; a test may pin a later one when the
+#: artifact is committed after the run it records.
+EVIDENCE_COMMIT = None
+
+#: Legacy monoliths a `legacy_base` segment may point at, OUTSIDE the block root.
+#:
+#: This came from the target, so a manifest could ship the permission that lets its own segment
+#: escape -- an allow-list taken from the thing it governs is not an allow-list. It is assessor
+#: configuration now, and empty by default: fail closed, because the deployments this runs
+#: against have no legacy segment at all.
+ALLOWED_LEGACY_PATHS = ()
+
 #: Modules whose bytes are fingerprinted and re-verified against the approved commit.
 INVENTORY_MODULES = (
     "store/block_manifest.py", "store/repair_wal.py", "store/compaction_lock.py",
@@ -155,6 +178,10 @@ def _reason(**kw) -> str:
     return "; ".join(f"{k}={v}" for k, v in kw.items())
 
 
+def _dev_dir() -> str:
+    return os.path.join(REPO_ROOT, DEV_PREFIX)
+
+
 def expected_module_digests(sha: str) -> Dict[str, str]:
     """sha256 of each inventory module AT `sha`, read from git by the assessor.
 
@@ -162,26 +189,74 @@ def expected_module_digests(sha: str) -> Dict[str, str]:
     contains. Comparing the two is the only version of the check that a target cannot satisfy
     by describing itself."""
     import hashlib
-    import subprocess
-    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    prefix = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     out = {}
     for rel in INVENTORY_MODULES:
-        proc = subprocess.run(["git", "show", f"{sha}:{prefix}/{rel}"], cwd=repo,
-                              capture_output=True)
-        if proc.returncode == 0:
-            out[rel] = hashlib.sha256(proc.stdout).hexdigest()
+        blob = _git_blob(sha, rel)
+        if blob is not None:
+            out[rel] = hashlib.sha256(blob).hexdigest()
     return out
+
+
+class ExecutionRefused(Exception):
+    """An executed-result claim that does not name a reviewable, committed artifact."""
 
 
 def _git_blob(sha: str, rel: str):
     """The bytes of one repository path at one commit, or None if it is not there."""
     import subprocess
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    repo, prefix = os.path.dirname(here), os.path.basename(here)
-    proc = subprocess.run(["git", "show", f"{sha}:{prefix}/{rel}"], cwd=repo,
+    proc = subprocess.run(["git", "show", f"{sha}:{DEV_PREFIX}/{rel}"], cwd=REPO_ROOT,
                           capture_output=True)
     return proc.stdout if proc.returncode == 0 else None
+
+
+def executions_dir() -> str:
+    return os.path.join(REPO_ROOT, DEV_PREFIX, EXECUTIONS_REL)
+
+
+def resolve_execution_path(claim: str) -> str:
+    """The canonical path of an executed-result artifact, or a refusal.
+
+    Absolute paths and `..` are refused by name -- saying which rule stopped it is more useful
+    than a generic containment message -- and the resolved path must land inside the one
+    committed directory, which is what catches a symlink pointing out of it."""
+    if os.path.isabs(claim):
+        raise ExecutionRefused(
+            f"{claim!r} is an absolute path; an executed-result artifact is named relative to "
+            f"the committed {EXECUTIONS_REL} directory")
+    if ".." in claim.replace("\\", "/").split("/"):
+        raise ExecutionRefused(
+            f"{claim!r} contains a '..' component; the artifact must be inside the committed "
+            f"directory, not reached by walking out of it")
+    root = os.path.realpath(executions_dir())
+    resolved = os.path.realpath(os.path.join(executions_dir(), claim))
+    if resolved != root and not resolved.startswith(root + os.sep):
+        raise ExecutionRefused(
+            f"{claim!r} resolves to {resolved}, outside the committed {root}. A symlink out of "
+            f"the directory is not in the directory")
+    return resolved
+
+
+def load_execution(claim: str, sha: str) -> Dict:
+    """An executed-result artifact, read FROM GIT at `sha`.
+
+    Read from the working tree, the artifact was whatever happened to be on disk -- so the hand
+    that wrote the claim could write the evidence. Reading the committed blob makes it a
+    reviewable object: it is in the history, or it does not count."""
+    import json
+    resolved = resolve_execution_path(claim)
+    # Both sides canonical. `resolved` is a realpath, and on macOS the temp tree lives behind
+    # a `/var` -> `/private/var` symlink -- so relpath against a non-canonical base produces a
+    # `../..` walk and every lookup misses.
+    rel = os.path.relpath(resolved, os.path.realpath(os.path.join(REPO_ROOT, DEV_PREFIX)))
+    blob = _git_blob(EVIDENCE_COMMIT or sha, rel)
+    if blob is None:
+        raise ExecutionRefused(
+            f"{claim!r} is not tracked at {(EVIDENCE_COMMIT or sha)[:7]}; an artifact that was "
+            f"never committed cannot be reviewed and is not evidence")
+    try:
+        return json.loads(blob)
+    except ValueError as exc:
+        raise ExecutionRefused(f"{claim!r} is not readable JSON at that commit: {exc}") from exc
 
 
 def expected_suite_digest(suite: str, sha: str):
@@ -270,8 +345,9 @@ def _check_blocks(t: Dict) -> tuple:
         return BLOCKED, f"cannot check blocks: {why}"
     from store.segmented_cube import SegmentedCubeStore
     try:
+        # From the module, never from `t`: the target is the thing being governed.
         store = SegmentedCubeStore(t["manifest_root"],
-                                   allowed_legacy_paths=t.get("allowed_legacy_paths"))
+                                   allowed_legacy_paths=list(ALLOWED_LEGACY_PATHS))
     except Exception as exc:                                  # noqa: BLE001
         return BLOCKED, f"the deployment could not open this manifest: {exc}"
     # `build_provenance` is optional in the schema and the store does not require it, so it is
@@ -507,15 +583,26 @@ def _check_capacity(t: Dict, now=None) -> tuple:
         return BLOCKED, (f"the reading is of device {cap['filesystem_dev']}, but {root!r} is "
                          f"on device {actual_dev}: free space was measured somewhere else")
 
-    free, minimum = cap.get("free_now_gib"), cap.get("minimum_free_gib")
-    if free is None or minimum is None:
+    collected_free, minimum = cap.get("free_now_gib"), cap.get("minimum_free_gib")
+    if collected_free is None or minimum is None:
         return NOT_ADJUDICATED, "the capacity evidence is missing free_now_gib/minimum_free_gib"
+    # The artifact's figure decided G18. An artifact is a record of what someone saw; the gate
+    # is about what is there NOW, on this device, and the assessor is standing on it. So it
+    # measures. The collected figure stays as provenance -- it says what the collection
+    # observed -- and decides nothing.
+    try:
+        st = os.statvfs(root)
+    except OSError as exc:
+        return NOT_ADJUDICATED, f"cannot statvfs the target root {root!r}: {exc}"
+    free = round(st.f_bavail * st.f_frsize / (1024 ** 3), 1)
+    drift = f"; collected {collected_free} GiB" if collected_free != free else ""
     if free < minimum:
-        return BLOCKED, (f"free {free} GiB is below the {minimum} GiB minimum "
-                         f"(run {cap['run_id']})")
+        return BLOCKED, (f"statvfs reports {free} GiB free on {root}, below the {minimum} GiB "
+                         f"minimum (run {cap['run_id']}){drift}")
     recommended = cap.get("recommended_free_gib")
     note = "" if recommended is None or free >= recommended else "; below the recommended target"
-    return READY, f"free {free} GiB against a {minimum} GiB minimum (run {cap['run_id']}){note}"
+    return READY, (f"statvfs reports {free} GiB free on {root} against a {minimum} GiB minimum "
+                   f"(run {cap['run_id']}){drift}{note}")
 
 
 #: Fields an executed-result artifact must carry. A source digest says which bytes exist; it
@@ -527,17 +614,6 @@ EXECUTION_FIELDS = ("suite", "deploy_sha", "command", "exit_code", "tests_run", 
 #: Where executed-result artifacts are committed.
 EXECUTIONS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                               "bench", "results", "p5_failure_semantics")
-
-
-def load_execution(path: str) -> Dict:
-    """An executed-result artifact, read from the repository rather than from the target.
-
-    The claim used to travel inside the collected JSON, so whatever wrote that file wrote the
-    evidence too. Reading it from a committed path means the artifact is reviewable on its own,
-    and a target can only point at one."""
-    import json
-    with open(path) as fh:
-        return json.load(fh)
 
 
 def _check_failure_semantics(t: Dict) -> tuple:
@@ -552,10 +628,14 @@ def _check_failure_semantics(t: Dict) -> tuple:
         return NOT_ADJUDICATED, (f"the claim {proven!r} is not a path to an executed-result "
                                  f"artifact. A source digest says which bytes exist; it says "
                                  f"nothing about whether anything ran them")
-    path = proven if os.path.isabs(proven) else os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), proven)
+    # The claim names a file in the committed directory; the artifact itself says which commit
+    # it is about, so it is read from that commit (or `EVIDENCE_COMMIT`, when the artifact was
+    # committed after the run it records).
     try:
-        run = load_execution(path)
+        peek = load_execution(proven, REVIEWED_DEPLOY_SHAS[0])
+        run = load_execution(proven, peek.get("deploy_sha") or REVIEWED_DEPLOY_SHAS[0])
+    except ExecutionRefused as exc:
+        return NOT_ADJUDICATED, f"no executed-result artifact at {proven!r}: {exc}"
     except Exception as exc:                                  # noqa: BLE001
         return NOT_ADJUDICATED, f"no executed-result artifact at {proven!r}: {exc}"
     missing = [k for k in EXECUTION_FIELDS if run.get(k) in (None, "")]

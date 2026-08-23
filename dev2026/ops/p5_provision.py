@@ -100,10 +100,19 @@ def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: st
     concerned nobody made it. That is unowned data — a directory a person has to identify and
     delete by hand, from memory of which one was safe.
 
-    Ownership is established BEFORE anything is created. A failure then rolls the root back and
-    re-raises, or, with `cleanup_on_failure=False`, leaves it in place still marked as ours and
-    flagged incomplete, so the same `rollback()` call disposes of it once it has been looked
-    at. Either way nothing unowned survives."""
+    Ownership is established BEFORE anything is created, and every write -- including the
+    initial stamp and the final completion record -- is inside the transaction. A failure rolls
+    the root back and re-raises, or, with `cleanup_on_failure=False`, leaves it in place still
+    marked as ours and flagged incomplete, so the same `rollback()` call disposes of it once it
+    has been looked at.
+
+    ## What this does NOT promise
+
+    A process CRASH between two writes is not covered by any of it: the handler that rolls back
+    does not run, and what survives is whatever had been written -- owned, because the stamp
+    comes first, but not cleaned up. Recovering that is a person calling `rollback()` on a root
+    whose marker says `complete: false`. Nothing here makes provisioning atomic against
+    power loss, a SIGKILL, or a filesystem that reorders the writes."""
     _refuse_if_not_isolated(stage_root, live_root)
     # ANY existing path, empty or not. An empty directory someone else made is still theirs,
     # and `rollback()` removes the whole root -- so accepting an existing empty directory hands
@@ -136,12 +145,12 @@ def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: st
         _discard_unowned(stage_root, failure)
         raise
     try:
-        result = _provision_contents(
+        result = _record_completion(stage_root, _provision_contents(
             stage_root=stage_root, live_root=live_root, manifest_root=manifest_root,
             wal_root=wal_root, anchor_root=anchor_root, artifacts=artifacts,
             delta_path=delta_path, start_day=start_day, end_day=end_day, days=days,
             operator=operator, at_utc=at_utc, grid=grid, block_name=block_name,
-            domain_id=domain_id, marker=marker)
+            domain_id=domain_id, marker=marker))
     except Exception as failure:
         partial = {**stamp, "failed_step": repr(failure)}
         try:
@@ -163,6 +172,15 @@ def provision(*, stage_root: str, live_root: str, delta_path: str, start_day: st
                 f"ours and incomplete: roll it back once the cause is understood"
             ) from failure
         raise
+    return result
+
+
+def _record_completion(stage_root: str, result: Dict) -> Dict:
+    """The success path's LAST act -- and a write, so it can fail.
+
+    It sat outside the transaction: a root that provisioned perfectly and then could not record
+    that it had was left carrying its initial `complete: false` stamp, describing a state that
+    is not the one on disk. Inside, it is a provisioning failure like any other."""
     _write_marker(stage_root, result)
     return result
 

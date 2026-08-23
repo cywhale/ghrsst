@@ -548,3 +548,78 @@ class TestRollbackOwnershipIsCanonical(_ProvisionBase):
                     pv.rollback(dict(out, **{field: wrong}))
                 self.assertIn(field, str(caught.exception))
                 self.assertTrue(os.path.isdir(out["stage_root"]))
+
+
+class TestTheFinalMarkerWriteIsInsideTheTransaction(_ProvisionBase):
+    """Every other write was brought inside the transaction and this one was left out: the
+    SUCCESS path's last act. A root that provisioned perfectly and then failed to record that
+    it had, kept its initial `complete: false` stamp -- rollbackable, but describing a state
+    that is not the one on disk -- or worse, raised with the caller holding no result."""
+
+    def _break_final_marker(self):
+        original = pv._write_marker
+        calls = {"n": 0}
+
+        def maybe_explode(stage_root, payload):
+            calls["n"] += 1
+            if payload.get("complete") is True:
+                raise OSError(28, "No space left on device")
+            return original(stage_root, payload)
+
+        self.addCleanup(setattr, pv, "_write_marker", original)
+        pv._write_marker = maybe_explode
+        return calls
+
+    def test_a_failed_final_marker_write_fails_the_provision(self):
+        self._break_final_marker()
+        with self.assertRaises(Exception) as caught:
+            self.provision()
+        self.assertNotIsInstance(caught.exception, AssertionError)
+
+    def test_it_leaves_no_staging_root_behind(self):
+        self._break_final_marker()
+        with self.assertRaises(Exception):
+            self.provision()
+        self.assertFalse(os.path.exists(self.stage_root),
+                         "a root that could not record its own completion survived")
+
+    def test_a_kept_root_is_marked_incomplete_and_rollbackable(self):
+        self._break_final_marker()
+        with self.assertRaises(Exception):
+            self.provision(cleanup_on_failure=False)
+        marker_path = os.path.join(self.stage_root, pv.MARKER_NAME)
+        self.assertTrue(os.path.isfile(marker_path))
+        with open(marker_path) as fh:
+            marker = json.load(fh)
+        self.assertIs(marker["complete"], False)
+        self.assertTrue(marker["failed_step"])
+        pv.rollback(marker)
+        self.assertFalse(os.path.exists(self.stage_root))
+
+    def test_the_live_root_is_untouched(self):
+        before = sorted(os.listdir(self.live_root))
+        self._break_final_marker()
+        with self.assertRaises(Exception):
+            self.provision()
+        self.assertEqual(sorted(os.listdir(self.live_root)), before)
+
+    def test_a_cleanup_failure_after_a_final_marker_failure_is_reported(self):
+        self._break_final_marker()
+        original_rollback = pv.rollback
+
+        def refuse(*a, **kw):
+            raise pv.ProvisionRefused("injected rollback failure")
+
+        self.addCleanup(setattr, pv, "rollback", original_rollback)
+        pv.rollback = refuse
+        with self.assertRaises(pv.ProvisionCleanupError) as caught:
+            self.provision()
+        self.assertIn(self.stage_root, str(caught.exception))
+
+    def test_the_docstring_claims_no_more_than_the_code_delivers(self):
+        """"Either way nothing unowned survives" was written while the success path's last
+        write sat outside the transaction, and it still cannot promise anything about a crash
+        between two writes."""
+        doc = pv.provision.__doc__
+        self.assertIn("crash", doc.lower())
+        self.assertNotIn("Either way nothing unowned survives", doc)
