@@ -66,7 +66,13 @@ def approved_assessor_repo():
             subprocess.run(("git",) + args, cwd=root, check=True, capture_output=True)
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
                               capture_output=True, text=True).stdout.strip()
-        _ASSESSOR_REPO = (root, head)
+        # The record lives beside the repository, never inside it.
+        record = os.path.join(tempfile.mkdtemp(prefix="p5-approval-"), "approval.json")
+        with open(record, "w") as fh:
+            json.dump({"scope": rd.APPROVAL_SCOPE, "approved_sha": head,
+                       "approved_by": "test fixture", "approved_utc": "2026-08-23T00:00:00Z"},
+                      fh)
+        _ASSESSOR_REPO = (root, head, record)
     return _ASSESSOR_REPO
 
 
@@ -145,7 +151,7 @@ def build_probe_workspace(case):
     evidence_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
                                   capture_output=True, text=True).stdout.strip()
 
-    assessor_root, assessor_head = approved_assessor_repo()
+    assessor_root, assessor_head, assessor_record = approved_assessor_repo()
     now = _now_iso()
     target = {
         "label": rd.QUALIFYING_LABEL, "host": socket.gethostname(),
@@ -176,7 +182,7 @@ def build_probe_workspace(case):
             "FAILURE_SEMANTICS_SUITES": ["tests.test_closure_probe_suite"],
             "INVENTORY_MODULES": [suite_rel],
             "ASSESSOR_REPO_ROOT": assessor_root,
-            "APPROVED_ASSESSOR_SHAS": [assessor_head],
+            "APPROVAL_RECORD_PATH": assessor_record,
         },
         "target": target,
         "canonical_minimum_gib": 0.001,
@@ -187,17 +193,40 @@ def build_probe_workspace(case):
     return cfg_path
 
 
+class _RecordWritingMixin:
+    """Write an operator approval record for a given commit, outside the repository."""
+
+    def _record_for(self, sha, **over):
+        record = {"scope": rd.APPROVAL_SCOPE, "approved_sha": sha,
+                  "approved_by": "test operator", "approved_utc": "2026-08-23T00:00:00Z"}
+        record.update(over)
+        outside = tempfile.mkdtemp(prefix="p5-record-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        path = os.path.join(outside, "approval.json")
+        with open(path, "w") as fh:
+            json.dump(record, fh)
+        return path
+
+
 class _ApprovedAssessorMixin:
-    """Point the assessor's self-check at an approved build of its own modules."""
+    """Point the assessor's self-check at an approved build of its own modules.
+
+    The approval is an operator record on a path OUTSIDE that repository -- the same route
+    production would use -- so the fixtures exercise the real mechanism rather than a switch.
+    It approves a repository these tests built, and nothing else."""
 
     def _approve_assessor(self):
-        root, head = approved_assessor_repo()
+        root, head, record = approved_assessor_repo()
         for name, value in (("ASSESSOR_REPO_ROOT", root),
-                            ("APPROVED_ASSESSOR_SHAS", (head,))):
+                            ("APPROVAL_RECORD_PATH", record)):
             self.addCleanup(setattr, rd, name, getattr(rd, name))
             setattr(rd, name, value)
         ok, why = rd.assessor_is_approved()
         assert ok, f"the fixture's own assessor approval failed: {why}"
+
+    def _unapprove_assessor(self):
+        self.addCleanup(setattr, rd, "APPROVAL_RECORD_PATH", rd.APPROVAL_RECORD_PATH)
+        rd.APPROVAL_RECORD_PATH = None
 
 
 def _now_iso():
@@ -348,7 +377,7 @@ class TestAnUnapprovedAssessorDemotesRealFindings(_TargetBase):
         was_ready = {r["id"] for r in approved["requirements"] if r["verdict"] == rd.READY}
         self.assertTrue(was_ready, "nothing was READY; the demotion would be unobservable")
 
-        rd.APPROVED_ASSESSOR_SHAS = ()
+        rd.APPROVAL_RECORD_PATH = None
         demoted = {r["id"]: r for r in rd.assess(self.target())["requirements"]}
         for rid in sorted(was_ready):
             with self.subTest(rid):
@@ -360,12 +389,12 @@ class TestAnUnapprovedAssessorDemotesRealFindings(_TargetBase):
         there was nothing to find."""
         approved = {r["id"]: r for r in rd.assess(self.target())["requirements"]}
         ready = next(r for r in approved.values() if r["verdict"] == rd.READY)
-        rd.APPROVED_ASSESSOR_SHAS = ()
+        rd.APPROVAL_RECORD_PATH = None
         demoted = {r["id"]: r for r in rd.assess(self.target())["requirements"]}[ready["id"]]
         self.assertIn("The check itself found", demoted["reason"])
 
     def test_readiness_is_false_and_the_report_says_why(self):
-        rd.APPROVED_ASSESSOR_SHAS = ()
+        rd.APPROVAL_RECORD_PATH = None
         report = rd.assess(self.target())
         self.assertIs(report["compaction_ready"], False)
         self.assertIs(report["assessor_approved"], False)
@@ -1753,7 +1782,7 @@ class TestTheEvidenceCommitIsDeclaredAndApproved(_ApprovedAssessorMixin, unittes
         self.assertFalse(hasattr(rd, "EVIDENCE_COMMIT"))
 
 
-class TestTheAssessorIsItselfBound(unittest.TestCase):
+class TestTheAssessorIsItselfBound(_RecordWritingMixin, unittest.TestCase):
     """Every guard so far pointed outward. The assessor read its own G18 policy from the
     WORKING TREE -- `ops/p5s8_evidence.py` as it happens to be on disk -- so editing one line
     of local policy moved the bar the assessor then enforced. The tool checking whether the
@@ -1763,7 +1792,7 @@ class TestTheAssessorIsItselfBound(unittest.TestCase):
     Below that bar nothing it produces may authorize anything."""
 
     def setUp(self):
-        for name in ("APPROVED_ASSESSOR_SHAS", "REPO_ROOT", "DEV_PREFIX"):
+        for name in ("APPROVAL_RECORD_PATH", "REPO_ROOT", "DEV_PREFIX"):
             self.addCleanup(setattr, rd, name, getattr(rd, name))
 
     def test_the_assessor_inventory_covers_itself_and_its_policy(self):
@@ -1787,24 +1816,25 @@ class TestTheAssessorIsItselfBound(unittest.TestCase):
         """"No assessor build is approved" and "you are on the wrong commit" are different
         situations for whoever reads this, and the membership test alone reports the second for
         both -- which is why deleting the empty-set branch survived a mutation round."""
-        rd.APPROVED_ASSESSOR_SHAS = ()
+        rd.APPROVAL_RECORD_PATH = None
         ok, reason = rd.assessor_is_approved()
         self.assertFalse(ok)
-        self.assertIn("APPROVED_ASSESSOR_SHAS is empty", reason)
+        self.assertIn("no approval record is configured", reason)
 
     def test_a_wrong_commit_says_which_commit(self):
         """The other half of the same distinction, so neither message stands in for the other."""
-        root, head = approved_assessor_repo()
+        root, head, _ = approved_assessor_repo()
         rd.ASSESSOR_REPO_ROOT = root
-        rd.APPROVED_ASSESSOR_SHAS = ("b" * 40,)
+        rd.APPROVAL_RECORD_PATH = self._record_for("b" * 40)
         ok, reason = rd.assessor_is_approved()
         self.assertFalse(ok)
         self.assertIn(head[:7], reason)
         self.assertNotIn("is empty", reason)
 
-    def test_this_branch_is_not_an_approved_assessor(self):
-        """The honest state today: `3efcfd5` has not been reviewed."""
-        self.assertEqual(tuple(rd.APPROVED_ASSESSOR_SHAS), ())
+    def test_this_branch_ships_no_approval(self):
+        """The honest state today: no operator has approved any assessor build, and the
+        shipped default names none."""
+        self.assertIsNone(rd.APPROVAL_RECORD_DEFAULT)
 
     def test_a_locally_edited_policy_is_refused_rather_than_used(self):
         """The reported defect, end to end: change the threshold on disk and the assessor must
@@ -1830,7 +1860,7 @@ class TestTheAssessorIsItselfBound(unittest.TestCase):
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
                               capture_output=True, text=True).stdout.strip()
         rd.REPO_ROOT, rd.DEV_PREFIX = repo, "dev2026"
-        rd.APPROVED_ASSESSOR_SHAS = (head,)
+        rd.APPROVAL_RECORD_PATH = self._record_for(head)
 
         ok, reason = rd.assessor_is_approved()
         self.assertTrue(ok, reason)                       # positive control: clean and approved
@@ -1843,7 +1873,7 @@ class TestTheAssessorIsItselfBound(unittest.TestCase):
         self.assertIn("p5s8_evidence.py", reason)
 
     def test_an_unapproved_assessor_demotes_every_requirement(self):
-        rd.APPROVED_ASSESSOR_SHAS = ()
+        rd.APPROVAL_RECORD_PATH = None
         report = rd.assess({"label": rd.QUALIFYING_LABEL, "host": "nowhere"})
         self.assertIs(report["compaction_ready"], False)
         self.assertEqual(report["summary"][rd.READY], [])
@@ -1853,7 +1883,7 @@ class TestTheAssessorIsItselfBound(unittest.TestCase):
     def test_the_demotion_reason_names_the_assessor_not_the_target(self):
         """Reported on the report, because a target with nothing in it is refused by its own
         checkers first -- the demotion only rewrites reasons that would otherwise be READY."""
-        rd.APPROVED_ASSESSOR_SHAS = ()
+        rd.APPROVAL_RECORD_PATH = None
         report = rd.assess({"label": rd.QUALIFYING_LABEL, "host": "nowhere"})
         self.assertIn("assessor", report["assessor_note"].lower())
         self.assertIn("approved", report["assessor_note"].lower())
@@ -1999,7 +2029,7 @@ class TestTheEvidenceCommitDescendsFromTheDeployCommit(TestTheEvidenceCommitIsDe
         self.assertTrue(rd.commit_descends_from(self.deploy_sha, self.deploy_sha))
 
 
-class TestTheAssessorRuntimeTreeIsClean(unittest.TestCase):
+class TestTheAssessorRuntimeTreeIsClean(_RecordWritingMixin, unittest.TestCase):
     """Comparing four policy files left the rest of the runtime unguarded.
 
     `_check_blocks` imports `store/segmented_cube.py` and the verdict comes straight out of it,
@@ -2021,10 +2051,10 @@ class TestTheAssessorRuntimeTreeIsClean(unittest.TestCase):
             subprocess.run(("git",) + args, cwd=self.repo, check=True, capture_output=True)
         self.head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
                                    capture_output=True, text=True).stdout.strip()
-        for name in ("ASSESSOR_REPO_ROOT", "DEV_PREFIX", "APPROVED_ASSESSOR_SHAS"):
+        for name in ("ASSESSOR_REPO_ROOT", "DEV_PREFIX", "APPROVAL_RECORD_PATH"):
             self.addCleanup(setattr, rd, name, getattr(rd, name))
         rd.ASSESSOR_REPO_ROOT, rd.DEV_PREFIX = self.repo, "dev2026"
-        rd.APPROVED_ASSESSOR_SHAS = (self.head,)
+        rd.APPROVAL_RECORD_PATH = self._record_for(self.head)
 
     def _path(self, rel):
         return os.path.join(self.repo, "dev2026", rel)
@@ -2057,7 +2087,7 @@ report = rd.assess(target)
 verdicts = {r["id"]: r["verdict"] for r in report["requirements"]}
 reasons = {r["id"]: r["reason"] for r in report["requirements"]}
 # The unapproved branch too: it renders different reasons and may import differently.
-rd.APPROVED_ASSESSOR_SHAS = ()
+rd.APPROVAL_RECORD_PATH = None
 rd.assess(target)
 out = set()
 for mod in list(sys.modules.values()):
@@ -2178,7 +2208,7 @@ print(json.dumps({"closure": sorted(out), "verdicts": verdicts, "reasons": reaso
                        capture_output=True)
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
                               capture_output=True, text=True).stdout.strip()
-        rd.APPROVED_ASSESSOR_SHAS = (head,)
+        rd.APPROVAL_RECORD_PATH = self._record_for(head)
         self.assertNotIn("ops/unrelated_helper.py", rd.ASSESSOR_MODULES)
         ok, _ = rd.assessor_is_approved()
         self.assertTrue(ok, "the fixture is not clean before the edit")
@@ -2233,7 +2263,7 @@ print(json.dumps({"closure": sorted(out), "verdicts": verdicts, "reasons": reaso
                        check=True, capture_output=True)
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
                               capture_output=True, text=True).stdout.strip()
-        rd.APPROVED_ASSESSOR_SHAS = (head,)
+        rd.APPROVAL_RECORD_PATH = self._record_for(head)
         status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
                                 cwd=self.repo, capture_output=True, text=True).stdout.strip()
         self.assertEqual(status, "", "the fixture is visible to status; it proves nothing")
@@ -2249,3 +2279,287 @@ print(json.dumps({"closure": sorted(out), "verdicts": verdicts, "reasons": reaso
             fh.write("x\n")
         _, reason = rd.assessor_is_approved()
         self.assertIn("untracked_note.txt", reason)
+
+
+class TestSelfApprovalIsImpossible(unittest.TestCase):
+    """The approved set lived in `ops/p5_readiness.py`, which is itself in the inventory. That
+    is a circle with no way in, and this proves it rather than asserting it.
+
+    A commit's SHA is a hash of its own content, so a commit cannot contain its own id: there
+    is no X whose text lists X. And if a later commit Y lists X, running at Y is refused for
+    `HEAD != X` — while checking out X finds a set that does not contain X. Both doors are
+    locked, so no clean checkout was ever approvable and the guard could only ever say no."""
+
+    def setUp(self):
+        import subprocess
+        self.repo = tempfile.mkdtemp(prefix="p5-self-approval-")
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self.approvals = os.path.join(self.repo, "approvals.py")
+
+        def git(*a):
+            subprocess.run(("git",) + a, cwd=self.repo, check=True, capture_output=True)
+        self.git = git
+        git("init", "-q")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+
+    def _commit(self, body):
+        import subprocess
+        with open(self.approvals, "w") as fh:
+            fh.write(body)
+        self.git("add", "-A")
+        self.git("commit", "-qm", "approval state")
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                              capture_output=True, text=True).stdout.strip()
+
+    def _approved_at(self, sha):
+        """The approved set as it reads AT that commit."""
+        import subprocess
+        blob = subprocess.run(["git", "show", f"{sha}:approvals.py"], cwd=self.repo,
+                              capture_output=True, text=True).stdout
+        ns = {}
+        exec(blob, ns)                                    # noqa: S102 -- fixture, not input
+        return tuple(ns["APPROVED"])
+
+    def test_a_commit_cannot_list_its_own_sha(self):
+        x = self._commit("APPROVED = ()\n")
+        self.assertNotIn(x, self._approved_at(x),
+                         "a commit contained its own id, which a content hash cannot do")
+
+    def test_a_later_commit_listing_it_is_refused_for_being_the_wrong_head(self):
+        x = self._commit("APPROVED = ()\n")
+        y = self._commit(f"APPROVED = ({x!r},)\n")
+        approved_at_y = self._approved_at(y)
+        self.assertIn(x, approved_at_y)
+        self.assertNotIn(y, approved_at_y,
+                         "running at Y would be refused: HEAD is Y and only X is approved")
+
+    def test_neither_checkout_is_approvable_so_the_design_admits_no_yes(self):
+        x = self._commit("APPROVED = ()\n")
+        y = self._commit(f"APPROVED = ({x!r},)\n")
+        for head in (x, y):
+            with self.subTest(head=head[:7]):
+                self.assertNotIn(head, self._approved_at(head))
+
+    def test_the_module_no_longer_carries_its_own_approval(self):
+        self.assertFalse(hasattr(rd, "APPROVED_ASSESSOR_SHAS"),
+                         "the approved set is back inside the code it approves")
+        with open(os.path.join(_DEV, "ops", "p5_readiness.py")) as fh:
+            source = fh.read()
+        self.assertNotIn("APPROVED_ASSESSOR_SHAS", source)
+
+
+class TestApprovalComesFromOutsideTheRepository(_RecordWritingMixin, unittest.TestCase):
+    """An approval record the operator holds, outside the tree it approves."""
+
+    def setUp(self):
+        import subprocess
+        self.tmp = tempfile.mkdtemp(prefix="p5-approval-record-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.join(self.tmp, "repo")
+        for rel in rd.ASSESSOR_MODULES:
+            dst = os.path.join(self.repo, "dev2026", rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy(os.path.join(_DEV, rel), dst)
+
+        def git(*a):
+            subprocess.run(("git",) + a, cwd=self.repo, check=True, capture_output=True)
+        self.git = git
+        git("init", "-q")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        git("add", "-A")
+        git("commit", "-qm", "the assessor build under review")
+        self.head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                                   capture_output=True, text=True).stdout.strip()
+
+        for name in ("ASSESSOR_REPO_ROOT", "DEV_PREFIX", "APPROVAL_RECORD_PATH"):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+        rd.ASSESSOR_REPO_ROOT, rd.DEV_PREFIX = self.repo, "dev2026"
+        rd.APPROVAL_RECORD_PATH = self._write_record()
+
+    def _write_record(self, path=None, **over):
+        record = {"scope": rd.APPROVAL_SCOPE, "approved_sha": self.head,
+                  "approved_by": "an operator", "approved_utc": "2026-08-23T12:00:00Z"}
+        record.update(over)
+        path = path or os.path.join(self.tmp, "approval.json")
+        with open(path, "w") as fh:
+            json.dump(record, fh)
+        return path
+
+    def _path(self, rel):
+        return os.path.join(self.repo, "dev2026", rel)
+
+    # ---------------------------------------------------------------- positive control
+    def test_an_external_record_naming_a_clean_head_is_approved(self):
+        ok, reason = rd.assessor_is_approved()
+        self.assertTrue(ok, reason)
+        self.assertIn(self.head[:7], reason)
+
+    # ---------------------------------------------------------------- the record itself
+    def test_no_record_is_refused(self):
+        rd.APPROVAL_RECORD_PATH = None
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("no approval record", reason.lower())
+
+    def test_a_missing_record_file_is_refused(self):
+        rd.APPROVAL_RECORD_PATH = os.path.join(self.tmp, "not_there.json")
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("not_there.json", reason)
+
+    def test_a_record_inside_the_repository_is_refused(self):
+        """A record the approved tree contains is the self-reference again, in a file."""
+        inside = os.path.join(self.repo, "approval.json")
+        rd.APPROVAL_RECORD_PATH = self._write_record(path=inside)
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("inside", reason.lower())
+
+    def test_a_record_for_another_commit_is_refused(self):
+        rd.APPROVAL_RECORD_PATH = self._write_record(approved_sha="b" * 40)
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn(self.head[:7], reason)
+
+    def test_a_record_with_a_malformed_sha_is_refused(self):
+        for bad in ("", "main", self.head[:7], self.head.upper(), 12345, True, None):
+            with self.subTest(repr(bad)):
+                rd.APPROVAL_RECORD_PATH = self._write_record(approved_sha=bad)
+                ok, reason = rd.assessor_is_approved()
+                self.assertFalse(ok)
+                self.assertNotIn("Traceback", reason)
+
+    def test_a_record_for_another_scope_is_refused(self):
+        rd.APPROVAL_RECORD_PATH = self._write_record(scope="something_else")
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("scope", reason.lower())
+
+    def test_unreadable_json_is_refused(self):
+        path = os.path.join(self.tmp, "broken.json")
+        with open(path, "w") as fh:
+            fh.write("{not json")
+        rd.APPROVAL_RECORD_PATH = path
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertNotIn("Traceback", reason)
+
+    # ---------------------------------------------------------------- signed tag route
+    def test_a_record_naming_a_tag_that_cannot_be_verified_is_refused(self):
+        self.git("tag", "-a", "assessor-approved", "-m", "unsigned")
+        rd.APPROVAL_RECORD_PATH = self._write_record(signed_tag="assessor-approved")
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("signature", reason.lower())
+
+    def _with_verifiable_signature(self):
+        """Make `git verify-tag` succeed, and nothing else.
+
+        There is no GPG on this machine, so a genuinely signed tag cannot be produced here.
+        Only the signature call is simulated -- the tag's RESOLUTION stays real git -- so the
+        test below is about where the tag points, which is the guard it names. The signature
+        guard has its own test above, against a tag that genuinely does not verify."""
+        original = rd._git
+
+        def verify_ok(*args, **kw):
+            if args and args[0] == "verify-tag":
+                return 0, ""
+            return original(*args, **kw)
+
+        self.addCleanup(setattr, rd, "_git", original)
+        rd._git = verify_ok
+
+    def test_a_verifying_tag_on_another_commit_is_refused(self):
+        """A signature proves who made the tag, never that it points at what is running."""
+        import subprocess
+        self.git("commit", "-q", "--allow-empty", "-m", "a later commit")
+        moved_on = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                                  capture_output=True, text=True).stdout.strip()
+        self.assertNotEqual(moved_on, self.head)
+        self.git("tag", "-a", "points-backwards", self.head, "-m", "on the older commit")
+        rd.APPROVAL_RECORD_PATH = self._write_record(approved_sha=moved_on,
+                                                     signed_tag="points-backwards")
+        self._with_verifiable_signature()
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok, "a verifying tag on a different commit was accepted")
+        self.assertIn("points-backwards", reason)
+        self.assertIn(moved_on[:7], reason)
+
+    def test_a_verifying_tag_on_the_running_commit_is_approved(self):
+        """The paired positive control, so the refusal above is about WHERE the tag points."""
+        self.git("tag", "-a", "points-here", self.head, "-m", "on the running commit")
+        rd.APPROVAL_RECORD_PATH = self._write_record(signed_tag="points-here")
+        self._with_verifiable_signature()
+        ok, reason = rd.assessor_is_approved()
+        self.assertTrue(ok, reason)
+
+    def test_a_record_naming_a_missing_tag_is_refused(self):
+        rd.APPROVAL_RECORD_PATH = self._write_record(signed_tag="no-such-tag")
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+
+    # ---------------------------------------------------------------- the retained guards
+    def test_a_dirty_tracked_file_is_still_refused(self):
+        with open(self._path("ops/p5s8_evidence.py"), "a") as fh:
+            fh.write("\n# edited\n")
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("not clean", reason.lower())
+
+    def test_an_untracked_file_is_still_refused(self):
+        with open(self._path("store/extra.py"), "w") as fh:
+            fh.write("# untracked\n")
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("untracked", reason.lower())
+
+    def test_assume_unchanged_is_still_refused(self):
+        import subprocess
+        rel = "store/segmented_cube.py"
+        subprocess.run(["git", "update-index", "--assume-unchanged", f"dev2026/{rel}"],
+                       cwd=self.repo, check=True, capture_output=True)
+        with open(self._path(rel), "a") as fh:
+            fh.write("\n# hidden edit\n")
+        status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
+                                cwd=self.repo, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(status, "", "the fixture is visible to status; it proves nothing")
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("segmented_cube.py", reason)
+
+    def test_an_ignored_runtime_module_is_still_refused(self):
+        import subprocess
+        rel = "ops/quiescence.py"
+        subprocess.run(["git", "rm", "--cached", "-q", f"dev2026/{rel}"], cwd=self.repo,
+                       check=True, capture_output=True)
+        with open(os.path.join(self.repo, ".gitignore"), "w") as fh:
+            fh.write(f"dev2026/{rel}\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "ignore a runtime module")
+        self.head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                                   capture_output=True, text=True).stdout.strip()
+        rd.APPROVAL_RECORD_PATH = self._write_record()
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("quiescence.py", reason)
+
+    def test_a_module_blob_mismatch_is_still_refused(self):
+        """Retained end to end: the record is right, HEAD is right, status is clean."""
+        import subprocess
+        rel = "store/block_manifest.py"
+        subprocess.run(["git", "update-index", "--assume-unchanged", f"dev2026/{rel}"],
+                       cwd=self.repo, check=True, capture_output=True)
+        with open(self._path(rel), "a") as fh:
+            fh.write("\n# mismatched\n")
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("block_manifest.py", reason)
+
+    # ---------------------------------------------------------------- not production proof
+    def test_the_test_overrides_are_not_evidence_of_a_production_approval(self):
+        """These fixtures point the assessor at a repository they built. That proves the
+        mechanism works; it approves nothing real, and the shipped default must stay closed."""
+        self.assertIsNone(rd.APPROVAL_RECORD_DEFAULT,
+                          "a default approval record is shipped in the code")

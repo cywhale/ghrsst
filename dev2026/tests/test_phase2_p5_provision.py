@@ -162,8 +162,8 @@ class TestWhatIsProvisioned(_ProvisionBase):
         this test is about the provisioned root rather than about that."""
         import socket
         import test_phase2_p5_readiness as rt
-        root, head = rt.approved_assessor_repo()
-        for name, value in (("ASSESSOR_REPO_ROOT", root), ("APPROVED_ASSESSOR_SHAS", (head,))):
+        root, _head, record = rt.approved_assessor_repo()
+        for name, value in (("ASSESSOR_REPO_ROOT", root), ("APPROVAL_RECORD_PATH", record)):
             self.addCleanup(setattr, rd, name, getattr(rd, name))
             setattr(rd, name, value)
         out = self.provision()

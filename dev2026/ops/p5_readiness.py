@@ -122,10 +122,21 @@ ASSESSOR_MODULES = (
     "store/repair_wal.py", "store/segmented_cube.py", "store/time_cube.py",
 )
 
-#: Commits at which the ASSESSOR itself has been reviewed. Empty means no assessor build is
-#: approved yet, which is the honest state of this branch: `3efcfd5` has not been reviewed, so
-#: nothing it produces may authorize anything.
-APPROVED_ASSESSOR_SHAS = ()
+#: Approval for the assessor comes from OUTSIDE the assessor.
+#:
+#: An approved-SHA set used to live in this module -- which is in `ASSESSOR_MODULES`, so the
+#: code being approved carried its own approval. That is a circle with no way in: a commit's id
+#: is a hash of its content, so no commit can list itself, and a later commit Y listing X is
+#: refused at run time for `HEAD != X`. Both doors locked, so the guard could only ever say no.
+#:
+#: The operator holds a record instead, on a path outside the repository, naming the exact
+#: commit they approved. `None` is the shipped default and fails closed: no record, no
+#: approval. Nothing here names a SHA, because approving one is not this code's to do.
+APPROVAL_RECORD_DEFAULT = None
+APPROVAL_RECORD_PATH = os.environ.get("P5_ASSESSOR_APPROVAL") or APPROVAL_RECORD_DEFAULT
+
+#: What a record must say it is for. A record approving something else is not this approval.
+APPROVAL_SCOPE = "p5_readiness_assessor"
 
 #: The suites that may stand as failure-semantics evidence, named in approved code.
 #:
@@ -292,16 +303,52 @@ def assessor_is_approved():
     check that points at the checker. Below this bar no requirement may read READY, because a
     verdict from an unapproved assessor is a verdict from unreviewed code."""
     import hashlib
-    if not APPROVED_ASSESSOR_SHAS:
-        return False, ("no assessor build is approved: APPROVED_ASSESSOR_SHAS is empty, so "
-                       "nothing this assessor produces may authorize anything")
+    import json
     root = _assessor_root()
+    if not APPROVAL_RECORD_PATH:
+        return False, ("no approval record is configured, so no assessor build is approved and "
+                       "nothing this assessor produces may authorize anything")
+    record_path = os.path.abspath(APPROVAL_RECORD_PATH)
+    if not os.path.isfile(record_path):
+        return False, f"the approval record {record_path!r} does not exist"
+    # A record the approved tree contains is the self-reference again, wearing a filename.
+    if record_path == os.path.abspath(root) or record_path.startswith(
+            os.path.abspath(root) + os.sep):
+        return False, (f"the approval record {record_path!r} is inside the repository it "
+                       f"approves; the authority has to be outside the thing it authorizes")
+    try:
+        with open(record_path) as fh:
+            record = json.load(fh)
+    except Exception as exc:                                  # noqa: BLE001
+        return False, f"the approval record {record_path!r} is not readable JSON: {exc}"
+    if not isinstance(record, dict) or record.get("scope") != APPROVAL_SCOPE:
+        return False, (f"the approval record declares scope {record.get('scope')!r} if it "
+                       f"declares one at all; this assessor needs {APPROVAL_SCOPE!r}")
+    approved_sha = record.get("approved_sha")
+    if not _is_sha1(approved_sha):
+        return False, (f"the approval record names {approved_sha!r}, which is not a commit id: "
+                       f"exactly 40 lowercase hex characters")
+
     rc, head = _git("rev-parse", "HEAD", cwd=root)
     if rc != 0 or not _is_sha1(head):
         return False, f"the assessor's own HEAD could not be read from {root!r}"
-    if head not in APPROVED_ASSESSOR_SHAS:
-        return False, (f"the assessor is running at {head[:7]}, which is not an approved "
-                       f"assessor commit")
+    if approved_sha != head:
+        return False, (f"the approval record approves {approved_sha[:7]}, and the assessor is "
+                       f"running at {head[:7]}")
+
+    # A record may point at a signed annotated tag instead of standing alone. If it names one,
+    # the signature has to verify AND the tag has to be this commit -- an unverifiable tag is
+    # a refusal, never a shrug.
+    tag = record.get("signed_tag")
+    if tag:
+        rc, _ = _git("verify-tag", str(tag), cwd=root)
+        if rc != 0:
+            return False, (f"the tag {tag!r} named by the approval record has no verifiable "
+                           f"signature")
+        rc, resolved = _git("rev-list", "-n", "1", str(tag), cwd=root)
+        if rc != 0 or resolved != head:
+            return False, (f"the tag {tag!r} resolves to {resolved[:7] or '?'}, not the "
+                           f"running {head[:7]}")
     # The commit is approved; the whole TREE has to be that commit.
     #
     # Comparing named modules is not enough on its own: it says nothing about a file nobody
@@ -336,7 +383,8 @@ def assessor_is_approved():
             return False, (f"{rel} on disk differs from the approved assessor commit "
                            f"{head[:7]}: the policy being enforced is not the policy that was "
                            f"reviewed")
-    return True, f"assessor at {head[:7]}, {len(ASSESSOR_MODULES)} modules matching"
+    return True, (f"assessor at {head[:7]}, approved by an external record, "
+                  f"{len(ASSESSOR_MODULES)} modules matching")
 
 
 def canonical_minimum_free_gib() -> float:
