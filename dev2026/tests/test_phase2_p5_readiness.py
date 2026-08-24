@@ -1880,3 +1880,209 @@ class TestTheEvidenceCommitDescendsFromTheDeployCommit(TestTheEvidenceCommitIsDe
     def test_the_deploy_commit_may_be_its_own_evidence_commit(self):
         """A commit is its own descendant; refusing that would be an off-by-one."""
         self.assertTrue(rd.commit_descends_from(self.deploy_sha, self.deploy_sha))
+
+
+class TestTheAssessorRuntimeTreeIsClean(unittest.TestCase):
+    """Comparing four policy files left the rest of the runtime unguarded.
+
+    `_check_blocks` imports `store/segmented_cube.py` and the verdict comes straight out of it,
+    yet it was not in the inventory: an approved HEAD with matching policy modules could be
+    running an edited containment rule. An inventory that lists what someone remembered is a
+    different thing from one covering what actually executes."""
+
+    def setUp(self):
+        import subprocess
+        self.repo = tempfile.mkdtemp(prefix="p5-runtime-tree-")
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        for rel in rd.ASSESSOR_MODULES:
+            dst = os.path.join(self.repo, "dev2026", rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy(os.path.join(_DEV, rel), dst)
+        for args in (("init", "-q"), ("config", "user.email", "t@example.invalid"),
+                     ("config", "user.name", "t"), ("add", "-A"),
+                     ("commit", "-qm", "approved assessor runtime")):
+            subprocess.run(("git",) + args, cwd=self.repo, check=True, capture_output=True)
+        self.head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                                   capture_output=True, text=True).stdout.strip()
+        for name in ("ASSESSOR_REPO_ROOT", "DEV_PREFIX", "APPROVED_ASSESSOR_SHAS"):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+        rd.ASSESSOR_REPO_ROOT, rd.DEV_PREFIX = self.repo, "dev2026"
+        rd.APPROVED_ASSESSOR_SHAS = (self.head,)
+
+    def _path(self, rel):
+        return os.path.join(self.repo, "dev2026", rel)
+
+    # ---------------------------------------------------------------- inventory coverage
+    #: Forces every branch a short-circuiting target never reaches, then reports the
+    #: first-party modules that ended up loaded. Run in a FRESH interpreter: measuring
+    #: `sys.modules` in the test process reports whatever the rest of the session imported --
+    #: the provisioner's `ingest/build_block.py` among them -- which is a different runtime
+    #: from the assessor's and would pad the inventory with modules that never execute here.
+    _CLOSURE_PROBE = """
+import json, os, sys
+DEV = sys.argv[1]
+sys.path.insert(0, DEV)
+from ops import p5_readiness as rd
+rd.canonical_minimum_free_gib()
+from store.segmented_cube import SegmentedCubeStore
+rd.expected_module_digests(rd.REVIEWED_DEPLOY_SHAS[0])
+out = set()
+for mod in list(sys.modules.values()):
+    f = getattr(mod, "__file__", None)
+    if not f:
+        continue
+    f = os.path.abspath(f)
+    if f.startswith(DEV + os.sep) and "/tests/" not in f and "/.venv/" not in f \
+            and f.endswith(".py"):
+        out.add(os.path.relpath(f, DEV))
+print(json.dumps(sorted(out)))
+"""
+
+    def test_the_inventory_covers_every_module_the_readiness_path_imports(self):
+        """Measured, not listed.
+
+        A hand-maintained inventory drifts from the code the moment an import is added, and
+        the drift is invisible until someone edits the module nobody listed -- which is how
+        `store/segmented_cube.py` came to decide verdicts from outside the inventory."""
+        import subprocess
+        proc = subprocess.run([sys.executable, "-c", self._CLOSURE_PROBE, _DEV],
+                              capture_output=True, text=True, cwd=_DEV)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        loaded = set(json.loads(proc.stdout))
+        self.assertIn("store/segmented_cube.py", loaded,
+                      "the probe did not reach _check_blocks; it would prove nothing")
+        missing = sorted(loaded - set(rd.ASSESSOR_MODULES))
+        self.assertEqual(missing, [],
+                         f"these execute on the readiness path and are not in the inventory: "
+                         f"{missing}")
+
+    def test_the_inventory_lists_nothing_that_does_not_execute(self):
+        """The other direction: padding the inventory with modules the path never imports
+        would make the coverage test pass without covering anything."""
+        import subprocess
+        proc = subprocess.run([sys.executable, "-c", self._CLOSURE_PROBE, _DEV],
+                              capture_output=True, text=True, cwd=_DEV)
+        loaded = set(json.loads(proc.stdout))
+        self.assertEqual(sorted(set(rd.ASSESSOR_MODULES) - loaded), [])
+
+    def test_the_named_runtime_modules_are_listed(self):
+        for rel in ("ops/p5_readiness.py", "ops/p5s8_evidence.py", "ops/p5_roadmap.py",
+                    "ops/p5s8_report.py", "store/segmented_cube.py"):
+            with self.subTest(rel):
+                self.assertIn(rel, rd.ASSESSOR_MODULES)
+
+    # ---------------------------------------------------------------- the four cases
+    def test_a_clean_approved_tree_is_approved(self):
+        """Positive control for all three refusals below."""
+        ok, reason = rd.assessor_is_approved()
+        self.assertTrue(ok, reason)
+
+    def test_editing_a_module_that_was_already_inventoried_is_refused(self):
+        with open(self._path("ops/p5s8_evidence.py"), "a") as fh:
+            fh.write("\n# edited policy\n")
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("p5s8_evidence.py", reason)
+
+    def test_editing_segmented_cube_is_refused(self):
+        """The module the old inventory omitted, and the one `_check_blocks` gets its verdict
+        from. Under the previous inventory this edit changed the containment rule and the
+        assessor still called itself approved."""
+        with open(self._path("store/segmented_cube.py"), "a") as fh:
+            fh.write("\n# edited containment\n")
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("segmented_cube.py", reason)
+
+    def test_an_untracked_runtime_file_is_refused(self):
+        """A new file shadowing or extending the runtime is not covered by comparing the
+        blobs of files that were already there."""
+        with open(self._path("store/sitecustomize_hack.py"), "w") as fh:
+            fh.write("# not tracked at the approved commit\n")
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("untracked", reason.lower())
+
+    def test_a_dirty_tracked_file_outside_the_inventory_is_refused(self):
+        """The clean-tree requirement, isolated: this file is tracked, is NOT in the inventory,
+        and the blob comparison therefore cannot object to it."""
+        import subprocess
+        extra = self._path("ops/unrelated_helper.py")
+        with open(extra, "w") as fh:
+            fh.write("# committed, not inventoried\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-qm", "extra"], cwd=self.repo, check=True,
+                       capture_output=True)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                              capture_output=True, text=True).stdout.strip()
+        rd.APPROVED_ASSESSOR_SHAS = (head,)
+        self.assertNotIn("ops/unrelated_helper.py", rd.ASSESSOR_MODULES)
+        ok, _ = rd.assessor_is_approved()
+        self.assertTrue(ok, "the fixture is not clean before the edit")
+
+        with open(extra, "a") as fh:
+            fh.write("# edited after approval\n")
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok, "a dirty tracked file outside the inventory was accepted")
+        self.assertIn("unrelated_helper.py", reason)
+
+    def test_a_deleted_tracked_file_is_refused(self):
+        os.remove(self._path("ops/p5_roadmap.py"))
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("p5_roadmap.py", reason)
+
+    def test_a_module_hidden_from_status_by_assume_unchanged_is_refused(self):
+        """The per-module comparison earns its place here.
+
+        With HEAD approved and the tree clean, every TRACKED file matches by definition -- so
+        the blob check looks redundant, and deleting it survived a mutation round. It is not
+        redundant against the cases `git status` cannot see: `--assume-unchanged` tells git to
+        stop noticing local edits to a tracked file, and the worktree then reports clean while
+        running different code."""
+        import subprocess
+        rel = "store/segmented_cube.py"
+        subprocess.run(["git", "update-index", "--assume-unchanged", f"dev2026/{rel}"],
+                       cwd=self.repo, check=True, capture_output=True)
+        with open(self._path(rel), "a") as fh:
+            fh.write("\n# edited behind git's back\n")
+        status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
+                                cwd=self.repo, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(status, "", "the fixture is visible to status; it proves nothing")
+
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok, "an edit hidden from status was accepted")
+        self.assertIn("segmented_cube.py", reason)
+        self.assertIn("differs", reason)
+
+    def test_an_ignored_module_absent_from_the_approved_commit_is_refused(self):
+        """The other case status cannot see: a runtime module that is `.gitignore`d, so it is
+        neither tracked nor reported as untracked -- present on disk, absent from the commit,
+        and imported all the same."""
+        import subprocess
+        rel = "ops/quiescence.py"
+        subprocess.run(["git", "rm", "--cached", "-q", f"dev2026/{rel}"],
+                       cwd=self.repo, check=True, capture_output=True)
+        with open(os.path.join(self.repo, ".gitignore"), "w") as fh:
+            fh.write(f"dev2026/{rel}\n")
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-qm", "ignore a runtime module"], cwd=self.repo,
+                       check=True, capture_output=True)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                              capture_output=True, text=True).stdout.strip()
+        rd.APPROVED_ASSESSOR_SHAS = (head,)
+        status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
+                                cwd=self.repo, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(status, "", "the fixture is visible to status; it proves nothing")
+        self.assertTrue(os.path.isfile(self._path(rel)), "the module is not on disk")
+
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok, "a runtime module absent from the approved commit was accepted")
+        self.assertIn("quiescence.py", reason)
+        self.assertIn("not present", reason)
+
+    def test_the_clean_tree_check_names_what_is_dirty(self):
+        with open(self._path("untracked_note.txt"), "w") as fh:
+            fh.write("x\n")
+        _, reason = rd.assessor_is_approved()
+        self.assertIn("untracked_note.txt", reason)

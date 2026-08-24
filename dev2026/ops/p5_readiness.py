@@ -110,9 +110,16 @@ INVENTORY_MODULES = (
 #: whether the deployment ran approved code was not itself approved code. The threshold reaches
 #: here through the roadmap and the report module, so a policy dependency left off this list is
 #: a place to change the bar unobserved.
+#: MEASURED, not remembered: every first-party module the readiness path actually imports.
+#: `tests/test_phase2_p5_readiness.py` recomputes the closure and fails if anything executes
+#: that is not listed here, so an import added later cannot quietly leave the runtime
+#: unguarded -- which is exactly what happened to `store/segmented_cube.py`, the module
+#: `_check_blocks` takes its verdict from.
 ASSESSOR_MODULES = (
     "ops/p5_readiness.py", "ops/p5s8_evidence.py",
-    "ops/p5_roadmap.py", "ops/p5s8_report.py",
+    "ops/p5_roadmap.py", "ops/p5s8_report.py", "ops/quiescence.py",
+    "store/__init__.py", "store/block_manifest.py", "store/durable_jsonl.py",
+    "store/repair_wal.py", "store/segmented_cube.py", "store/time_cube.py",
 )
 
 #: Commits at which the ASSESSOR itself has been reviewed. Empty means no assessor build is
@@ -295,8 +302,22 @@ def assessor_is_approved():
     if head not in APPROVED_ASSESSOR_SHAS:
         return False, (f"the assessor is running at {head[:7]}, which is not an approved "
                        f"assessor commit")
-    # The commit is approved; the TREE has to be that commit. A clean-looking SHA with an
-    # edited policy file on disk is the exact hole this closes.
+    # The commit is approved; the whole TREE has to be that commit.
+    #
+    # Comparing named modules is not enough on its own: it says nothing about a file nobody
+    # thought to list, nor about a new one dropped in beside them. `git status` answers for
+    # everything at once -- tracked edits, deletions and untracked additions alike -- and the
+    # per-module comparison below then says WHICH runtime file differs, which a status line
+    # about some unrelated path would not.
+    rc, dirty = _git("status", "--porcelain", "--untracked-files=all", cwd=root)
+    if rc != 0:
+        return False, f"the assessor's own worktree status could not be read from {root!r}"
+    if dirty:
+        entries = [ln.strip() for ln in dirty.splitlines()][:8]
+        untracked = any(ln.startswith("??") for ln in dirty.splitlines())
+        return False, (f"the assessor's worktree is not clean at {head[:7]}"
+                       f"{' (including untracked files)' if untracked else ''}: "
+                       f"{entries}. The code running is not the code that was approved")
     for rel in ASSESSOR_MODULES:
         rc, _ = _git("cat-file", "-e", f"{head}:{DEV_PREFIX}/{rel}", cwd=root)
         blob = None
