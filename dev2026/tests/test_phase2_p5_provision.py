@@ -155,8 +155,17 @@ class TestWhatIsProvisioned(_ProvisionBase):
             os.path.abspath(out["manifest_root"]) + os.sep))
 
     def test_the_result_passes_the_readiness_store_requirements(self):
-        """The point of provisioning: the checks that were BLOCKED become READY."""
+        """The point of provisioning: the checks that were BLOCKED become READY.
+
+        The assessor's own approval is established first -- against a real committed build of
+        its modules, not a stub -- because an unapproved assessor demotes every finding, and
+        this test is about the provisioned root rather than about that."""
         import socket
+        import test_phase2_p5_readiness as rt
+        root, head = rt.approved_assessor_repo()
+        for name, value in (("ASSESSOR_REPO_ROOT", root), ("APPROVED_ASSESSOR_SHAS", (head,))):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+            setattr(rd, name, value)
         out = self.provision()
         target = {
             "label": rd.QUALIFYING_LABEL, "host": socket.gethostname(),

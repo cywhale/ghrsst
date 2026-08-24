@@ -43,6 +43,45 @@ S = 90
 NY = NX = 16
 _APPROVED = rd.REVIEWED_DEPLOY_SHAS[0]
 
+_ASSESSOR_REPO = None
+
+
+def approved_assessor_repo():
+    """A real git repository holding THIS assessor's modules, committed and approved.
+
+    Not a stub: `assessor_is_approved()` runs its whole comparison against it, so the fixtures
+    exercise the check positively rather than switching it off. Built once -- copying four
+    modules and running `git init` per test would dominate the suite."""
+    global _ASSESSOR_REPO
+    if _ASSESSOR_REPO is None:
+        import subprocess
+        root = tempfile.mkdtemp(prefix="p5-approved-assessor-")
+        for rel in rd.ASSESSOR_MODULES:
+            dst = os.path.join(root, "dev2026", rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy(os.path.join(_DEV, rel), dst)
+        for args in (("init", "-q"), ("config", "user.email", "t@example.invalid"),
+                     ("config", "user.name", "t"), ("add", "-A"),
+                     ("commit", "-qm", "approved assessor")):
+            subprocess.run(("git",) + args, cwd=root, check=True, capture_output=True)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
+                              capture_output=True, text=True).stdout.strip()
+        _ASSESSOR_REPO = (root, head)
+    return _ASSESSOR_REPO
+
+
+class _ApprovedAssessorMixin:
+    """Point the assessor's self-check at an approved build of its own modules."""
+
+    def _approve_assessor(self):
+        root, head = approved_assessor_repo()
+        for name, value in (("ASSESSOR_REPO_ROOT", root),
+                            ("APPROVED_ASSESSOR_SHAS", (head,))):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+            setattr(rd, name, value)
+        ok, why = rd.assessor_is_approved()
+        assert ok, f"the fixture's own assessor approval failed: {why}"
+
 
 def _now_iso():
     """A just-taken timestamp. The fixture stands for a collection that happened now, because a
@@ -82,7 +121,7 @@ def _fresh_capacity(free_gib=1263.8, run_id=FIXTURE_RUN, measured_utc=None,
     }
 
 
-class _TargetBase(unittest.TestCase):
+class _TargetBase(_ApprovedAssessorMixin, unittest.TestCase):
     """A real, isolated P5 root: block, manifest, WAL, anchor on a separate root."""
 
     def _set_canonical(self, minimum_gib):
@@ -96,6 +135,7 @@ class _TargetBase(unittest.TestCase):
         ev.MINIMUM_FREE_GIB = minimum_gib
 
     def setUp(self):
+        self._approve_assessor()
         self.collected_utc = _now_iso()
         # Production's 403.3 GiB against a temp filesystem would test this machine's disk
         # rather than the code, so the fixtures run against a bar they genuinely clear.
@@ -176,6 +216,43 @@ class _TargetBase(unittest.TestCase):
         }
         base.update(over)
         return base
+
+
+class TestAnUnapprovedAssessorDemotesRealFindings(_TargetBase):
+    """The demotion branch on a target that would otherwise pass.
+
+    `TestTheAssessorIsItselfBound` uses a bare target, so every requirement is refused by its
+    own checker before the demotion is reached -- deleting the branch survived a mutation round
+    against it. Here the fixture is complete and several requirements DO read READY with an
+    approved assessor, so the branch is the only thing that can change them."""
+
+    def test_the_same_target_flips_when_the_assessor_loses_approval(self):
+        approved = rd.assess(self.target())
+        was_ready = {r["id"] for r in approved["requirements"] if r["verdict"] == rd.READY}
+        self.assertTrue(was_ready, "nothing was READY; the demotion would be unobservable")
+
+        rd.APPROVED_ASSESSOR_SHAS = ()
+        demoted = {r["id"]: r for r in rd.assess(self.target())["requirements"]}
+        for rid in sorted(was_ready):
+            with self.subTest(rid):
+                self.assertEqual(demoted[rid]["verdict"], rd.NOT_ADJUDICATED)
+                self.assertIn("assessor is not approved", demoted[rid]["reason"])
+
+    def test_the_demoted_reason_keeps_what_the_checker_actually_found(self):
+        """Demotion must not erase the finding: it says the finding cannot authorize, not that
+        there was nothing to find."""
+        approved = {r["id"]: r for r in rd.assess(self.target())["requirements"]}
+        ready = next(r for r in approved.values() if r["verdict"] == rd.READY)
+        rd.APPROVED_ASSESSOR_SHAS = ()
+        demoted = {r["id"]: r for r in rd.assess(self.target())["requirements"]}[ready["id"]]
+        self.assertIn("The check itself found", demoted["reason"])
+
+    def test_readiness_is_false_and_the_report_says_why(self):
+        rd.APPROVED_ASSESSOR_SHAS = ()
+        report = rd.assess(self.target())
+        self.assertIs(report["compaction_ready"], False)
+        self.assertIs(report["assessor_approved"], False)
+        self.assertEqual(report["summary"][rd.READY], [])
 
 
 class TestTheVerdictVocabulary(unittest.TestCase):
@@ -1057,7 +1134,8 @@ class TestCapacityIsBoundToTheFilesystemUnderTest(_TargetBase):
         self.assertEqual(by_id["capacity"]["verdict"], rd.NOT_ADJUDICATED)
 
 
-class TestTheExecutedResultMustBeCommittedAndTracked(unittest.TestCase):
+class TestTheExecutedResultMustBeCommittedAndTracked(_ApprovedAssessorMixin,
+                                                    unittest.TestCase):
     """`load_execution` read whatever JSON the path pointed at. A path is not a provenance:
     `/tmp/whatever.json`, `../../anything.json` and a symlink out of the committed directory
     all satisfied it, so the evidence could be written by the same hand that wrote the claim.
@@ -1067,6 +1145,7 @@ class TestTheExecutedResultMustBeCommittedAndTracked(unittest.TestCase):
 
     def setUp(self):
         import subprocess
+        self._approve_assessor()
         self.tmp = tempfile.mkdtemp(prefix="p5-exec-repo-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.repo = os.path.join(self.tmp, "repo")
@@ -1372,7 +1451,7 @@ class TestTheG18ThresholdIsCanonicalNotCollected(_TargetBase):
                 self.assertNotIn(stale, source)
 
 
-class TestTheEvidenceCommitIsDeclaredAndApproved(unittest.TestCase):
+class TestTheEvidenceCommitIsDeclaredAndApproved(_ApprovedAssessorMixin, unittest.TestCase):
     """`load_execution(proven, REVIEWED_DEPLOY_SHAS[0])` assumed the artifact lived at the FIRST
     approved commit. A result recording a run of commit N is committed AFTER commit N, so in
     production it lives at some later commit -- and the peek would simply not find it.
@@ -1383,6 +1462,7 @@ class TestTheEvidenceCommitIsDeclaredAndApproved(unittest.TestCase):
 
     def setUp(self):
         import subprocess
+        self._approve_assessor()
         self.tmp = tempfile.mkdtemp(prefix="p5-evidence-repo-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.repo = os.path.join(self.tmp, "repo")
@@ -1405,9 +1485,13 @@ class TestTheEvidenceCommitIsDeclaredAndApproved(unittest.TestCase):
         git("commit", "-qm", "the code under test")
         self.deploy_sha = self._head()
 
-        for name in ("REPO_ROOT", "DEV_PREFIX", "REVIEWED_DEPLOY_SHAS"):
+        for name in ("REPO_ROOT", "DEV_PREFIX", "REVIEWED_DEPLOY_SHAS",
+                     "FAILURE_SEMANTICS_SUITES"):
             self.addCleanup(setattr, rd, name, getattr(rd, name))
         rd.REPO_ROOT, rd.DEV_PREFIX = self.repo, "dev2026"
+        # The fixture's suite is authorized HERE so these tests isolate their own subjects --
+        # the allow-list has its own class, which narrows it deliberately.
+        rd.FAILURE_SEMANTICS_SUITES = ("tests.test_thing",)
 
     def _head(self):
         import subprocess
@@ -1550,3 +1634,249 @@ class TestTheEvidenceCommitIsDeclaredAndApproved(unittest.TestCase):
         """`EVIDENCE_COMMIT` let a test read from anywhere, which would have hidden exactly the
         production path this class exists to exercise."""
         self.assertFalse(hasattr(rd, "EVIDENCE_COMMIT"))
+
+
+class TestTheAssessorIsItselfBound(unittest.TestCase):
+    """Every guard so far pointed outward. The assessor read its own G18 policy from the
+    WORKING TREE -- `ops/p5s8_evidence.py` as it happens to be on disk -- so editing one line
+    of local policy moved the bar the assessor then enforced. The tool checking whether the
+    deployment is approved code was not itself approved code.
+
+    An assessor is trustworthy only at a commit someone approved, with a worktree matching it.
+    Below that bar nothing it produces may authorize anything."""
+
+    def setUp(self):
+        for name in ("APPROVED_ASSESSOR_SHAS", "REPO_ROOT", "DEV_PREFIX"):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+
+    def test_the_assessor_inventory_covers_itself_and_its_policy(self):
+        for rel in ("ops/p5_readiness.py", "ops/p5s8_evidence.py"):
+            with self.subTest(rel):
+                self.assertIn(rel, rd.ASSESSOR_MODULES)
+
+    def test_the_inventory_covers_every_g18_policy_dependency(self):
+        """`MINIMUM_FREE_GIB` is derived through the roadmap and the report module; a policy
+        dependency left out of the inventory is a place to change the bar unobserved."""
+        for rel in ("ops/p5_roadmap.py", "ops/p5s8_report.py"):
+            with self.subTest(rel):
+                self.assertIn(rel, rd.ASSESSOR_MODULES)
+
+    def test_the_deployment_inventory_covers_them_too(self):
+        for rel in ("ops/p5_readiness.py", "ops/p5s8_evidence.py"):
+            with self.subTest(rel):
+                self.assertIn(rel, rd.INVENTORY_MODULES)
+
+    def test_an_empty_approved_set_says_so_specifically(self):
+        """"No assessor build is approved" and "you are on the wrong commit" are different
+        situations for whoever reads this, and the membership test alone reports the second for
+        both -- which is why deleting the empty-set branch survived a mutation round."""
+        rd.APPROVED_ASSESSOR_SHAS = ()
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("APPROVED_ASSESSOR_SHAS is empty", reason)
+
+    def test_a_wrong_commit_says_which_commit(self):
+        """The other half of the same distinction, so neither message stands in for the other."""
+        root, head = approved_assessor_repo()
+        rd.ASSESSOR_REPO_ROOT = root
+        rd.APPROVED_ASSESSOR_SHAS = ("b" * 40,)
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn(head[:7], reason)
+        self.assertNotIn("is empty", reason)
+
+    def test_this_branch_is_not_an_approved_assessor(self):
+        """The honest state today: `3efcfd5` has not been reviewed."""
+        self.assertEqual(tuple(rd.APPROVED_ASSESSOR_SHAS), ())
+
+    def test_a_locally_edited_policy_is_refused_rather_than_used(self):
+        """The reported defect, end to end: change the threshold on disk and the assessor must
+        refuse, not enforce the new number."""
+        import subprocess
+        repo = tempfile.mkdtemp(prefix="p5-assessor-repo-")
+        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        dev = os.path.join(repo, "dev2026", "ops")
+        os.makedirs(dev)
+        for rel in rd.ASSESSOR_MODULES:
+            path = os.path.join(repo, "dev2026", rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write("MINIMUM_FREE_GIB = 403.3\n")
+
+        def git(*a):
+            subprocess.run(("git",) + a, cwd=repo, check=True, capture_output=True)
+        git("init", "-q")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        git("add", "-A")
+        git("commit", "-qm", "approved assessor")
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                              capture_output=True, text=True).stdout.strip()
+        rd.REPO_ROOT, rd.DEV_PREFIX = repo, "dev2026"
+        rd.APPROVED_ASSESSOR_SHAS = (head,)
+
+        ok, reason = rd.assessor_is_approved()
+        self.assertTrue(ok, reason)                       # positive control: clean and approved
+
+        policy = os.path.join(repo, "dev2026", "ops", "p5s8_evidence.py")
+        with open(policy, "w") as fh:
+            fh.write("MINIMUM_FREE_GIB = 0.001\n")        # the bar, lowered on disk
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok, "a locally edited policy was accepted")
+        self.assertIn("p5s8_evidence.py", reason)
+
+    def test_an_unapproved_assessor_demotes_every_requirement(self):
+        rd.APPROVED_ASSESSOR_SHAS = ()
+        report = rd.assess({"label": rd.QUALIFYING_LABEL, "host": "nowhere"})
+        self.assertIs(report["compaction_ready"], False)
+        self.assertEqual(report["summary"][rd.READY], [])
+        self.assertIs(report["assessor_approved"], False)
+        self.assertTrue(report["assessor_note"])
+
+    def test_the_demotion_reason_names_the_assessor_not_the_target(self):
+        """Reported on the report, because a target with nothing in it is refused by its own
+        checkers first -- the demotion only rewrites reasons that would otherwise be READY."""
+        rd.APPROVED_ASSESSOR_SHAS = ()
+        report = rd.assess({"label": rd.QUALIFYING_LABEL, "host": "nowhere"})
+        self.assertIn("assessor", report["assessor_note"].lower())
+        self.assertIn("approved", report["assessor_note"].lower())
+
+
+class TestTheFailureSemanticsSuiteIsAuthorized(TestTheEvidenceCommitIsDeclaredAndApproved):
+    """`suite` was any name, as long as the command mentioned it and the run was green. A
+    trivial suite that asserts `True` passes with exit 0 and a positive test count, so the
+    evidence said "some tests ran and did not fail" -- about nothing in particular."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, rd, "FAILURE_SEMANTICS_SUITES",
+                        rd.FAILURE_SEMANTICS_SUITES)
+
+    def test_the_allow_list_is_declared_in_approved_code(self):
+        self.assertTrue(rd.FAILURE_SEMANTICS_SUITES)
+        for name in rd.FAILURE_SEMANTICS_SUITES:
+            with self.subTest(name):
+                self.assertTrue(name.startswith("tests."))
+
+    def test_an_unauthorized_suite_is_blocked(self):
+        """Everything else about this artifact is correct: it is committed at an approved
+        evidence commit, its digest matches the suite at the deploy commit, its path is clean
+        and its run was green. Only the allow-list can refuse it."""
+        rd.FAILURE_SEMANTICS_SUITES = ("tests.test_the_only_authorized_one",)
+        evidence_sha = self._record_the_run()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("authorized", reason.lower())
+        self.assertIn("tests.test_thing", reason)
+
+    def test_an_authorized_suite_with_the_same_evidence_is_ready(self):
+        """The paired positive control: identical artifact, allow-list widened by one name."""
+        rd.FAILURE_SEMANTICS_SUITES = ("tests.test_thing",)
+        evidence_sha = self._record_the_run()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.READY, reason)
+
+    def test_the_digest_check_still_applies_to_an_authorized_suite(self):
+        rd.FAILURE_SEMANTICS_SUITES = ("tests.test_thing",)
+        evidence_sha = self._record_the_run(source_digest="a" * 64)
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("different file", reason)
+
+
+class TestTheCommitSchemaFailsClosed(TestTheEvidenceCommitIsDeclaredAndApproved):
+    """A commit id is 40 lowercase hex characters. Anything else -- an int, a bool, a short
+    SHA, a branch name, an empty string -- must be refused as malformed, not passed to git and
+    not raised as a TypeError out of a slice."""
+
+    MALFORMED = (1, True, False, 0, "", "main", "HEAD", "3efcfd5",
+                 "3EFCFD5A" * 5, "z" * 40, None, ["a" * 40], 40.0)
+
+    def test_a_malformed_evidence_commit_is_refused_without_raising(self):
+        evidence_sha = self._record_the_run()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        for bad in self.MALFORMED:
+            with self.subTest(repr(bad)):
+                verdict, reason = self._verdict(failure_semantics_evidence_commit=bad)
+                self.assertIn(verdict, (rd.NOT_ADJUDICATED, rd.BLOCKED))
+                self.assertNotIn("Traceback", reason)
+
+    def test_a_malformed_evidence_commit_says_what_shape_is_required(self):
+        evidence_sha = self._record_the_run()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        _, reason = self._verdict(failure_semantics_evidence_commit="3efcfd5")
+        self.assertIn("40", reason)
+
+    def test_a_malformed_deploy_sha_in_the_artifact_is_refused(self):
+        for bad in ("3efcfd5", "", "main", 12345, True):
+            with self.subTest(repr(bad)):
+                evidence_sha = self._record_the_run(deploy_sha=bad)
+                rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+                verdict, reason = self._verdict(
+                    failure_semantics_evidence_commit=evidence_sha)
+                self.assertIn(verdict, (rd.NOT_ADJUDICATED, rd.BLOCKED))
+                self.assertNotIn("Traceback", reason)
+
+    def test_a_well_formed_pair_is_still_ready(self):
+        evidence_sha = self._record_the_run()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.READY, reason)
+
+
+class TestTheEvidenceCommitDescendsFromTheDeployCommit(TestTheEvidenceCommitIsDeclaredAndApproved):
+    """A result about commit N has to be recorded in history that contains N. An approved
+    commit on an unrelated line is approved -- and says nothing about N."""
+
+    def test_an_unrelated_approved_commit_is_blocked(self):
+        """The unrelated commit CARRIES the artifact, and the same suite bytes.
+
+        An orphan branch without them is refused for being untracked, which is a different
+        objection and would have let the descendancy rule be deleted unnoticed. Here tracking
+        passes, the digest matches the suite at the deploy commit, the deploy sha is approved
+        and the evidence commit is approved -- and it is on a line of history that never
+        contained the commit it claims to be about."""
+        import subprocess
+        evidence_sha = self._record_the_run()
+        main = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,
+                              capture_output=True, text=True).stdout.strip()
+        with open(os.path.join(self.dev, self.suite_rel)) as fh:
+            suite_bytes = fh.read()
+        with open(os.path.join(self.execs, "run.json")) as fh:
+            artifact = fh.read()
+
+        self.git("checkout", "-q", "--orphan", "sideline")
+        subprocess.run(["git", "rm", "-rqf", "."], cwd=self.repo, capture_output=True)
+        for rel, body in ((self.suite_rel, suite_bytes),
+                          (os.path.join(rd.EXECUTIONS_REL, "run.json"), artifact)):
+            path = os.path.join(self.dev, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(body)
+        self.git("add", "-A")
+        self.git("commit", "-qm", "same content, unrelated history")
+        unrelated = self._head()
+        self.git("checkout", "-q", "-f", main)
+
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha, unrelated)
+        self.assertIsNotNone(rd._git_blob(unrelated, f"{rd.EXECUTIONS_REL}/run.json"),
+                             "the artifact is absent on the unrelated line; tracking would "
+                             "refuse it first and the descendancy rule would go untested")
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=unrelated)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("descend", reason.lower())
+
+    def test_the_descendant_positive_control_still_holds(self):
+        evidence_sha = self._record_the_run()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        self.assertIsNone(rd._git_blob(self.deploy_sha, f"{rd.EXECUTIONS_REL}/run.json"),
+                          "the artifact exists at the deploy commit; ordering untested")
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.READY, reason)
+
+    def test_the_deploy_commit_may_be_its_own_evidence_commit(self):
+        """A commit is its own descendant; refusing that would be an off-by-one."""
+        self.assertTrue(rd.commit_descends_from(self.deploy_sha, self.deploy_sha))

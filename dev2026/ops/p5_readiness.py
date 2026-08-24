@@ -75,6 +75,12 @@ REVIEWED_DEPLOY_SHAS = (
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEV_PREFIX = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+#: Where the ASSESSOR's own approval is checked. Separate from `REPO_ROOT` because the two
+#: answer different questions -- "is the deployment's code approved" and "is the code asking
+#: that question approved" -- and a test exercising one must not have to fake the other.
+#: `None` means the same repository.
+ASSESSOR_REPO_ROOT = None
+
 #: The ONE committed directory an executed-result artifact may live in, relative to the dev
 #: directory. A path is not a provenance: `/tmp/x.json` and `../../x.json` are paths too.
 EXECUTIONS_REL = os.path.join("bench", "results", "p5_failure_semantics")
@@ -88,9 +94,41 @@ EXECUTIONS_REL = os.path.join("bench", "results", "p5_failure_semantics")
 ALLOWED_LEGACY_PATHS = ()
 
 #: Modules whose bytes are fingerprinted and re-verified against the approved commit.
+#:
+#: The assessor and its policy are on this list too. A deployment running compaction code that
+#: matches review, while the tool that judged it ran from somewhere else, is only half checked.
 INVENTORY_MODULES = (
     "store/block_manifest.py", "store/repair_wal.py", "store/compaction_lock.py",
     "ingest/build_block.py", "ingest/publish_manifest.py", "api/app.py",
+    "ops/p5_readiness.py", "ops/p5s8_evidence.py",
+)
+
+#: The assessor's OWN modules, plus every module the G18 threshold is derived through.
+#:
+#: `canonical_minimum_free_gib()` imports `ops/p5s8_evidence.py` from the working tree, so one
+#: edited line of local policy moved the bar the assessor then enforced -- the tool checking
+#: whether the deployment ran approved code was not itself approved code. The threshold reaches
+#: here through the roadmap and the report module, so a policy dependency left off this list is
+#: a place to change the bar unobserved.
+ASSESSOR_MODULES = (
+    "ops/p5_readiness.py", "ops/p5s8_evidence.py",
+    "ops/p5_roadmap.py", "ops/p5s8_report.py",
+)
+
+#: Commits at which the ASSESSOR itself has been reviewed. Empty means no assessor build is
+#: approved yet, which is the honest state of this branch: `3efcfd5` has not been reviewed, so
+#: nothing it produces may authorize anything.
+APPROVED_ASSESSOR_SHAS = ()
+
+#: The suites that may stand as failure-semantics evidence, named in approved code.
+#:
+#: `suite` was any name whose run was green. A trivial suite asserting `True` exits 0 with a
+#: positive test count, so the evidence said "some tests ran and did not fail" -- about nothing
+#: in particular. These are the ones whose subject IS the refusal, rollback and partial-staging
+#: behaviour being claimed.
+FAILURE_SEMANTICS_SUITES = (
+    "tests.test_phase2_p5_provision",
+    "tests.test_phase2_p5s8_evidence",
 )
 
 #: How long a free-space reading may be believed. Free space is true of a moment: an ingest
@@ -111,6 +149,20 @@ MAX_CLOCK_LEAD_S = 60
 MAX_PROBE_SKEW_S = 900
 
 _SHA256 = None
+_SHA1 = None
+
+
+def _is_sha1(value) -> bool:
+    """Exactly 40 lowercase hex characters.
+
+    Fail closed on shape BEFORE anything is sliced or handed to git: an int has no `[:7]`, a
+    bool is an int, `"main"` is a valid ref and a terrible identity, and `""` resolves to
+    nothing anywhere. Each of those used to reach further in than it should."""
+    global _SHA1
+    if _SHA1 is None:
+        import re
+        _SHA1 = re.compile(r"^[0-9a-f]{40}$")
+    return type(value) is str and bool(_SHA1.match(value))
 
 
 def _is_sha256(value) -> bool:
@@ -202,6 +254,68 @@ def _git_blob(sha: str, rel: str):
     proc = subprocess.run(["git", "show", f"{sha}:{DEV_PREFIX}/{rel}"], cwd=REPO_ROOT,
                           capture_output=True)
     return proc.stdout if proc.returncode == 0 else None
+
+
+def _git(*args, cwd=None):
+    """Run git in a repository, returning (returncode, stdout)."""
+    import subprocess
+    proc = subprocess.run(("git",) + args, cwd=cwd or REPO_ROOT, capture_output=True, text=True)
+    return proc.returncode, proc.stdout.strip()
+
+
+def _assessor_root() -> str:
+    return ASSESSOR_REPO_ROOT or REPO_ROOT
+
+
+def commit_descends_from(ancestor: str, descendant: str) -> bool:
+    """Is `descendant` in history that contains `ancestor`? A commit is its own descendant.
+
+    A result about commit N has to be recorded in history containing N. An approved commit on
+    an unrelated line is approved -- and says nothing about N."""
+    if not (_is_sha1(ancestor) and _is_sha1(descendant)):
+        return False
+    rc, _ = _git("merge-base", "--is-ancestor", ancestor, descendant)
+    return rc == 0
+
+
+def assessor_is_approved():
+    """Is the code doing the assessing itself reviewed, and is the tree it runs from that code?
+
+    Returns `(ok, reason)`. Everything else in this module points outward; this is the one
+    check that points at the checker. Below this bar no requirement may read READY, because a
+    verdict from an unapproved assessor is a verdict from unreviewed code."""
+    import hashlib
+    if not APPROVED_ASSESSOR_SHAS:
+        return False, ("no assessor build is approved: APPROVED_ASSESSOR_SHAS is empty, so "
+                       "nothing this assessor produces may authorize anything")
+    root = _assessor_root()
+    rc, head = _git("rev-parse", "HEAD", cwd=root)
+    if rc != 0 or not _is_sha1(head):
+        return False, f"the assessor's own HEAD could not be read from {root!r}"
+    if head not in APPROVED_ASSESSOR_SHAS:
+        return False, (f"the assessor is running at {head[:7]}, which is not an approved "
+                       f"assessor commit")
+    # The commit is approved; the TREE has to be that commit. A clean-looking SHA with an
+    # edited policy file on disk is the exact hole this closes.
+    for rel in ASSESSOR_MODULES:
+        rc, _ = _git("cat-file", "-e", f"{head}:{DEV_PREFIX}/{rel}", cwd=root)
+        blob = None
+        if rc == 0:
+            import subprocess
+            blob = subprocess.run(["git", "show", f"{head}:{DEV_PREFIX}/{rel}"], cwd=root,
+                                  capture_output=True).stdout
+        if blob is None:
+            return False, f"{rel} is not present at the approved assessor commit {head[:7]}"
+        try:
+            with open(os.path.join(root, DEV_PREFIX, rel), "rb") as fh:
+                actual = fh.read()
+        except OSError as exc:
+            return False, f"{rel} cannot be read from the assessor's tree: {exc}"
+        if hashlib.sha256(actual).hexdigest() != hashlib.sha256(blob).hexdigest():
+            return False, (f"{rel} on disk differs from the approved assessor commit "
+                           f"{head[:7]}: the policy being enforced is not the policy that was "
+                           f"reviewed")
+    return True, f"assessor at {head[:7]}, {len(ASSESSOR_MODULES)} modules matching"
 
 
 def canonical_minimum_free_gib() -> float:
@@ -653,9 +767,13 @@ def _check_failure_semantics(t: Dict) -> tuple:
     # approved commit. A result recording a run of commit N is committed AFTER N, so in
     # production it lives at some later commit and the lookup simply misses.
     evidence_commit = t.get("failure_semantics_evidence_commit")
-    if not evidence_commit:
+    if evidence_commit in (None, ""):
         return NOT_ADJUDICATED, ("the target declares no failure_semantics_evidence_commit, so "
                                  "nothing says which commit the executed result is read from")
+    if not _is_sha1(evidence_commit):
+        return NOT_ADJUDICATED, (f"failure_semantics_evidence_commit {evidence_commit!r} is not "
+                                 f"a commit id: exactly 40 lowercase hex characters. A branch "
+                                 f"name, a short SHA or a number is not an identity")
     if evidence_commit not in REVIEWED_DEPLOY_SHAS:
         return BLOCKED, (f"the evidence commit {evidence_commit[:7]} is not in the approved "
                          f"set; a target cannot nominate its own history to be read from")
@@ -673,9 +791,23 @@ def _check_failure_semantics(t: Dict) -> tuple:
     if not _is_sha256(digest):
         return NOT_ADJUDICATED, (f"source_digest {digest!r} is not a SHA-256: 64 lowercase hex "
                                  f"characters")
+    if not _is_sha1(sha):
+        return NOT_ADJUDICATED, (f"the artifact's deploy_sha {sha!r} is not a commit id: "
+                                 f"exactly 40 lowercase hex characters")
+    if suite not in FAILURE_SEMANTICS_SUITES:
+        return BLOCKED, (f"{suite!r} is not an authorized failure-semantics suite. A green run "
+                         f"of some other suite says tests ran and did not fail, about nothing "
+                         f"in particular; the authorized set is {list(FAILURE_SEMANTICS_SUITES)}")
     if sha not in REVIEWED_DEPLOY_SHAS:
         return BLOCKED, (f"the run was against {sha[:7]}, which is not in the approved deploy "
                          f"set")
+    # After the approved-set check, deliberately: an unapproved sha is usually not a commit in
+    # this history at all, so asking whether anything descends from it answers a different
+    # question and hides the real objection.
+    if not commit_descends_from(sha, evidence_commit):
+        return BLOCKED, (f"the evidence commit {evidence_commit[:7]} does not descend from the "
+                         f"deploy commit {sha[:7]}: a result about one line of history was "
+                         f"recorded on another")
     if type(run["exit_code"]) is not int or run["exit_code"] != 0:
         return BLOCKED, (f"the recorded run exited {run['exit_code']!r}: a failing or unknown "
                          f"run proves nothing about fail-closed behaviour")
@@ -744,6 +876,10 @@ def assess(target: Dict, now=None) -> Dict:
     label = target.get("label") or "UNLABELLED"
     disqualified = label in NON_QUALIFYING_LABELS or label != QUALIFYING_LABEL
     on_host, host_reason = _on_host(target)
+    # The checker checks itself first. An unapproved assessor demotes everything: its findings
+    # may be perfectly correct, and they are findings of unreviewed code, which is a different
+    # statement from an approved one.
+    assessor_ok, assessor_note = assessor_is_approved()
 
     results = []
     for req in REQUIREMENTS:
@@ -756,7 +892,11 @@ def assess(target: Dict, now=None) -> Dict:
             verdict, reason = _check_capacity(target, now=now)
         else:
             verdict, reason = CHECKERS[rid](target)
-        if verdict == READY and disqualified:
+        if verdict == READY and not assessor_ok:
+            verdict = NOT_ADJUDICATED
+            reason = (f"the assessor is not approved, so this finding cannot authorize "
+                      f"anything: {assessor_note}. The check itself found: {reason}")
+        elif verdict == READY and disqualified:
             # The checker found the thing. It found it in evidence that is not of this
             # deployment, which is a different statement -- and the one that keeps being
             # collapsed. Report what stopped it, not merely that it stopped.
@@ -773,6 +913,8 @@ def assess(target: Dict, now=None) -> Dict:
     return {
         "schema": "ghrsst.p5.readiness/1",
         "label": label,
+        "assessor_approved": assessor_ok,
+        "assessor_note": assessor_note,
         "adjudicated_on_host": on_host,
         "adjudicated_on_host_note": host_reason or "paths were stat-ed on the host that owns them",
         "target": {k: target.get(k) for k in
