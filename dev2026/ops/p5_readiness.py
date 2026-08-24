@@ -93,17 +93,25 @@ EXECUTIONS_REL = os.path.join("bench", "results", "p5_failure_semantics")
 #: against have no legacy segment at all.
 ALLOWED_LEGACY_PATHS = ()
 
-#: Modules whose bytes are fingerprinted and re-verified against the approved commit.
+#: The DEPLOYMENT-target inventory: what a host must carry to RUN a compaction.
 #:
-#: The assessor and its policy are on this list too. A deployment running compaction code that
-#: matches review, while the tool that judged it ran from somewhere else, is only half checked.
+#: The assessor's own modules used to be on this list, on the reasoning that a deployment
+#: matching review while the tool judging it ran from elsewhere is only half checked. That
+#: reasoning was right and the remedy was wrong: the assessor's integrity is `ASSESSOR_MODULES`
+#: plus an external approval, and mixing the two produced a module the deployment never ships.
+#: `ops/p5_readiness.py` was declared for the deployment and does not exist at the approved
+#: deployment commit at all -- it was added eleven commits later -- so the comparison silently
+#: shrank to the seven modules that happened to be there.
+#:
+#: Two inventories, two questions: "is the deployment running approved compaction code" and
+#: "is the tool asking that question approved code". Neither answers the other.
 INVENTORY_MODULES = (
     "store/block_manifest.py", "store/repair_wal.py", "store/compaction_lock.py",
     "ingest/build_block.py", "ingest/publish_manifest.py", "api/app.py",
-    "ops/p5_readiness.py", "ops/p5s8_evidence.py",
 )
 
-#: The assessor's OWN modules, plus every module the G18 threshold is derived through.
+#: The ASSESSOR runtime inventory -- its own modules, plus every module the G18 threshold is
+#: derived through. Distinct from `INVENTORY_MODULES` above, which is the DEPLOYMENT's.
 #:
 #: `canonical_minimum_free_gib()` imports `ops/p5s8_evidence.py` from the working tree, so one
 #: edited line of local policy moved the bar the assessor then enforced -- the tool checking
@@ -260,6 +268,16 @@ def expected_module_digests(sha: str) -> Dict[str, str]:
         if blob is not None:
             out[rel] = hashlib.sha256(blob).hexdigest()
     return out
+
+
+def missing_inventory_modules(sha: str) -> List[str]:
+    """Declared deployment modules that do not exist at `sha`.
+
+    `expected_module_digests()` returns only what it FOUND, so a declared module absent at the
+    approved commit vanished from the comparison instead of failing it -- the check quietly
+    shrinking to fit whatever the commit happened to contain. A declaration that a commit
+    cannot satisfy is a defect in one of the two, and either way it is not a pass."""
+    return sorted(rel for rel in INVENTORY_MODULES if _git_blob(sha, rel) is None)
 
 
 class ExecutionRefused(Exception):
@@ -528,6 +546,14 @@ def _check_identity(t: Dict) -> tuple:
         return NOT_ADJUDICATED, (f"could not recompute the module fingerprints for {reviewed} "
                                  f"here, so the reported ones cannot be checked against "
                                  f"anything")
+    # Fail closed on a declared module the approved commit does not contain. Skipping it let
+    # identity pass having never examined one of its own declared modules.
+    absent = missing_inventory_modules(reviewed)
+    if absent:
+        return BLOCKED, (f"declared deployment module(s) {absent} are not present at the "
+                         f"approved commit {reviewed[:7]}, so the inventory cannot be checked "
+                         f"in full; a declaration the commit cannot satisfy is a defect in "
+                         f"one of the two, never a pass")
     missing = sorted(set(expected) - set(reported))
     if missing:
         return BLOCKED, (f"the inventory does not cover {missing}; an absent module reads as "

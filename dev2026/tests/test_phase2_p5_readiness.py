@@ -1811,10 +1811,28 @@ class TestTheAssessorIsItselfBound(_RecordWritingMixin, unittest.TestCase):
             with self.subTest(rel):
                 self.assertIn(rel, rd.ASSESSOR_MODULES)
 
-    def test_the_deployment_inventory_covers_them_too(self):
+    def test_the_deployment_inventory_does_NOT_carry_the_assessor(self):
+        """This asserted the opposite, and the opposite was the defect.
+
+        Putting the assessor's modules in the deployment's inventory declared, for the
+        deployment, a module the deployment never ships -- `ops/p5_readiness.py` does not exist
+        at the approved deployment commit at all. `expected_module_digests()` then dropped it
+        silently and identity passed on a shrunken comparison.
+
+        The assessor's integrity is `ASSESSOR_MODULES` plus an external approval, which is a
+        different question from what the deployment must carry, and answering one with the
+        other is what went wrong."""
         for rel in ("ops/p5_readiness.py", "ops/p5s8_evidence.py"):
             with self.subTest(rel):
-                self.assertIn(rel, rd.INVENTORY_MODULES)
+                self.assertNotIn(rel, rd.INVENTORY_MODULES)
+                self.assertIn(rel, rd.ASSESSOR_MODULES)
+
+    def test_modules_both_actually_use_may_appear_in_both(self):
+        """The separation is by question, not by exclusion: the store modules genuinely run on
+        both sides, and listing them twice states two true things."""
+        shared = set(rd.INVENTORY_MODULES) & set(rd.ASSESSOR_MODULES)
+        self.assertEqual(sorted(shared),
+                         ["store/block_manifest.py", "store/repair_wal.py"])
 
     def test_an_empty_approved_set_says_so_specifically(self):
         """"No assessor build is approved" and "you are on the wrong commit" are different
@@ -2730,3 +2748,161 @@ class TestTheApprovalRecordsAuditFields(_RecordWritingMixin, unittest.TestCase):
         ok, reason = self._verdict(approved_by=_MISSING, signed_tag="whatever")
         self.assertFalse(ok)
         self.assertIn("approved_by", reason)
+
+
+class TestTheDeploymentInventoryIsCompleteAtTheApprovedCommit(_RecordWritingMixin,
+                                                             unittest.TestCase):
+    """`expected_module_digests()` returned only the modules it FOUND, so a declared module
+    absent at the approved commit was silently dropped from the comparison.
+
+    That is exactly what happened on VM24: the deployment inventory listed eight modules and
+    `3223fba` contains seven, because `ops/p5_readiness.py` was added eleven commits later.
+    Identity could then pass having never examined one of its own declared modules -- the check
+    quietly shrinking to fit whatever the commit happened to contain.
+
+    Two things were wrong and both are fixed: a declared module that is not there now refuses
+    by name, and the ASSESSOR's own modules no longer sit in the DEPLOYMENT's inventory, which
+    is how a module the deployment never needed came to be declared for it."""
+
+    def setUp(self):
+        import subprocess
+        self.tmp = tempfile.mkdtemp(prefix="p5-deploy-inventory-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.join(self.tmp, "repo")
+        self.dev = os.path.join(self.repo, "dev2026")
+
+        def git(*a):
+            subprocess.run(("git",) + a, cwd=self.repo, check=True, capture_output=True)
+        self.git = git
+
+        # A repository holding exactly the DECLARED deployment inventory, so the only variable
+        # in each test below is which of those modules exists.
+        for rel in rd.INVENTORY_MODULES:
+            path = os.path.join(self.dev, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(f"# deployment module {rel}\n")
+        git("init", "-q")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        git("add", "-A")
+        git("commit", "-qm", "a deployment carrying every declared module")
+        self.deploy_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                                         capture_output=True, text=True).stdout.strip()
+
+        for name in ("REPO_ROOT", "DEV_PREFIX", "REVIEWED_DEPLOY_SHAS",
+                     "ASSESSOR_REPO_ROOT", "APPROVAL_RECORD_PATH"):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+        rd.REPO_ROOT, rd.DEV_PREFIX = self.repo, "dev2026"
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha,)
+        # The assessor's own approval is arranged separately and really: an unapproved assessor
+        # demotes everything and would mask which guard fired.
+        root, head, record = approved_assessor_repo()
+        rd.ASSESSOR_REPO_ROOT, rd.APPROVAL_RECORD_PATH = root, record
+
+    def _digest(self, rel):
+        import hashlib
+        with open(os.path.join(self.dev, rel), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    def _target(self, modules=None):
+        reported = {rel: self._digest(rel) for rel in rd.INVENTORY_MODULES
+                    if os.path.isfile(os.path.join(self.dev, rel))}
+        if modules is not None:
+            reported = modules
+        return {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
+                "identity": {"reviewed_sha": self.deploy_sha, "head_sha": self.deploy_sha,
+                             "worktree_clean": True, "modules": reported}}
+
+    def _verdict(self, **kw):
+        by_id = {r["id"]: r for r in rd.assess(self._target(**kw))["requirements"]}
+        return by_id["identity"]["verdict"], by_id["identity"]["reason"]
+
+    # ---------------------------------------------------------------- positive control
+    def test_a_complete_inventory_is_ready(self):
+        verdict, reason = self._verdict()
+        self.assertEqual(verdict, rd.READY, reason)
+        self.assertIn(str(len(rd.INVENTORY_MODULES)), reason)
+
+    def test_the_positive_control_really_covers_every_declared_module(self):
+        """Otherwise the control could pass on a subset and prove nothing."""
+        self.assertTrue(rd.INVENTORY_MODULES)
+        for rel in rd.INVENTORY_MODULES:
+            with self.subTest(rel):
+                self.assertTrue(os.path.isfile(os.path.join(self.dev, rel)))
+        self.assertEqual(sorted(rd.expected_module_digests(self.deploy_sha)),
+                         sorted(rd.INVENTORY_MODULES))
+
+    # ---------------------------------------------------------------- the defect
+    def test_a_declared_module_absent_at_the_approved_commit_refuses(self):
+        """The VM24 case. Everything else is valid: the SHA is approved, HEAD matches, the tree
+        is clean, and the target honestly reports every module that DOES exist. Only the
+        absence of a declared module can refuse this -- the guard under test."""
+        import subprocess
+        gone = rd.INVENTORY_MODULES[0]
+        subprocess.run(["git", "rm", "-q", f"dev2026/{gone}"], cwd=self.repo, check=True,
+                       capture_output=True)
+        self.git("commit", "-qm", "a deployment missing one declared module")
+        self.deploy_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                                         capture_output=True, text=True).stdout.strip()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha,)
+
+        verdict, reason = self._verdict()
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn(gone, reason)
+        self.assertIn("declared", reason.lower())
+        # Not the neighbouring guards: the target reported no stale entry and nothing mismatched.
+        self.assertNotIn("does not cover", reason)
+        self.assertNotIn("fingerprint mismatch", reason)
+
+    def test_the_helper_reports_which_declared_modules_are_absent(self):
+        import subprocess
+        gone = rd.INVENTORY_MODULES[-1]
+        subprocess.run(["git", "rm", "-q", f"dev2026/{gone}"], cwd=self.repo, check=True,
+                       capture_output=True)
+        self.git("commit", "-qm", "drop one")
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                             capture_output=True, text=True).stdout.strip()
+        self.assertEqual(rd.missing_inventory_modules(sha), [gone])
+        self.assertEqual(rd.missing_inventory_modules(self.deploy_sha), [])
+
+    def test_a_target_omitting_a_present_module_still_refuses_differently(self):
+        """The neighbouring guard, kept distinct: the module EXISTS at the commit and the
+        target simply did not report it. Different defect, different reason."""
+        reported = {rel: self._digest(rel) for rel in rd.INVENTORY_MODULES}
+        reported.pop(rd.INVENTORY_MODULES[0])
+        verdict, reason = self._verdict(modules=reported)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("does not cover", reason)
+        self.assertNotIn("declared", reason.lower())
+
+    # ---------------------------------------------------------------- the separation
+    def test_the_deployment_inventory_holds_no_assessor_only_module(self):
+        """`ops/p5_readiness.py` is the tool, not the deployment. Declaring the assessor for
+        the deployment is what produced a declared module the deployment never shipped."""
+        for rel in ("ops/p5_readiness.py", "ops/p5_roadmap.py", "ops/p5s8_report.py",
+                    "ops/quiescence.py", "store/segmented_cube.py"):
+            with self.subTest(rel):
+                self.assertNotIn(rel, rd.INVENTORY_MODULES)
+
+    def test_the_assessor_inventory_still_covers_the_assessor(self):
+        """The separation must not weaken the assessor side: its own runtime is unchanged."""
+        for rel in ("ops/p5_readiness.py", "ops/p5s8_evidence.py", "ops/p5_roadmap.py",
+                    "ops/p5s8_report.py", "store/segmented_cube.py"):
+            with self.subTest(rel):
+                self.assertIn(rel, rd.ASSESSOR_MODULES)
+
+    def test_the_two_inventories_are_documented_as_different_questions(self):
+        self.assertNotEqual(set(rd.INVENTORY_MODULES), set(rd.ASSESSOR_MODULES))
+        with open(os.path.join(_DEV, "ops", "p5_readiness.py")) as fh:
+            source = fh.read()
+        self.assertIn("DEPLOYMENT", source)
+        self.assertIn("ASSESSOR", source)
+
+    def test_the_deployment_inventory_is_the_compaction_code(self):
+        """What a deployment must carry to RUN a compaction, and nothing else."""
+        for rel in ("store/block_manifest.py", "store/repair_wal.py",
+                    "store/compaction_lock.py", "ingest/build_block.py",
+                    "ingest/publish_manifest.py", "api/app.py"):
+            with self.subTest(rel):
+                self.assertIn(rel, rd.INVENTORY_MODULES)
