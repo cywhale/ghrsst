@@ -70,6 +70,123 @@ def approved_assessor_repo():
     return _ASSESSOR_REPO
 
 
+def build_probe_workspace(case):
+    """Everything a complete `assess()` needs, built OUTSIDE the process that measures.
+
+    A real published manifest and block, a real WAL and anchor, a real evidence repository with
+    a committed executed-result artifact, and an approved assessor build. Written to a config
+    file the probe reads, so the measuring interpreter imports nothing but the readiness path.
+    Building a manifest and a WAL here imports `ingest/build_block.py` and friends; counting
+    those would pad the inventory with modules the assessor never runs."""
+    import hashlib
+    import subprocess
+
+    tmp = tempfile.mkdtemp(prefix="p5-closure-ws-")
+    case.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+
+    root = os.path.join(tmp, "data")
+    manifest_root = os.path.join(root, "p5_blocks")
+    wal_root = os.path.join(root, "p5_repairs")
+    anchor_root = os.path.join(tmp, "anchor")
+    for d in (manifest_root, wal_root, anchor_root):
+        os.makedirs(d, exist_ok=True)
+    s0, e0 = bm.block_bounds(ANCHOR, S, 0)
+    days = fx.calendar_span(s0, e0)[:8]
+    delta = os.path.join(tmp, "delta.zarr")
+    fx.build_delta(delta, days, ny=NY, nx=NX)
+    plan = build_block(os.path.join(manifest_root, "block_v1.zarr"), start_day=s0, end_day=e0,
+                       classification_target=list(days), delta_path=delta,
+                       artifacts_dir=os.path.join(tmp, "artifacts"), lock=None,
+                       hard_reserve_bytes=0, unsafe_skip_isolation=True)
+    m = {"format": bm.MANIFEST_FORMAT, "version": bm.SCHEMA_VERSION, "generation": 1,
+         "generation_id": "gen000001-closure", "created_utc": "2026-08-23T00:00:00Z",
+         "created_by": "closure-probe", "predecessor_generation": None,
+         "predecessor_manifest": None,
+         "grid": {"ny": NY, "nx": NX, "region": [0, NY, 0, NX]},
+         "variables": list(fx.VARS), "block_grid": {"anchor_day": ANCHOR, "block_days": S},
+         "segments": [dict(plan["segment"])], "superseded": [], "manifest_checksum": ""}
+    m["manifest_checksum"] = bm.compute_checksum(m)
+    bm.publish(manifest_root, m)
+    rw.declare_anchor_domain(anchor_root, domain_id="closure-probe",
+                             at_utc="2026-08-23T00:00:00Z", operator="tests",
+                             allow_same_filesystem=True)
+    rw.initialize_wal(wal_root, manifest_root=manifest_root, at_utc="2026-08-23T00:00:01Z",
+                      operator="tests", anchor_root=anchor_root)
+
+    repo = os.path.join(tmp, "repo")
+    dev = os.path.join(repo, "dev2026")
+    execs = os.path.join(dev, rd.EXECUTIONS_REL)
+    os.makedirs(execs)
+    suite_rel = "tests/test_closure_probe_suite.py"
+    suite_path = os.path.join(dev, suite_rel)
+    os.makedirs(os.path.dirname(suite_path), exist_ok=True)
+    with open(suite_path, "w") as fh:
+        fh.write("# the suite whose run is recorded\n")
+    with open(suite_path, "rb") as fh:
+        suite_digest = hashlib.sha256(fh.read()).hexdigest()
+
+    def git(*a):
+        subprocess.run(("git",) + a, cwd=repo, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.invalid")
+    git("config", "user.name", "t")
+    git("add", "-A")
+    git("commit", "-qm", "the code under test")
+    deploy_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                                capture_output=True, text=True).stdout.strip()
+    with open(os.path.join(execs, "run.json"), "w") as fh:
+        json.dump({"suite": "tests.test_closure_probe_suite", "deploy_sha": deploy_sha,
+                   "command": ".venv/bin/python -m unittest tests.test_closure_probe_suite",
+                   "exit_code": 0, "tests_run": 17, "ran_utc": "2026-08-23T10:00:00Z",
+                   "source_digest": suite_digest}, fh)
+    git("add", "-A")
+    git("commit", "-qm", "record the run")
+    evidence_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                                  capture_output=True, text=True).stdout.strip()
+
+    assessor_root, assessor_head = approved_assessor_repo()
+    now = _now_iso()
+    target = {
+        "label": rd.QUALIFYING_LABEL, "host": socket.gethostname(),
+        "run_id": "CLOSURE_RUN", "collected_utc": now,
+        "root": root, "manifest_root": manifest_root, "wal_root": wal_root,
+        "anchor_root": anchor_root,
+        "identity": {"reviewed_sha": deploy_sha, "head_sha": deploy_sha,
+                     "worktree_clean": True, "modules": {suite_rel: suite_digest}},
+        "capacity": {"label": rd.QUALIFYING_LABEL, "run_id": "CLOSURE_RUN",
+                     "measured_utc": now, "free_now_gib": 1.0,
+                     "minimum_free_gib": 0.001, "recommended_free_gib": 0.001,
+                     "hard_reserve_gib": 250, "data_root": root,
+                     "filesystem_dev": os.stat(root).st_dev},
+        "locks": {"compaction": os.path.join(root, "p5_compaction.lock"),
+                  "ingest": os.path.join(root, "ingest.lock"),
+                  "acquire_probe": {"acquired": True, "released": True,
+                                    "path": os.path.join(root, "p5_compaction.lock"),
+                                    "run_id": "CLOSURE_RUN", "host": socket.gethostname(),
+                                    "at_utc": now, "actor": "closure-probe"}},
+        "failure_semantics_proven_by": "run.json",
+        "failure_semantics_evidence_commit": evidence_sha,
+    }
+    cfg = {
+        "dev": _DEV,
+        "overrides": {
+            "REPO_ROOT": repo, "DEV_PREFIX": "dev2026",
+            "REVIEWED_DEPLOY_SHAS": [deploy_sha, evidence_sha],
+            "FAILURE_SEMANTICS_SUITES": ["tests.test_closure_probe_suite"],
+            "INVENTORY_MODULES": [suite_rel],
+            "ASSESSOR_REPO_ROOT": assessor_root,
+            "APPROVED_ASSESSOR_SHAS": [assessor_head],
+        },
+        "target": target,
+        "canonical_minimum_gib": 0.001,
+    }
+    cfg_path = os.path.join(tmp, "probe_config.json")
+    with open(cfg_path, "w") as fh:
+        json.dump(cfg, fh)
+    return cfg_path
+
+
 class _ApprovedAssessorMixin:
     """Point the assessor's self-check at an approved build of its own modules."""
 
@@ -1913,42 +2030,92 @@ class TestTheAssessorRuntimeTreeIsClean(unittest.TestCase):
         return os.path.join(self.repo, "dev2026", rel)
 
     # ---------------------------------------------------------------- inventory coverage
-    #: Forces every branch a short-circuiting target never reaches, then reports the
-    #: first-party modules that ended up loaded. Run in a FRESH interpreter: measuring
-    #: `sys.modules` in the test process reports whatever the rest of the session imported --
-    #: the provisioner's `ingest/build_block.py` among them -- which is a different runtime
-    #: from the assessor's and would pad the inventory with modules that never execute here.
+    #: Runs the REAL readiness path in a fresh interpreter and reports what it imported.
+    #:
+    #: The previous probe hand-imported the modules it expected to find, which proves only that
+    #: those modules exist. A first-party import added inside `_check_wal_anchor` or any other
+    #: checker would never have loaded, and the coverage test would have passed while the
+    #: inventory silently missed it.
+    #:
+    #: This drives `assess()` and reports the REASONS the checkers produced, so the closure is
+    #: what execution pulled in and the evidence that it executed is the checkers' own output.
     _CLOSURE_PROBE = """
 import json, os, sys
-DEV = sys.argv[1]
+cfg = json.load(open(sys.argv[1]))
+DEV = cfg["dev"]
 sys.path.insert(0, DEV)
 from ops import p5_readiness as rd
-rd.canonical_minimum_free_gib()
-from store.segmented_cube import SegmentedCubeStore
-rd.expected_module_digests(rd.REVIEWED_DEPLOY_SHAS[0])
+for key, value in cfg["overrides"].items():
+    setattr(rd, key, tuple(value) if isinstance(value, list) else value)
+# The canonical G18 bar is policy the assessor reads through `ops.p5s8_evidence`; a temp
+# filesystem does not hold 403.3 GiB, so the probe moves the POLICY rather than letting the
+# target claim a lower one -- which is the point of that threshold being canonical.
+from ops import p5s8_evidence as _ev
+_ev.MINIMUM_FREE_GIB = cfg["canonical_minimum_gib"]
+target = cfg["target"]
+report = rd.assess(target)
+verdicts = {r["id"]: r["verdict"] for r in report["requirements"]}
+reasons = {r["id"]: r["reason"] for r in report["requirements"]}
+# The unapproved branch too: it renders different reasons and may import differently.
+rd.APPROVED_ASSESSOR_SHAS = ()
+rd.assess(target)
 out = set()
 for mod in list(sys.modules.values()):
     f = getattr(mod, "__file__", None)
     if not f:
         continue
     f = os.path.abspath(f)
-    if f.startswith(DEV + os.sep) and "/tests/" not in f and "/.venv/" not in f \
+    if f.startswith(DEV + os.sep) and "/tests/" not in f and "/.venv/" not in f \\
             and f.endswith(".py"):
         out.add(os.path.relpath(f, DEV))
-print(json.dumps(sorted(out)))
+print(json.dumps({"closure": sorted(out), "verdicts": verdicts, "reasons": reasons,
+                  "schema": report["schema"]}))
 """
 
-    def test_the_inventory_covers_every_module_the_readiness_path_imports(self):
-        """Measured, not listed.
-
-        A hand-maintained inventory drifts from the code the moment an import is added, and
-        the drift is invisible until someone edits the module nobody listed -- which is how
-        `store/segmented_cube.py` came to decide verdicts from outside the inventory."""
+    def _run_closure_probe(self):
+        """Build a complete target elsewhere, then measure one clean `assess()` run."""
         import subprocess
-        proc = subprocess.run([sys.executable, "-c", self._CLOSURE_PROBE, _DEV],
+        cfg_path = build_probe_workspace(self)
+        proc = subprocess.run([sys.executable, "-c", self._CLOSURE_PROBE, cfg_path],
                               capture_output=True, text=True, cwd=_DEV)
-        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-        loaded = set(json.loads(proc.stdout))
+        self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
+        return json.loads(proc.stdout)
+
+    #: Text only the real checker produces. A probe that hand-imported modules and reported
+    #: invented verdicts would satisfy a verdict-only assertion -- these it cannot fabricate
+    #: without running the checkers, which is the thing being evidenced.
+    CHECKER_SIGNATURES = {
+        "capacity": "statvfs reports",
+        "blocks": "segments_verified=",
+        "wal_anchor": "anchor=",
+        "locks": "acquired and released by",
+        "identity": "module fingerprints recomputed",
+        "failure_semantics": "tests_run=",
+        "manifest": "generation=",
+    }
+
+    def test_the_probe_actually_reaches_every_checker(self):
+        """Without this, the coverage test could pass on a run where nothing executed.
+
+        Each requirement must have been adjudicated on its merits AND its reason must carry
+        text only that checker emits -- the evidence that the code ran, rather than a claim
+        that it did."""
+        result = self._run_closure_probe()
+        self.assertEqual(result["schema"], "ghrsst.p5.readiness/1")
+        for rid, signature in self.CHECKER_SIGNATURES.items():
+            with self.subTest(rid):
+                self.assertEqual(result["verdicts"].get(rid), rd.READY,
+                                 f"{rid} did not run its success path")
+                self.assertIn(signature, result["reasons"].get(rid, ""),
+                              f"{rid}'s reason does not look like that checker's own output")
+
+    def test_the_inventory_covers_every_module_the_readiness_path_imports(self):
+        """Measured by execution, not by listing.
+
+        A hand-maintained inventory drifts the moment an import is added, and the drift is
+        invisible until someone edits the module nobody listed -- which is how
+        `store/segmented_cube.py` came to decide verdicts from outside the inventory."""
+        loaded = set(self._run_closure_probe()["closure"])
         self.assertIn("store/segmented_cube.py", loaded,
                       "the probe did not reach _check_blocks; it would prove nothing")
         missing = sorted(loaded - set(rd.ASSESSOR_MODULES))
@@ -1957,12 +2124,8 @@ print(json.dumps(sorted(out)))
                          f"{missing}")
 
     def test_the_inventory_lists_nothing_that_does_not_execute(self):
-        """The other direction: padding the inventory with modules the path never imports
-        would make the coverage test pass without covering anything."""
-        import subprocess
-        proc = subprocess.run([sys.executable, "-c", self._CLOSURE_PROBE, _DEV],
-                              capture_output=True, text=True, cwd=_DEV)
-        loaded = set(json.loads(proc.stdout))
+        """The other direction: padding the inventory would make coverage pass emptily."""
+        loaded = set(self._run_closure_probe()["closure"])
         self.assertEqual(sorted(set(rd.ASSESSOR_MODULES) - loaded), [])
 
     def test_the_named_runtime_modules_are_listed(self):
