@@ -296,6 +296,40 @@ def commit_descends_from(ancestor: str, descendant: str) -> bool:
     return rc == 0
 
 
+def _exact_nonempty_str(value) -> bool:
+    """A real string with something in it. `True` is not a name and `""` is not a date."""
+    return type(value) is str and value.strip() != ""
+
+
+def _approval_schema_problem(record: Dict):
+    """The first thing wrong with an approval record, or `None`.
+
+    `approved_by` and `approved_utc` were documented and unchecked, so a record naming nobody
+    and dated never was accepted. An approval no one signed and nothing dates is not an audit
+    trail; it is a file that happens to contain a SHA."""
+    if "scope" not in record:
+        return "declares no scope; this assessor needs " + repr(APPROVAL_SCOPE)
+    if type(record["scope"]) is not str or record["scope"] != APPROVAL_SCOPE:
+        return (f"declares scope {record['scope']!r}; this assessor needs "
+                f"{APPROVAL_SCOPE!r}")
+    if "approved_sha" not in record:
+        return "names no approved_sha"
+    if not _is_sha1(record["approved_sha"]):
+        return (f"names approved_sha {record['approved_sha']!r}, which is not a commit id: "
+                f"exactly 40 lowercase hex characters")
+    if "approved_by" not in record:
+        return "records no approved_by, so nobody is named as having approved it"
+    if not _exact_nonempty_str(record["approved_by"]):
+        return f"records approved_by {record['approved_by']!r}, which is not a name"
+    if "approved_utc" not in record:
+        return "records no approved_utc, so nothing dates the approval"
+    if not _exact_nonempty_str(record["approved_utc"]):
+        return f"records approved_utc {record['approved_utc']!r}, which is not a timestamp"
+    if _parse_utc(record["approved_utc"]) is None:
+        return f"records approved_utc {record['approved_utc']!r}, which is not a timestamp"
+    return None
+
+
 def assessor_is_approved():
     """Is the code doing the assessing itself reviewed, and is the tree it runs from that code?
 
@@ -308,26 +342,38 @@ def assessor_is_approved():
     if not APPROVAL_RECORD_PATH:
         return False, ("no approval record is configured, so no assessor build is approved and "
                        "nothing this assessor produces may authorize anything")
-    record_path = os.path.abspath(APPROVAL_RECORD_PATH)
-    if not os.path.isfile(record_path):
-        return False, f"the approval record {record_path!r} does not exist"
-    # A record the approved tree contains is the self-reference again, wearing a filename.
-    if record_path == os.path.abspath(root) or record_path.startswith(
-            os.path.abspath(root) + os.sep):
-        return False, (f"the approval record {record_path!r} is inside the repository it "
-                       f"approves; the authority has to be outside the thing it authorizes")
+    given = os.path.abspath(APPROVAL_RECORD_PATH)
+    if not os.path.isfile(given):
+        return False, f"the approval record {given!r} does not exist"
+    # The boundary is about where the BYTES are, so both the name and what it resolves to are
+    # checked. Comparing `abspath` alone meant a link whose name sat outside the repository
+    # counted as outside while the file it named was in the tree being approved -- the
+    # self-reference restored by one symlink. The literal path is checked too, conservatively:
+    # a link inside the approved tree is the tree choosing what its own approval says, whatever
+    # it happens to point at today.
+    real_root = os.path.realpath(root)
+    for label, candidate in (("resolves to", os.path.realpath(given)), ("is at", given)):
+        if candidate == real_root or candidate.startswith(real_root + os.sep) \
+                or candidate == os.path.abspath(root) \
+                or candidate.startswith(os.path.abspath(root) + os.sep):
+            return False, (f"the approval record {label} {candidate!r}, inside the repository "
+                           f"it approves; the authority has to be outside the thing it "
+                           f"authorizes")
+    record_path = given
     try:
         with open(record_path) as fh:
             record = json.load(fh)
     except Exception as exc:                                  # noqa: BLE001
         return False, f"the approval record {record_path!r} is not readable JSON: {exc}"
-    if not isinstance(record, dict) or record.get("scope") != APPROVAL_SCOPE:
-        return False, (f"the approval record declares scope {record.get('scope')!r} if it "
-                       f"declares one at all; this assessor needs {APPROVAL_SCOPE!r}")
-    approved_sha = record.get("approved_sha")
-    if not _is_sha1(approved_sha):
-        return False, (f"the approval record names {approved_sha!r}, which is not a commit id: "
-                       f"exactly 40 lowercase hex characters")
+    # An approval record is external input, and `[]`, `null`, a string and a number are all
+    # valid JSON. None of them has `.get` -- which the refusal message used to call anyway.
+    if not isinstance(record, dict):
+        return False, (f"the approval record is a JSON {type(record).__name__}, not an object; "
+                       f"there are no fields to read")
+    problem = _approval_schema_problem(record)
+    if problem:
+        return False, f"the approval record {problem}"
+    approved_sha = record["approved_sha"]
 
     rc, head = _git("rev-parse", "HEAD", cwd=root)
     if rc != 0 or not _is_sha1(head):

@@ -43,6 +43,10 @@ S = 90
 NY = NX = 16
 _APPROVED = rd.REVIEWED_DEPLOY_SHAS[0]
 
+#: "drop this field entirely", so an absent field is distinguishable from a `None` one --
+#: the two fail for different reasons and a test that conflates them proves neither.
+_MISSING = object()
+
 _ASSESSOR_REPO = None
 
 
@@ -2378,13 +2382,22 @@ class TestApprovalComesFromOutsideTheRepository(_RecordWritingMixin, unittest.Te
         rd.ASSESSOR_REPO_ROOT, rd.DEV_PREFIX = self.repo, "dev2026"
         rd.APPROVAL_RECORD_PATH = self._write_record()
 
-    def _write_record(self, path=None, **over):
+    def _write_record(self, path=None, raw=_MISSING, **over):
+        """A complete, valid record with `over` applied. `_MISSING` drops a field entirely, so
+        an absent field is distinguishable from a `None` one."""
         record = {"scope": rd.APPROVAL_SCOPE, "approved_sha": self.head,
                   "approved_by": "an operator", "approved_utc": "2026-08-23T12:00:00Z"}
-        record.update(over)
+        for key, value in over.items():
+            if value is _MISSING:
+                record.pop(key, None)
+            else:
+                record[key] = value
         path = path or os.path.join(self.tmp, "approval.json")
         with open(path, "w") as fh:
-            json.dump(record, fh)
+            if raw is _MISSING:
+                json.dump(record, fh)
+            else:
+                fh.write(raw)
         return path
 
     def _path(self, rel):
@@ -2417,6 +2430,49 @@ class TestApprovalComesFromOutsideTheRepository(_RecordWritingMixin, unittest.Te
         self.assertFalse(ok)
         self.assertIn("inside", reason.lower())
 
+    def test_a_symlink_outside_pointing_at_a_record_inside_is_refused(self):
+        """The boundary compared `abspath`, so a link whose NAME sits outside the repository
+        counted as outside while the file it named was in the tree being approved -- the
+        self-reference restored by one symlink. `realpath` is what makes the question about
+        where the bytes are."""
+        inside = os.path.join(self.repo, "approval.json")
+        self._write_record(path=inside)
+        link = os.path.join(self.tmp, "looks_external.json")
+        os.symlink(inside, link)
+        rd.APPROVAL_RECORD_PATH = link
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok, "a link from outside to a record inside the repo was accepted")
+        self.assertIn("inside", reason.lower())
+
+    def test_a_symlink_inside_pointing_at_a_record_outside_is_also_refused(self):
+        """Conservative, and stated as policy: the link itself lives in the approved tree, so
+        the tree chooses what its own approval says. Where it happens to point is not the
+        operator's decision at that moment."""
+        outside = self._write_record(path=os.path.join(self.tmp, "real_record.json"))
+        link = os.path.join(self.repo, "approval_link.json")
+        os.symlink(outside, link)
+        rd.APPROVAL_RECORD_PATH = link
+        ok, reason = rd.assessor_is_approved()
+        self.assertFalse(ok)
+        self.assertIn("inside", reason.lower())
+
+    def test_a_record_physically_outside_is_accepted(self):
+        """The positive control for the boundary alone: a real file, really outside."""
+        rd.APPROVAL_RECORD_PATH = self._write_record(
+            path=os.path.join(self.tmp, "genuinely_outside.json"))
+        ok, reason = rd.assessor_is_approved()
+        self.assertTrue(ok, reason)
+
+    def test_a_symlink_outside_pointing_outside_is_accepted(self):
+        """A link is not the problem; where it resolves is. Refusing every link would push
+        operators towards copies, and a stale copy is worse than a link."""
+        real = self._write_record(path=os.path.join(self.tmp, "real_outside.json"))
+        link = os.path.join(self.tmp, "link_outside.json")
+        os.symlink(real, link)
+        rd.APPROVAL_RECORD_PATH = link
+        ok, reason = rd.assessor_is_approved()
+        self.assertTrue(ok, reason)
+
     def test_a_record_for_another_commit_is_refused(self):
         rd.APPROVAL_RECORD_PATH = self._write_record(approved_sha="b" * 40)
         ok, reason = rd.assessor_is_approved()
@@ -2438,13 +2494,30 @@ class TestApprovalComesFromOutsideTheRepository(_RecordWritingMixin, unittest.Te
         self.assertIn("scope", reason.lower())
 
     def test_unreadable_json_is_refused(self):
-        path = os.path.join(self.tmp, "broken.json")
-        with open(path, "w") as fh:
-            fh.write("{not json")
-        rd.APPROVAL_RECORD_PATH = path
+        rd.APPROVAL_RECORD_PATH = self._write_record(raw="{not json")
         ok, reason = rd.assessor_is_approved()
         self.assertFalse(ok)
         self.assertNotIn("Traceback", reason)
+
+    def test_every_malformed_json_root_is_refused_without_raising(self):
+        """A record is external input. `[]`, `null`, a string and a number are all valid JSON
+        and none of them has `.get` -- the refusal message called it anyway."""
+        for raw in ("[]", "null", '"a string"', "42", "true", '[{"scope": "x"}]', "{}"):
+            with self.subTest(raw):
+                rd.APPROVAL_RECORD_PATH = self._write_record(raw=raw)
+                try:
+                    ok, reason = rd.assessor_is_approved()
+                except Exception as exc:                      # noqa: BLE001
+                    self.fail(f"malformed root {raw!r} raised {exc!r}")
+                self.assertFalse(ok)
+                self.assertTrue(reason)
+                self.assertNotIn("Traceback", reason)
+
+    def test_a_non_object_root_says_what_was_found(self):
+        rd.APPROVAL_RECORD_PATH = self._write_record(raw="[]")
+        _, reason = rd.assessor_is_approved()
+        self.assertIn("object", reason.lower())
+
 
     # ---------------------------------------------------------------- signed tag route
     def test_a_record_naming_a_tag_that_cannot_be_verified_is_refused(self):
@@ -2563,3 +2636,97 @@ class TestApprovalComesFromOutsideTheRepository(_RecordWritingMixin, unittest.Te
         mechanism works; it approves nothing real, and the shipped default must stay closed."""
         self.assertIsNone(rd.APPROVAL_RECORD_DEFAULT,
                           "a default approval record is shipped in the code")
+
+
+class TestTheApprovalRecordsAuditFields(_RecordWritingMixin, unittest.TestCase):
+    """`approved_by` and `approved_utc` were documented and unchecked, so a record with no
+    approver and no date passed. An approval nobody signed and nothing dates is not an audit
+    trail; it is a file that happens to contain a SHA."""
+
+    def setUp(self):
+        import subprocess
+        self.tmp = tempfile.mkdtemp(prefix="p5-audit-fields-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.join(self.tmp, "repo")
+        for rel in rd.ASSESSOR_MODULES:
+            dst = os.path.join(self.repo, "dev2026", rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy(os.path.join(_DEV, rel), dst)
+        for args in (("init", "-q"), ("config", "user.email", "t@example.invalid"),
+                     ("config", "user.name", "t"), ("add", "-A"),
+                     ("commit", "-qm", "the assessor build under review")):
+            subprocess.run(("git",) + args, cwd=self.repo, check=True, capture_output=True)
+        self.head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                                   capture_output=True, text=True).stdout.strip()
+        for name in ("ASSESSOR_REPO_ROOT", "DEV_PREFIX", "APPROVAL_RECORD_PATH"):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+        rd.ASSESSOR_REPO_ROOT, rd.DEV_PREFIX = self.repo, "dev2026"
+
+    def _record(self, **over):
+        record = {"scope": rd.APPROVAL_SCOPE, "approved_sha": self.head,
+                  "approved_by": "an operator", "approved_utc": "2026-08-23T12:00:00Z"}
+        for key, value in over.items():
+            if value is _MISSING:
+                record.pop(key, None)
+            else:
+                record[key] = value
+        path = os.path.join(self.tmp, "approval.json")
+        with open(path, "w") as fh:
+            json.dump(record, fh)
+        return path
+
+    def _verdict(self, **over):
+        rd.APPROVAL_RECORD_PATH = self._record(**over)
+        return rd.assessor_is_approved()
+
+    def test_a_complete_record_is_approved(self):
+        """Positive control: every field present and well typed."""
+        ok, reason = self._verdict()
+        self.assertTrue(ok, reason)
+
+    def test_approved_by_must_be_present(self):
+        ok, reason = self._verdict(approved_by=_MISSING)
+        self.assertFalse(ok)
+        self.assertIn("approved_by", reason)
+
+    def test_approved_by_must_be_a_non_empty_string(self):
+        for bad in ("", "   ", None, 1, True, ["someone"], {"name": "x"}):
+            with self.subTest(repr(bad)):
+                ok, reason = self._verdict(approved_by=bad)
+                self.assertFalse(ok)
+                self.assertIn("approved_by", reason)
+
+    def test_approved_utc_must_be_present(self):
+        ok, reason = self._verdict(approved_utc=_MISSING)
+        self.assertFalse(ok)
+        self.assertIn("approved_utc", reason)
+
+    def test_approved_utc_must_be_a_timestamp(self):
+        for bad in ("", "   ", "last tuesday", "2026-13-45T99:99:99Z", None, 0, True,
+                    1756000000):
+            with self.subTest(repr(bad)):
+                ok, reason = self._verdict(approved_utc=bad)
+                self.assertFalse(ok)
+                self.assertIn("approved_utc", reason)
+
+    def test_the_scope_must_be_an_exact_string(self):
+        for bad in (None, 1, True, [rd.APPROVAL_SCOPE], rd.APPROVAL_SCOPE + " "):
+            with self.subTest(repr(bad)):
+                ok, reason = self._verdict(scope=bad)
+                self.assertFalse(ok)
+                self.assertIn("scope", reason.lower())
+
+    def test_each_audit_field_is_refused_on_its_own(self):
+        """One defect at a time, everything else valid -- so no field's absence is covered by
+        another's, and each refusal names the field it is about."""
+        for field in ("scope", "approved_sha", "approved_by", "approved_utc"):
+            with self.subTest(field):
+                ok, reason = self._verdict(**{field: _MISSING})
+                self.assertFalse(ok)
+                self.assertIn(field, reason)
+
+    def test_a_signed_tag_record_still_needs_its_audit_fields(self):
+        """The tag route is not a way around the schema."""
+        ok, reason = self._verdict(approved_by=_MISSING, signed_tag="whatever")
+        self.assertFalse(ok)
+        self.assertIn("approved_by", reason)
