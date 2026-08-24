@@ -3763,6 +3763,23 @@ class TestTheApprovalRecordIsDocumentedAsATranscription(unittest.TestCase):
         self.assertIn("transcription", doc)
         self.assertIn("not a cryptographic signature", doc)
 
+    def test_the_document_says_authorship_is_not_among_what_is_checked(self):
+        """The substantive claim, not the label. "Transcription" is only meaningful next to
+        the reason it is one: the assessor binds a record to a commit and cannot establish who
+        wrote it. A document carrying the word without the reason teaches nobody anything."""
+        doc = self._doc()
+        self.assertIn("who wrote", doc)
+        self.assertIn("write access", doc,
+                      "the document does not say who CAN write a record")
+
+    def test_the_document_records_the_incident_that_demonstrated_it(self):
+        """An unrelated session wrote the record for 7126c7b from a misdirected prompt, and it
+        passed every binding check. That is the evidence for the paragraph above; without it
+        the limitation reads as hypothetical."""
+        doc = self._doc()
+        self.assertIn("2026-08-24", doc)
+        self.assertIn("7126c7b", doc)
+
     def test_the_document_names_what_the_record_does_and_does_not_bind(self):
         doc = self._doc()
         self.assertIn("signed_tag", doc, "the document does not name the mechanism that "
@@ -3777,3 +3794,93 @@ class TestTheApprovalRecordIsDocumentedAsATranscription(unittest.TestCase):
         approval = approval[:approval.index("\ndef ")]
         self.assertIn("verify-tag", approval)
         self.assertIn("signed_tag", approval)
+
+
+class TestTheProposedDeploymentRevision(_RecordWritingMixin, unittest.TestCase):
+    """What `PROPOSED_DEPLOY_SHAS` claims, measured from the proposed commit itself.
+
+    A proposal is worth no more than the evidence attached to it, and "I built a revision that
+    includes the provisioner" is a claim about a commit -- so it is checked against that commit,
+    materialized from git blobs, exactly as the approved deployment is.
+
+    The three things the proposal rests on:
+
+      * it carries `ops/p5_provision.py`, which the approved `3223fba` predates;
+      * its runtime is byte-identical to the approved deployment's, so nothing about what a
+        compaction RUNS is being changed under cover of adding a tool;
+      * its lifecycle and API closures still match the declared inventories both ways.
+
+    And the thing it must not do: become deployable. `_check_identity` reads
+    `REVIEWED_DEPLOY_SHAS`, this is not that, and a test says so."""
+
+    REVIEWED = "3223fba37da5d292ea6acb58ccef0da2b5138d31"
+
+    def setUp(self):
+        for name in ("REVIEWED_DEPLOY_SHAS", "ASSESSOR_REPO_ROOT", "APPROVAL_RECORD_PATH"):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+        root, _head, record = approved_assessor_repo()
+        rd.ASSESSOR_REPO_ROOT, rd.APPROVAL_RECORD_PATH = root, record
+        self.assertEqual(len(rd.PROPOSED_DEPLOY_SHAS), 1,
+                         "this test describes exactly one proposed revision")
+        self.proposed = rd.PROPOSED_DEPLOY_SHAS[0]
+
+    def test_the_proposed_revision_exists_and_is_a_commit(self):
+        import subprocess
+        self.assertTrue(rd._is_sha1(self.proposed))
+        rc = subprocess.run(["git", "cat-file", "-e", f"{self.proposed}^{{commit}}"],
+                            cwd=rd.REPO_ROOT, capture_output=True).returncode
+        self.assertEqual(rc, 0, "PROPOSED_DEPLOY_SHAS names a commit that is not in this repo")
+
+    def test_the_proposed_revision_descends_from_the_approved_deployment(self):
+        """A proposal that forked away from the reviewed deployment would be a different
+        lineage, not a revision of it."""
+        self.assertTrue(rd.commit_descends_from(self.REVIEWED, self.proposed),
+                        "the proposed revision does not descend from the approved deployment")
+
+    def test_the_proposed_revision_carries_the_provisioner(self):
+        self.assertIsNone(rd.deployment_tools_problem(self.proposed))
+
+    def test_the_approved_deployment_still_does_not(self):
+        """The blocker this proposal exists to close, still true where it was true."""
+        self.assertTrue(rd.deployment_tools_problem(self.REVIEWED))
+
+    def test_the_proposed_revisions_runtime_is_byte_identical_to_the_approved_one(self):
+        """The load-bearing claim. Adding a tool must not smuggle a runtime change: if any of
+        the 23 modules differed, the proposal would need reviewing as a code change and not as
+        a packaging one."""
+        for rel in rd.INVENTORY_MODULES:
+            with self.subTest(rel):
+                approved = rd._git_blob(self.REVIEWED, rel)
+                proposed = rd._git_blob(self.proposed, rel)
+                self.assertIsNotNone(approved, "absent at the approved deployment")
+                self.assertIsNotNone(proposed, "absent at the proposed revision")
+                self.assertEqual(approved, proposed, f"{rel} differs from the approved runtime")
+
+    def test_the_proposed_revisions_closure_matches_both_ways(self):
+        self.assertIsNone(rd.target_closure_problem(self.proposed))
+        self.assertEqual(rd.missing_inventory_modules(self.proposed), [])
+
+    def test_the_proposed_revisions_lifecycle_actually_runs(self):
+        """Measured, not inherited from the approved commit's measurement."""
+        observed = rd.target_runtime_closure(self.proposed)
+        self.assertEqual(observed["errors"], {})
+        self.assertEqual(observed["executed"]["build"]["attested"], ["2026-06-27"])
+        prune_swap = observed["executed"]["prune_swap"]
+        self.assertEqual(prune_swap["refold"], "refolded")
+        self.assertIs(prune_swap["swap_performed"], True)
+        for stage, (_entries, declared, _smoke) in rd.RUNTIME_GROUPS.items():
+            with self.subTest(stage):
+                self.assertEqual(sorted(observed[stage]), sorted(declared))
+
+    def test_the_proposed_revision_is_not_deployable(self):
+        """Proposed is not approved, and nothing in this commit makes it so."""
+        self.assertNotIn(self.proposed, rd.REVIEWED_DEPLOY_SHAS)
+        import hashlib
+        modules = {rel: hashlib.sha256(rd._git_blob(self.proposed, rel)).hexdigest()
+                   for rel in rd.INVENTORY_MODULES}
+        target = {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
+                  "identity": {"reviewed_sha": self.proposed, "head_sha": self.proposed,
+                               "worktree_clean": True, "modules": modules}}
+        by_id = {r["id"]: r for r in rd.assess(target)["requirements"]}
+        self.assertEqual(by_id["identity"]["verdict"], rd.BLOCKED,
+                         "a proposed revision reached a deployable verdict")

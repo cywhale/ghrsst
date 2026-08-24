@@ -73,7 +73,14 @@ REVIEWED_DEPLOY_SHAS = (
 #: `REVIEWED_DEPLOY_SHAS` on purpose: `_check_identity` reads only that tuple, so a revision
 #: named here can be measured, argued about and rejected without ever being deployable. Adding
 #: one of these to the approved set is a review decision and a separate commit.
-PROPOSED_DEPLOY_SHAS = ()
+#:
+#: `708058e` carries `ops/p5_provision.py`, which the approved `3223fba` predates, and a runtime
+#: byte-identical to it: the 23 lifecycle/API modules do not differ by one byte between the two
+#: commits, so proposing it changes what the deployment CARRIES and not what it RUNS. Measured
+#: from that commit, not from this tree -- see `TestTheProposedDeploymentRevision`.
+PROPOSED_DEPLOY_SHAS = (
+    "708058e15b37a02e1d7aa5a66b9978c6e13bd446",
+)
 
 #: What the deployment must CARRY but no runtime stage imports.
 #:
