@@ -105,10 +105,48 @@ ALLOWED_LEGACY_PATHS = ()
 #:
 #: Two inventories, two questions: "is the deployment running approved compaction code" and
 #: "is the tool asking that question approved code". Neither answers the other.
-INVENTORY_MODULES = (
-    "store/block_manifest.py", "store/repair_wal.py", "store/compaction_lock.py",
-    "ingest/build_block.py", "ingest/publish_manifest.py", "api/app.py",
+#:
+#: ## Measured, not written out
+#:
+#: This was six paths chosen by hand and defended as "the compaction code". It was not.
+#: `ingest/build_block.py` and `ingest/publish_manifest.py` both import
+#: `store/source_provenance.py`, which was absent from the list -- so identity could pass
+#: without ever fingerprinting a first-party module the compaction path runs. And `api/app.py`
+#: was listed while none of its dependencies were: `hybrid_router`, `store_access`,
+#: `tiered_cube`, `time_cube`, `segmented_cube`, `bbox_encode`, `spatial_policy`,
+#: `zarr_paths`. Naming an entry point is not declaring what it runs.
+#:
+#: So the deployment inventory is a measured closure, exactly as the assessor's own is:
+#: `tests/test_phase2_p5_readiness.py` imports the entry points below in a fresh interpreter
+#: and requires the declaration to EQUAL what loaded, in both directions.
+
+#: The entry points a compaction actually runs through.
+COMPACTION_ENTRY_POINTS = ("ingest.build_block", "ingest.publish_manifest",
+                           "store.compaction_lock")
+
+#: The entry point whose parity `api_parity` is about.
+API_ENTRY_POINTS = ("api.app",)
+
+#: The first-party closure of `COMPACTION_ENTRY_POINTS`, measured.
+COMPACTION_RUNTIME_MODULES = (
+    "ingest/build_block.py", "ingest/publish_manifest.py",
+    "store/__init__.py", "store/block_manifest.py", "store/compaction_lock.py",
+    "store/repair_wal.py", "store/source_provenance.py",
 )
+
+#: The first-party closure of `API_ENTRY_POINTS`, measured. Kept separate from the compaction
+#: runtime because they answer different questions -- what performs a compaction, and what
+#: serves the API whose parity is being claimed -- and a deployment must carry both.
+API_RUNTIME_MODULES = (
+    "api/__init__.py", "api/app.py",
+    "store/__init__.py", "store/bbox_encode.py", "store/block_manifest.py",
+    "store/hybrid_router.py", "store/segmented_cube.py", "store/spatial_policy.py",
+    "store/store_access.py", "store/tiered_cube.py", "store/time_cube.py",
+    "store/zarr_paths.py",
+)
+
+#: What the deployment must carry: both runtimes. Sorted so the declaration has one spelling.
+INVENTORY_MODULES = tuple(sorted(set(COMPACTION_RUNTIME_MODULES) | set(API_RUNTIME_MODULES)))
 
 #: The ASSESSOR runtime inventory -- its own modules, plus every module the G18 threshold is
 #: derived through. Distinct from `INVENTORY_MODULES` above, which is the DEPLOYMENT's.
@@ -268,6 +306,25 @@ def expected_module_digests(sha: str) -> Dict[str, str]:
         if blob is not None:
             out[rel] = hashlib.sha256(blob).hexdigest()
     return out
+
+
+def deployment_inventory_problem():
+    """Is the declared deployment inventory the union of the two measured runtimes?
+
+    Guards the declaration itself: shrinking `INVENTORY_MODULES` would otherwise make every
+    inventory check pass on a subset, which is how a hand-written list came to omit
+    `store/source_provenance.py` and every dependency of `api/app.py`."""
+    declared = set(INVENTORY_MODULES)
+    required = set(COMPACTION_RUNTIME_MODULES) | set(API_RUNTIME_MODULES)
+    undeclared = sorted(required - declared)
+    if undeclared:
+        return (f"runs {undeclared} and does not declare them; naming an entry point is not "
+                f"declaring what it runs")
+    extra = sorted(declared - required)
+    if extra:
+        return (f"declares {extra}, which neither runtime imports; a declaration nothing "
+                f"executes is not a check")
+    return None
 
 
 def missing_inventory_modules(sha: str) -> List[str]:
@@ -541,6 +598,12 @@ def _check_identity(t: Dict) -> tuple:
     if not reported:
         return NOT_ADJUDICATED, ("no module inventory was fingerprinted, so a matching SHA "
                                  "proves only what git says, not what is on disk")
+    # The declaration itself, before anything is compared against it. A shrunken inventory
+    # makes every check below pass on a subset, which is exactly how the hand-written list
+    # came to omit `store/source_provenance.py` and every dependency of `api/app.py`.
+    declaration = deployment_inventory_problem()
+    if declaration:
+        return BLOCKED, f"the declared deployment inventory {declaration}"
     expected = expected_module_digests(reviewed)
     if not expected:
         return NOT_ADJUDICATED, (f"could not recompute the module fingerprints for {reviewed} "

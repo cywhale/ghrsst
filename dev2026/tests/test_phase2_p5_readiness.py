@@ -184,7 +184,12 @@ def build_probe_workspace(case):
             "REPO_ROOT": repo, "DEV_PREFIX": "dev2026",
             "REVIEWED_DEPLOY_SHAS": [deploy_sha, evidence_sha],
             "FAILURE_SEMANTICS_SUITES": ["tests.test_closure_probe_suite"],
+            # All three together: the declaration guard requires the inventory to BE the
+            # union of the two runtimes, so overriding one alone is a self-inconsistent
+            # declaration -- which it would rightly refuse.
             "INVENTORY_MODULES": [suite_rel],
+            "COMPACTION_RUNTIME_MODULES": [suite_rel],
+            "API_RUNTIME_MODULES": [suite_rel],
             "ASSESSOR_REPO_ROOT": assessor_root,
             "APPROVAL_RECORD_PATH": assessor_record,
         },
@@ -1829,10 +1834,19 @@ class TestTheAssessorIsItselfBound(_RecordWritingMixin, unittest.TestCase):
 
     def test_modules_both_actually_use_may_appear_in_both(self):
         """The separation is by question, not by exclusion: the store modules genuinely run on
-        both sides, and listing them twice states two true things."""
+        both sides, and listing them twice states two true things.
+
+        The overlap grew when the deployment inventory became a measured closure -- the API
+        runtime imports `segmented_cube`, `time_cube` and the rest -- so it is computed rather
+        than enumerated. What matters is that it is non-empty and contains only modules both
+        runtimes really import."""
         shared = set(rd.INVENTORY_MODULES) & set(rd.ASSESSOR_MODULES)
-        self.assertEqual(sorted(shared),
-                         ["store/block_manifest.py", "store/repair_wal.py"])
+        self.assertTrue(shared)
+        for rel in shared:
+            with self.subTest(rel):
+                self.assertIn(rel, rd.ASSESSOR_MODULES)
+                self.assertIn(rel, set(rd.COMPACTION_RUNTIME_MODULES)
+                              | set(rd.API_RUNTIME_MODULES))
 
     def test_an_empty_approved_set_says_so_specifically(self):
         """"No assessor build is approved" and "you are on the wrong commit" are different
@@ -2880,8 +2894,11 @@ class TestTheDeploymentInventoryIsCompleteAtTheApprovedCommit(_RecordWritingMixi
     def test_the_deployment_inventory_holds_no_assessor_only_module(self):
         """`ops/p5_readiness.py` is the tool, not the deployment. Declaring the assessor for
         the deployment is what produced a declared module the deployment never shipped."""
+        # `store/segmented_cube.py` and `store/time_cube.py` are NOT on this list: the API
+        # runtime imports them, so they belong to the deployment as well. Assessor-only means
+        # the tooling the deployment never runs.
         for rel in ("ops/p5_readiness.py", "ops/p5_roadmap.py", "ops/p5s8_report.py",
-                    "ops/quiescence.py", "store/segmented_cube.py"):
+                    "ops/quiescence.py", "ops/p5s8_evidence.py"):
             with self.subTest(rel):
                 self.assertNotIn(rel, rd.INVENTORY_MODULES)
 
@@ -2906,3 +2923,234 @@ class TestTheDeploymentInventoryIsCompleteAtTheApprovedCommit(_RecordWritingMixi
                     "ingest/publish_manifest.py", "api/app.py"):
             with self.subTest(rel):
                 self.assertIn(rel, rd.INVENTORY_MODULES)
+
+
+class TestTheDeploymentInventoryIsTheMeasuredRuntime(_RecordWritingMixin, unittest.TestCase):
+    """The deployment inventory was six paths I wrote out by hand and then defended as "the
+    compaction code". It was not.
+
+    `ingest/build_block.py` and `ingest/publish_manifest.py` both import
+    `store/source_provenance.py`, which was not on the list -- so identity could pass without
+    ever fingerprinting a first-party module the compaction path runs. And `api/app.py` was
+    listed while none of its first-party dependencies were: `hybrid_router`, `store_access`,
+    `tiered_cube`, `time_cube`, `segmented_cube`, `bbox_encode`, `spatial_policy`,
+    `zarr_paths`. Naming an entry point is not declaring what it runs.
+
+    So the inventory is a measured closure now, exactly as the assessor's own is. Two runtimes,
+    because they answer different questions -- what performs a compaction, and what serves the
+    API whose parity is being claimed -- and the deployment must carry both."""
+
+    #: Each probe imports ONLY its entry points, in a fresh interpreter, and reports the
+    #: first-party modules that ended up loaded. A fresh process matters: measuring in the test
+    #: process reports whatever the rest of the session imported.
+    _PROBE = """
+import json, os, sys
+DEV = sys.argv[1]
+sys.path.insert(0, DEV)
+for name in sys.argv[2:]:
+    __import__(name)
+out = set()
+for mod in list(sys.modules.values()):
+    f = getattr(mod, "__file__", None)
+    if not f:
+        continue
+    f = os.path.abspath(f)
+    if f.startswith(DEV + os.sep) and "/tests/" not in f and "/.venv/" not in f \\
+            and f.endswith(".py"):
+        out.add(os.path.relpath(f, DEV))
+print(json.dumps(sorted(out)))
+"""
+
+    def _closure(self, *entry_points):
+        import subprocess
+        proc = subprocess.run([sys.executable, "-c", self._PROBE, _DEV, *entry_points],
+                              capture_output=True, text=True, cwd=_DEV)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        return set(json.loads(proc.stdout))
+
+    # ---------------------------------------------------------------- measured, not listed
+    def test_the_compaction_inventory_equals_its_measured_closure(self):
+        observed = self._closure(*rd.COMPACTION_ENTRY_POINTS)
+        self.assertEqual(sorted(rd.COMPACTION_RUNTIME_MODULES), sorted(observed))
+
+    def test_the_api_inventory_equals_its_measured_closure(self):
+        observed = self._closure(*rd.API_ENTRY_POINTS)
+        self.assertEqual(sorted(rd.API_RUNTIME_MODULES), sorted(observed))
+
+    def test_source_provenance_is_in_the_compaction_runtime(self):
+        """The module the hand-written list missed, named explicitly so its omission cannot
+        recur silently."""
+        self.assertIn("store/source_provenance.py", rd.COMPACTION_RUNTIME_MODULES)
+        self.assertIn("store/source_provenance.py",
+                      self._closure(*rd.COMPACTION_ENTRY_POINTS))
+
+    def test_the_api_dependencies_are_in_the_api_runtime(self):
+        for rel in ("store/hybrid_router.py", "store/store_access.py", "store/tiered_cube.py",
+                    "store/time_cube.py", "store/segmented_cube.py", "store/bbox_encode.py",
+                    "store/spatial_policy.py", "store/zarr_paths.py"):
+            with self.subTest(rel):
+                self.assertIn(rel, rd.API_RUNTIME_MODULES)
+
+    def test_the_deployment_inventory_is_the_union_of_both_runtimes(self):
+        self.assertEqual(sorted(rd.INVENTORY_MODULES),
+                         sorted(set(rd.COMPACTION_RUNTIME_MODULES)
+                                | set(rd.API_RUNTIME_MODULES)))
+
+    def test_the_declared_inventory_is_not_a_hand_written_list(self):
+        source = open_source = None
+        with open(os.path.join(_DEV, "ops", "p5_readiness.py")) as fh:
+            source = fh.read()
+        del open_source
+        self.assertIn("COMPACTION_ENTRY_POINTS", source)
+        self.assertIn("API_ENTRY_POINTS", source)
+
+
+class TestTheDeploymentClosureIsEnforcedBothWays(_RecordWritingMixin, unittest.TestCase):
+    """Declared must equal observed in both directions: an observed-but-undeclared module is a
+    hole, and a declared-but-absent module is a check that cannot run."""
+
+    def setUp(self):
+        import subprocess
+        self.tmp = tempfile.mkdtemp(prefix="p5-deploy-closure-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.join(self.tmp, "repo")
+        self.dev = os.path.join(self.repo, "dev2026")
+
+        def git(*a):
+            subprocess.run(("git",) + a, cwd=self.repo, check=True, capture_output=True)
+        self.git = git
+
+        for rel in rd.INVENTORY_MODULES:
+            path = os.path.join(self.dev, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(f"# deployment module {rel}\n")
+        git("init", "-q")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        git("add", "-A")
+        git("commit", "-qm", "a deployment carrying every declared runtime module")
+        self.sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                                  capture_output=True, text=True).stdout.strip()
+
+        for name in ("REPO_ROOT", "DEV_PREFIX", "REVIEWED_DEPLOY_SHAS",
+                     "ASSESSOR_REPO_ROOT", "APPROVAL_RECORD_PATH"):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+        rd.REPO_ROOT, rd.DEV_PREFIX = self.repo, "dev2026"
+        rd.REVIEWED_DEPLOY_SHAS = (self.sha,)
+        root, _head, record = approved_assessor_repo()
+        rd.ASSESSOR_REPO_ROOT, rd.APPROVAL_RECORD_PATH = root, record
+
+    def _digest(self, rel):
+        import hashlib
+        with open(os.path.join(self.dev, rel), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    def _verdict(self, modules=None, sha=None):
+        reported = modules if modules is not None else {
+            rel: self._digest(rel) for rel in rd.INVENTORY_MODULES
+            if os.path.isfile(os.path.join(self.dev, rel))}
+        sha = sha or self.sha
+        target = {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
+                  "identity": {"reviewed_sha": sha, "head_sha": sha,
+                               "worktree_clean": True, "modules": reported}}
+        by_id = {r["id"]: r for r in rd.assess(target)["requirements"]}
+        return by_id["identity"]["verdict"], by_id["identity"]["reason"]
+
+    def _drop(self, rel, message):
+        import subprocess
+        subprocess.run(["git", "rm", "-q", f"dev2026/{rel}"], cwd=self.repo, check=True,
+                       capture_output=True)
+        self.git("commit", "-qm", message)
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                             capture_output=True, text=True).stdout.strip()
+        rd.REVIEWED_DEPLOY_SHAS = (sha,)
+        return sha
+
+    # ---------------------------------------------------------------- positive control
+    def test_a_complete_approved_deployment_passes(self):
+        verdict, reason = self._verdict()
+        self.assertEqual(verdict, rd.READY, reason)
+        self.assertIn(str(len(rd.INVENTORY_MODULES)), reason)
+
+    def test_the_positive_control_covers_every_declared_module(self):
+        self.assertEqual(sorted(rd.expected_module_digests(self.sha)),
+                         sorted(rd.INVENTORY_MODULES))
+
+    # ---------------------------------------------------------------- negative controls
+    def test_source_provenance_omitted_from_the_commit_refuses(self):
+        """The reported defect, as a deployment that does not ship it."""
+        sha = self._drop("store/source_provenance.py", "drop source_provenance")
+        verdict, reason = self._verdict(sha=sha)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("source_provenance.py", reason)
+        self.assertIn("declared", reason.lower())
+
+    def test_an_api_dependency_omitted_from_the_commit_refuses(self):
+        sha = self._drop("store/hybrid_router.py", "drop an API dependency")
+        verdict, reason = self._verdict(sha=sha)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("hybrid_router.py", reason)
+
+    def test_a_runtime_module_present_but_untracked_refuses(self):
+        """Ignored or simply never committed: it is on disk, absent from the commit, and
+        imported all the same. `git status` on the deployment host would call it untracked;
+        the assessor sees only that the approved commit does not contain it."""
+        import subprocess
+        rel = "store/spatial_policy.py"
+        subprocess.run(["git", "rm", "--cached", "-q", f"dev2026/{rel}"], cwd=self.repo,
+                       check=True, capture_output=True)
+        with open(os.path.join(self.repo, ".gitignore"), "w") as fh:
+            fh.write(f"dev2026/{rel}\n")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "ignore a runtime module")
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                             capture_output=True, text=True).stdout.strip()
+        rd.REVIEWED_DEPLOY_SHAS = (sha,)
+        self.assertTrue(os.path.isfile(os.path.join(self.dev, rel)), "not on disk")
+        verdict, reason = self._verdict(sha=sha)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("spatial_policy.py", reason)
+
+    def test_a_module_edited_while_status_looks_clean_refuses(self):
+        """The deployment reports `worktree_clean: true` and a digest for every module. The
+        assessor recomputes from the commit, so bytes that differ are caught whatever the host
+        believed about its own cleanliness."""
+        reported = {rel: self._digest(rel) for rel in rd.INVENTORY_MODULES}
+        reported["store/repair_wal.py"] = "a" * 64
+        verdict, reason = self._verdict(modules=reported)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("fingerprint mismatch", reason)
+        self.assertIn("repair_wal.py", reason)
+        self.assertNotIn("declared", reason.lower())
+
+    def test_an_observed_but_undeclared_module_refuses(self):
+        """The other direction, at the helper: shrink the declared inventory and the closure
+        check must object rather than pass on a subset."""
+        original = rd.INVENTORY_MODULES
+        self.addCleanup(setattr, rd, "INVENTORY_MODULES", original)
+        rd.INVENTORY_MODULES = tuple(m for m in original
+                                     if m != "store/source_provenance.py")
+        problem = rd.deployment_inventory_problem()
+        self.assertTrue(problem)
+        self.assertIn("source_provenance.py", problem)
+
+    def test_an_undeclared_module_refuses_THROUGH_assess(self):
+        """The helper being right is not the same as identity consulting it.
+
+        Testing `deployment_inventory_problem()` alone left the wiring unexercised, and
+        removing the call from `_check_identity` survived a mutation round. Here the target is
+        otherwise perfect -- every reported digest matches the commit -- so only the
+        declaration guard can refuse."""
+        original = rd.INVENTORY_MODULES
+        self.addCleanup(setattr, rd, "INVENTORY_MODULES", original)
+        rd.INVENTORY_MODULES = tuple(m for m in original
+                                     if m != "store/source_provenance.py")
+        reported = {rel: self._digest(rel) for rel in rd.INVENTORY_MODULES}
+        verdict, reason = self._verdict(modules=reported)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("declared deployment inventory", reason)
+        self.assertIn("source_provenance.py", reason)
+        # Not a neighbouring guard: nothing is absent at the commit and nothing mismatched.
+        self.assertNotIn("not present at the approved commit", reason)
+        self.assertNotIn("fingerprint mismatch", reason)
