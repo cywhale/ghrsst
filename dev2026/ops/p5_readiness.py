@@ -79,11 +79,6 @@ DEV_PREFIX = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__
 #: directory. A path is not a provenance: `/tmp/x.json` and `../../x.json` are paths too.
 EXECUTIONS_REL = os.path.join("bench", "results", "p5_failure_semantics")
 
-#: The commit an artifact is READ FROM. `None` means the approved commit that the artifact
-#: itself claims to be about, which is the normal case; a test may pin a later one when the
-#: artifact is committed after the run it records.
-EVIDENCE_COMMIT = None
-
 #: Legacy monoliths a `legacy_base` segment may point at, OUTSIDE the block root.
 #:
 #: This came from the target, so a manifest could ship the permission that lets its own segment
@@ -209,6 +204,20 @@ def _git_blob(sha: str, rel: str):
     return proc.stdout if proc.returncode == 0 else None
 
 
+def canonical_minimum_free_gib() -> float:
+    """G18's threshold, from the capacity model -- never from the target.
+
+    The assessor re-measured free space and then compared it against a `minimum_free_gib` the
+    TARGET supplied: half the gate hardened, half left as a field anyone could write. Lower it
+    and an empty device passes.
+
+    Read at call time, from `ops/p5s8_evidence.MINIMUM_FREE_GIB`, which is itself derived as
+    `HARD_RESERVE + additional`. A copy of the number here would be a second threshold to keep
+    in step, and the copy is what goes stale."""
+    from ops import p5s8_evidence
+    return p5s8_evidence.MINIMUM_FREE_GIB
+
+
 def executions_dir() -> str:
     return os.path.join(REPO_ROOT, DEV_PREFIX, EXECUTIONS_REL)
 
@@ -248,11 +257,11 @@ def load_execution(claim: str, sha: str) -> Dict:
     # a `/var` -> `/private/var` symlink -- so relpath against a non-canonical base produces a
     # `../..` walk and every lookup misses.
     rel = os.path.relpath(resolved, os.path.realpath(os.path.join(REPO_ROOT, DEV_PREFIX)))
-    blob = _git_blob(EVIDENCE_COMMIT or sha, rel)
+    blob = _git_blob(sha, rel)
     if blob is None:
         raise ExecutionRefused(
-            f"{claim!r} is not tracked at {(EVIDENCE_COMMIT or sha)[:7]}; an artifact that was "
-            f"never committed cannot be reviewed and is not evidence")
+            f"{claim!r} is not tracked at {sha[:7]}; an artifact that was never committed "
+            f"cannot be reviewed and is not evidence")
     try:
         return json.loads(blob)
     except ValueError as exc:
@@ -583,9 +592,20 @@ def _check_capacity(t: Dict, now=None) -> tuple:
         return BLOCKED, (f"the reading is of device {cap['filesystem_dev']}, but {root!r} is "
                          f"on device {actual_dev}: free space was measured somewhere else")
 
-    collected_free, minimum = cap.get("free_now_gib"), cap.get("minimum_free_gib")
-    if collected_free is None or minimum is None:
-        return NOT_ADJUDICATED, "the capacity evidence is missing free_now_gib/minimum_free_gib"
+    collected_free = cap.get("free_now_gib")
+    if collected_free is None:
+        return NOT_ADJUDICATED, "the capacity evidence is missing free_now_gib"
+    # The THRESHOLD is policy, not collected data. The artifact's copy is provenance: it says
+    # what the collection believed the bar to be, and it has to agree with the bar.
+    minimum = canonical_minimum_free_gib()
+    collected_minimum = cap.get("minimum_free_gib")
+    if collected_minimum is None:
+        return NOT_ADJUDICATED, ("the capacity evidence records no minimum_free_gib, so there "
+                                 "is nothing to check the canonical threshold against")
+    if collected_minimum != minimum:
+        return BLOCKED, (f"the collection's minimum_free_gib is {collected_minimum}, and the "
+                         f"canonical threshold is {minimum}. A gate whose bar travels with the "
+                         f"evidence is not a gate")
     # The artifact's figure decided G18. An artifact is a record of what someone saw; the gate
     # is about what is there NOW, on this device, and the assessor is standing on it. So it
     # measures. The collected figure stays as provenance -- it says what the collection
@@ -597,12 +617,12 @@ def _check_capacity(t: Dict, now=None) -> tuple:
     free = round(st.f_bavail * st.f_frsize / (1024 ** 3), 1)
     drift = f"; collected {collected_free} GiB" if collected_free != free else ""
     if free < minimum:
-        return BLOCKED, (f"statvfs reports {free} GiB free on {root}, below the {minimum} GiB "
-                         f"minimum (run {cap['run_id']}){drift}")
+        return BLOCKED, (f"statvfs reports {free} GiB free on {root}, below the canonical "
+                         f"{minimum} GiB minimum (run {cap['run_id']}){drift}")
     recommended = cap.get("recommended_free_gib")
     note = "" if recommended is None or free >= recommended else "; below the recommended target"
-    return READY, (f"statvfs reports {free} GiB free on {root} against a {minimum} GiB minimum "
-                   f"(run {cap['run_id']}){drift}{note}")
+    return READY, (f"statvfs reports {free} GiB free on {root} against the canonical "
+                   f"{minimum} GiB minimum (run {cap['run_id']}){drift}{note}")
 
 
 #: Fields an executed-result artifact must carry. A source digest says which bytes exist; it
@@ -628,12 +648,19 @@ def _check_failure_semantics(t: Dict) -> tuple:
         return NOT_ADJUDICATED, (f"the claim {proven!r} is not a path to an executed-result "
                                  f"artifact. A source digest says which bytes exist; it says "
                                  f"nothing about whether anything ran them")
-    # The claim names a file in the committed directory; the artifact itself says which commit
-    # it is about, so it is read from that commit (or `EVIDENCE_COMMIT`, when the artifact was
-    # committed after the run it records).
+    # WHERE the record lives and WHAT it is about are separate claims, and conflating them was
+    # the bug: reading from `REVIEWED_DEPLOY_SHAS[0]` assumed the artifact sits at the first
+    # approved commit. A result recording a run of commit N is committed AFTER N, so in
+    # production it lives at some later commit and the lookup simply misses.
+    evidence_commit = t.get("failure_semantics_evidence_commit")
+    if not evidence_commit:
+        return NOT_ADJUDICATED, ("the target declares no failure_semantics_evidence_commit, so "
+                                 "nothing says which commit the executed result is read from")
+    if evidence_commit not in REVIEWED_DEPLOY_SHAS:
+        return BLOCKED, (f"the evidence commit {evidence_commit[:7]} is not in the approved "
+                         f"set; a target cannot nominate its own history to be read from")
     try:
-        peek = load_execution(proven, REVIEWED_DEPLOY_SHAS[0])
-        run = load_execution(proven, peek.get("deploy_sha") or REVIEWED_DEPLOY_SHAS[0])
+        run = load_execution(proven, evidence_commit)
     except ExecutionRefused as exc:
         return NOT_ADJUDICATED, f"no executed-result artifact at {proven!r}: {exc}"
     except Exception as exc:                                  # noqa: BLE001
@@ -669,7 +696,8 @@ def _check_failure_semantics(t: Dict) -> tuple:
     if digest != expected:
         return BLOCKED, (f"source_digest does not match {suite} at {sha[:7]}: the run was of a "
                          f"different file than the one it names")
-    return READY, _reason(suite=suite, deploy_sha=sha[:7], exit_code=0,
+    return READY, _reason(suite=suite, deploy_sha=sha[:7],
+                          evidence_commit=evidence_commit[:7], exit_code=0,
                           tests_run=run["tests_run"], ran_utc=run["ran_utc"])
 
 

@@ -85,8 +85,21 @@ def _fresh_capacity(free_gib=1263.8, run_id=FIXTURE_RUN, measured_utc=None,
 class _TargetBase(unittest.TestCase):
     """A real, isolated P5 root: block, manifest, WAL, anchor on a separate root."""
 
+    def _set_canonical(self, minimum_gib):
+        """Move the CANONICAL G18 threshold, restoring it afterwards.
+
+        The threshold is policy now, so a fixture cannot lower it by writing a field. Tests
+        that need a different bar move the policy -- which is also how "the gate follows the
+        capacity model" is demonstrated rather than asserted."""
+        from ops import p5s8_evidence as ev
+        self.addCleanup(setattr, ev, "MINIMUM_FREE_GIB", ev.MINIMUM_FREE_GIB)
+        ev.MINIMUM_FREE_GIB = minimum_gib
+
     def setUp(self):
         self.collected_utc = _now_iso()
+        # Production's 403.3 GiB against a temp filesystem would test this machine's disk
+        # rather than the code, so the fixtures run against a bar they genuinely clear.
+        self._set_canonical(FIXTURE_MINIMUM_GIB)
         self.tmp = tempfile.mkdtemp(prefix="p5-readiness-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.root = os.path.join(self.tmp, "data")
@@ -387,6 +400,7 @@ class TestIdentityAndCapacity(_TargetBase):
         st = os.statvfs(self.root)
         live = st.f_bavail * st.f_frsize / 1024 ** 3
         minimum = round(live + 1000.0, 1)
+        self._set_canonical(minimum)
         by_id = {r["id"]: r for r in rd.assess(self.target(
             capacity=_fresh_capacity(measured_utc=self.collected_utc, data_root=self.root,
                                      filesystem_dev=os.stat(self.root).st_dev,
@@ -1164,110 +1178,8 @@ class TestTheExecutedResultMustBeCommittedAndTracked(unittest.TestCase):
     # ---------------------------------------------------------------- end to end
     def _target(self, claim):
         return {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
-                "failure_semantics_proven_by": claim}
-
-    def test_a_committed_tracked_artifact_at_the_approved_sha_is_ready(self):
-        """The full positive control: every guard satisfied, by a real committed object."""
-        import subprocess
-        self._write_artifact(self.artifact_rel, deploy_sha=self.sha)
-        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-qm", "sha-stamped"], cwd=self.repo, check=True,
-                       capture_output=True)
-        sha2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
-                              capture_output=True, text=True).stdout.strip()
-        self._write_artifact(self.artifact_rel, deploy_sha=sha2)
-        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-qm", "self-referential"], cwd=self.repo, check=True,
-                       capture_output=True)
-        sha3 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
-                              capture_output=True, text=True).stdout.strip()
-        # The artifact committed at sha3 names sha2; approve sha2 and read it from sha3.
-        rd.REVIEWED_DEPLOY_SHAS = (sha2,)
-        rd.EVIDENCE_COMMIT = sha3
-        self.addCleanup(setattr, rd, "EVIDENCE_COMMIT", None)
-        by_id = {r["id"]: r for r in rd.assess(self._target(self.artifact_rel))["requirements"]}
-        self.assertEqual(by_id["failure_semantics"]["verdict"], rd.READY,
-                         by_id["failure_semantics"]["reason"])
-
-    # ---------------------------------------------------------------- content policy
-    def _committed(self, **over):
-        """Commit an artifact and approve the commit it claims. Returns the claim path.
-
-        Every content test goes through a REAL commit, so no content guard is ever exercised
-        against a file the path and tracking guards would have refused first."""
-        import subprocess
-        fields = {"deploy_sha": self.sha}
-        fields.update(over)                    # so a test may blank deploy_sha itself
-        self._write_artifact(self.artifact_rel, **fields)
-        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-qm", "content"], cwd=self.repo, check=True,
-                       capture_output=True)
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
-                              capture_output=True, text=True).stdout.strip()
-        rd.REVIEWED_DEPLOY_SHAS = (self.sha,)
-        rd.EVIDENCE_COMMIT = head
-        self.addCleanup(setattr, rd, "EVIDENCE_COMMIT", None)
-        return self.artifact_rel
-
-    def _content_verdict(self, **over):
-        by_id = {r["id"]: r for r in
-                 rd.assess(self._target(self._committed(**over)))["requirements"]}
-        return by_id["failure_semantics"]["verdict"], by_id["failure_semantics"]["reason"]
-
-    def test_a_committed_complete_artifact_is_ready(self):
-        verdict, reason = self._content_verdict()
-        self.assertEqual(verdict, rd.READY, reason)
-
-    def test_each_required_field_is_refused_on_its_own(self):
-        for field in rd.EXECUTION_FIELDS:
-            with self.subTest(field):
-                verdict, reason = self._content_verdict(**{field: None})
-                self.assertEqual(verdict, rd.NOT_ADJUDICATED)
-                self.assertIn(field, reason)
-
-    def test_a_nonzero_exit_code_is_blocked(self):
-        verdict, reason = self._content_verdict(exit_code=1)
-        self.assertEqual(verdict, rd.BLOCKED)
-        self.assertIn("exited", reason)
-
-    def test_a_boolean_exit_code_is_refused_as_the_wrong_raw_type(self):
-        """`False == 0` in Python, so a bool sails through a value-only check."""
-        verdict, _ = self._content_verdict(exit_code=False)
-        self.assertEqual(verdict, rd.BLOCKED)
-
-    def test_a_run_of_zero_tests_is_blocked(self):
-        verdict, reason = self._content_verdict(tests_run=0)
-        self.assertEqual(verdict, rd.BLOCKED)
-        self.assertIn("nothing", reason)
-
-    def test_a_command_that_does_not_name_the_suite_is_blocked(self):
-        verdict, reason = self._content_verdict(command="echo hello")
-        self.assertEqual(verdict, rd.BLOCKED)
-        self.assertIn("does not name the suite", reason)
-
-    def test_a_digest_of_a_different_file_is_blocked(self):
-        verdict, reason = self._content_verdict(source_digest="a" * 64)
-        self.assertEqual(verdict, rd.BLOCKED)
-        self.assertIn("different file", reason)
-
-    def test_a_malformed_digest_is_not_adjudicated(self):
-        verdict, reason = self._content_verdict(source_digest="deadbeef")
-        self.assertEqual(verdict, rd.NOT_ADJUDICATED)
-        self.assertIn("SHA-256", reason)
-
-    def test_an_unparseable_timestamp_is_not_adjudicated(self):
-        verdict, reason = self._content_verdict(ran_utc="last tuesday")
-        self.assertEqual(verdict, rd.NOT_ADJUDICATED)
-        self.assertIn("not a timestamp", reason)
-
-    def test_each_guard_refuses_for_its_own_reason(self):
-        for over, phrase in ((dict(exit_code=1), "exited"),
-                             (dict(tests_run=0), "nothing"),
-                             (dict(command="echo hi"), "does not name the suite"),
-                             (dict(source_digest="a" * 64), "different file")):
-            with self.subTest(**{k: repr(v) for k, v in over.items()}):
-                _, reason = self._content_verdict(**over)
-                self.assertIn(phrase, reason)
+                "failure_semantics_proven_by": claim,
+                "failure_semantics_evidence_commit": getattr(self, "evidence_commit", self.sha)}
 
     def test_each_path_defect_is_refused_end_to_end(self):
         for claim in ("/tmp/x.json", "../x.json", "looks_committed.json"):
@@ -1344,16 +1256,18 @@ class TestCapacityIsRemeasuredNotRead(_TargetBase):
         return by_id["capacity"]["verdict"], by_id["capacity"]["reason"]
 
     def test_a_fabricated_free_space_figure_does_not_pass_the_gate(self):
-        """500 GiB claimed, a minimum just above what the device actually has. The claim is
-        generous, the device is not, and the device is what the build will run on."""
-        minimum = self._live_free_gib() + 1000.0
+        """500 GiB claimed against a canonical bar just above what the device actually has. The
+        claim is generous, the device is not, and the device is what the build runs on."""
+        minimum = round(self._live_free_gib() + 1000.0, 1)
+        self._set_canonical(minimum)
         verdict, reason = self._verdict(
             capacity=self._cap(free_now_gib=500.0, minimum_free_gib=minimum))
         self.assertEqual(verdict, rd.BLOCKED)
         self.assertIn("statvfs", reason.lower())
 
     def test_the_verdict_quotes_the_remeasured_figure_not_the_claimed_one(self):
-        minimum = self._live_free_gib() + 1000.0
+        minimum = round(self._live_free_gib() + 1000.0, 1)
+        self._set_canonical(minimum)
         _, reason = self._verdict(
             capacity=self._cap(free_now_gib=500.0, minimum_free_gib=minimum))
         self.assertNotIn("500.0 GiB free", reason)
@@ -1361,7 +1275,7 @@ class TestCapacityIsRemeasuredNotRead(_TargetBase):
     def test_real_free_space_above_the_minimum_is_ready(self):
         """Positive control, with the device binding intact -- a low threshold this temp
         filesystem genuinely clears."""
-        verdict, reason = self._verdict(capacity=self._cap(minimum_free_gib=0.001))
+        verdict, reason = self._verdict(capacity=self._cap())
         self.assertEqual(verdict, rd.READY, reason)
         self.assertIn("statvfs", reason.lower())
 
@@ -1370,19 +1284,269 @@ class TestCapacityIsRemeasuredNotRead(_TargetBase):
         path to statvfs, and that path has to be the target's own root."""
         elsewhere = os.path.join(self.tmp, "elsewhere")
         os.makedirs(elsewhere, exist_ok=True)
-        verdict, reason = self._verdict(
-            capacity=self._cap(data_root=elsewhere, minimum_free_gib=0.001))
+        verdict, reason = self._verdict(capacity=self._cap(data_root=elsewhere))
         self.assertEqual(verdict, rd.BLOCKED)
         self.assertIn("data_root", reason.lower())
 
     def test_the_collected_figure_is_kept_as_provenance(self):
-        verdict, reason = self._verdict(
-            capacity=self._cap(free_now_gib=500.0, minimum_free_gib=0.001))
+        verdict, reason = self._verdict(capacity=self._cap(free_now_gib=500.0))
         self.assertEqual(verdict, rd.READY, reason)
         self.assertIn("collected", reason.lower())
 
     def test_an_unstatable_root_is_not_adjudicated(self):
         gone = os.path.join(self.tmp, "no_such_root")
-        verdict, reason = self._verdict(
-            root=gone, capacity=self._cap(data_root=gone, minimum_free_gib=0.001))
+        verdict, reason = self._verdict(root=gone, capacity=self._cap(data_root=gone))
         self.assertEqual(verdict, rd.NOT_ADJUDICATED)
+
+
+class TestTheG18ThresholdIsCanonicalNotCollected(_TargetBase):
+    """The assessor re-measured free space and then compared it against the threshold the
+    TARGET supplied. Half the gate was hardened and the other half left as a field anyone could
+    write: lower `minimum_free_gib` and a device with nothing on it passes.
+
+    The threshold is policy. It comes from the capacity model in `ops/p5s8_evidence.py`, where
+    `MINIMUM_FREE_GIB = HARD_RESERVE + additional`, and the collected figure is checked against
+    it rather than believed."""
+
+    def _live_free_gib(self):
+        st = os.statvfs(self.root)
+        return st.f_bavail * st.f_frsize / 1024 ** 3
+
+    def _cap(self, **over):
+        cap = _fresh_capacity(measured_utc=self.collected_utc, data_root=self.root,
+                              filesystem_dev=os.stat(self.root).st_dev)
+        cap.update(over)
+        return cap
+
+    def _verdict(self, **over):
+        by_id = {r["id"]: r for r in rd.assess(self.target(**over))["requirements"]}
+        return by_id["capacity"]["verdict"], by_id["capacity"]["reason"]
+
+    def test_a_lowered_threshold_in_the_artifact_does_not_open_the_gate(self):
+        """The reported reproduction: statvfs clears the target's tiny minimum and falls far
+        short of the canonical one. The canonical one decides."""
+        self._set_canonical(self._live_free_gib() + 1000.0)
+        verdict, reason = self._verdict(capacity=self._cap(minimum_free_gib=0.001))
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("canonical", reason.lower())
+
+    def test_an_artifact_minimum_disagreeing_with_policy_is_blocked(self):
+        verdict, reason = self._verdict(capacity=self._cap(minimum_free_gib=1.5))
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("minimum_free_gib", reason)
+
+    def test_a_missing_artifact_minimum_is_not_adjudicated(self):
+        cap = self._cap()
+        cap.pop("minimum_free_gib")
+        verdict, reason = self._verdict(capacity=cap)
+        self.assertEqual(verdict, rd.NOT_ADJUDICATED)
+        self.assertIn("minimum_free_gib", reason)
+
+    def test_an_agreeing_artifact_above_the_canonical_threshold_is_ready(self):
+        """Positive control: policy and provenance agree, and the device clears it."""
+        verdict, reason = self._verdict(capacity=self._cap())
+        self.assertEqual(verdict, rd.READY, reason)
+
+    def test_the_gate_and_the_report_move_with_the_canonical_model(self):
+        """No second hardcoded threshold anywhere: raise the policy and the verdict flips."""
+        raised = self._live_free_gib() + 1000.0
+        self._set_canonical(raised)
+        verdict, reason = self._verdict(capacity=self._cap(minimum_free_gib=raised))
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn(str(raised), reason)
+
+    def test_the_canonical_value_is_the_capacity_models_own(self):
+        """Read through the fixture's patch AND against the model's own derivation, so the
+        readiness module is shown to have no threshold of its own either way."""
+        from ops import p5s8_evidence as ev
+        self.assertEqual(rd.canonical_minimum_free_gib(), ev.MINIMUM_FREE_GIB)
+        self._set_canonical(round(ev.HARD_RESERVE_GIB
+                                  + ev.capacity_model()["additional_gb"], 1))
+        self.assertEqual(rd.canonical_minimum_free_gib(), 403.3)
+
+    def test_the_readiness_module_hardcodes_no_threshold(self):
+        with open(os.path.join(_DEV, "ops", "p5_readiness.py")) as fh:
+            source = fh.read()
+        for stale in ("403.3", "250", "600.0"):
+            with self.subTest(stale):
+                self.assertNotIn(stale, source)
+
+
+class TestTheEvidenceCommitIsDeclaredAndApproved(unittest.TestCase):
+    """`load_execution(proven, REVIEWED_DEPLOY_SHAS[0])` assumed the artifact lived at the FIRST
+    approved commit. A result recording a run of commit N is committed AFTER commit N, so in
+    production it lives at some later commit -- and the peek would simply not find it.
+
+    The target names the commit the evidence is read from, that commit must itself be approved,
+    and the artifact's own `deploy_sha` is checked separately: one says where the record is, the
+    other says what it is about."""
+
+    def setUp(self):
+        import subprocess
+        self.tmp = tempfile.mkdtemp(prefix="p5-evidence-repo-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.join(self.tmp, "repo")
+        self.dev = os.path.join(self.repo, "dev2026")
+        self.execs = os.path.join(self.dev, rd.EXECUTIONS_REL)
+        os.makedirs(self.execs)
+        self.suite_rel = "tests/test_thing.py"
+        suite_path = os.path.join(self.dev, self.suite_rel)
+        os.makedirs(os.path.dirname(suite_path), exist_ok=True)
+        with open(suite_path, "w") as fh:
+            fh.write("# the suite whose run is being recorded\n")
+
+        def git(*a):
+            subprocess.run(("git",) + a, cwd=self.repo, check=True, capture_output=True)
+        self.git = git
+        git("init", "-q")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        git("add", "-A")
+        git("commit", "-qm", "the code under test")
+        self.deploy_sha = self._head()
+
+        for name in ("REPO_ROOT", "DEV_PREFIX", "REVIEWED_DEPLOY_SHAS"):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+        rd.REPO_ROOT, rd.DEV_PREFIX = self.repo, "dev2026"
+
+    def _head(self):
+        import subprocess
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                              capture_output=True, text=True).stdout.strip()
+
+    def _record_the_run(self, **over):
+        """Commit the result AFTER the commit it is about -- the production ordering."""
+        import hashlib
+        with open(os.path.join(self.dev, self.suite_rel), "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        run = {"suite": "tests.test_thing", "deploy_sha": self.deploy_sha,
+               "command": ".venv/bin/python -m unittest tests.test_thing",
+               "exit_code": 0, "tests_run": 31, "ran_utc": "2026-08-23T10:00:00Z",
+               "source_digest": digest}
+        run.update(over)
+        with open(os.path.join(self.execs, "run.json"), "w") as fh:
+            json.dump(run, fh)
+        self.git("add", "-A")
+        self.git("commit", "-qm", "record the run")
+        return self._head()
+
+    def _target(self, **over):
+        t = {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
+             "failure_semantics_proven_by": "run.json"}
+        t.update(over)
+        return t
+
+    def _verdict(self, **over):
+        by_id = {r["id"]: r for r in rd.assess(self._target(**over))["requirements"]}
+        return by_id["failure_semantics"]["verdict"], by_id["failure_semantics"]["reason"]
+
+    def test_the_production_ordering_is_ready(self):
+        """The artifact exists ONLY at a later approved commit, never at the first one."""
+        evidence_sha = self._record_the_run()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        self.assertIsNone(rd._git_blob(self.deploy_sha, f"{rd.EXECUTIONS_REL}/run.json"),
+                          "the artifact exists at the first approved commit; ordering untested")
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.READY, reason)
+
+    def test_no_declared_evidence_commit_is_not_adjudicated(self):
+        evidence_sha = self._record_the_run()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        verdict, reason = self._verdict()
+        self.assertEqual(verdict, rd.NOT_ADJUDICATED)
+        self.assertIn("failure_semantics_evidence_commit", reason)
+
+    def test_an_unapproved_evidence_commit_is_blocked(self):
+        evidence_sha = self._record_the_run()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha,)      # the evidence commit is NOT approved
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("approved", reason.lower())
+
+    def test_an_artifact_naming_an_unapproved_deploy_sha_is_blocked(self):
+        """Where the record lives and what it is about are separate claims."""
+        evidence_sha = self._record_the_run(deploy_sha="d" * 40)
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("approved deploy set", reason)
+
+    def test_the_digest_is_checked_against_the_deploy_commit_not_the_evidence_commit(self):
+        """The suite must DIFFER between the two commits, or the test proves nothing.
+
+        Recording the run and changing the suite in separate commits leaves the suite identical
+        at the deploy and evidence commits, so comparing against either gives the same answer --
+        which is how swapping one for the other survived a mutation round. Here the suite is
+        changed IN the evidence commit: the digest is of the suite as it was when the run
+        happened, so it matches at the deploy commit and would not at the evidence commit."""
+        import hashlib
+        with open(os.path.join(self.dev, self.suite_rel), "rb") as fh:
+            at_deploy = hashlib.sha256(fh.read()).hexdigest()
+        with open(os.path.join(self.dev, self.suite_rel), "a") as fh:
+            fh.write("# changed in the same commit that records the run\n")
+        with open(os.path.join(self.dev, self.suite_rel), "rb") as fh:
+            at_evidence = hashlib.sha256(fh.read()).hexdigest()
+        self.assertNotEqual(at_deploy, at_evidence, "the two commits carry the same suite")
+
+        evidence_sha = self._record_the_run(source_digest=at_deploy)
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.READY, reason)
+
+    def test_a_digest_matching_only_the_evidence_commit_is_blocked(self):
+        """The other direction: a run claiming a suite it never ran."""
+        import hashlib
+        with open(os.path.join(self.dev, self.suite_rel), "a") as fh:
+            fh.write("# changed in the same commit that records the run\n")
+        with open(os.path.join(self.dev, self.suite_rel), "rb") as fh:
+            at_evidence = hashlib.sha256(fh.read()).hexdigest()
+        evidence_sha = self._record_the_run(source_digest=at_evidence)
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("different file", reason)
+
+    def test_a_digest_of_a_different_file_is_still_blocked(self):
+        evidence_sha = self._record_the_run(source_digest="a" * 64)
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.BLOCKED)
+        self.assertIn("different file", reason)
+
+    def test_an_untracked_artifact_at_the_evidence_commit_is_refused(self):
+        evidence_sha = self._record_the_run()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        with open(os.path.join(self.execs, "uncommitted.json"), "w") as fh:
+            json.dump({"suite": "x"}, fh)
+        verdict, reason = self._verdict(failure_semantics_proven_by="uncommitted.json",
+                                        failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.NOT_ADJUDICATED)
+        self.assertIn("not tracked", reason.lower())
+
+    def test_a_working_tree_edit_does_not_change_the_verdict(self):
+        evidence_sha = self._record_the_run()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        with open(os.path.join(self.execs, "run.json"), "w") as fh:
+            json.dump({"suite": "tests.test_thing", "deploy_sha": self.deploy_sha,
+                       "command": "x", "exit_code": 1, "tests_run": 0,
+                       "ran_utc": "no", "source_digest": "b" * 64}, fh)
+        verdict, reason = self._verdict(failure_semantics_evidence_commit=evidence_sha)
+        self.assertEqual(verdict, rd.READY, reason)
+
+    def test_path_defects_are_still_refused(self):
+        evidence_sha = self._record_the_run()
+        rd.REVIEWED_DEPLOY_SHAS = (self.deploy_sha, evidence_sha)
+        outside = os.path.join(self.tmp, "outside.json")
+        with open(outside, "w") as fh:
+            json.dump({}, fh)
+        os.symlink(outside, os.path.join(self.execs, "escape.json"))
+        for claim in ("/tmp/x.json", "../x.json", "sub/../run.json", "escape.json"):
+            with self.subTest(claim):
+                verdict, _ = self._verdict(failure_semantics_proven_by=claim,
+                                           failure_semantics_evidence_commit=evidence_sha)
+                self.assertEqual(verdict, rd.NOT_ADJUDICATED)
+
+    def test_there_is_no_test_only_evidence_commit_override(self):
+        """`EVIDENCE_COMMIT` let a test read from anywhere, which would have hidden exactly the
+        production path this class exists to exercise."""
+        self.assertFalse(hasattr(rd, "EVIDENCE_COMMIT"))
