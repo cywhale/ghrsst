@@ -190,6 +190,10 @@ def build_probe_workspace(case):
             "INVENTORY_MODULES": [suite_rel],
             "COMPACTION_RUNTIME_MODULES": [suite_rel],
             "API_RUNTIME_MODULES": [suite_rel],
+            # The target-closure check imports these FROM the target commit, so they must name
+            # modules that commit actually provides -- here, the recorded suite itself.
+            "COMPACTION_ENTRY_POINTS": [suite_rel[:-3].replace("/", ".")],
+            "API_ENTRY_POINTS": [suite_rel[:-3].replace("/", ".")],
             "ASSESSOR_REPO_ROOT": assessor_root,
             "APPROVAL_RECORD_PATH": assessor_record,
         },
@@ -200,6 +204,41 @@ def build_probe_workspace(case):
     with open(cfg_path, "w") as fh:
         json.dump(cfg, fh)
     return cfg_path
+
+
+def build_synthetic_deployment(case, repo):
+    """A small, importable deployment whose declared inventory IS its measured closure.
+
+    The older fixtures wrote placeholder files at the real 17 paths, which are not importable
+    as the real entry points -- so the target-closure check refused them first and masked the
+    guard each test was about. Here the declaration and the tree agree by construction, leaving
+    exactly one variable per test.
+
+    Returns the module-relative paths it created."""
+    dev = os.path.join(repo, "dev2026", "depl")
+    os.makedirs(dev, exist_ok=True)
+    files = {
+        "depl/__init__.py": "",
+        "depl/dep.py": "VALUE = 1\n",
+        "depl/entry_compaction.py": "from depl import dep  # noqa: F401\n",
+        "depl/entry_api.py": "from depl import dep  # noqa: F401\n",
+    }
+    for rel, body in files.items():
+        path = os.path.join(repo, "dev2026", rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(body)
+
+    compaction = ("depl/__init__.py", "depl/dep.py", "depl/entry_compaction.py")
+    api = ("depl/__init__.py", "depl/dep.py", "depl/entry_api.py")
+    for name, value in (("COMPACTION_ENTRY_POINTS", ("depl.entry_compaction",)),
+                        ("API_ENTRY_POINTS", ("depl.entry_api",)),
+                        ("COMPACTION_RUNTIME_MODULES", compaction),
+                        ("API_RUNTIME_MODULES", api),
+                        ("INVENTORY_MODULES", tuple(sorted(set(compaction) | set(api))))):
+        case.addCleanup(setattr, rd, name, getattr(rd, name))
+        setattr(rd, name, value)
+    return sorted(files)
 
 
 class _RecordWritingMixin:
@@ -2791,11 +2830,7 @@ class TestTheDeploymentInventoryIsCompleteAtTheApprovedCommit(_RecordWritingMixi
 
         # A repository holding exactly the DECLARED deployment inventory, so the only variable
         # in each test below is which of those modules exists.
-        for rel in rd.INVENTORY_MODULES:
-            path = os.path.join(self.dev, rel)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as fh:
-                fh.write(f"# deployment module {rel}\n")
+        build_synthetic_deployment(self, self.repo)
         git("init", "-q")
         git("config", "user.email", "t@example.invalid")
         git("config", "user.name", "t")
@@ -2853,7 +2888,7 @@ class TestTheDeploymentInventoryIsCompleteAtTheApprovedCommit(_RecordWritingMixi
         is clean, and the target honestly reports every module that DOES exist. Only the
         absence of a declared module can refuse this -- the guard under test."""
         import subprocess
-        gone = rd.INVENTORY_MODULES[0]
+        gone = "depl/dep.py"
         subprocess.run(["git", "rm", "-q", f"dev2026/{gone}"], cwd=self.repo, check=True,
                        capture_output=True)
         self.git("commit", "-qm", "a deployment missing one declared module")
@@ -2871,7 +2906,7 @@ class TestTheDeploymentInventoryIsCompleteAtTheApprovedCommit(_RecordWritingMixi
 
     def test_the_helper_reports_which_declared_modules_are_absent(self):
         import subprocess
-        gone = rd.INVENTORY_MODULES[-1]
+        gone = "depl/dep.py"
         subprocess.run(["git", "rm", "-q", f"dev2026/{gone}"], cwd=self.repo, check=True,
                        capture_output=True)
         self.git("commit", "-qm", "drop one")
@@ -2916,13 +2951,6 @@ class TestTheDeploymentInventoryIsCompleteAtTheApprovedCommit(_RecordWritingMixi
         self.assertIn("DEPLOYMENT", source)
         self.assertIn("ASSESSOR", source)
 
-    def test_the_deployment_inventory_is_the_compaction_code(self):
-        """What a deployment must carry to RUN a compaction, and nothing else."""
-        for rel in ("store/block_manifest.py", "store/repair_wal.py",
-                    "store/compaction_lock.py", "ingest/build_block.py",
-                    "ingest/publish_manifest.py", "api/app.py"):
-            with self.subTest(rel):
-                self.assertIn(rel, rd.INVENTORY_MODULES)
 
 
 class TestTheDeploymentInventoryIsTheMeasuredRuntime(_RecordWritingMixin, unittest.TestCase):
@@ -3020,11 +3048,7 @@ class TestTheDeploymentClosureIsEnforcedBothWays(_RecordWritingMixin, unittest.T
             subprocess.run(("git",) + a, cwd=self.repo, check=True, capture_output=True)
         self.git = git
 
-        for rel in rd.INVENTORY_MODULES:
-            path = os.path.join(self.dev, rel)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as fh:
-                fh.write(f"# deployment module {rel}\n")
+        build_synthetic_deployment(self, self.repo)
         git("init", "-q")
         git("config", "user.email", "t@example.invalid")
         git("config", "user.name", "t")
@@ -3080,24 +3104,23 @@ class TestTheDeploymentClosureIsEnforcedBothWays(_RecordWritingMixin, unittest.T
     # ---------------------------------------------------------------- negative controls
     def test_source_provenance_omitted_from_the_commit_refuses(self):
         """The reported defect, as a deployment that does not ship it."""
-        sha = self._drop("store/source_provenance.py", "drop source_provenance")
+        sha = self._drop("depl/dep.py", "drop the shared dependency")
         verdict, reason = self._verdict(sha=sha)
         self.assertEqual(verdict, rd.BLOCKED)
-        self.assertIn("source_provenance.py", reason)
-        self.assertIn("declared", reason.lower())
+        self.assertIn("dep.py", reason)
 
     def test_an_api_dependency_omitted_from_the_commit_refuses(self):
-        sha = self._drop("store/hybrid_router.py", "drop an API dependency")
+        sha = self._drop("depl/entry_api.py", "drop the API entry point")
         verdict, reason = self._verdict(sha=sha)
         self.assertEqual(verdict, rd.BLOCKED)
-        self.assertIn("hybrid_router.py", reason)
+        self.assertIn("entry_api", reason)
 
     def test_a_runtime_module_present_but_untracked_refuses(self):
         """Ignored or simply never committed: it is on disk, absent from the commit, and
         imported all the same. `git status` on the deployment host would call it untracked;
         the assessor sees only that the approved commit does not contain it."""
         import subprocess
-        rel = "store/spatial_policy.py"
+        rel = "depl/dep.py"
         subprocess.run(["git", "rm", "--cached", "-q", f"dev2026/{rel}"], cwd=self.repo,
                        check=True, capture_output=True)
         with open(os.path.join(self.repo, ".gitignore"), "w") as fh:
@@ -3110,18 +3133,18 @@ class TestTheDeploymentClosureIsEnforcedBothWays(_RecordWritingMixin, unittest.T
         self.assertTrue(os.path.isfile(os.path.join(self.dev, rel)), "not on disk")
         verdict, reason = self._verdict(sha=sha)
         self.assertEqual(verdict, rd.BLOCKED)
-        self.assertIn("spatial_policy.py", reason)
+        self.assertIn("dep.py", reason)
 
     def test_a_module_edited_while_status_looks_clean_refuses(self):
         """The deployment reports `worktree_clean: true` and a digest for every module. The
         assessor recomputes from the commit, so bytes that differ are caught whatever the host
         believed about its own cleanliness."""
         reported = {rel: self._digest(rel) for rel in rd.INVENTORY_MODULES}
-        reported["store/repair_wal.py"] = "a" * 64
+        reported["depl/dep.py"] = "a" * 64
         verdict, reason = self._verdict(modules=reported)
         self.assertEqual(verdict, rd.BLOCKED)
         self.assertIn("fingerprint mismatch", reason)
-        self.assertIn("repair_wal.py", reason)
+        self.assertIn("dep.py", reason)
         self.assertNotIn("declared", reason.lower())
 
     def test_an_observed_but_undeclared_module_refuses(self):
@@ -3129,11 +3152,10 @@ class TestTheDeploymentClosureIsEnforcedBothWays(_RecordWritingMixin, unittest.T
         check must object rather than pass on a subset."""
         original = rd.INVENTORY_MODULES
         self.addCleanup(setattr, rd, "INVENTORY_MODULES", original)
-        rd.INVENTORY_MODULES = tuple(m for m in original
-                                     if m != "store/source_provenance.py")
+        rd.INVENTORY_MODULES = tuple(m for m in original if m != "depl/dep.py")
         problem = rd.deployment_inventory_problem()
         self.assertTrue(problem)
-        self.assertIn("source_provenance.py", problem)
+        self.assertIn("dep.py", problem)
 
     def test_an_undeclared_module_refuses_THROUGH_assess(self):
         """The helper being right is not the same as identity consulting it.
@@ -3144,13 +3166,211 @@ class TestTheDeploymentClosureIsEnforcedBothWays(_RecordWritingMixin, unittest.T
         declaration guard can refuse."""
         original = rd.INVENTORY_MODULES
         self.addCleanup(setattr, rd, "INVENTORY_MODULES", original)
-        rd.INVENTORY_MODULES = tuple(m for m in original
-                                     if m != "store/source_provenance.py")
+        rd.INVENTORY_MODULES = tuple(m for m in original if m != "depl/dep.py")
         reported = {rel: self._digest(rel) for rel in rd.INVENTORY_MODULES}
         verdict, reason = self._verdict(modules=reported)
         self.assertEqual(verdict, rd.BLOCKED)
         self.assertIn("declared deployment inventory", reason)
-        self.assertIn("source_provenance.py", reason)
+        self.assertIn("dep.py", reason)
         # Not a neighbouring guard: nothing is absent at the commit and nothing mismatched.
         self.assertNotIn("not present at the approved commit", reason)
         self.assertNotIn("fingerprint mismatch", reason)
+
+
+class TestTheClosureIsComputedFromTheTargetSha(_RecordWritingMixin, unittest.TestCase):
+    """The closure was measured from the ASSESSOR's working tree, not the target's commit.
+
+    `deployment_inventory_problem()` compares two static tuples against what *today's* source
+    imports. That says nothing about `reviewed_sha`: the approved commit could import a module
+    the declaration omits, or omit one it declares, and identity would still pass because the
+    only tree ever imported was the one the assessor happens to be sitting on.
+
+    So the closure is recomputed from the target commit itself -- materialized from git blobs
+    into an isolated tree and imported in a fresh subprocess.
+
+    ## On executing target code
+
+    Computing an import closure means importing, and importing runs module-level code. There is
+    no way around that and this does not pretend otherwise. What bounds it: the tree is
+    materialized from a commit that has ALREADY been checked against `REVIEWED_DEPLOY_SHAS`, so
+    only approved code is ever imported; it runs in a throwaway directory with its own
+    `sys.path`; and the subprocess is fresh, so nothing the assessor imported can satisfy an
+    import the target should have provided. It is isolation, not a sandbox, and the safety
+    rests on the commit being approved first."""
+
+    APPROVED = "3223fba37da5d292ea6acb58ccef0da2b5138d31"
+
+    def setUp(self):
+        for name in ("REVIEWED_DEPLOY_SHAS", "ASSESSOR_REPO_ROOT", "APPROVAL_RECORD_PATH"):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+        root, _head, record = approved_assessor_repo()
+        rd.ASSESSOR_REPO_ROOT, rd.APPROVAL_RECORD_PATH = root, record
+
+    # ---------------------------------------------------------------- the real commit
+    def test_the_closure_of_the_approved_commit_is_computable(self):
+        observed = rd.target_runtime_closure(self.APPROVED)
+        self.assertIn("compaction", observed)
+        self.assertIn("api", observed)
+        self.assertTrue(observed["compaction"])
+        self.assertTrue(observed["api"])
+
+    def test_the_declared_inventories_match_the_approved_commits_own_closure(self):
+        """The question the previous round never asked: does 3223fba import these 17?"""
+        observed = rd.target_runtime_closure(self.APPROVED)
+        self.assertEqual(sorted(rd.COMPACTION_RUNTIME_MODULES),
+                         sorted(observed["compaction"]))
+        self.assertEqual(sorted(rd.API_RUNTIME_MODULES), sorted(observed["api"]))
+
+    def test_source_provenance_is_in_the_approved_commits_compaction_closure(self):
+        observed = rd.target_runtime_closure(self.APPROVED)
+        self.assertIn("store/source_provenance.py", observed["compaction"])
+
+    def test_the_api_dependencies_are_in_the_approved_commits_api_closure(self):
+        observed = rd.target_runtime_closure(self.APPROVED)
+        for rel in ("store/hybrid_router.py", "store/store_access.py", "store/tiered_cube.py",
+                    "store/time_cube.py", "store/segmented_cube.py", "store/bbox_encode.py",
+                    "store/spatial_policy.py", "store/zarr_paths.py"):
+            with self.subTest(rel):
+                self.assertIn(rel, observed["api"])
+
+    def test_the_materialized_tree_is_the_commit_not_the_working_tree(self):
+        """A file added after the approved commit must NOT appear in the materialized tree."""
+        import subprocess
+        later_only = "ops/p5_readiness.py"
+        # git reports a path missing from a tree with a non-zero status; which non-zero
+        # varies by version (1 or 128), so the assertion is "not found", not a number.
+        self.assertNotEqual(subprocess.run(
+            ["git", "cat-file", "-e", f"{self.APPROVED}:{rd.DEV_PREFIX}/{later_only}"],
+            cwd=rd.REPO_ROOT, capture_output=True).returncode, 0,
+            "the fixture module already exists at the approved commit")
+        tree = rd.materialize_target_tree(self.APPROVED)
+        self.addCleanup(shutil.rmtree, tree, ignore_errors=True)
+        self.assertTrue(os.path.isfile(os.path.join(tree, "ingest", "build_block.py")))
+        self.assertFalse(os.path.isfile(os.path.join(tree, later_only)),
+                         "the assessor's own working tree leaked into the target tree")
+
+    def test_a_complete_approved_target_still_passes(self):
+        """Positive control end to end: the closure check must not become a blanket refusal."""
+        import hashlib
+        modules = {}
+        for rel in rd.INVENTORY_MODULES:
+            blob = rd._git_blob(self.APPROVED, rel)
+            self.assertIsNotNone(blob, rel)
+            modules[rel] = hashlib.sha256(blob).hexdigest()
+        rd.REVIEWED_DEPLOY_SHAS = (self.APPROVED,)
+        target = {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
+                  "identity": {"reviewed_sha": self.APPROVED, "head_sha": self.APPROVED,
+                               "worktree_clean": True, "modules": modules}}
+        by_id = {r["id"]: r for r in rd.assess(target)["requirements"]}
+        self.assertEqual(by_id["identity"]["verdict"], rd.READY, by_id["identity"]["reason"])
+
+    # ---------------------------------------------------------------- refusals
+    def _closure_problem_for(self, sha):
+        return rd.target_closure_problem(sha)
+
+    def test_a_commit_whose_closure_omits_a_declared_module_refuses(self):
+        """Built here rather than found: a commit whose compaction path genuinely does not
+        import `source_provenance`, with everything else declared correctly."""
+        sha = self._commit_variant(drop_import="source_provenance")
+        problem = self._closure_problem_for(sha)
+        self.assertTrue(problem, "a target missing a declared import was accepted")
+        self.assertIn("source_provenance.py", problem)
+
+    def test_a_commit_whose_closure_adds_an_undeclared_module_refuses(self):
+        sha = self._commit_variant(add_module="store/an_extra_runtime.py")
+        problem = self._closure_problem_for(sha)
+        self.assertTrue(problem, "a target importing an undeclared module was accepted")
+        self.assertIn("an_extra_runtime.py", problem)
+
+    def test_a_commit_missing_an_entry_point_refuses(self):
+        sha = self._commit_variant(delete="ingest/publish_manifest.py")
+        problem = self._closure_problem_for(sha)
+        self.assertTrue(problem)
+        self.assertIn("publish_manifest", problem)
+
+    def test_an_entry_point_that_raises_on_import_refuses_AS_SUCH(self):
+        """Isolating the import-failure branch, which a deleted entry point does not.
+
+        Deleting one makes the module absent, and the absent branch reports that -- so the
+        two diagnoses are indistinguishable and removing the error branch survived a mutation
+        round. Here the entry point EXISTS and raises, which is a different thing wrong with
+        the deployment and needs to be said differently: "your entry point does not load" is
+        the answer, not "a module is missing"."""
+        sha = self._commit_variant(raise_in="ingest/publish_manifest.py")
+        problem = self._closure_problem_for(sha)
+        self.assertTrue(problem, "an entry point that raises on import was accepted")
+        self.assertIn("do not import at", problem)
+        self.assertIn("publish_manifest", problem,
+                      "the refusal does not say WHICH entry point failed")
+        self.assertIn("RuntimeError", problem)
+
+    def test_the_refusal_reaches_the_identity_verdict(self):
+        sha = self._commit_variant(add_module="store/an_extra_runtime.py")
+        rd.REVIEWED_DEPLOY_SHAS = (sha,)
+        import hashlib
+        modules = {}
+        for rel in rd.INVENTORY_MODULES:
+            blob = rd._git_blob(sha, rel)
+            if blob is not None:
+                modules[rel] = hashlib.sha256(blob).hexdigest()
+        target = {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
+                  "identity": {"reviewed_sha": sha, "head_sha": sha,
+                               "worktree_clean": True, "modules": modules}}
+        by_id = {r["id"]: r for r in rd.assess(target)["requirements"]}
+        self.assertEqual(by_id["identity"]["verdict"], rd.BLOCKED)
+        self.assertIn("an_extra_runtime.py", by_id["identity"]["reason"])
+
+    # ---------------------------------------------------------------- variant builder
+    def _commit_variant(self, drop_import=None, add_module=None, delete=None,
+                        raise_in=None):
+        """A commit derived from the approved one, in a scratch repository.
+
+        Derived rather than invented so the closure being measured is a real one: everything
+        except the single alteration is the approved commit's own bytes."""
+        import subprocess
+        repo = tempfile.mkdtemp(prefix="p5-variant-repo-")
+        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        dev = os.path.join(repo, rd.DEV_PREFIX)
+        os.makedirs(dev)
+        subprocess.run(f"git archive {self.APPROVED} {rd.DEV_PREFIX} | tar -x -C {repo}",
+                       shell=True, cwd=rd.REPO_ROOT, check=True, capture_output=True)
+
+        if delete:
+            os.remove(os.path.join(dev, delete))
+        if raise_in:
+            path = os.path.join(dev, raise_in)
+            with open(path, "a") as fh:
+                fh.write("\nraise RuntimeError('injected import failure')\n")
+        if drop_import:
+            path = os.path.join(dev, "ingest", "build_block.py")
+            with open(path) as fh:
+                body = fh.read()
+            body = "\n".join(ln for ln in body.split("\n") if drop_import not in ln)
+            with open(path, "w") as fh:
+                fh.write(body)
+            path = os.path.join(dev, "ingest", "publish_manifest.py")
+            with open(path) as fh:
+                body = fh.read()
+            body = "\n".join(ln for ln in body.split("\n") if drop_import not in ln)
+            with open(path, "w") as fh:
+                fh.write(body)
+        if add_module:
+            with open(os.path.join(dev, add_module), "w") as fh:
+                fh.write("# an extra first-party runtime module\n")
+            path = os.path.join(dev, "store", "compaction_lock.py")
+            with open(path) as fh:
+                body = fh.read()
+            mod = os.path.splitext(os.path.basename(add_module))[0]
+            with open(path, "w") as fh:
+                fh.write(body + f"\nfrom store import {mod}  # noqa: E402,F401\n")
+
+        for args in (("init", "-q"), ("config", "user.email", "t@example.invalid"),
+                     ("config", "user.name", "t"), ("add", "-A"),
+                     ("commit", "-qm", "a variant of the approved commit")):
+            subprocess.run(("git",) + args, cwd=repo, check=True, capture_output=True)
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                             capture_output=True, text=True).stdout.strip()
+        self.addCleanup(setattr, rd, "REPO_ROOT", rd.REPO_ROOT)
+        rd.REPO_ROOT = repo
+        rd.REVIEWED_DEPLOY_SHAS = (sha,)
+        return sha

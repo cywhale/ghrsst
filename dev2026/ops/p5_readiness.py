@@ -308,6 +308,120 @@ def expected_module_digests(sha: str) -> Dict[str, str]:
     return out
 
 
+#: The probe that measures a TARGET tree's first-party closure. Run in a fresh interpreter
+#: with the materialized tree first on `sys.path`, so nothing the assessor imported can satisfy
+#: an import the target should have provided.
+#: ONE group per process. Clearing `sys.modules` between groups and re-importing fails on
+#: anything backed by a C extension -- "cannot load module more than once per process" -- and
+#: the two groups share the `store` package, so a single process could measure only the first.
+_TARGET_CLOSURE_PROBE = """
+import json, os, sys
+tree = sys.argv[1]
+sys.path.insert(0, tree)
+error = None
+# Which entry point failed, not merely that one did: "publish_manifest raised RuntimeError" is
+# actionable and "the compaction group failed" sends someone reading four modules.
+for name in json.loads(sys.argv[2]):
+    try:
+        __import__(name)
+    except Exception as exc:
+        error = f"{name}: {type(exc).__name__}: {exc}"
+        break
+found = set()
+for mod in list(sys.modules.values()):
+    f = getattr(mod, "__file__", None)
+    if not f:
+        continue
+    f = os.path.abspath(f)
+    if f.startswith(tree + os.sep) and f.endswith(".py"):
+        found.add(os.path.relpath(f, tree))
+print(json.dumps({"closure": sorted(found), "error": error}))
+"""
+
+_TARGET_CLOSURE_CACHE = {}
+
+
+def materialize_target_tree(sha: str) -> str:
+    """The deployment's own source AT `sha`, written to a throwaway directory.
+
+    From git blobs, never from the working tree: the closure was previously measured against
+    whatever the assessor happened to be sitting on, which says nothing about the commit being
+    adjudicated. Caller removes the directory."""
+    import subprocess
+    import tempfile
+    dest = tempfile.mkdtemp(prefix=f"p5-target-{sha[:7]}-")
+    proc = subprocess.run(f"git archive {sha} {DEV_PREFIX} | tar -x -C {dest}",
+                          shell=True, cwd=REPO_ROOT, capture_output=True)
+    if proc.returncode != 0:
+        import shutil
+        shutil.rmtree(dest, ignore_errors=True)
+        raise ExecutionRefused(
+            f"could not materialize {sha[:7]}: {proc.stderr.decode(errors='replace')[:400]}")
+    # `git archive` writes `<prefix>/...`; the importable root is that directory.
+    return os.path.join(dest, DEV_PREFIX)
+
+
+def target_runtime_closure(sha: str) -> Dict:
+    """The first-party modules the TARGET commit's entry points import.
+
+    Importing runs module-level code, and this does not pretend otherwise. What bounds it: the
+    caller has already checked `sha` against `REVIEWED_DEPLOY_SHAS`, so only approved code is
+    ever imported; it runs from a throwaway tree with its own `sys.path`; and the subprocess is
+    fresh, so nothing the assessor loaded can stand in for a module the target should ship. That
+    is isolation, not a sandbox -- the safety is that the commit was approved first."""
+    import json
+    import shutil
+    import subprocess
+    if sha in _TARGET_CLOSURE_CACHE:
+        return _TARGET_CLOSURE_CACHE[sha]
+    import sys as _sys
+    groups = {"compaction": list(COMPACTION_ENTRY_POINTS), "api": list(API_ENTRY_POINTS)}
+    tree = materialize_target_tree(sha)
+    out, errors = {}, {}
+    try:
+        for group, entries in groups.items():
+            proc = subprocess.run(
+                [_sys.executable, "-c", _TARGET_CLOSURE_PROBE, tree, json.dumps(entries)],
+                capture_output=True, text=True, cwd=tree)
+            if proc.returncode != 0 or not proc.stdout.strip():
+                raise ExecutionRefused(
+                    f"the {group} closure probe failed for {sha[:7]}: {proc.stderr[-400:]}")
+            result = json.loads(proc.stdout)
+            out[group] = result["closure"]
+            if result["error"]:
+                errors[group] = result["error"]
+    finally:
+        shutil.rmtree(os.path.dirname(tree), ignore_errors=True)
+    out["errors"] = errors
+    _TARGET_CLOSURE_CACHE[sha] = out
+    return out
+
+
+def target_closure_problem(sha: str):
+    """Does the TARGET commit import exactly what the inventories declare? Or `None`."""
+    try:
+        observed = target_runtime_closure(sha)
+    except Exception as exc:                                  # noqa: BLE001
+        return f"its runtime closure could not be computed: {exc}"
+    errors = observed.get("errors") or {}
+    if errors:
+        return (f"its entry points do not import at {sha[:7]}: {errors}; a deployment whose "
+                f"compaction or API entry point cannot be loaded is not a deployment")
+    for group, declared in (("compaction", COMPACTION_RUNTIME_MODULES),
+                            ("api", API_RUNTIME_MODULES)):
+        seen = set(observed.get(group) or ())
+        undeclared = sorted(seen - set(declared))
+        if undeclared:
+            return (f"its {group} runtime imports {undeclared}, which the inventory does not "
+                    f"declare; the closure is measured from the target, not from the "
+                    f"assessor's own tree")
+        absent = sorted(set(declared) - seen)
+        if absent:
+            return (f"its {group} runtime does not import {absent}, which the inventory "
+                    f"declares; a declaration the commit does not satisfy is not a check")
+    return None
+
+
 def deployment_inventory_problem():
     """Is the declared deployment inventory the union of the two measured runtimes?
 
@@ -617,6 +731,16 @@ def _check_identity(t: Dict) -> tuple:
                          f"approved commit {reviewed[:7]}, so the inventory cannot be checked "
                          f"in full; a declaration the commit cannot satisfy is a defect in "
                          f"one of the two, never a pass")
+    # And the same question asked of the TARGET's commit rather than the assessor's tree: the
+    # declaration agreeing with what today's source imports says nothing about `reviewed_sha`.
+    #
+    # AFTER the git-only checks above, deliberately. This one materializes a tree and imports
+    # it, so it is both the expensive check and the one whose failure is least specific -- a
+    # missing declared module makes the entry point fail to import, and "your entry point did
+    # not load" is a worse answer than naming the module that is gone.
+    target_problem = target_closure_problem(reviewed)
+    if target_problem:
+        return BLOCKED, f"the approved commit {reviewed[:7]} {target_problem}"
     missing = sorted(set(expected) - set(reported))
     if missing:
         return BLOCKED, (f"the inventory does not cover {missing}; an absent module reads as "
