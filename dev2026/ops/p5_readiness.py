@@ -120,19 +120,46 @@ ALLOWED_LEGACY_PATHS = ()
 #: `tests/test_phase2_p5_readiness.py` imports the entry points below in a fresh interpreter
 #: and requires the declaration to EQUAL what loaded, in both directions.
 
-#: The entry points a compaction actually runs through.
-COMPACTION_ENTRY_POINTS = ("ingest.build_block", "ingest.publish_manifest",
-                           "store.compaction_lock")
+#: The lifecycle, split by stage. One list per stage because they are separately reviewable
+#: and separately reachable -- a deployment can ship a build path and be missing the prune/swap
+#: half, and "the compaction modules" as one bag hid exactly that.
+COMPACTION_BUILD_ENTRY_POINTS = ("ingest.build_block", "ingest.publish_manifest",
+                                 "store.compaction_lock")
+PRUNE_SWAP_ENTRY_POINTS = ("ingest.prune_delta", "ingest.swap_delta", "ingest.corrected_day")
+
+#: Kept for the older call sites; the build stage by another name.
+COMPACTION_ENTRY_POINTS = COMPACTION_BUILD_ENTRY_POINTS
 
 #: The entry point whose parity `api_parity` is about.
 API_ENTRY_POINTS = ("api.app",)
 
-#: The first-party closure of `COMPACTION_ENTRY_POINTS`, measured.
-COMPACTION_RUNTIME_MODULES = (
-    "ingest/build_block.py", "ingest/publish_manifest.py",
+#: The first-party closure of the BUILD stage, measured -- by importing the entry points AND
+#: by executing a controlled build with WAL and anchor enabled.
+#:
+#: Import-only probing is not enough here. `ingest/build_block.py` imports
+#: `ingest.corrected_day` inside a function, in the WAL-attestation branch, so a deployment
+#: could be missing that module entirely and an import of `build_block` would never notice.
+#: The smoke below actually runs a build with `wal_root` set, which is what reaches it.
+COMPACTION_BUILD_RUNTIME_MODULES = (
+    "ingest/build_block.py", "ingest/corrected_day.py", "ingest/publish_manifest.py",
     "store/__init__.py", "store/block_manifest.py", "store/compaction_lock.py",
-    "store/repair_wal.py", "store/source_provenance.py",
+    "store/repair_wal.py", "store/segmented_cube.py", "store/source_provenance.py",
+    "store/time_cube.py",
 )
+
+#: The first-party closure of the PRUNE/SWAP stage, measured the same way.
+PRUNE_SWAP_RUNTIME_MODULES = (
+    "ingest/build_block.py", "ingest/build_timecube.py", "ingest/corrected_day.py",
+    "ingest/dual_write.py", "ingest/prune_delta.py", "ingest/publish_manifest.py",
+    "ingest/swap_delta.py",
+    "store/__init__.py", "store/block_manifest.py", "store/compaction_lock.py",
+    "store/durable_jsonl.py", "store/repair_wal.py", "store/segmented_cube.py",
+    "store/source_provenance.py", "store/time_cube.py", "store/zarr_paths.py",
+)
+
+#: The union of both compaction stages, for callers that want "the compaction runtime".
+COMPACTION_RUNTIME_MODULES = tuple(sorted(set(COMPACTION_BUILD_RUNTIME_MODULES)
+                                          | set(PRUNE_SWAP_RUNTIME_MODULES)))
 
 #: The first-party closure of `API_ENTRY_POINTS`, measured. Kept separate from the compaction
 #: runtime because they answer different questions -- what performs a compaction, and what
@@ -145,8 +172,18 @@ API_RUNTIME_MODULES = (
     "store/zarr_paths.py",
 )
 
-#: What the deployment must carry: both runtimes. Sorted so the declaration has one spelling.
-INVENTORY_MODULES = tuple(sorted(set(COMPACTION_RUNTIME_MODULES) | set(API_RUNTIME_MODULES)))
+#: What the deployment must carry: every lifecycle stage plus the API. `api_parity` is a
+#: readiness requirement, so the API runtime is unioned in for identity while staying its own
+#: declaration -- the two are reviewed separately and fail separately.
+INVENTORY_MODULES = tuple(sorted(set(COMPACTION_BUILD_RUNTIME_MODULES)
+                                 | set(PRUNE_SWAP_RUNTIME_MODULES)
+                                 | set(API_RUNTIME_MODULES)))
+
+#: Stage -> (entry points, declared closure, smoke). Defined once, below the smokes, so a
+#: stage added later cannot be measured by one check and forgotten by another. Every reader
+#: goes through this table rather than the tuples, which is also what lets a test substitute a
+#: whole synthetic lifecycle instead of patching five names and hoping they stay consistent.
+RUNTIME_GROUPS = {}         # populated at the end of this section, once the smokes exist
 
 #: The ASSESSOR runtime inventory -- its own modules, plus every module the G18 threshold is
 #: derived through. Distinct from `INVENTORY_MODULES` above, which is the DEPLOYMENT's.
@@ -308,25 +345,180 @@ def expected_module_digests(sha: str) -> Dict[str, str]:
     return out
 
 
+#: What the smokes import to FABRICATE their synthetic inputs, and which the deployment
+#: therefore does not have to ship. Named one path at a time rather than excluding `tests/`
+#: wholesale: the justification is "this builds the fixture", not "it lives under tests", and
+#: the broad rule would silently drop a real dependency that happened to sit there.
+SMOKE_FABRICATORS = ("tests/p5_fixtures.py",)
+
+#: The shared setup every compaction smoke needs: a synthetic delta, a published generation
+#: and an initialized WAL carrying one committed repair. Entirely inside a throwaway temp
+#: directory of the target tree's own making -- no store, no VM24 path, no environment root.
+_SMOKE_SETUP = """
+import os, tempfile
+import numpy as np
+import zarr
+import p5_fixtures as fx
+from ingest.build_block import build_block
+from store import block_manifest as bm
+from store import repair_wal as rw
+
+ANCHOR, S = "2026-06-27", 90
+tmp = tempfile.mkdtemp(prefix="p5-smoke-")
+root = os.path.join(tmp, "manifest_root"); wal = os.path.join(tmp, "wal")
+arts = os.path.join(tmp, "artifacts"); hold = os.path.join(tmp, "hold")
+for d in (root, wal, arts, hold):
+    os.makedirs(d, exist_ok=True)
+clock = os.path.join(tmp, "p5_compaction.lock")
+# The anchor shares a filesystem with the WAL under `mkdtemp`, so the waiver is named here
+# rather than smuggled: this smoke measures which MODULES run, not whether a deployment's
+# rollback domain is real. G14 adjudicates that separately, from evidence.
+AK = {"unsafe_allow_colocated_anchor": True}
+
+s0, e0 = bm.block_bounds(ANCHOR, S, 0)
+days = fx.calendar_span(s0, e0)[:6]
+repaired, folded = days[0], days[2]
+keep_days = [d for d in days if d not in (repaired, folded)]
+
+delta_v1 = os.path.join(tmp, "delta_v1.zarr")
+fx.build_delta(delta_v1, days)
+live = os.path.join(tmp, "delta_live.zarr")
+os.symlink(delta_v1, live)                       # the live delta is a symlink, as on the host
+
+
+def publish(segment, generation):
+    m = {"format": bm.MANIFEST_FORMAT, "version": bm.SCHEMA_VERSION,
+         "generation": generation, "generation_id": f"gen{generation:06d}-x",
+         "created_utc": "2027-01-01T00:00:00Z", "created_by": "p5-readiness-smoke",
+         "predecessor_generation": generation - 1 if generation > 1 else None,
+         "predecessor_manifest": (bm.archive_name(generation - 1) if generation > 1 else None),
+         "grid": {"ny": 32, "nx": 32, "region": [0, 32, 0, 32]},
+         "variables": list(fx.VARS), "block_grid": {"anchor_day": ANCHOR, "block_days": S},
+         "segments": [dict(segment)], "superseded": [], "manifest_checksum": ""}
+    m["manifest_checksum"] = bm.compute_checksum(m)
+    bm.publish(root, m)
+
+
+def inline_fingerprint(path, idx):
+    \"\"\"The repaired bytes, hashed HERE. The build smoke must not import
+    `ingest.corrected_day` to compute this: that module is exactly what the smoke exists to
+    observe `build_block` reaching on its own, and importing it would answer the question.\"\"\"
+    import hashlib
+    h = hashlib.sha256()
+    g = zarr.open_group(path, mode="r")
+    for v in fx.VARS:
+        h.update(np.ascontiguousarray(g[v][idx]).tobytes())
+    return h.hexdigest()
+
+
+v1 = build_block(os.path.join(root, "b_v1.zarr"), start_day=s0, end_day=e0,
+                 classification_target=[d for d in days if d != folded],
+                 delta_path=live, artifacts_dir=arts, lock=None,
+                 hard_reserve_bytes=0, unsafe_skip_isolation=True)
+v1_id = v1["segment"]["segment_id"]
+publish(v1["segment"], 1)
+rw.initialize_wal(wal, manifest_root=root, at_utc="t", operator="ops", **AK)
+
+# A real repair: the day is corrected in delta and the correction committed to the WAL.
+rec = rw.open_repair(wal, day=repaired, at_utc="t", operator="ops",
+                     payload={"expected_vars": list(fx.VARS)}, **AK)
+idx = list(bm.inspect_store_contract(live).days).index(repaired)
+g = zarr.open_group(live, mode="a")
+g["sst"][idx] = np.asarray(g["sst"][idx]) + 21.0
+if stage == "prune_swap":
+    from ingest import corrected_day as cd    # a declared entry point of THIS stage
+    fp = cd.fingerprint_day(live, repaired, physical_index=idx)[0]
+else:
+    fp = inline_fingerprint(live, idx)
+rw.append(wal, record=rw.COMMITTED, repair_id=rec["repair_id"], day=repaired,
+          at_utc="t", operator="ops", payload={"fingerprint": fp}, **AK)
+"""
+
+#: The BUILD stage: a fold with the WAL enabled. `build_block` imports `ingest.corrected_day`
+#: from inside that branch, so a deployment could ship without the module and an import of
+#: `build_block` would never notice. This call is where it shows.
+_SMOKE_BUILD = _SMOKE_SETUP + """
+v2 = build_block(os.path.join(root, "b_v2.zarr"), start_day=s0, end_day=e0,
+                 classification_target=list(days), delta_path=live, artifacts_dir=arts,
+                 lock=None, hard_reserve_bytes=0, unsafe_skip_isolation=True,
+                 wal_root=wal, **AK)
+# Not merely "it ran": the days the fold ATTESTED. An empty list would mean the WAL branch
+# was entered and did nothing, which is not the path a compaction takes.
+result = {"attested": sorted(((v2.get("segment") or {}).get("build_provenance") or {})
+                             .get("materialized_repairs") or ())}
+"""
+
+#: The PRUNE/SWAP stage: the §7.8 refold, the §7.5a eligibility gate, a real prune with its
+#: validation, and a swap plan actually executed. The swap's corrected-day re-authorization
+#: imports `ingest.corrected_day` from inside `execute_swap_plan` -- another function-local
+#: import, on the path that decides whether a day may be dropped.
+_SMOKE_PRUNE_SWAP = _SMOKE_SETUP + """
+from ingest.prune_delta import prune_delta
+from ingest.swap_delta import execute_swap_plan
+
+refold = cd.corrective_refold(
+    day=repaired, manifest_root=root, delta_path=live, wal_root=wal, **AK,
+    new_block_path=os.path.join(root, "b_v2.zarr"), artifacts_dir=arts,
+    start_day=s0, end_day=e0, classification_target=list(days),
+    predecessor_segment_id=v1_id, ingest_lock_path=os.path.join(tmp, "ingest.lock"),
+    compaction_lock_path=clock, hard_reserve_bytes=1 << 20, operator="ops")
+elig = cd.prune_eligibility(sorted(set(days) - set(keep_days)), manifest_root=root,
+                            delta_path=live, wal_root=wal, **AK)
+plan = prune_delta(live, os.path.join(tmp, "staging.zarr"), list(keep_days), base_days=days,
+                   spatial_window_days=1, wal_root=wal, manifest_root=root, **AK)
+swap = execute_swap_plan(
+    plan, mode="s1", hold_dir=hold, wal_root=wal, manifest_root=root,
+    compaction_lock_path=clock, **AK,
+    pre_swap_quiesce_fn=lambda **kw: {"drained": True, "observed_inflight": 0,
+                                      "evidence": "smoke: a private tree, no readers",
+                                      "attestation_id": "att-smoke", **kw})
+result = {"refold": refold.get("status"), "authorized": sorted(elig.get("authorized") or ()),
+          "swap": swap.get("status"), "swap_performed": swap.get("swap_performed"),
+          "swap_reason": swap.get("reason")}
+"""
+
+# The API stage has no smoke: `api/app.py` wires its routers at import, so importing it
+# observes the whole surface. Claiming a smoke there would be claiming evidence that does not
+# exist -- and `api_parity` is adjudicated from measured responses, not from this.
+RUNTIME_GROUPS.update({
+    "build": (COMPACTION_BUILD_ENTRY_POINTS, COMPACTION_BUILD_RUNTIME_MODULES, _SMOKE_BUILD),
+    "prune_swap": (PRUNE_SWAP_ENTRY_POINTS, PRUNE_SWAP_RUNTIME_MODULES, _SMOKE_PRUNE_SWAP),
+    "api": (API_ENTRY_POINTS, API_RUNTIME_MODULES, ""),
+})
+
 #: The probe that measures a TARGET tree's first-party closure. Run in a fresh interpreter
 #: with the materialized tree first on `sys.path`, so nothing the assessor imported can satisfy
 #: an import the target should have provided.
 #: ONE group per process. Clearing `sys.modules` between groups and re-importing fails on
 #: anything backed by a C extension -- "cannot load module more than once per process" -- and
-#: the two groups share the `store` package, so a single process could measure only the first.
+#: the groups share the `store` package, so a single process could measure only the first.
+#: Entry points are imported first, then the stage's smoke RUNS. Import-only probing cannot
+#: see a function-local import, and three of this lifecycle's dependencies are exactly that.
 _TARGET_CLOSURE_PROBE = """
 import json, os, sys
-tree = sys.argv[1]
+tree, stage = sys.argv[1], sys.argv[2]
 sys.path.insert(0, tree)
+# The fabricators live in `tests/`; they build the synthetic inputs and are not deployed. The
+# closure below excludes them for that reason -- what is measured is what the LIFECYCLE runs.
+sys.path.insert(0, os.path.join(tree, "tests"))
+fabricators = set(json.loads(sys.argv[5]))
 error = None
 # Which entry point failed, not merely that one did: "publish_manifest raised RuntimeError" is
 # actionable and "the compaction group failed" sends someone reading four modules.
-for name in json.loads(sys.argv[2]):
+for name in json.loads(sys.argv[3]):
     try:
         __import__(name)
     except Exception as exc:
-        error = f"{name}: {type(exc).__name__}: {exc}"
+        error = f"{name} does not import: {type(exc).__name__}: {exc}"
         break
+executed = None
+if error is None and sys.argv[4]:
+    try:
+        ns = {"__name__": "__p5_smoke__", "stage": stage}
+        exec(compile(sys.argv[4], "<p5-smoke>", "exec"), ns)
+        executed = ns.get("result")
+    except BaseException as exc:
+        error = f"the {stage} lifecycle does not run: {type(exc).__name__}: {exc}"
 found = set()
 for mod in list(sys.modules.values()):
     f = getattr(mod, "__file__", None)
@@ -334,8 +526,11 @@ for mod in list(sys.modules.values()):
         continue
     f = os.path.abspath(f)
     if f.startswith(tree + os.sep) and f.endswith(".py"):
-        found.add(os.path.relpath(f, tree))
-print(json.dumps({"closure": sorted(found), "error": error}))
+        rel = os.path.relpath(f, tree)
+        if rel not in fabricators:
+            found.add(rel)
+print(json.dumps({"closure": sorted(found), "error": error, "executed": executed},
+                 default=str))
 """
 
 _TARGET_CLOSURE_CACHE = {}
@@ -375,24 +570,28 @@ def target_runtime_closure(sha: str) -> Dict:
     if sha in _TARGET_CLOSURE_CACHE:
         return _TARGET_CLOSURE_CACHE[sha]
     import sys as _sys
-    groups = {"compaction": list(COMPACTION_ENTRY_POINTS), "api": list(API_ENTRY_POINTS)}
     tree = materialize_target_tree(sha)
-    out, errors = {}, {}
+    out, errors, executed = {}, {}, {}
     try:
-        for group, entries in groups.items():
+        for group, (entries, _declared, smoke) in RUNTIME_GROUPS.items():
             proc = subprocess.run(
-                [_sys.executable, "-c", _TARGET_CLOSURE_PROBE, tree, json.dumps(entries)],
+                [_sys.executable, "-c", _TARGET_CLOSURE_PROBE, tree, group,
+                 json.dumps(list(entries)), smoke or "",
+                 json.dumps(list(SMOKE_FABRICATORS))],
                 capture_output=True, text=True, cwd=tree)
             if proc.returncode != 0 or not proc.stdout.strip():
                 raise ExecutionRefused(
                     f"the {group} closure probe failed for {sha[:7]}: {proc.stderr[-400:]}")
             result = json.loads(proc.stdout)
             out[group] = result["closure"]
+            if result["executed"] is not None:
+                executed[group] = result["executed"]
             if result["error"]:
                 errors[group] = result["error"]
     finally:
         shutil.rmtree(os.path.dirname(tree), ignore_errors=True)
     out["errors"] = errors
+    out["executed"] = executed
     _TARGET_CLOSURE_CACHE[sha] = out
     return out
 
@@ -405,10 +604,9 @@ def target_closure_problem(sha: str):
         return f"its runtime closure could not be computed: {exc}"
     errors = observed.get("errors") or {}
     if errors:
-        return (f"its entry points do not import at {sha[:7]}: {errors}; a deployment whose "
-                f"compaction or API entry point cannot be loaded is not a deployment")
-    for group, declared in (("compaction", COMPACTION_RUNTIME_MODULES),
-                            ("api", API_RUNTIME_MODULES)):
+        return (f"its lifecycle does not run at {sha[:7]}: {errors}; a deployment whose build, "
+                f"prune/swap or API stage cannot be loaded and run is not a deployment")
+    for group, (_entries, declared, _smoke) in RUNTIME_GROUPS.items():
         seen = set(observed.get(group) or ())
         undeclared = sorted(seen - set(declared))
         if undeclared:
@@ -429,7 +627,7 @@ def deployment_inventory_problem():
     inventory check pass on a subset, which is how a hand-written list came to omit
     `store/source_provenance.py` and every dependency of `api/app.py`."""
     declared = set(INVENTORY_MODULES)
-    required = set(COMPACTION_RUNTIME_MODULES) | set(API_RUNTIME_MODULES)
+    required = set().union(*(set(d) for _e, d, _s in RUNTIME_GROUPS.values()))
     undeclared = sorted(required - declared)
     if undeclared:
         return (f"runs {undeclared} and does not declare them; naming an entry point is not "

@@ -135,6 +135,57 @@ The deployment cannot run a compaction because the code that performs one is not
 | `capacity` | **READY** | 1260.7 GiB free against a 403.3 GiB minimum, measured in run `20260821T130320Z` |
 | `failure_semantics` | **NOT_ADJUDICATED** | the local suites prove the *code's* refusal/rollback behaviour, and that code is not deployed, so the property is not a property of this deployment |
 
+## What "the deployment" means: three stages, measured by running them
+
+`identity` compares a deployment against a declared module inventory. That inventory used to be
+the import closure of four entry points — `ingest.build_block`, `ingest.publish_manifest`,
+`store.compaction_lock`, `api.app` — and importing a module is not running a lifecycle.
+
+Three of this lifecycle's dependencies are **function-local imports**, invisible to any
+import-only probe:
+
+| where | imports | on which path |
+| --- | --- | --- |
+| `ingest/build_block.py` | `ingest.corrected_day` | the WAL repair-attestation branch |
+| `ingest/swap_delta.py` | `ingest.corrected_day` | §7.5a re-authorization, under the lock |
+| `ingest/corrected_day.py` | `ingest.publish_manifest` | the §7.8 refold |
+
+A deployment could therefore be missing `ingest/corrected_day.py` outright, import all four
+entry points cleanly, read `READY`, and fail at the first repair it tried to fold — with the
+store half-changed. Worse, `ingest/prune_delta.py` and `ingest/swap_delta.py` — the half of the
+lifecycle that **deletes days** — were named by nothing at all.
+
+So the runtime is now declared as three stages, and each is measured by **executing** it against
+the exact target commit, materialized from git blobs into a throwaway tree:
+
+| stage | entry points | modules | how it is measured |
+| --- | --- | --- | --- |
+| `build` | `ingest.build_block`, `ingest.publish_manifest`, `store.compaction_lock` | 10 | a real fold with the WAL and anchor enabled, which attests a committed repair |
+| `prune_swap` | `ingest.prune_delta`, `ingest.swap_delta`, `ingest.corrected_day` | 16 | a §7.8 refold, the §7.5a eligibility gate, a real prune with its validation, and a swap plan **actually executed** |
+| `api` | `api.app` | 12 | import alone — `api/app.py` wires its routers at import, so there is no lazier surface to reach, and claiming a smoke here would be claiming evidence that does not exist |
+
+Union, and the deployment's identity inventory: **23 modules**. The API stage stays a separate
+declaration because it fails separately, and is unioned in because `api_parity` is a readiness
+requirement.
+
+The smokes run entirely inside `mkdtemp` in the materialized tree's own process, against a
+synthetic 32×32 store built by that commit's own fixtures. They touch no store, no `$G` path and
+no environment root. The one module they import that a deployment need not ship —
+`tests/p5_fixtures.py`, which fabricates the inputs — is excluded by name, not by a blanket
+exemption for `tests/`.
+
+The match is required **in both directions**. A module the stage runs and the inventory does not
+declare is a hole; a module the inventory declares and the stage never runs is a check that
+cannot fire. Either one refuses.
+
+### A separate blocker: `ops/p5_provision.py` is not at the reviewed commit
+
+The reviewed deployment SHA `3223fba` does **not** contain `ops/p5_provision.py`. Provisioning is
+therefore not deployable at that commit whatever this assessment says about the compaction
+runtime, and closing the lifecycle-closure gap did not change that. It is listed here rather than
+folded into `identity` because it is a different fact: the compaction runtime at `3223fba` is
+complete and runs; the provisioning tool is simply not in it.
+
 ## `p5_shadow` is verification-only, and that is a real limit
 
 `ops/p5_roadmap.py` declares the profile `scope: verification_only`: it proves a pre-provisioned

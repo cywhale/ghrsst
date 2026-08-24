@@ -194,6 +194,12 @@ def build_probe_workspace(case):
             # modules that commit actually provides -- here, the recorded suite itself.
             "COMPACTION_ENTRY_POINTS": [suite_rel[:-3].replace("/", ".")],
             "API_ENTRY_POINTS": [suite_rel[:-3].replace("/", ".")],
+            # And the stage table with them, or the probe measures the REAL lifecycle's
+            # stages against this synthetic commit and refuses it for the wrong reason.
+            # No smokes: a recorded test suite has no lifecycle to run.
+            "RUNTIME_GROUPS": {
+                stage: [[suite_rel[:-3].replace("/", ".")], [suite_rel], ""]
+                for stage in ("build", "prune_swap", "api")},
             "ASSESSOR_REPO_ROOT": assessor_root,
             "APPROVAL_RECORD_PATH": assessor_record,
         },
@@ -231,7 +237,15 @@ def build_synthetic_deployment(case, repo):
 
     compaction = ("depl/__init__.py", "depl/dep.py", "depl/entry_compaction.py")
     api = ("depl/__init__.py", "depl/dep.py", "depl/entry_api.py")
-    for name, value in (("COMPACTION_ENTRY_POINTS", ("depl.entry_compaction",)),
+    # The whole stage table at once. Substituting it -- rather than patching the tuples it was
+    # built from -- is the point: a table assembled at import would keep the real lifecycle's
+    # entry points and smokes, and every test here would measure the real deployment instead
+    # of this one. Empty smokes because a synthetic entry point has no lifecycle to run.
+    groups = {"build": (("depl.entry_compaction",), compaction, ""),
+              "prune_swap": (("depl.entry_compaction",), compaction, ""),
+              "api": (("depl.entry_api",), api, "")}
+    for name, value in (("RUNTIME_GROUPS", groups),
+                        ("COMPACTION_ENTRY_POINTS", ("depl.entry_compaction",)),
                         ("API_ENTRY_POINTS", ("depl.entry_api",)),
                         ("COMPACTION_RUNTIME_MODULES", compaction),
                         ("API_RUNTIME_MODULES", api),
@@ -2997,11 +3011,17 @@ print(json.dumps(sorted(out)))
         return set(json.loads(proc.stdout))
 
     # ---------------------------------------------------------------- measured, not listed
-    def test_the_compaction_inventory_equals_its_measured_closure(self):
+    # These probe by IMPORT, from the assessor's own tree. That is a floor, not the
+    # measurement: importing cannot observe a function-local import, and three of this
+    # lifecycle's dependencies are exactly that. Equality is asserted against the TARGET
+    # commit, by running each stage, in `TestTheLifecycleIsExecutedNotJustImported`.
+    def test_everything_the_compaction_entry_points_import_is_declared(self):
         observed = self._closure(*rd.COMPACTION_ENTRY_POINTS)
-        self.assertEqual(sorted(rd.COMPACTION_RUNTIME_MODULES), sorted(observed))
+        self.assertEqual(sorted(observed - set(rd.COMPACTION_RUNTIME_MODULES)), [],
+                         "imported by the compaction entry points and not declared")
 
     def test_the_api_inventory_equals_its_measured_closure(self):
+        """The API stage has no lazily imported dependencies, so here import IS the closure."""
         observed = self._closure(*rd.API_ENTRY_POINTS)
         self.assertEqual(sorted(rd.API_RUNTIME_MODULES), sorted(observed))
 
@@ -3019,10 +3039,9 @@ print(json.dumps(sorted(out)))
             with self.subTest(rel):
                 self.assertIn(rel, rd.API_RUNTIME_MODULES)
 
-    def test_the_deployment_inventory_is_the_union_of_both_runtimes(self):
-        self.assertEqual(sorted(rd.INVENTORY_MODULES),
-                         sorted(set(rd.COMPACTION_RUNTIME_MODULES)
-                                | set(rd.API_RUNTIME_MODULES)))
+    def test_the_deployment_inventory_is_the_union_of_every_stage(self):
+        union = set().union(*(set(d) for _e, d, _s in rd.RUNTIME_GROUPS.values()))
+        self.assertEqual(sorted(rd.INVENTORY_MODULES), sorted(union))
 
     def test_the_declared_inventory_is_not_a_hand_written_list(self):
         source = open_source = None
@@ -3209,21 +3228,21 @@ class TestTheClosureIsComputedFromTheTargetSha(_RecordWritingMixin, unittest.Tes
     # ---------------------------------------------------------------- the real commit
     def test_the_closure_of_the_approved_commit_is_computable(self):
         observed = rd.target_runtime_closure(self.APPROVED)
-        self.assertIn("compaction", observed)
-        self.assertIn("api", observed)
-        self.assertTrue(observed["compaction"])
-        self.assertTrue(observed["api"])
+        for group in rd.RUNTIME_GROUPS:
+            with self.subTest(group):
+                self.assertIn(group, observed)
+                self.assertTrue(observed[group])
 
     def test_the_declared_inventories_match_the_approved_commits_own_closure(self):
-        """The question the previous round never asked: does 3223fba import these 17?"""
+        """The question the previous round never asked: does 3223fba RUN these?"""
         observed = rd.target_runtime_closure(self.APPROVED)
-        self.assertEqual(sorted(rd.COMPACTION_RUNTIME_MODULES),
-                         sorted(observed["compaction"]))
-        self.assertEqual(sorted(rd.API_RUNTIME_MODULES), sorted(observed["api"]))
+        for group, (_entries, declared, _smoke) in rd.RUNTIME_GROUPS.items():
+            with self.subTest(group):
+                self.assertEqual(sorted(declared), sorted(observed[group]))
 
     def test_source_provenance_is_in_the_approved_commits_compaction_closure(self):
         observed = rd.target_runtime_closure(self.APPROVED)
-        self.assertIn("store/source_provenance.py", observed["compaction"])
+        self.assertIn("store/source_provenance.py", observed["build"])
 
     def test_the_api_dependencies_are_in_the_approved_commits_api_closure(self):
         observed = rd.target_runtime_closure(self.APPROVED)
@@ -3269,12 +3288,26 @@ class TestTheClosureIsComputedFromTheTargetSha(_RecordWritingMixin, unittest.Tes
         return rd.target_closure_problem(sha)
 
     def test_a_commit_whose_closure_omits_a_declared_module_refuses(self):
-        """Built here rather than found: a commit whose compaction path genuinely does not
-        import `source_provenance`, with everything else declared correctly."""
-        sha = self._commit_variant(drop_import="source_provenance")
-        problem = self._closure_problem_for(sha)
-        self.assertTrue(problem, "a target missing a declared import was accepted")
-        self.assertIn("source_provenance.py", problem)
+        """A module that EXISTS at the approved commit and that its lifecycle never runs.
+
+        `ingest/prune_staging.py` is real, committed, importable -- and on no stage's path.
+        Declaring it is the isolated form of "declared but not observed": the commit is the
+        approved one, unaltered, so nothing else can be what refuses it. (Deleting an import
+        from the real source instead leaves its USES behind, and the lifecycle then fails
+        with a NameError -- a different guard answering, which is how this once passed for
+        the wrong reason.)"""
+        rd.REVIEWED_DEPLOY_SHAS = (self.APPROVED,)
+        never_run = "ingest/prune_staging.py"
+        self.assertIsNotNone(rd._git_blob(self.APPROVED, never_run),
+                             "the fixture module is not at the approved commit")
+        entries, declared, smoke = rd.RUNTIME_GROUPS["build"]
+        self.addCleanup(setattr, rd, "RUNTIME_GROUPS", rd.RUNTIME_GROUPS)
+        rd.RUNTIME_GROUPS = dict(rd.RUNTIME_GROUPS,
+                                 build=(entries, tuple(declared) + (never_run,), smoke))
+        problem = self._closure_problem_for(self.APPROVED)
+        self.assertTrue(problem, "a declared module the lifecycle never runs was accepted")
+        self.assertIn(never_run, problem)
+        self.assertIn("does not import", problem)
 
     def test_a_commit_whose_closure_adds_an_undeclared_module_refuses(self):
         sha = self._commit_variant(add_module="store/an_extra_runtime.py")
@@ -3299,7 +3332,7 @@ class TestTheClosureIsComputedFromTheTargetSha(_RecordWritingMixin, unittest.Tes
         sha = self._commit_variant(raise_in="ingest/publish_manifest.py")
         problem = self._closure_problem_for(sha)
         self.assertTrue(problem, "an entry point that raises on import was accepted")
-        self.assertIn("do not import at", problem)
+        self.assertIn("does not import", problem)
         self.assertIn("publish_manifest", problem,
                       "the refusal does not say WHICH entry point failed")
         self.assertIn("RuntimeError", problem)
@@ -3322,7 +3355,7 @@ class TestTheClosureIsComputedFromTheTargetSha(_RecordWritingMixin, unittest.Tes
 
     # ---------------------------------------------------------------- variant builder
     def _commit_variant(self, drop_import=None, add_module=None, delete=None,
-                        raise_in=None):
+                        raise_in=None, lazy_add_module=None, fail_in_wal_branch=False):
         """A commit derived from the approved one, in a scratch repository.
 
         Derived rather than invented so the closure being measured is a real one: everything
@@ -3342,18 +3375,17 @@ class TestTheClosureIsComputedFromTheTargetSha(_RecordWritingMixin, unittest.Tes
             with open(path, "a") as fh:
                 fh.write("\nraise RuntimeError('injected import failure')\n")
         if drop_import:
-            path = os.path.join(dev, "ingest", "build_block.py")
-            with open(path) as fh:
-                body = fh.read()
-            body = "\n".join(ln for ln in body.split("\n") if drop_import not in ln)
-            with open(path, "w") as fh:
-                fh.write(body)
-            path = os.path.join(dev, "ingest", "publish_manifest.py")
-            with open(path) as fh:
-                body = fh.read()
-            body = "\n".join(ln for ln in body.split("\n") if drop_import not in ln)
-            with open(path, "w") as fh:
-                fh.write(body)
+            # From EVERY module that imports it, or the closure still contains it and the
+            # fixture tests nothing: `corrected_day` reaches `source_provenance` too, and it
+            # is on the build path now that the smoke runs the WAL branch.
+            for rel in ("ingest/build_block.py", "ingest/publish_manifest.py",
+                        "ingest/corrected_day.py"):
+                path = os.path.join(dev, rel)
+                with open(path) as fh:
+                    body = fh.read()
+                body = "\n".join(ln for ln in body.split("\n") if drop_import not in ln)
+                with open(path, "w") as fh:
+                    fh.write(body)
         if add_module:
             with open(os.path.join(dev, add_module), "w") as fh:
                 fh.write("# an extra first-party runtime module\n")
@@ -3363,6 +3395,25 @@ class TestTheClosureIsComputedFromTheTargetSha(_RecordWritingMixin, unittest.Tes
             mod = os.path.splitext(os.path.basename(add_module))[0]
             with open(path, "w") as fh:
                 fh.write(body + f"\nfrom store import {mod}  # noqa: E402,F401\n")
+
+        if lazy_add_module or fail_in_wal_branch:
+            # Injected INSIDE `build_block`'s WAL branch, beside the function-local import of
+            # `corrected_day` that already lives there. Nothing an importer of `build_block`
+            # can observe: only a build with `wal_root` set reaches this line.
+            path = os.path.join(dev, "ingest", "build_block.py")
+            with open(path) as fh:
+                body = fh.read()
+            anchor = "        from ingest.corrected_day import date_slot"
+            self.assertIn(anchor, body, "the WAL branch's function-local import moved")
+            if lazy_add_module:
+                with open(os.path.join(dev, lazy_add_module), "w") as fh:
+                    fh.write("# a lazily imported first-party runtime module\n")
+                mod = os.path.splitext(os.path.basename(lazy_add_module))[0]
+                inject = f"        from store import {mod}  # noqa: F401"
+            else:
+                inject = "        raise RuntimeError('injected: the WAL build path is broken')"
+            with open(path, "w") as fh:
+                fh.write(body.replace(anchor, anchor + "\n" + inject, 1))
 
         for args in (("init", "-q"), ("config", "user.email", "t@example.invalid"),
                      ("config", "user.name", "t"), ("add", "-A"),
@@ -3374,3 +3425,222 @@ class TestTheClosureIsComputedFromTheTargetSha(_RecordWritingMixin, unittest.Tes
         rd.REPO_ROOT = repo
         rd.REVIEWED_DEPLOY_SHAS = (sha,)
         return sha
+
+
+class TestTheLifecycleIsExecutedNotJustImported(_RecordWritingMixin, unittest.TestCase):
+    """A 17-module closure proved that four entry points IMPORT. That is not the lifecycle.
+
+    Production compaction runs build -> publish -> prune -> swap, with corrected-day
+    re-authorization at two of those steps, and three of the dependencies on that path are
+    function-local imports:
+
+      * `ingest/build_block.py` imports `ingest.corrected_day` inside the WAL-attestation
+        branch;
+      * `ingest/swap_delta.py` imports `ingest.corrected_day` inside the under-the-lock
+        re-authorization;
+      * `ingest/corrected_day.py` imports `ingest.publish_manifest` inside the refold.
+
+    Importing a module never executes any of them. A deployment could be missing
+    `ingest/corrected_day.py` outright, import all four entry points cleanly, and fail at the
+    first repair it tried to fold -- with the store half-changed.
+
+    So the closure is measured by RUNNING each stage against a throwaway synthetic store built
+    from the target commit's own fixtures: a real fold with the WAL enabled, a real §7.5a
+    eligibility gate, a real prune with its validation, and a swap plan actually executed.
+    Nothing here touches a production path; everything lives under `mkdtemp` inside the
+    materialized tree's own process.
+
+    The three stages stay separately declared because they fail separately: a deployment can
+    ship a working build path and be missing the prune/swap half, and one bag called "the
+    compaction modules" is what hid exactly that."""
+
+    APPROVED = "3223fba37da5d292ea6acb58ccef0da2b5138d31"
+
+    def setUp(self):
+        for name in ("REVIEWED_DEPLOY_SHAS", "ASSESSOR_REPO_ROOT", "APPROVAL_RECORD_PATH",
+                     "REPO_ROOT"):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+        root, _head, record = approved_assessor_repo()
+        rd.ASSESSOR_REPO_ROOT, rd.APPROVAL_RECORD_PATH = root, record
+
+    # ------------------------------------------------- the stages are separately declared
+    def test_the_lifecycle_is_declared_as_three_stages(self):
+        self.assertEqual(set(rd.RUNTIME_GROUPS), {"build", "prune_swap", "api"})
+        self.assertEqual(rd.RUNTIME_GROUPS["build"][0], rd.COMPACTION_BUILD_ENTRY_POINTS)
+        self.assertEqual(rd.RUNTIME_GROUPS["prune_swap"][0], rd.PRUNE_SWAP_ENTRY_POINTS)
+        self.assertEqual(rd.RUNTIME_GROUPS["api"][0], rd.API_ENTRY_POINTS)
+        # A stage that declares no smoke is measured by import alone; the two compaction
+        # stages must not be able to become that silently.
+        self.assertTrue(rd.RUNTIME_GROUPS["build"][2], "the build stage runs no lifecycle")
+        self.assertTrue(rd.RUNTIME_GROUPS["prune_swap"][2],
+                        "the prune/swap stage runs no lifecycle")
+
+    def test_the_prune_and_swap_entry_points_are_named(self):
+        """They were absent entirely: nothing adjudicated the half of the lifecycle that
+        DELETES days."""
+        for name in ("ingest.prune_delta", "ingest.swap_delta", "ingest.corrected_day"):
+            with self.subTest(name):
+                self.assertIn(name, rd.PRUNE_SWAP_ENTRY_POINTS)
+
+    def test_the_api_inventory_is_separate_but_unioned_into_the_deployment(self):
+        """`api_parity` is a readiness requirement, so the API runtime is part of the
+        deployment's identity -- and still its own declaration, reviewed and failing on its
+        own."""
+        self.assertNotIn("api/app.py", rd.COMPACTION_BUILD_RUNTIME_MODULES)
+        self.assertNotIn("api/app.py", rd.PRUNE_SWAP_RUNTIME_MODULES)
+        self.assertIn("api/app.py", rd.API_RUNTIME_MODULES)
+        self.assertIn("api/app.py", rd.INVENTORY_MODULES)
+        for rel in rd.API_RUNTIME_MODULES:
+            with self.subTest(rel):
+                self.assertIn(rel, rd.INVENTORY_MODULES)
+
+    # ------------------------------------------------- what only EXECUTION can observe
+    def test_corrected_day_is_in_the_build_closure(self):
+        observed = rd.target_runtime_closure(self.APPROVED)
+        self.assertIn("ingest/corrected_day.py", observed["build"],
+                      "the WAL build path's function-local dependency was not observed")
+
+    def test_importing_the_build_entry_points_alone_does_NOT_observe_corrected_day(self):
+        """The positive control for the whole mechanism.
+
+        If importing already saw `ingest/corrected_day.py`, running the build would prove
+        nothing and this file's premise would be wrong. So the same probe is run against the
+        same commit with the smoke removed, and the module has to be MISSING."""
+        import json
+        import subprocess
+        import sys as _sys
+        tree = rd.materialize_target_tree(self.APPROVED)
+        self.addCleanup(shutil.rmtree, os.path.dirname(tree), ignore_errors=True)
+        proc = subprocess.run(
+            [_sys.executable, "-c", rd._TARGET_CLOSURE_PROBE, tree, "build",
+             json.dumps(list(rd.COMPACTION_BUILD_ENTRY_POINTS)), "",
+             json.dumps(list(rd.SMOKE_FABRICATORS))],
+            capture_output=True, text=True, cwd=tree)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-400:])
+        import_only = json.loads(proc.stdout)
+        self.assertIsNone(import_only["error"], import_only["error"])
+        self.assertNotIn("ingest/corrected_day.py", import_only["closure"],
+                         "import-only probing already sees it; the smoke proves nothing")
+        self.assertIn("ingest/build_block.py", import_only["closure"])
+
+    def test_the_build_smoke_actually_attested_a_repair(self):
+        """Reaching the branch is not enough: an empty attestation would mean the WAL path was
+        entered and did nothing, which is not what a compaction does."""
+        observed = rd.target_runtime_closure(self.APPROVED)
+        self.assertEqual(observed["executed"]["build"]["attested"], ["2026-06-27"])
+
+    def test_the_prune_swap_smoke_actually_performed_a_swap(self):
+        executed = rd.target_runtime_closure(self.APPROVED)["executed"]["prune_swap"]
+        self.assertEqual(executed["refold"], "refolded", executed)
+        self.assertTrue(executed["authorized"], "the §7.5a gate authorized nothing to drop")
+        self.assertEqual(executed["swap"], "swapped", executed.get("swap_reason"))
+        self.assertIs(executed["swap_performed"], True)
+
+    def test_the_prune_and_swap_modules_are_in_the_prune_swap_closure(self):
+        observed = rd.target_runtime_closure(self.APPROVED)
+        for rel in ("ingest/prune_delta.py", "ingest/swap_delta.py",
+                    "ingest/corrected_day.py", "store/durable_jsonl.py",
+                    "ingest/dual_write.py", "store/zarr_paths.py"):
+            with self.subTest(rel):
+                self.assertIn(rel, observed["prune_swap"])
+
+    def test_the_only_excluded_module_is_the_named_fabricator(self):
+        """The smokes import `tests/p5_fixtures.py` to BUILD their synthetic store, and a
+        deployment does not ship it. That is one named path, not a blanket exemption for
+        `tests/`: a real runtime dependency that happened to live there would vanish from
+        every closure and no check would notice."""
+        self.assertEqual(rd.SMOKE_FABRICATORS, ("tests/p5_fixtures.py",))
+        observed = rd.target_runtime_closure(self.APPROVED)
+        for group in ("build", "prune_swap"):
+            leaked = [m for m in observed[group] if m.startswith("tests/")]
+            with self.subTest(group):
+                self.assertEqual(leaked, [], "a test-only module reached the closure")
+
+    def test_the_declared_stages_match_the_target_commit_both_ways(self):
+        observed = rd.target_runtime_closure(self.APPROVED)
+        for group, (_entries, declared, _smoke) in rd.RUNTIME_GROUPS.items():
+            with self.subTest(group):
+                self.assertEqual(sorted(set(declared) - set(observed[group])), [],
+                                 "declared and not run")
+                self.assertEqual(sorted(set(observed[group]) - set(declared)), [],
+                                 "run and not declared")
+
+    # ------------------------------------------------- refusals, through the real verdict
+    def _identity_verdict(self, sha):
+        """What `assess()` says about a target claiming to be `sha`, with honest digests."""
+        import hashlib
+        modules = {}
+        for rel in rd.INVENTORY_MODULES:
+            blob = rd._git_blob(sha, rel)
+            if blob is not None:
+                modules[rel] = hashlib.sha256(blob).hexdigest()
+        rd.REVIEWED_DEPLOY_SHAS = (sha,)
+        target = {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
+                  "identity": {"reviewed_sha": sha, "head_sha": sha,
+                               "worktree_clean": True, "modules": modules}}
+        by_id = {r["id"]: r for r in rd.assess(target)["requirements"]}
+        return by_id["identity"]
+
+    def test_a_lazily_imported_undeclared_module_refuses(self):
+        """The gap this round closes, stated as a test.
+
+        The extra import is function-local, inside the WAL branch -- invisible to every
+        import-only probe. Only running the build finds it."""
+        sha = self._commit_variant(lazy_add_module="store/a_lazy_runtime.py")
+        problem = rd.target_closure_problem(sha)
+        self.assertTrue(problem, "a lazily imported undeclared module was accepted")
+        self.assertIn("a_lazy_runtime.py", problem)
+
+    def test_the_lazy_refusal_reaches_the_identity_verdict(self):
+        sha = self._commit_variant(lazy_add_module="store/a_lazy_runtime.py")
+        verdict = self._identity_verdict(sha)
+        self.assertEqual(verdict["verdict"], rd.BLOCKED, verdict["reason"])
+        self.assertIn("a_lazy_runtime.py", verdict["reason"])
+
+    def test_an_entry_point_that_imports_but_fails_during_the_smoke_refuses(self):
+        """Isolated from every other injection: `build_block` imports perfectly, every
+        declared module is present at the commit, and the deployment is still not ready --
+        because the build path does not run. An import-only assessor calls this READY."""
+        sha = self._commit_variant(fail_in_wal_branch=True)
+        self.assertEqual(rd.missing_inventory_modules(sha), [],
+                         "the fixture removed a module; the smoke failure is not isolated")
+        problem = rd.target_closure_problem(sha)
+        self.assertTrue(problem, "a deployment whose build path raises was accepted")
+        self.assertIn("build lifecycle does not run", problem)
+        self.assertIn("the WAL build path is broken", problem)
+
+    def test_the_smoke_failure_reaches_the_identity_verdict(self):
+        sha = self._commit_variant(fail_in_wal_branch=True)
+        verdict = self._identity_verdict(sha)
+        self.assertNotEqual(verdict["verdict"], rd.READY)
+        self.assertEqual(verdict["verdict"], rd.BLOCKED, verdict["reason"])
+
+    def test_a_declared_module_absent_at_the_target_refuses(self):
+        """`ingest/prune_delta.py` is newly declared; a commit without it must not pass by
+        the check quietly shrinking to what the commit happens to contain."""
+        sha = self._commit_variant(delete="ingest/prune_delta.py")
+        self.assertIn("ingest/prune_delta.py", rd.missing_inventory_modules(sha))
+        verdict = self._identity_verdict(sha)
+        self.assertEqual(verdict["verdict"], rd.BLOCKED, verdict["reason"])
+        self.assertIn("prune_delta.py", verdict["reason"])
+
+    def test_provisioning_is_still_absent_from_the_reviewed_commit(self):
+        """A separate blocker, pinned so closing the closure gap cannot look like closing it.
+
+        `ops/p5_provision.py` is not at `3223fba`. The compaction runtime there is complete
+        and runs -- that is what the stages above establish -- and provisioning still is not
+        deployable at that commit. Two different facts; this one is not adjudicated by
+        `identity`, and must not quietly become so."""
+        self.assertIsNone(rd._git_blob(self.APPROVED, "ops/p5_provision.py"),
+                          "provisioning now ships at the reviewed commit; the blocker in "
+                          "specs/p5_deployment_readiness.md is stale")
+        for _entries, declared, _smoke in rd.RUNTIME_GROUPS.values():
+            self.assertNotIn("ops/p5_provision.py", declared)
+        self.assertNotIn("ops/p5_provision.py", rd.INVENTORY_MODULES)
+
+    def test_the_approved_commit_still_passes_identity(self):
+        """Positive control: none of the above turned identity into a blanket refusal."""
+        verdict = self._identity_verdict(self.APPROVED)
+        self.assertEqual(verdict["verdict"], rd.READY, verdict["reason"])
+
+    _commit_variant = TestTheClosureIsComputedFromTheTargetSha._commit_variant
