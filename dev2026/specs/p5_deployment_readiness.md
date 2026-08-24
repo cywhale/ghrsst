@@ -186,6 +186,49 @@ runtime, and closing the lifecycle-closure gap did not change that. It is listed
 folded into `identity` because it is a different fact: the compaction runtime at `3223fba` is
 complete and runs; the provisioning tool is simply not in it.
 
+This is now a check rather than a paragraph. `DEPLOYMENT_TOOLS` declares what a deployment must
+**carry** without any stage importing it, and `deployment_tools_problem(sha)` answers it per
+commit. The provisioner is deliberately **not** in `INVENTORY_MODULES`: nothing on the runtime
+path imports it, and `deployment_inventory_problem()` refuses a declared module no stage runs —
+correctly, because a declaration nothing executes is not a check. "Carried by the deployment" and
+"on the runtime path" are different claims, so they are checked separately.
+
+It is also deliberately **not** wired into `identity`. `3223fba` predates the module entirely, so
+folding it in would put `identity` at `BLOCKED` for a reason that has nothing to do with whether
+the deployed code matches its commit — one blocker restated as another. Promoting it to a
+readiness requirement is a review decision, not one this module should take on its own.
+
+## The external approval record is a transcription, not a cryptographic signature
+
+`assessor_is_approved()` binds an approval record to a commit. It requires the record to sit
+**outside** the repository (checked through `realpath` as well as `abspath`, so a symlink cannot
+smuggle it back in), to name this assessor's scope, to carry `approved_by` and a parsable
+`approved_utc`, to name a SHA equal to the assessor's current `HEAD`, to find that worktree clean,
+and to match every module in `ASSESSOR_MODULES` blob-for-blob at that commit.
+
+What it does **not** establish is who wrote the file. Any process with write access to the
+operator's home directory can produce one. On 2026-08-24 an unrelated session on the same machine
+did exactly that, from a prompt pasted into the wrong window: the record it wrote for `7126c7b`
+was correct in every field and passed every binding check above. That is the honest shape of the
+mechanism — the guards held, and authorship was never among them.
+
+So the record is an **operator transcription of a human decision, not a cryptographic
+signature**, and this document says so rather than letting the phrase "approval record" imply
+otherwise. The record for `7126c7b` is accepted on that basis.
+
+The mechanism that would close the gap already exists and is unused: a record may carry
+`signed_tag`, which the assessor verifies with `git verify-tag` **and** requires to resolve to the
+approved commit. It needs a real signing key on the assessor host. Until there is one, no signed
+tag is created — a fabricated signature would be worse than an acknowledged transcription.
+
+## A deployment revision has been proposed, and approved by nothing
+
+`PROPOSED_DEPLOY_SHAS` names revisions put forward for deployment review. It is kept apart from
+`REVIEWED_DEPLOY_SHAS`, which `_check_identity` reads and which alone makes a commit deployable.
+A proposed revision can be measured, argued about and rejected without ever being deployable;
+moving one into the approved set is a review decision and its own commit.
+
+
 ## `p5_shadow` is verification-only, and that is a real limit
 
 `ops/p5_roadmap.py` declares the profile `scope: verification_only`: it proves a pre-provisioned

@@ -69,6 +69,21 @@ REVIEWED_DEPLOY_SHAS = (
     "3223fba37da5d292ea6acb58ccef0da2b5138d31",
 )
 
+#: Revisions PROPOSED for deployment review, and approved by nothing. Kept apart from
+#: `REVIEWED_DEPLOY_SHAS` on purpose: `_check_identity` reads only that tuple, so a revision
+#: named here can be measured, argued about and rejected without ever being deployable. Adding
+#: one of these to the approved set is a review decision and a separate commit.
+PROPOSED_DEPLOY_SHAS = ()
+
+#: What the deployment must CARRY but no runtime stage imports.
+#:
+#: `ops/p5_provision.py` builds the P5 roots. An operator runs it as a command; a compaction
+#: never imports it, and it is therefore deliberately NOT in `INVENTORY_MODULES` --
+#: `deployment_inventory_problem()` refuses a declared module nothing runs, and it is right to:
+#: a declaration nothing executes is not a check. "Present at the deployment commit" is a
+#: different claim from "on the runtime path", so it is checked as a different one.
+DEPLOYMENT_TOOLS = ("ops/p5_provision.py",)
+
 #: Where the assessor's repository lives, and the directory prefix inside it. Module-level so
 #: tests can point the whole git-backed path at a purpose-built repository instead of stubbing
 #: the checks out.
@@ -636,6 +651,20 @@ def deployment_inventory_problem():
     if extra:
         return (f"declares {extra}, which neither runtime imports; a declaration nothing "
                 f"executes is not a check")
+    return None
+
+
+def deployment_tools_problem(sha: str):
+    """Tools the deployment must carry that are absent at `sha`, or `None`.
+
+    Deliberately NOT wired into `_check_identity`, and so not part of any verdict: the reviewed
+    deployment `3223fba` predates `ops/p5_provision.py` entirely, and folding its absence into
+    `identity` would restate one blocker as another. Promoting this to a requirement is a
+    review decision, not something this module should take on its own."""
+    absent = sorted(rel for rel in DEPLOYMENT_TOOLS if _git_blob(sha, rel) is None)
+    if absent:
+        return (f"does not carry {absent}; provisioning the P5 roots is an operator command, "
+                f"and a command absent from the deployment cannot be run on it")
     return None
 
 

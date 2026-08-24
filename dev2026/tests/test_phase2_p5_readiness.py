@@ -3644,3 +3644,136 @@ class TestTheLifecycleIsExecutedNotJustImported(_RecordWritingMixin, unittest.Te
         self.assertEqual(verdict["verdict"], rd.READY, verdict["reason"])
 
     _commit_variant = TestTheClosureIsComputedFromTheTargetSha._commit_variant
+
+
+class TestTheDeploymentCarriesItsProvisioningTool(unittest.TestCase):
+    """`ops/p5_provision.py` builds the P5 roots, and the reviewed deployment does not have it.
+
+    That blocker has been recorded in prose for several rounds. Prose is not a check, so it is
+    one here -- and deliberately not part of any verdict.
+
+    The provisioner is not on any runtime path: an operator runs it as a command, and no
+    compaction imports it. So it must NOT be in `INVENTORY_MODULES`, where
+    `deployment_inventory_problem()` would rightly refuse it as a declaration nothing executes.
+    "Carried by the deployment" and "on the runtime path" are different claims and are checked
+    separately.
+
+    Folding this into `identity` would restate one blocker as another: `3223fba` predates the
+    module entirely, so `identity` would go BLOCKED for a reason that has nothing to do with
+    whether the deployment's code matches its commit. Whether to promote it to a readiness
+    requirement is a review decision."""
+
+    REVIEWED = "3223fba37da5d292ea6acb58ccef0da2b5138d31"
+
+    def setUp(self):
+        self.addCleanup(setattr, rd, "REPO_ROOT", rd.REPO_ROOT)
+
+    def test_the_provisioner_is_declared_as_a_tool_not_as_runtime(self):
+        self.assertIn("ops/p5_provision.py", rd.DEPLOYMENT_TOOLS)
+        self.assertNotIn("ops/p5_provision.py", rd.INVENTORY_MODULES)
+        for stage, (_entries, declared, _smoke) in rd.RUNTIME_GROUPS.items():
+            with self.subTest(stage):
+                self.assertNotIn("ops/p5_provision.py", declared)
+
+    def test_declaring_the_provisioner_as_runtime_would_be_refused(self):
+        """Why it is a separate declaration, demonstrated rather than asserted: the inventory
+        guard refuses a module no stage runs, and the provisioner is exactly that."""
+        self.addCleanup(setattr, rd, "INVENTORY_MODULES", rd.INVENTORY_MODULES)
+        rd.INVENTORY_MODULES = tuple(rd.INVENTORY_MODULES) + ("ops/p5_provision.py",)
+        problem = rd.deployment_inventory_problem()
+        self.assertTrue(problem, "a declared module nothing runs was accepted")
+        self.assertIn("p5_provision.py", problem)
+
+    def test_the_reviewed_deployment_does_not_carry_it(self):
+        problem = rd.deployment_tools_problem(self.REVIEWED)
+        self.assertTrue(problem, "the reviewed deployment was said to carry the provisioner")
+        self.assertIn("ops/p5_provision.py", problem)
+
+    def test_a_revision_that_carries_it_is_accepted(self):
+        """Positive control: the check must not be a blanket refusal."""
+        self.assertIsNone(rd.deployment_tools_problem(self._revision(with_tool=True)))
+
+    def test_a_revision_missing_it_is_refused(self):
+        problem = rd.deployment_tools_problem(self._revision(with_tool=False))
+        self.assertTrue(problem)
+        self.assertIn("ops/p5_provision.py", problem)
+
+    # ------------------------------------------------- proposed is not approved
+    def test_the_proposed_set_is_disjoint_from_the_approved_set(self):
+        """A revision may be proposed and measured without becoming deployable. If the two
+        sets ever overlap, a proposal has been promoted without the commit that promotes it."""
+        self.assertEqual(set(rd.PROPOSED_DEPLOY_SHAS) & set(rd.REVIEWED_DEPLOY_SHAS), set())
+
+    def test_a_revision_outside_the_approved_set_cannot_reach_identity_READY(self):
+        """Whatever is proposed, `_check_identity` reads only `REVIEWED_DEPLOY_SHAS`."""
+        sha = self._revision(with_tool=True)
+        self.addCleanup(setattr, rd, "PROPOSED_DEPLOY_SHAS", rd.PROPOSED_DEPLOY_SHAS)
+        rd.PROPOSED_DEPLOY_SHAS = (sha,)          # proposed, and still not approved
+        target = {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
+                  "identity": {"reviewed_sha": sha, "head_sha": sha,
+                               "worktree_clean": True, "modules": {}}}
+        by_id = {r["id"]: r for r in rd.assess(target)["requirements"]}
+        self.assertEqual(by_id["identity"]["verdict"], rd.BLOCKED)
+        self.assertNotIn(sha, rd.REVIEWED_DEPLOY_SHAS)
+
+    # ------------------------------------------------- fixture
+    def _revision(self, *, with_tool):
+        """A scratch commit that does or does not carry the provisioner. Nothing else varies."""
+        import subprocess
+        repo = tempfile.mkdtemp(prefix="p5-tools-repo-")
+        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        dev = os.path.join(repo, rd.DEV_PREFIX, "ops")
+        os.makedirs(dev)
+        with open(os.path.join(dev, "unrelated.py"), "w") as fh:
+            fh.write("# so the commit is never empty\n")
+        if with_tool:
+            with open(os.path.join(dev, "p5_provision.py"), "w") as fh:
+                fh.write("# the provisioner\n")
+        for args in (("init", "-q"), ("config", "user.email", "t@example.invalid"),
+                     ("config", "user.name", "t"), ("add", "-A"),
+                     ("commit", "-qm", "a revision")):
+            subprocess.run(("git",) + args, cwd=repo, check=True, capture_output=True)
+        rd.REPO_ROOT = repo
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                              capture_output=True, text=True).stdout.strip()
+
+
+class TestTheApprovalRecordIsDocumentedAsATranscription(unittest.TestCase):
+    """The external approval record is written by whoever runs the bootstrap, not signed.
+
+    `assessor_is_approved()` binds a record to a commit: same SHA as HEAD, clean worktree, every
+    assessor module's blob matching, and the record outside the repository so the code cannot
+    approve itself. What it cannot establish is WHO wrote the file -- any process with write
+    access to the operator's home directory can produce one. On 2026-08-24 an unrelated session
+    on the same machine did exactly that, from a prompt pasted into the wrong window; the record
+    it wrote was correct and passed every binding check, which is the point: the guards held,
+    and authorship was never among them.
+
+    `signed_tag` is the mechanism that would close it -- verified with `git verify-tag` and
+    required to resolve to HEAD -- and it needs a real key. Until then the record is an operator
+    transcription of a human decision, and the documentation has to say so rather than let
+    "approval record" imply a signature."""
+
+    def _doc(self):
+        with open(os.path.join(_DEV, "specs", "p5_deployment_readiness.md")) as fh:
+            return fh.read()
+
+    def test_the_document_says_the_record_is_not_a_signature(self):
+        doc = self._doc()
+        self.assertIn("transcription", doc)
+        self.assertIn("not a cryptographic signature", doc)
+
+    def test_the_document_names_what_the_record_does_and_does_not_bind(self):
+        doc = self._doc()
+        self.assertIn("signed_tag", doc, "the document does not name the mechanism that "
+                                         "would make the record a signature")
+
+    def test_the_optional_signed_tag_is_still_verified_when_present(self):
+        """The documented escape hatch must not be decoration: if a record names a tag, the
+        assessor verifies it AND requires it to resolve to the approved commit."""
+        with open(os.path.join(_DEV, "ops", "p5_readiness.py")) as fh:
+            source = fh.read()
+        approval = source[source.index("def assessor_is_approved"):]
+        approval = approval[:approval.index("\ndef ")]
+        self.assertIn("verify-tag", approval)
+        self.assertIn("signed_tag", approval)
