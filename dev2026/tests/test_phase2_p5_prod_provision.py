@@ -543,17 +543,44 @@ class TestTheAnchorMustBeOnAnotherFailureDomain(_ProdBase):
 
 class TestExistingRootsAreNeitherAdoptedNorDeleted(_ProdBase):
 
-    def test_an_existing_manifest_root_refuses(self):
+    def test_an_existing_manifest_root_refuses_AS_PRE_EXISTING(self):
+        """The diagnosis matters, not only the refusal.
+
+        Without the preflight the run still stops -- `makedirs` without `exist_ok` raises and
+        the racing-creator branch catches it -- but it reports a root that "appeared while the
+        lock was held". That sends an operator to look for a concurrent writer that does not
+        exist. "It was already there before this run started" is a different investigation, and
+        it is the true one."""
         os.makedirs(os.path.join(self.live, pp.MANIFEST_DIRNAME))
         with self.assertRaises(pp.ProductionProvisionRefused) as caught:
             self.provision()
-        self.assertIn(pp.MANIFEST_DIRNAME, str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn(pp.MANIFEST_DIRNAME, message)
+        self.assertIn("already exists", message)
+        self.assertIn("will not adopt it", " ".join(message.split()))
+        self.assertNotIn("appeared while the lock was held", message)
+
+    def test_the_pre_existing_refusal_happens_before_the_lock_is_taken(self):
+        """It is a preflight, and a preflight that runs after the lock is a different check."""
+        os.makedirs(os.path.join(self.live, pp.WAL_DIRNAME))
+        acquired = []
+        real_acquire = cl.CompactionLock.acquire
+
+        def recording(self_):
+            acquired.append(self_.path)
+            return real_acquire(self_)
+
+        with mock.patch.object(cl.CompactionLock, "acquire", recording):
+            with self.assertRaises(pp.ProductionProvisionRefused):
+                self.provision()
+        self.assertEqual(acquired, [], "the lock was taken before the existing-root preflight")
 
     def test_an_existing_wal_root_refuses(self):
         os.makedirs(os.path.join(self.live, pp.WAL_DIRNAME))
         with self.assertRaises(pp.ProductionProvisionRefused) as caught:
             self.provision()
         self.assertIn(pp.WAL_DIRNAME, str(caught.exception))
+        self.assertIn("already exists", str(caught.exception))
 
     def test_the_refusal_leaves_the_existing_data_untouched(self):
         root = os.path.join(self.live, pp.MANIFEST_DIRNAME)
@@ -895,6 +922,31 @@ class TestTheDocumentsRecordTheCorrection(unittest.TestCase):
                                     "generation 1 would drop from the served view")
         self.assertIn("initialize_wal", doc)
 
+    def test_the_document_records_the_legacy_base_blocker(self):
+        """The second blocker: the deployed API cannot construct a legacy_base manifest."""
+        doc = self._doc()
+        self.assertIn("the API cannot serve `legacy_base`", doc)
+        self.assertIn("allowed_legacy_paths", doc)
+        self.assertIn("daily-only", doc)
+        self.assertIn("No builder is shipped", doc)
+
+    def test_the_document_says_empty_roots_move_nothing(self):
+        doc = self._doc()
+        self.assertIn("Empty roots move nothing", doc)
+        self.assertIn("not progress toward `compaction_ready`", doc)
+
+    def test_the_document_says_a_new_deployment_commit_and_approval_are_needed(self):
+        doc = self._doc()
+        self.assertIn("new reviewed deployment commit", doc)
+        self.assertIn("new assessor approval record", doc)
+        self.assertIn("never run against a real\nproduction root", doc)
+
+    def test_the_document_records_the_recovery_protocol(self):
+        doc = self._doc()
+        self.assertIn("Interruption: recoverable, not atomic", doc)
+        self.assertIn("planned_paths", doc)
+        self.assertIn("Operator recovery", doc)
+
     def test_the_generated_blocker_row_agrees_with_the_gate(self):
         from ops import p5s8_evidence as ev_
         row = ev_._provisioning_blocker()
@@ -902,3 +954,213 @@ class TestTheDocumentsRecordTheCorrection(unittest.TestCase):
             with self.subTest(tool):
                 self.assertIn(tool, row)
         self.assertIn("no approved commit", row)
+
+
+class TestASurvivingRecordNamesEveryPathThatMayExist(_ProdBase):
+    """The gap a marker written AFTER the fact cannot close.
+
+    The protocol used to learn what existed by recording each root once it was created. Between
+    `os.makedirs(A)` and the write that records A, the marker says nothing was created while A
+    is on disk — and if the process stops there, nothing on disk names A.
+
+    So the set is PLANNED before anything exists. It is knowable in advance: two fixed names
+    under one root. `created_paths` still grows as they really appear, and the difference
+    between the two lists is exactly the window."""
+
+    def test_the_ownership_stamp_declares_the_planned_paths_before_anything_exists(self):
+        payloads = []
+        real_write = pp._write_marker
+
+        def watching(path, payload):
+            # Existence is captured AT THE MOMENT of the write. Checking it after the run
+            # would ask whether the roots exist now, which they do -- a different question.
+            payloads.append((dict(payload),
+                             {p: os.path.exists(p) for p in (payload.get("planned_paths") or ())}))
+            return real_write(path, payload)
+
+        with mock.patch.object(pp, "_write_marker", side_effect=watching):
+            self.provision()
+        first, existed = payloads[0]
+        self.assertEqual(sorted(first["planned_paths"]), sorted(self.roots()))
+        self.assertEqual(first["created_paths"], [],
+                         "the first stamp claimed something was created")
+        self.assertEqual(sorted(existed), sorted(self.roots()))
+        for path, was_there in existed.items():
+            with self.subTest(path):
+                self.assertFalse(was_there,
+                                 "a planned path already existed when it was declared")
+
+    def test_an_incremental_marker_write_failure_still_cleans_up(self):
+        """The exact gap: the write that would have recorded the first root fails."""
+        real_write = pp._write_marker
+        state = {"n": 0}
+
+        def fail_on_first_update(path, payload):
+            state["n"] += 1
+            if state["n"] == 2:                       # the stamp is 1; this is the first update
+                raise OSError("injected: the incremental marker update failed")
+            return real_write(path, payload)
+
+        with mock.patch.object(pp, "_write_marker", side_effect=fail_on_first_update):
+            with self.assertRaises(OSError):
+                self.provision()
+        for path in self.roots():
+            with self.subTest(path):
+                self.assertFalse(os.path.exists(path))
+
+    def test_an_incremental_marker_failure_AND_a_cleanup_failure_leaves_a_complete_record(self):
+        """Both halves broken at once, which is where the old protocol lost information.
+
+        The recovery marker on disk was written before the first root existed, so what makes it
+        complete is `planned_paths`, not anything learned afterwards."""
+        real_write = pp._write_marker
+        state = {"n": 0}
+
+        def fail_updates(path, payload):
+            state["n"] += 1
+            if state["n"] >= 2:
+                raise OSError("injected: every marker update after the stamp fails")
+            return real_write(path, payload)
+
+        with mock.patch.object(pp, "_write_marker", side_effect=fail_updates), \
+                mock.patch.object(pp.shutil, "rmtree",
+                                  side_effect=OSError("injected: cannot remove")):
+            with self.assertRaises(pp.ProductionCleanupError) as caught:
+                self.provision()
+        err = caught.exception
+        self.assertEqual(os.path.realpath(err.live_root), os.path.realpath(self.live))
+        self.assertIsNotNone(err.__cause__)
+        marker = self.marker()
+        # The record that survived predates the first root, and still names it.
+        self.assertEqual(sorted(marker["planned_paths"]), sorted(self.roots()))
+        on_disk = [p for p in self.roots() if os.path.exists(p)]
+        named = pp.owned_paths(marker)
+        for path in on_disk:
+            with self.subTest(path):
+                self.assertIn(path, named,
+                              "a path exists that the surviving record does not name")
+
+    def test_owned_paths_covers_a_root_created_but_never_recorded(self):
+        """The crash window, as the record a crash would leave behind."""
+        marker = {"planned_paths": self.roots(), "created_paths": [], "contested_paths": []}
+        self.assertEqual(sorted(pp.owned_paths(marker)), sorted(self.roots()))
+
+    def test_owned_paths_excludes_a_contested_path(self):
+        """A root that appeared under the lock was not created by this run, so removing it
+        would delete data this run has no authority over."""
+        first, second = self.roots()
+        marker = {"planned_paths": [first, second], "created_paths": [],
+                  "contested_paths": [first]}
+        self.assertEqual(pp.owned_paths(marker), [second])
+
+    def test_a_root_appearing_under_the_lock_is_refused_and_recorded_as_contested(self):
+        real_makedirs = pp.os.makedirs
+
+        def racing(path, *a, **kw):
+            if os.path.basename(path) == pp.MANIFEST_DIRNAME and not os.path.exists(path):
+                real_makedirs(path)                   # a racing creator wins
+            return real_makedirs(path, *a, **kw)
+
+        with mock.patch.object(pp.os, "makedirs", side_effect=racing):
+            with self.assertRaises(pp.ProductionProvisionRefused) as caught:
+                self.provision()
+        self.assertIn("appeared while the lock was held", str(caught.exception))
+        self.assertTrue(os.path.isdir(self.roots()[0]),
+                        "a contested path was removed by this run")
+
+
+class TestTheCrashWindowIsRecoverableNotAtomic(_ProdBase):
+    """Every boundary between creating a root and recording ownership, as a recovery case.
+
+    None of this makes provisioning atomic. What it makes it is RECOVERABLE: whatever write did
+    not happen, a marker that predates every root names every root, so one `rollback_production`
+    call finishes the job. These are the non-crash equivalents — the on-disk states a crash
+    would leave, constructed directly and then recovered."""
+
+    def _crashed_marker(self, *, created):
+        """The marker as it would stand after a crash at a given point."""
+        marker_path = os.path.join(self.live, pp.marker_name(self.RUN_ID))
+        record = {"label": pp.PRODUCTION_LABEL,
+                  "marker": f"{pp.PRODUCTION_LABEL}:{self.RUN_ID}:t:tests",
+                  "run_id": self.RUN_ID, "live_root": os.path.realpath(self.live),
+                  "planned_paths": self.roots(), "created_paths": list(created),
+                  "contested_paths": [], "complete": False, "failed_step": None}
+        pp._write_marker(marker_path, record)
+        return record
+
+    def test_crash_after_the_stamp_before_any_root(self):
+        record = self._crashed_marker(created=[])
+        pp.rollback_production(record)
+        self.assertFalse(os.path.exists(os.path.join(self.live, pp.marker_name(self.RUN_ID))))
+        self.assertEqual(sorted(os.listdir(self.live)), [])
+
+    def test_crash_after_the_first_root_before_it_was_recorded(self):
+        """The window the planned list exists for."""
+        first = self.roots()[0]
+        os.makedirs(first)
+        record = self._crashed_marker(created=[])       # the update never happened
+        pp.rollback_production(record)
+        self.assertFalse(os.path.exists(first), "the unrecorded root survived recovery")
+        self.assertFalse(os.path.exists(os.path.join(self.live, pp.marker_name(self.RUN_ID))))
+
+    def test_crash_after_the_second_root_before_it_was_recorded(self):
+        first, second = self.roots()
+        os.makedirs(first)
+        os.makedirs(second)
+        record = self._crashed_marker(created=[first])  # only the first was recorded
+        pp.rollback_production(record)
+        for path in (first, second):
+            with self.subTest(path):
+                self.assertFalse(os.path.exists(path))
+
+    def test_crash_after_both_roots_were_recorded(self):
+        first, second = self.roots()
+        os.makedirs(first)
+        os.makedirs(second)
+        record = self._crashed_marker(created=[first, second])
+        pp.rollback_production(record)
+        for path in (first, second):
+            with self.subTest(path):
+                self.assertFalse(os.path.exists(path))
+
+    def test_recovery_never_touches_anything_else_in_the_live_root(self):
+        witness = os.path.join(self.live, "pre_existing_production_file")
+        with open(witness, "w") as fh:
+            fh.write("not ours")
+        os.makedirs(self.roots()[0])
+        record = self._crashed_marker(created=[])
+        pp.rollback_production(record)
+        self.assertTrue(os.path.isfile(witness))
+        self.assertTrue(os.path.isdir(self.live))
+
+    def test_the_marker_write_is_durable_against_a_lost_rename(self):
+        """The protocol rests on the marker being there after a crash, so the rename is fsynced
+        as well as the contents. Checked by observing the directory fsync rather than by
+        trusting that it happens."""
+        synced = []
+        real_open, real_fsync = os.open, os.fsync
+        fds = {}
+
+        def watching_open(path, flags, *a, **kw):
+            fd = real_open(path, flags, *a, **kw)
+            if os.path.isdir(path):
+                fds[fd] = path
+            return fd
+
+        def watching_fsync(fd):
+            if fd in fds:
+                synced.append(fds[fd])
+            return real_fsync(fd)
+
+        with mock.patch.object(pp.os, "open", side_effect=watching_open), \
+                mock.patch.object(pp.os, "fsync", side_effect=watching_fsync):
+            self.provision()
+        self.assertTrue(synced, "no directory was fsynced, so a marker rename can be lost")
+        self.assertIn(os.path.realpath(self.live),
+                      [os.path.realpath(p) for p in synced])
+
+    def test_the_module_does_not_claim_provisioning_is_atomic(self):
+        import inspect
+        doc = inspect.getdoc(pp) or ""
+        self.assertNotIn("atomic provisioning", doc.lower().replace("not atomic", ""))
+        self.assertIn("crash", doc.lower())

@@ -50,12 +50,48 @@ live root's device, undeclared, or carrying the same-filesystem waiver.
 The anchor is verified here even though the WAL is initialized later: an operator who cannot
 produce a valid anchor should learn it before roots exist, not after.
 
+## Interruption: recoverable, NOT atomic
+
+This is not atomic and does not claim to be. A crash can leave a root on disk. What it
+guarantees instead is that **whatever write did not happen, the record that survives names
+every path that may exist** — so recovery is one call, not an investigation.
+
+That works because the path set is knowable in advance: two fixed names under one root. The
+ownership marker declares them as `planned_paths` **before anything is created**, and
+`created_paths` grows as they really appear. The difference between the two lists is exactly
+the interruption window, and `owned_paths()` covers it by taking the union. `contested_paths`
+records a root that appeared under the lock — this run did not create it, so recovery must not
+remove it, and refusing to start when a root already exists is what makes that inference sound.
+
+Every boundary, and what a surviving marker says at each:
+
+| interrupted at | on disk | marker says | recovery |
+|---|---|---|---|
+| before the stamp | nothing | no marker | nothing to do |
+| after the stamp, before any root | marker only | planned=[A,B], created=[] | removes the marker |
+| after creating A, before recording it | A | planned=[A,B], created=[] | removes A |
+| after recording A, before B | A | planned=[A,B], created=[A] | removes A |
+| after creating B, before recording it | A, B | planned=[A,B], created=[A] | removes both |
+| after the completion write | A, B | complete: true | nothing to undo |
+
+`_write_marker()` writes to a temporary file, fsyncs it, renames it, and then fsyncs the
+**directory** — the rename has to reach disk too, or a crash can lose a marker whose contents
+were durable.
+
+**Operator recovery procedure.** Read `<live_root>/.p5_prod_provision_<run_id>.json`. If
+`complete` is `true`, the roots are provisioned and there is nothing to undo. Otherwise the run
+was interrupted: pass that JSON object to `rollback_production()`, which removes every owned
+path that still exists and then the marker. If it raises `ProductionCleanupError`, its
+`unrestored` attribute lists the exact paths it could not remove and the marker is deliberately
+left in place — it is the record of what is still outstanding. Remove those paths by hand, then
+re-run `rollback_production()` to clear the marker. Never delete the marker while any path it
+owns is still there: that is the only thing making the leftover state identifiable.
+
 ## What it does not promise
 
-A process crash between two writes is not covered. The marker records each path as it is
-created, so it is never behind what exists on disk, and cleanup is checked rather than
-best-effort: a path that cannot be removed keeps the marker and raises
-`ProductionCleanupError` naming exactly what remains.
+Atomicity, as above. Cleanup is checked rather than best-effort — a path that cannot be removed
+keeps the marker and raises `ProductionCleanupError` naming exactly what remains — but nothing
+here makes the sequence a single filesystem transaction.
 """
 from __future__ import annotations
 
@@ -357,23 +393,33 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
              "locks": locks, "provisioned_utc": at_utc, "operator": operator,
              "approved_by": approval["approved_by"], "approved_utc": approval["approved_utc"],
              "capacity_at_start": capacity, "anchor_verified": anchor,
-             "created_paths": [], "complete": False, "failed_step": None}
+             # PLANNED before anything exists, because "what may be on disk" cannot be learned
+             # after a crash from a record written after the fact. The set is fixed and known
+             # in advance -- these two names, under this root -- so declaring it up front makes
+             # every surviving marker complete, whichever write was the one that did not
+             # happen. `created_paths` still grows as they really appear, and the difference
+             # between the two lists is exactly the crash window.
+             "planned_paths": [manifest_root, wal_root],
+             "created_paths": [], "contested_paths": [],
+             "complete": False, "failed_step": None}
 
     # Ownership before the first thing worth owning. The marker is itself a write and can fail;
     # if it does, nothing has been created and there is nothing to own.
     _write_marker(marker_path, stamp)
     created: List[str] = []
+    contested: List[str] = []
     try:
         _create_roots(live_root=live_root, manifest_root=manifest_root, wal_root=wal_root,
                       capacity=capacity, locks=locks, run_id=run_id, created=created,
-                      marker_path=marker_path, stamp=stamp)
+                      contested=contested, marker_path=marker_path, stamp=stamp)
         # The completion write is INSIDE the recovery path. Outside it, a failure here left the
         # roots on disk under a marker still saying `created_paths: []` and `complete: false` --
         # a marker that authorized removing nothing while two directories existed.
         _write_marker(marker_path, {**stamp, "created_paths": list(created), "complete": True})
     except BaseException as failure:
         _recover(failure, marker_path=marker_path, stamp=stamp, created=created,
-                 live_root=live_root, cleanup_on_failure=cleanup_on_failure)
+                 contested=contested, live_root=live_root,
+                 cleanup_on_failure=cleanup_on_failure)
         raise
 
     return {
@@ -400,7 +446,7 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
 
 
 def _create_roots(*, live_root, manifest_root, wal_root, capacity, locks, run_id, created,
-                  marker_path, stamp) -> None:
+                  contested, marker_path, stamp) -> None:
     """Create the roots under the compaction lock, recording each as it appears."""
     holder = f"p5_prod_provision/{run_id}"
     with compaction_lock.CompactionLock(locks["compaction"], holder=holder):
@@ -418,7 +464,18 @@ def _create_roots(*, live_root, manifest_root, wal_root, capacity, locks, run_id
                 f"free space fell to {free_gib:.1f} GiB under the lock, below the canonical "
                 f"floor {capacity['min_free_gib']:.1f} GiB")
         for path in (manifest_root, wal_root):
-            os.makedirs(path)                       # no exist_ok: refuse a racing creator
+            try:
+                os.makedirs(path)                   # no exist_ok: refuse a racing creator
+            except FileExistsError:
+                # It appeared between the preflight and here, so this run did not create it and
+                # has no authority to remove it. Recorded so recovery can tell "ours, created
+                # just before a marker write failed" from "someone else's".
+                contested.append(path)
+                _write_marker(marker_path, {**stamp, "created_paths": list(created),
+                                            "contested_paths": list(contested)})
+                raise ProductionProvisionRefused(
+                    f"{path!r} appeared while the lock was held; this run did not create it "
+                    f"and will not adopt or remove it")
             created.append(path)
             # The marker is brought up to date the moment the path exists, so it is never
             # behind the filesystem. A crash between these two writes leaves a marker naming
@@ -427,20 +484,44 @@ def _create_roots(*, live_root, manifest_root, wal_root, capacity, locks, run_id
             _write_marker(marker_path, {**stamp, "created_paths": list(created)})
 
 
-def _recover(failure: BaseException, *, marker_path, stamp, created, live_root,
+def _recover(failure: BaseException, *, marker_path, stamp, created, contested, live_root,
              cleanup_on_failure: bool) -> None:
     """Record the failure accurately, then clean up if asked. Never silently."""
-    partial = {**stamp, "created_paths": list(created), "failed_step": repr(failure)}
+    partial = {**stamp, "created_paths": list(created), "contested_paths": list(contested),
+               "failed_step": repr(failure)}
     try:
         _write_marker(marker_path, partial)
     except Exception:                                         # noqa: BLE001
         # The marker cannot be written, so nothing on disk can describe what exists. Remove
         # what was created, checked, and say so if that fails too.
-        _discard(created, marker_path, live_root=live_root, cause=failure)
+        _discard(owned_paths(stamp, created=created, contested=contested), marker_path,
+                 live_root=live_root, cause=failure)
         return
     if not cleanup_on_failure:
         return
     rollback_production(partial, cause=failure)
+
+
+def owned_paths(record: Dict, *, created: Sequence[str] = (),
+                contested: Sequence[str] = ()) -> List[str]:
+    """Every path this run may have put on disk, from a record plus anything held in memory.
+
+    The union of what was PLANNED and what was observed created, minus anything contested. The
+    planned set is what makes this complete after a crash: a run interrupted between creating a
+    root and recording it leaves a marker whose `created_paths` is one short, and the planned
+    list covers exactly that gap. Contested paths are excluded because this run did not create
+    them -- refusing to start when a root already exists is what makes the rest of that
+    inference sound."""
+    out: List[str] = []
+    skip = {os.path.realpath(p) for p in
+            list(record.get("contested_paths") or []) + list(contested)}
+    for path in (list(record.get("planned_paths") or [])
+                 + list(record.get("created_paths") or []) + list(created)):
+        if os.path.realpath(path) in skip:
+            continue
+        if path not in out:
+            out.append(path)
+    return out
 
 
 def _remove_checked(paths: Sequence[str]) -> List[str]:
@@ -517,10 +598,8 @@ def rollback_production(provisioned: Dict, *, cause: Optional[BaseException] = N
     # The union of what the marker records and what the caller holds: a crash between creating
     # a root and re-writing the marker leaves the marker one behind, and the caller's list is
     # the more complete of the two.
-    recorded_paths = list(recorded.get("created_paths") or [])
-    for path in (provisioned.get("created_paths") or []):
-        if path not in recorded_paths:
-            recorded_paths.append(path)
+    recorded_paths = owned_paths(recorded, created=provisioned.get("created_paths") or (),
+                                 contested=provisioned.get("contested_paths") or ())
     for path in recorded_paths:
         if not _inside(path, live_root):
             raise ProductionProvisionRefused(
@@ -546,3 +625,10 @@ def _write_marker(path: str, payload: Dict) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+    # The rename itself has to reach the disk, or a crash can lose a marker whose contents were
+    # fsynced. The whole recovery protocol rests on the marker being there afterwards.
+    fd = os.open(os.path.dirname(os.path.abspath(path)) or ".", os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)

@@ -314,6 +314,64 @@ best-effort: any created path it cannot remove keeps the ownership marker and ra
 The compaction lock is held across the creation; the ingest lock is **validated but not taken**,
 because §7.1b scopes it to the publish critical section and this operation has none.
 
+#### Interruption: recoverable, not atomic
+
+Provisioning is **not atomic** and does not claim to be. What it guarantees is that whatever
+write did not happen, the surviving record names every path that may exist. The marker declares
+`planned_paths` **before anything is created** — the set is two fixed names under one root, so it
+is knowable in advance — and `created_paths` grows as they really appear. The difference between
+those lists is exactly the interruption window, and recovery takes the union. `contested_paths`
+records a root that appeared under the lock, which this run did not create and must not remove.
+
+`_write_marker()` fsyncs the file *and* the directory after the rename, because the protocol
+rests on the marker being there afterwards.
+
+**Operator recovery:** read `<live_root>/.p5_prod_provision_<run_id>.json`. If `complete` is
+true there is nothing to undo. Otherwise pass that object to `rollback_production()`. If it
+raises `ProductionCleanupError`, its `unrestored` list names the paths it could not remove and
+the marker is deliberately kept — remove those by hand, then re-run to clear the marker. Never
+delete the marker while a path it owns still exists.
+
+#### Empty roots move nothing
+
+The two directories are a precondition, not evidence. `manifest`, `blocks` and `wal_anchor` all
+keep refusing until a valid generation 1 and an initialized WAL exist, and tests pin that.
+Provisioning roots is not progress toward `compaction_ready`.
+
+### A second blocker, found while attempting generation 1: the API cannot serve `legacy_base`
+
+A valid generation 1 is a `legacy_base` segment over the existing monolith. It cannot be
+deployed today, and the reason is in the serving code rather than in the manifest:
+
+* `api/app.py` constructs the store as `SegmentedCubeStore(mf_dir)` — with **no
+  `allowed_legacy_paths`**.
+* `SegmentedCubeStore` refuses an absolute segment path outright, and refuses a `legacy_base`
+  path that resolves outside the block root unless the deployment names it explicitly.
+* The production monolith is a sibling of `p5_blocks`, so it resolves outside. The construction
+  raises, the startup handler leaves `cube = None`, and the service degrades to **daily-only**
+  under a `/healthz` that still answers.
+
+So a `legacy_base` generation 1 needs an API change that passes the deployment's allow-list —
+its own review, its own deployment commit. `p5_readiness.ALLOWED_LEGACY_PATHS` is still `()`,
+which fails closed, so the deployment would also have to name the monolith explicitly.
+
+`tests/test_phase2_p5_legacy_base_contract.py` settles the semantics in an isolated fixture so
+that change has a specification: the segment path must be **relative**, the allow-list is matched
+by `realpath`, layout and fingerprints are derived from disk through `block_manifest`, and with
+the allow-list supplied `SegmentedCubeStore.point_series()` matches a `TimeCubeStore` oracle on
+every day and every variable, boundaries included, with NaN preserved.
+
+Two guarantees found while establishing that, both worth recording:
+
+* a `legacy_base` segment that **under-declares** the store it points at is refused as a
+  `STALE MANIFEST` — a partially covering legacy base cannot be served at all;
+* the real hazard is a **`block`** segment over delta-only data: it is self-consistent, so
+  nothing refuses it, and it serves only the delta tail. That is precisely the manifest the
+  earlier version of the provisioner would have published.
+
+**No builder is shipped.** Building one now would produce a manifest the deployed API cannot
+load.
+
 **`708058e` is therefore not sufficient for production provisioning.** It carries only the
 isolated tool. Closing this blocker needs a **new reviewed deployment commit** carrying
 `ops/p5_prod_provision.py`, reviewed and approved on its own terms.
@@ -399,6 +457,15 @@ Being in the approved set and being fit to deploy are therefore different proper
 set now contains one commit of each kind. `CURRENT_DEPLOY_SHA` names which one a new deployment
 should use — `708058e` — separately from `REVIEWED_DEPLOY_SHAS`, because "was this reviewed" does
 not expire and "which should be deployed now" moves.
+
+### The local work is ahead of the approved set, and needs its own review
+
+`ops/p5_prod_provision.py` exists only in local commits. It has **never run against a real
+production root**, and no local result here claims VM24 readiness or compaction readiness —
+`compaction_ready` is `false` on every artifact this phase has produced. Deploying it requires a
+**new reviewed deployment commit** carrying the module, and the assessor commit that adjudicates
+it requires a **new assessor approval record**, because every commit since `5e6b076` has moved
+`HEAD` and invalidated the one that exists.
 
 ### `708058e` is deployable, and is not sufficient for production provisioning
 
