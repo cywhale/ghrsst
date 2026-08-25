@@ -4214,6 +4214,49 @@ class TestTheArchivedArtifactIsNotPresentedAsCurrentState(unittest.TestCase):
         with open(os.path.join(_DEV, "specs", "p5_deployment_readiness.md")) as fh:
             return fh.read()
 
+    # ------------------------------------------------- the OPENING, not just the table
+    #: How much of the page a reader sees before deciding what it says. The earlier fix
+    #: labelled the requirements table and left lines 3-4 stating the counts as the verdict, so
+    #: anyone reading the top of the document got a current-state claim and had to scroll a
+    #: hundred lines to learn it was a transcript. A marker further down does not undo a claim
+    #: made at the top.
+    OPENING_LINES = 15
+
+    def _opening(self):
+        return "\n".join(self._doc().split("\n")[:self.OPENING_LINES])
+
+    def test_the_opening_marks_the_verdict_as_historical(self):
+        self.assertIn("Historical artifact verdict — 2026-08-21, not current state",
+                      self._opening(),
+                      "the first %d lines do not mark the verdict as historical"
+                      % self.OPENING_LINES)
+
+    def test_the_opening_says_the_counts_belong_to_the_archived_artifact(self):
+        """The counts stay -- they are checked against the artifact by the drift guard -- but
+        they must not read as a current state."""
+        opening = self._opening()
+        self.assertIn("archived historical artifact", opening)
+        self.assertIn("and to nothing else", opening)
+
+    def test_the_opening_denies_a_current_readiness_verdict(self):
+        self.assertIn("no\ncurrent readiness verdict anywhere on this page", self._opening())
+
+    def test_the_opening_names_both_schema_counts(self):
+        """Eight in the artifact, nine in the checker, said where the reader starts."""
+        opening = self._opening()
+        self.assertIn("**eight** requirements", opening)
+        self.assertIn("**nine**", opening)
+        self.assertIn("no collection has run against the current checker", opening)
+
+    def test_the_machine_readable_authority_is_marked_archived(self):
+        """The paragraph naming the JSON must not call it the current readiness report: it is
+        the authority for ONE RUN, and pointing at it without saying so is how a stale artifact
+        gets quoted as a live verdict."""
+        doc = self._doc()
+        self.assertIn("historical artifact, not a current readiness report**", doc)
+        self.assertIn("The machine-readable authority **for that run**", doc)
+        self.assertIn("eight-requirement schema", doc)
+
     # ------------------------------------------------- the artifacts are left alone
     def test_the_archived_artifacts_still_carry_the_eight_requirement_schema(self):
         for rel in self.ARCHIVED:
