@@ -45,12 +45,17 @@ for p in (_DEV, HERE):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import p5_fixtures as fx  # noqa: E402
+import numpy as np  # noqa: E402
 from ops import p5_prod_provision as pp  # noqa: E402
+from ops import p5_legacy_base as lb  # noqa: E402
 from ops import p5s8_evidence as ev  # noqa: E402
 from ops import p5_provision as pv  # noqa: E402
 from ops import p5_readiness as rd  # noqa: E402
+from store import block_manifest as bm  # noqa: E402
 from store import compaction_lock as cl  # noqa: E402
 from store import repair_wal as rw  # noqa: E402
+from store.segmented_cube import SegmentedCubeStore  # noqa: E402
 
 #: The real production root. It must never be created, opened or written by this suite; a test
 #: asserts it does not appear as a default anywhere and that the suite leaves it alone.
@@ -107,6 +112,11 @@ class _ProdBase(unittest.TestCase):
         rw.declare_anchor_domain(self.anchor, domain_id="p5-prod-tests-domain",
                                  at_utc="2026-08-25T12:00:00Z", operator="tests",
                                  note="unit-test domain; NOT a real rollback domain")
+        # The legacy base generation 1 is published over: a pre-existing monolith beside the
+        # roots, exactly as production has it.
+        self.monolith = os.path.join(self.live, "mur_timecube_s8_t90_sh128.zarr")
+        self.mono_days = fx.days_from("2026-01-01", 6)
+        fx.build_block(self.monolith, self.mono_days, ny=8, nx=8)
         self.locks = pp.canonical_lock_paths(self.live)
         self.clock = self.locks["compaction"]
         self.ilock = self.locks["ingest"]
@@ -123,6 +133,7 @@ class _ProdBase(unittest.TestCase):
 
     def kwargs(self, **over):
         kw = dict(live_root=self.live, anchor_root=self.anchor, approval=self.approval(),
+                  monolith_path=self.monolith,
                   compaction_lock_path=self.clock, ingest_lock_path=self.ilock,
                   run_id=self.RUN_ID, operator="tests", at_utc="2026-08-25T12:00:00Z",
                   min_free_gib=self.TEST_FLOOR)
@@ -176,69 +187,105 @@ class TestTheIsolatedToolStaysIsolated(unittest.TestCase):
         self.assertNotEqual(pp.__file__, pv.__file__)
 
 
-class TestItPublishesNothing(_ProdBase):
-    """Generation 1 is not this operation's to invent, and the WAL cannot precede it.
+class TestItPublishesGenerationOneAndBindsTheWal(_ProdBase):
+    """Roots, generation 1 over the monolith, and a WAL bound to it — in that order.
 
-    A delta-only generation 1 would be an invalid authority: `api/app.py` treats a configured
-    manifest as THE base and deliberately does not fall back to the monolith, so a manifest
-    holding only delta-derived days would drop the monolith's history from the served view under
-    a healthy `/healthz`. A valid generation 1 is a `legacy_base` segment over the existing
-    monolith, which is a separate reviewed step.
+    An earlier version published a block built from the delta, which would have dropped the
+    monolith's history from the served view; and a version after that published nothing, which
+    left a manifest root nothing could bind a WAL to. The valid shape is a `legacy_base`
+    generation 1, and `initialize_wal()` can only follow it because it binds through
+    `load_live()`.
 
-    And `initialize_wal()` binds to a published authority via `load_live()`, so it cannot run
-    before that manifest exists. Both are therefore out of scope here, and these tests hold the
-    module to that rather than trusting the docstring."""
+    What this still does NOT do is point the service at the result. `GHRSST_BLOCK_MANIFEST_DIR`
+    is a separate production change."""
 
-    def test_it_creates_only_the_two_roots(self):
+    def test_it_creates_the_two_roots(self):
         out = self.provision()
         self.assertEqual(sorted(out["created_paths"]), sorted(self.roots()))
         for path in self.roots():
             with self.subTest(path):
                 self.assertTrue(os.path.isdir(path))
-                self.assertEqual(os.listdir(path), [], "a root was populated")
 
-    def test_it_publishes_no_manifest(self):
+    def test_it_publishes_a_legacy_base_generation_one(self):
         out = self.provision()
-        self.assertIs(out["manifest_published"], False)
-        self.assertIsNone(out["generation"])
-        self.assertFalse(os.path.exists(os.path.join(out["manifest_root"], "manifest.json")))
+        self.assertIs(out["manifest_published"], True)
+        self.assertEqual(out["generation"], 1)
+        live = bm.load_live(out["manifest_root"])
+        self.assertEqual(live["generation"], 1)
+        self.assertEqual(len(live["segments"]), 1)
+        self.assertEqual(live["segments"][0]["kind"], "legacy_base")
+        self.assertEqual(live["segments"][0]["boundary_kind"], "legacy")
 
-    def test_it_initializes_no_wal(self):
+    def test_the_generation_covers_the_whole_monolith(self):
         out = self.provision()
-        self.assertIs(out["wal_initialized"], False)
-        self.assertEqual(os.listdir(out["wal_root"]), [])
+        insp = bm.inspect_store_contract(self.monolith)
+        seg = bm.load_live(out["manifest_root"])["segments"][0]
+        self.assertEqual(seg["start_day"], insp.days[0])
+        self.assertEqual(seg["end_day"], insp.days[-1])
+        self.assertEqual(seg["day_count"], len(insp.days))
 
-    def test_it_does_not_call_the_builder_or_the_manifest_writer(self):
-        """By AST, not by text: the docstring names these to explain why they are absent, and a
-        substring search cannot tell that sentence from a call making it."""
+    def test_it_initializes_the_wal_against_the_published_manifest(self):
+        out = self.provision()
+        self.assertIs(out["wal_initialized"], True)
+        with dev_map(self.devs):
+            state = rw.read_wal(out["wal_root"], anchor_root=out["anchor_root"])
+            state.assert_fresh()
+        self.assertIsNotNone(state.authority)
+        self.assertEqual(os.path.realpath(state.authority["manifest_root"]),
+                         os.path.realpath(out["manifest_root"]))
+
+    def test_it_does_not_switch_the_service_configuration(self):
+        """Pointing the service at these roots is a different production change."""
+        before = os.environ.get("GHRSST_BLOCK_MANIFEST_DIR")
+        out = self.provision()
+        self.assertEqual(os.environ.get("GHRSST_BLOCK_MANIFEST_DIR"), before)
+        # By AST: the note deliberately NAMES the setting to say it is not switched, and a
+        # substring scan cannot tell that sentence from an assignment doing it.
         import ast
-        import inspect
-        tree = ast.parse(inspect.getsource(pp))
-        called = set()
+        import inspect as _i
+        tree = ast.parse(_i.getsource(pp))
+        writes = [n for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and n.func.attr in ("putenv", "setdefault")]
+        self.assertEqual(writes, [])
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                fn = node.func
-                if isinstance(fn, ast.Name):
-                    called.add(fn.id)
-                elif isinstance(fn, ast.Attribute):
-                    called.add(fn.attr)
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                for alias in node.names:
-                    called.add(alias.name.rsplit(".", 1)[-1])
-        for banned in ("build_block", "publish", "initialize_wal", "prune_delta",
-                       "execute_swap_plan", "corrective_refold"):
-            with self.subTest(banned):
-                self.assertNotIn(banned, called)
+            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute):
+                self.assertNotEqual(node.value.attr, "environ",
+                                    "the operation writes to the environment")
+        self.assertIn("GHRSST_ALLOWED_LEGACY_PATHS", out["note"])
 
-    def test_the_wal_really_cannot_be_initialized_without_a_manifest(self):
-        """The finding, as an executable check rather than a claim in a docstring. If this ever
-        stops raising, the scope decision here should be revisited."""
-        from store import block_manifest as bm
+    def test_the_published_manifest_needs_the_runtime_allow_list_to_be_served(self):
+        """The manifest names the monolith; it does not authorize it."""
         out = self.provision()
-        with self.assertRaises(bm.ManifestError):
-            rw.initialize_wal(out["wal_root"], manifest_root=out["manifest_root"],
-                              at_utc="t", operator="t",
-                              unsafe_allow_colocated_anchor=True)
+        with self.assertRaises(Exception):
+            SegmentedCubeStore(out["manifest_root"])
+        store = SegmentedCubeStore(out["manifest_root"],
+                                   allowed_legacy_paths=[self.monolith])
+        self.assertEqual(set(store.days), set(self.mono_days))
+
+    def test_a_missing_monolith_refuses_before_anything_is_created(self):
+        before = sorted(os.listdir(self.live))
+        with self.assertRaises(pp.ProductionProvisionRefused) as caught:
+            self.provision(monolith_path=os.path.join(self.live, "not_there.zarr"))
+        self.assertIn("not an existing directory", str(caught.exception))
+        self.assertEqual(sorted(os.listdir(self.live)), before)
+
+    def test_a_monolith_inside_the_block_root_cannot_arise(self):
+        """Where that refusal actually lives, rather than a second guard that cannot fire.
+
+        For the monolith to be inside the block root, the block root must exist — it has to be
+        an existing directory — and an existing block root is already refused. So the operation
+        carries no separate containment check for it, and this pins the reason."""
+        inside = os.path.join(self.live, pp.MANIFEST_DIRNAME, "nested_store.zarr")
+        os.makedirs(inside)
+        self.addCleanup(shutil.rmtree, os.path.join(self.live, pp.MANIFEST_DIRNAME),
+                        ignore_errors=True)
+        with self.assertRaises(pp.ProductionProvisionRefused) as caught:
+            self.provision(monolith_path=inside)
+        self.assertIn("already exists", str(caught.exception))
+        import inspect as _i
+        self.assertNotIn("inside the block root being created", _i.getsource(pp),
+                         "an unreachable containment guard was added back")
 
 
 class TestProductionScopeIsRequired(_ProdBase):
@@ -456,23 +503,53 @@ class TestTheLockPathsAreCanonical(_ProdBase):
                 with self.assertRaises(pp.ProductionProvisionRefused):
                     self.provision(compaction_lock_path=value)
 
-    def test_the_ingest_lock_is_validated_but_not_taken(self):
-        """§7.1b scopes the ingest lock to the publish critical section, and this operation
-        publishes nothing. Validating it still matters: a request naming the wrong one is a
-        request about a different deployment."""
-        held = {"ingest": None}
+    def test_the_ingest_lock_is_taken_ONLY_across_the_publish(self):
+        """§7.1b: the compaction lock is outermost and held throughout; the ingest lock is
+        taken for the publish and released before the WAL is initialized. Checked by ORDER,
+        because "both were acquired at some point" says nothing about the scope."""
         real_acquire = cl.CompactionLock.acquire
-        seen = []
+        real_release = cl.CompactionLock.release
+        real_publish = pp.p5_legacy_base.build_generation_one
+        real_wal = pp.repair_wal.initialize_wal
+        order = []
 
-        def recording(self_):
-            seen.append(os.path.realpath(self_.path))
+        def which(self_):
+            p = os.path.realpath(self_.path)
+            return ("compaction" if p == os.path.realpath(self.clock)
+                    else "ingest" if p == os.path.realpath(self.ilock) else "other")
+
+        def rec_acquire(self_):
+            order.append(f"acquire:{which(self_)}")
             return real_acquire(self_)
 
-        with mock.patch.object(cl.CompactionLock, "acquire", recording):
+        def rec_release(self_):
+            if self_.held:
+                order.append(f"release:{which(self_)}")
+            return real_release(self_)
+
+        def rec_publish(*a, **kw):
+            order.append("publish")
+            return real_publish(*a, **kw)
+
+        def rec_wal(*a, **kw):
+            order.append("wal_init")
+            return real_wal(*a, **kw)
+
+        with mock.patch.object(cl.CompactionLock, "acquire", rec_acquire), \
+                mock.patch.object(cl.CompactionLock, "release", rec_release), \
+                mock.patch.object(pp.p5_legacy_base, "build_generation_one",
+                                  side_effect=rec_publish), \
+                mock.patch.object(pp.repair_wal, "initialize_wal", side_effect=rec_wal):
             self.provision()
-        self.assertIn(os.path.realpath(self.clock), seen)
-        self.assertNotIn(os.path.realpath(self.ilock), seen)
-        del held
+
+        self.assertEqual(order[0], "acquire:compaction", f"order: {order}")
+        self.assertEqual(order[-1], "release:compaction", f"order: {order}")
+        i_acq, i_rel = order.index("acquire:ingest"), order.index("release:ingest")
+        pub, wal = order.index("publish"), order.index("wal_init")
+        self.assertLess(i_acq, pub, f"the ingest lock was taken after the publish: {order}")
+        self.assertLess(pub, i_rel, f"the ingest lock was released before the publish: {order}")
+        self.assertLess(i_rel, wal,
+                        f"the WAL was initialized while the ingest lock was held: {order}")
 
     def test_a_compaction_already_running_refuses(self):
         with cl.CompactionLock(self.clock, holder="someone-else"):
@@ -672,7 +749,10 @@ class TestTheMarkerIsNeverBehindTheFilesystem(_ProdBase):
                                side_effect=OSError("injected: first marker failed")):
             with self.assertRaises(OSError):
                 self.provision()
-        self.assertEqual(sorted(os.listdir(self.live)), [])
+        for path in self.roots():
+            with self.subTest(path):
+                self.assertFalse(os.path.exists(path))
+        self.assertTrue(os.path.isdir(self.monolith), "pre-existing data was removed")
 
 
 class TestCleanupIsCheckedNotBestEffort(_ProdBase):
@@ -912,15 +992,33 @@ class TestTheDocumentsRecordTheCorrection(unittest.TestCase):
         self.assertIn("A tool that refuses the job is not the tool for the job", doc)
         self.assertIn("allow_same_filesystem=True", doc)
 
-    def test_the_document_records_the_narrowed_scope_and_its_reason(self):
-        """The scope decision rests on two findings; both belong on the page, because "roots
-        only" reads as unfinished work unless the reason is there."""
+    def test_the_document_records_what_the_operation_does_and_why(self):
+        """Both rejected shapes belong on the page: "publishes generation 1" reads as an
+        arbitrary choice unless the two that do not work are recorded beside it."""
         doc = self._doc()
-        self.assertIn("publishes no manifest", doc)
         self.assertIn("legacy_base", doc)
         self.assertIn("1 273", doc, "the document does not quantify what a delta-only "
                                     "generation 1 would drop from the served view")
         self.assertIn("initialize_wal", doc)
+        self.assertIn("does NOT switch `GHRSST_BLOCK_MANIFEST_DIR`",
+                      " ".join(doc.split()))
+
+    def test_the_document_records_the_immutability_finding(self):
+        flat = " ".join(self._doc().split())
+        self.assertIn("The monolith is not sealed by the fingerprints alone", flat)
+        self.assertIn("a value rewritten in place inside an existing day", flat)
+        self.assertIn("change detection, not a cryptographic seal", flat)
+
+    def test_the_document_records_the_block_grid_policy(self):
+        flat = " ".join(self._doc().split())
+        self.assertIn("BLOCK_DAYS_S", flat)
+        self.assertIn("provisional only; nothing has selected it", flat)
+        self.assertIn("the day after the audited `end_day`", flat)
+
+    def test_the_document_says_running_it_against_production_needs_approval(self):
+        flat = " ".join(self._doc().split())
+        self.assertIn("only ever run in a local synthetic fixture", flat)
+        self.assertIn("separate production operation requiring explicit approval", flat)
 
     def test_the_document_separates_the_two_allow_lists(self):
         """Runtime authorization and assessor configuration answer different questions, and a
@@ -1111,7 +1209,11 @@ class TestTheCrashWindowIsRecoverableNotAtomic(_ProdBase):
         record = self._crashed_marker(created=[])
         pp.rollback_production(record)
         self.assertFalse(os.path.exists(os.path.join(self.live, pp.marker_name(self.RUN_ID))))
-        self.assertEqual(sorted(os.listdir(self.live)), [])
+        for path in self.roots():
+            with self.subTest(path):
+                self.assertFalse(os.path.exists(path))
+        # The monolith is pre-existing production data and is never this run's to remove.
+        self.assertTrue(os.path.isdir(self.monolith))
 
     def test_crash_after_the_first_root_before_it_was_recorded(self):
         """The window the planned list exists for."""
@@ -1183,3 +1285,186 @@ class TestTheCrashWindowIsRecoverableNotAtomic(_ProdBase):
         doc = inspect.getdoc(pp) or ""
         self.assertNotIn("atomic provisioning", doc.lower().replace("not atomic", ""))
         self.assertIn("crash", doc.lower())
+
+
+class TestFailureAtEveryNewStep(_ProdBase):
+    """Publish, WAL init and the completion write each fail, and each leaves a clean outcome.
+
+    Two acceptable outcomes and no third: everything this run created is removed and verified
+    absent, or it remains under an accurate marker with a typed `ProductionCleanupError`. What
+    must never happen is a root on disk that nothing names."""
+
+    def assert_clean_or_owned(self, error=None):
+        roots_present = [p for p in self.roots() if os.path.exists(p)]
+        marker_path = os.path.join(self.live, pp.marker_name(self.RUN_ID))
+        if not roots_present:
+            self.assertFalse(os.path.exists(marker_path),
+                             "everything was removed but the marker was kept")
+            return
+        self.assertTrue(os.path.isfile(marker_path),
+                        f"{roots_present} remain and no marker names them")
+        named = pp.owned_paths(self.marker())
+        for path in roots_present:
+            self.assertIn(path, named, "a surviving root is not named by the marker")
+        self.assertIsInstance(error, pp.ProductionCleanupError)
+        self.assertEqual(sorted(error.unrestored), sorted(roots_present))
+
+    def test_a_failure_publishing_the_manifest_leaves_nothing(self):
+        with mock.patch.object(pp.p5_legacy_base, "build_generation_one",
+                               side_effect=RuntimeError("injected: publish failed")):
+            with self.assertRaises(RuntimeError):
+                self.provision()
+        self.assert_clean_or_owned()
+        self.assertTrue(os.path.isdir(self.monolith), "the monolith was removed")
+
+    def test_a_failure_initializing_the_wal_leaves_nothing(self):
+        with mock.patch.object(pp.repair_wal, "initialize_wal",
+                               side_effect=RuntimeError("injected: wal init failed")):
+            with self.assertRaises(RuntimeError):
+                self.provision()
+        self.assert_clean_or_owned()
+
+    def test_a_failure_at_the_completion_marker_leaves_nothing(self):
+        real_write = pp._write_marker
+
+        def fail_on_complete(path, payload):
+            if payload.get("complete") is True:
+                raise OSError("injected: completion marker failed")
+            return real_write(path, payload)
+
+        with mock.patch.object(pp, "_write_marker", side_effect=fail_on_complete):
+            with self.assertRaises(OSError):
+                self.provision()
+        self.assert_clean_or_owned()
+
+    def test_a_publish_failure_whose_cleanup_also_fails_is_typed_and_accurate(self):
+        boom = RuntimeError("injected: publish failed")
+        with mock.patch.object(pp.p5_legacy_base, "build_generation_one", side_effect=boom), \
+                mock.patch.object(pp.shutil, "rmtree",
+                                  side_effect=OSError("injected: cannot remove")):
+            with self.assertRaises(pp.ProductionCleanupError) as caught:
+                self.provision()
+        self.assert_clean_or_owned(caught.exception)
+        self.assertIs(caught.exception.__cause__, boom)
+
+    def test_a_wal_failure_whose_cleanup_also_fails_is_typed_and_accurate(self):
+        boom = RuntimeError("injected: wal init failed")
+        with mock.patch.object(pp.repair_wal, "initialize_wal", side_effect=boom), \
+                mock.patch.object(pp.shutil, "rmtree",
+                                  side_effect=OSError("injected: cannot remove")):
+            with self.assertRaises(pp.ProductionCleanupError) as caught:
+                self.provision()
+        self.assert_clean_or_owned(caught.exception)
+        self.assertIs(caught.exception.__cause__, boom)
+
+    def test_a_published_manifest_is_removed_with_its_root(self):
+        """A failure after the publish must not leave a manifest behind: the block root is
+        removed whole, and the manifest lives inside it."""
+        with mock.patch.object(pp.repair_wal, "initialize_wal",
+                               side_effect=RuntimeError("injected")):
+            with self.assertRaises(RuntimeError):
+                self.provision()
+        self.assertFalse(os.path.exists(
+            os.path.join(self.live, pp.MANIFEST_DIRNAME, "manifest.json")))
+
+    def test_a_second_run_after_a_clean_failure_can_start_again(self):
+        """The point of removing everything: the next attempt is not blocked by leftovers."""
+        with mock.patch.object(pp.repair_wal, "initialize_wal",
+                               side_effect=RuntimeError("injected")):
+            with self.assertRaises(RuntimeError):
+                self.provision()
+        out = self.provision()
+        self.assertIs(out["complete"], True)
+        self.assertIs(out["wal_initialized"], True)
+
+
+class TestTheFenceBeforePublishing(_ProdBase):
+    """`assert_still_held()` immediately before the publish, checked by order.
+
+    This was lost when the publishing class was rewritten, and a mutation deleting the fence
+    then survived. Order, not count: the roots and the WAL init also assert the lock, so "an
+    assert happened at some point" is satisfied by them and says nothing about the publish —
+    after which the manifest is already the store's authority and the fence has nothing left
+    to protect."""
+
+    def test_a_fence_check_immediately_precedes_the_publish(self):
+        real_assert = cl.CompactionLock.assert_still_held
+        real_publish = pp.p5_legacy_base.build_generation_one
+        order = []
+
+        def rec_assert(self_):
+            order.append("assert")
+            return real_assert(self_)
+
+        def rec_publish(*a, **kw):
+            order.append("publish")
+            return real_publish(*a, **kw)
+
+        with mock.patch.object(cl.CompactionLock, "assert_still_held", rec_assert), \
+                mock.patch.object(pp.p5_legacy_base, "build_generation_one",
+                                  side_effect=rec_publish):
+            self.provision()
+        self.assertIn("publish", order)
+        idx = order.index("publish")
+        self.assertGreater(idx, 0, f"publish came first (order: {order})")
+        self.assertEqual(order[idx - 1], "assert",
+                         f"the event before publishing was not a fence check: {order}")
+
+    def test_a_fence_check_also_precedes_the_wal_initialization(self):
+        """The publish is recorded too, deliberately.
+
+        Without it the sequence is just asserts and the WAL, so the PUBLISH's fence sits
+        immediately before `wal` in the recording and deleting the WAL's own fence changes
+        nothing visible. With the publish in the sequence, the event before `wal` must be an
+        assert that comes after it."""
+        real_assert = cl.CompactionLock.assert_still_held
+        real_wal = pp.repair_wal.initialize_wal
+        real_publish = pp.p5_legacy_base.build_generation_one
+        order = []
+
+        def rec_assert(self_):
+            order.append("assert")
+            return real_assert(self_)
+
+        def rec_publish(*a, **kw):
+            order.append("publish")
+            return real_publish(*a, **kw)
+
+        def rec_wal(*a, **kw):
+            order.append("wal")
+            return real_wal(*a, **kw)
+
+        with mock.patch.object(cl.CompactionLock, "assert_still_held", rec_assert), \
+                mock.patch.object(pp.p5_legacy_base, "build_generation_one",
+                                  side_effect=rec_publish), \
+                mock.patch.object(pp.repair_wal, "initialize_wal", side_effect=rec_wal):
+            self.provision()
+        idx = order.index("wal")
+        self.assertEqual(order[idx - 1], "assert", f"order: {order}")
+        self.assertGreater(idx - 1, order.index("publish"),
+                           f"the fence before the WAL is the publish's, not its own: {order}")
+
+
+class TestThePartialSealIsRefused(_ProdBase):
+    """A seal missing a field is not a seal, and must not be treated as one."""
+
+    def test_a_seal_missing_any_required_field_is_refused(self):
+        out = self.provision()
+        full = dict(bm.load_live(out["manifest_root"])["segments"][0]["content_seal"])
+        for field in ("algo", "ledger_digest", "file_count", "total_bytes"):
+            with self.subTest(field):
+                partial = {k: v for k, v in full.items() if k != field}
+                problem = bm.verify_content_seal(self.monolith, partial)
+                self.assertTrue(problem, f"a seal with no {field} was accepted")
+                self.assertIn(field, problem)
+
+    def test_a_seal_that_is_not_an_object_is_refused(self):
+        for value in (None, "x", [], 3):
+            with self.subTest(repr(value)):
+                self.assertTrue(bm.verify_content_seal(self.monolith, value))
+
+    def test_a_complete_seal_still_verifies(self):
+        """Positive control: the refusals above are not a blanket one."""
+        out = self.provision()
+        full = bm.load_live(out["manifest_root"])["segments"][0]["content_seal"]
+        self.assertIsNone(bm.verify_content_seal(self.monolith, full))

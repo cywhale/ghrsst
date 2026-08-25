@@ -101,6 +101,7 @@ import os
 import shutil
 from typing import Dict, List, Optional, Sequence
 
+from ops import p5_legacy_base
 from store import compaction_lock
 from store import repair_wal
 
@@ -346,16 +347,25 @@ def _refuse_existing_roots(manifest_root: str, wal_root: str) -> None:
 
 # ---------------------------------------------------------------- the operation
 def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
+                         monolith_path: str,
                          compaction_lock_path: str, ingest_lock_path: str,
                          run_id: str, operator: str, at_utc: str,
                          min_free_gib: float,
                          cleanup_on_failure: bool = True) -> Dict:
-    """Create the two P5 roots under `live_root`. Returns what was made.
+    """Create the P5 roots, publish generation 1 over the monolith, initialize the WAL.
 
-    Publishes no manifest and initializes no WAL — see the module docstring for why neither is
-    reachable here. The compaction lock is held across the creation so no compaction can be
-    running against roots appearing underneath it; the ingest lock is NOT taken, because §7.1b
-    scopes it to the publish critical section and this operation has none."""
+    `monolith_path` is REQUIRED, not optional. A provisioner that might or might not publish is
+    two operations wearing one name, and the one that stops after creating directories leaves a
+    manifest root nothing can bind a WAL to.
+
+    Ordering follows §7.1b: the compaction lock is taken FIRST and held across everything; the
+    ingest lock is taken ONLY across the publish, the moment the store's authority changes and
+    the only moment ingest must be excluded from. The WAL is initialized after the publish and
+    still under the compaction lock, because it binds to the authority that now exists.
+
+    It does NOT switch `GHRSST_BLOCK_MANIFEST_DIR`. Provisioning the roots and pointing the
+    service at them are different production changes, and the second is not this one's to
+    make."""
     approval = check_production_approval(approval, live_root=live_root, run_id=run_id)
     if not os.path.isdir(live_root):
         raise ProductionProvisionRefused(
@@ -375,6 +385,14 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
                 f"{path!r} did not resolve inside {live_root!r}; refusing rather than writing "
                 f"somewhere the containment check does not cover")
     _refuse_existing_roots(manifest_root, wal_root)
+    if not os.path.isdir(monolith_path):
+        raise ProductionProvisionRefused(
+            f"monolith_path {monolith_path!r} is not an existing directory; generation 1 is a "
+            f"legacy base over a store that must already be there")
+    # There is deliberately NO "is the monolith inside the block root" check. For it to be, the
+    # block root would have to exist -- the monolith must be an existing directory -- and
+    # `_refuse_existing_roots` above has already refused that. A branch that cannot fire is not
+    # a guard, and it would read like one.
     anchor = check_anchor_domain(anchor_root, live_root)
     capacity = measure_capacity(live_root, min_free_gib=min_free_gib)
 
@@ -390,7 +408,7 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
     stamp = {"label": PRODUCTION_LABEL, "marker": marker, "run_id": run_id,
              "live_root": os.path.realpath(live_root), "manifest_root": manifest_root,
              "wal_root": wal_root, "anchor_root": anchor["anchor_root"],
-             "locks": locks, "provisioned_utc": at_utc, "operator": operator,
+             "monolith_path": os.path.realpath(monolith_path), "locks": locks, "provisioned_utc": at_utc, "operator": operator,
              "approved_by": approval["approved_by"], "approved_utc": approval["approved_utc"],
              "capacity_at_start": capacity, "anchor_verified": anchor,
              # PLANNED before anything exists, because "what may be on disk" cannot be learned
@@ -408,10 +426,13 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
     _write_marker(marker_path, stamp)
     created: List[str] = []
     contested: List[str] = []
+    published: Dict = {}
     try:
         _create_roots(live_root=live_root, manifest_root=manifest_root, wal_root=wal_root,
                       capacity=capacity, locks=locks, run_id=run_id, created=created,
-                      contested=contested, marker_path=marker_path, stamp=stamp)
+                      contested=contested, marker_path=marker_path, stamp=stamp,
+                      monolith_path=monolith_path, anchor=anchor, at_utc=at_utc,
+                      operator=operator, published=published)
         # The completion write is INSIDE the recovery path. Outside it, a failure here left the
         # roots on disk under a marker still saying `created_paths: []` and `complete: false` --
         # a marker that authorized removing nothing while two directories existed.
@@ -428,28 +449,38 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
         "manifest_root": manifest_root, "wal_root": wal_root,
         "anchor_root": anchor["anchor_root"], "anchor_domain_id": anchor["domain_id"],
         "created_paths": list(created), "marker": marker, "marker_path": marker_path,
+        "monolith_path": os.path.realpath(monolith_path),
         "locks": {**locks, "order": ("compaction lock held across creation; ingest lock NOT "
                                      "taken -- §7.1b scopes it to the publish critical "
                                      "section and this operation publishes nothing")},
         "capacity_at_start": capacity, "anchor_verified": anchor,
         "approved_by": approval["approved_by"], "approved_utc": approval["approved_utc"],
         "provisioned_utc": at_utc, "operator": operator,
-        "manifest_published": False, "wal_initialized": False,
-        "generation": None,
+        "manifest_published": True, "wal_initialized": True,
+        "generation": published.get("generation"),
+        "generation_id": published.get("generation_id"),
+        "legacy_base": dict(published),
         "complete": True, "failed_step": None,
-        "note": ("Empty P5 roots only. No manifest is published and no WAL is initialized: a "
-                 "generation 1 must be a legacy_base segment over the existing monolith, and "
-                 "initialize_wal() binds to a published authority, so both are later reviewed "
-                 "steps. Nothing reads these roots until then, and "
-                 "GHRSST_BLOCK_MANIFEST_DIR must stay unset."),
+        "note": ("P5 roots, generation 1 over the existing monolith, and a WAL bound to it. "
+                 "GHRSST_BLOCK_MANIFEST_DIR is NOT switched: pointing the service at these "
+                 "roots is a separate production change. The deployment must also name the "
+                 "monolith in GHRSST_ALLOWED_LEGACY_PATHS before this manifest can be served "
+                 "-- the manifest does not authorize its own external path."),
     }
 
 
 def _create_roots(*, live_root, manifest_root, wal_root, capacity, locks, run_id, created,
-                  contested, marker_path, stamp) -> None:
-    """Create the roots under the compaction lock, recording each as it appears."""
+                  contested, marker_path, stamp, monolith_path, anchor, at_utc, operator,
+                  published) -> None:
+    """Roots, generation 1 and the WAL, under §7.1b ordering.
+
+        flock(p5_compaction.lock, LOCK_EX)  ->  create roots
+           ->  acquire ingest lock  ->  assert compaction lock still held
+           ->  publish generation 1  ->  release ingest lock
+           ->  initialize the WAL  ->  release compaction lock
+    """
     holder = f"p5_prod_provision/{run_id}"
-    with compaction_lock.CompactionLock(locks["compaction"], holder=holder):
+    with compaction_lock.CompactionLock(locks["compaction"], holder=holder) as clock:
         # Re-measured INSIDE the lock. A binding taken before the lock is a binding to a
         # different moment than the one being written in.
         now_dev = os.stat(live_root).st_dev
@@ -482,6 +513,24 @@ def _create_roots(*, live_root, manifest_root, wal_root, capacity, locks, run_id
             # one root while two exist -- which is why the recovery path uses the in-memory
             # list as well.
             _write_marker(marker_path, {**stamp, "created_paths": list(created)})
+
+        # The publish critical section -- the only part ingest must be excluded from.
+        with compaction_lock.CompactionLock(locks["ingest"],
+                                            holder=f"{holder}/publish") as ingest:
+            clock.assert_still_held()
+            published.update(p5_legacy_base.build_generation_one(
+                monolith_path=monolith_path, manifest_root=manifest_root,
+                at_utc=at_utc, operator=operator))
+        # The `with` block above is what releases the ingest lock, and it ends here -- before
+        # the WAL is initialized. An explicit `release()` as the block's last statement was
+        # redundant: removing it changed nothing, which is why a mutation deleting it survived.
+
+        # After the publish, still under the compaction lock: `initialize_wal` binds to the
+        # authority that now exists and reads it through `load_live()`.
+        clock.assert_still_held()
+        repair_wal.initialize_wal(wal_root, manifest_root=manifest_root, at_utc=at_utc,
+                                  operator=operator, anchor_root=anchor["anchor_root"])
+        clock.assert_still_held()
 
 
 def _recover(failure: BaseException, *, marker_path, stamp, created, contested, live_root,

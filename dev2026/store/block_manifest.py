@@ -40,7 +40,13 @@ _SEG_REQUIRED = ("segment_id", "kind", "path", "immutable", "boundary_kind",
                  "start_day", "end_day", "materialized_through", "day_count", "gaps",
                  "unknown", "day_list", "layout", "variables", "fingerprint",
                  "precedence", "sealed", "supersedes")
-_SEG_OPTIONAL = ("build_provenance", "var_valid_mode")
+#: `content_seal` is optional because only a `legacy_base` segment needs one. A block is built
+#: by us into an immutable path and nothing writes it afterwards; the legacy monolith is a
+#: pre-existing store this project does not own, and the manifest's fingerprints cover its
+#: metadata and day set but NOT its chunk bytes -- so a value rewritten in place inside an
+#: existing day is invisible to them. The seal closes that, and carrying it is what lets
+#: `SegmentedCubeStore` refuse a monolith that changed after the manifest described it.
+_SEG_OPTIONAL = ("build_provenance", "var_valid_mode", "content_seal")
 _SUP_REQUIRED = ("segment_id", "path", "superseded_at_generation", "release_after_utc",
                  "hold_until_utc", "status", "current_path", "bytes", "fingerprint")
 _SUP_STATUS = ("referenced", "releasable", "held")
@@ -801,3 +807,60 @@ def load_live(root: str) -> dict:
         raise ManifestError(f"no live manifest at {path}")
     with open(path) as fh:
         return json.load(fh)
+
+
+#: Fields a `content_seal` must carry. A partial seal is not a seal.
+_SEAL_REQUIRED = ("algo", "ledger_digest", "file_count", "total_bytes")
+
+
+def content_ledger(store_path: str) -> dict:
+    """A change-detection ledger over every file in a store: path, size, mtime.
+
+    **This is not a cryptographic seal and must not be described as one.** It hashes file
+    METADATA, not contents, so it detects a store that was written to — which is the failure
+    that matters here — and not a forgery that restores size and mtime. Hashing ~2 TB of chunk
+    bytes at every service start is not available, which is exactly why the segment fingerprints
+    cover metadata and the day set in the first place.
+
+    What it does catch is the gap those leave: a value rewritten in place inside an existing
+    day, which changes neither the day set nor the array metadata and was served silently."""
+    import hashlib
+    h = hashlib.sha256()
+    count = 0
+    total = 0
+    root = os.path.realpath(store_path)
+
+    def boom(err):
+        raise ManifestError(f"content ledger: traversal error at {err.filename}: {err}")
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=boom):
+        dirnames.sort()
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            st = os.stat(full)
+            rel = os.path.relpath(full, root)
+            h.update(f"{rel}\0{st.st_size}\0{st.st_mtime_ns}\0".encode())
+            count += 1
+            total += st.st_size
+    return {"algo": "sha256-path-size-mtime", "ledger_digest": h.hexdigest(),
+            "file_count": count, "total_bytes": total}
+
+
+def verify_content_seal(store_path: str, seal: dict) -> Optional[str]:
+    """The first thing wrong with `seal` against the store on disk, or `None`."""
+    if type(seal) is not dict:
+        return f"content_seal must be an object, got {type(seal).__name__}"
+    for field in _SEAL_REQUIRED:
+        if field not in seal:
+            return f"content_seal records no {field}"
+    now = content_ledger(store_path)
+    if seal["algo"] != now["algo"]:
+        return (f"content_seal algo {seal['algo']!r} is not {now['algo']!r}; a seal this "
+                f"version cannot recompute is not one it can check")
+    if seal["ledger_digest"] != now["ledger_digest"]:
+        return (f"content_seal mismatch: the store has changed since the manifest described "
+                f"it (files {seal['file_count']}->{now['file_count']}, bytes "
+                f"{seal['total_bytes']}->{now['total_bytes']}). The manifest's fingerprints "
+                f"cover metadata and the day set, so a value rewritten inside an existing day "
+                f"would otherwise be served as though nothing happened")
+    return None

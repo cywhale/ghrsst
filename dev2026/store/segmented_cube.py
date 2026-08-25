@@ -186,6 +186,20 @@ class SegmentedCubeStore:
                     f"store {fp[:12]}\u2026 vs manifest "
                     f"{str(seg['fingerprint']['metadata'])[:12]}\u2026")
 
+            # A segment carrying a content seal is checked against it. Only `legacy_base`
+            # segments carry one: a block is built into an immutable path and nothing writes
+            # it afterwards, while the legacy monolith is a pre-existing store this project
+            # does not own. The fingerprints above cover its METADATA and its day set, so a
+            # value rewritten in place inside an existing day changes neither and was served
+            # as though nothing had happened. Absent seal = nothing to check, so this cannot
+            # break a manifest written before the field existed.
+            seal = seg.get("content_seal")
+            if seal is not None:
+                problem = bm.verify_content_seal(spath, seal)
+                if problem:
+                    raise SnapshotError(
+                        f"segment {seg['segment_id']!r} {problem}")
+
             if sorted(seg["variables"]) != sorted(insp.vars):
                 raise SnapshotError(
                     f"segment {seg['segment_id']!r} declares variables "

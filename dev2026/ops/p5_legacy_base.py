@@ -46,6 +46,23 @@ class LegacyBaseRefused(Exception):
 #: it names something stable rather than whatever the monolith directory happened to be called.
 SEGMENT_ID = "legacy_base"
 
+#: S -- the block size in calendar days for the grid this generation fixes.
+#:
+#: **Policy, not derived.** There is no canonical S anywhere in the code to derive it from:
+#: the design carries `S = 90 / C = 30` as prose and the generated blockers table says in as
+#: many words that it is "provisional only; nothing has selected it". So it is declared here,
+#: once, named as policy, and read by everything that needs it -- rather than appearing as a
+#: literal `90` in a manifest builder where it would look like a measurement.
+#:
+#: Changing it changes the calendar grid every future block is cut on. A test binds the
+#: generated manifest to this constant so the two cannot drift.
+BLOCK_DAYS_S = 90
+
+#: And it is still provisional. Nothing in P5 has selected 90 over any other value; S6 was to
+#: validate it and has not. Recorded so a reader of a generated manifest does not mistake the
+#: number for a settled one.
+BLOCK_DAYS_S_IS_PROVISIONAL = True
+
 
 def legacy_base_segment(monolith_path: str, manifest_root: str) -> Dict:
     """The `legacy_base` segment describing `monolith_path`, derived from disk.
@@ -79,7 +96,12 @@ def legacy_base_segment(monolith_path: str, manifest_root: str) -> Dict:
         "end_day": insp.days[-1],
         "materialized_through": insp.days[-1],
         "day_count": len(insp.days),
-        "gaps": [], "unknown": [], "day_list": None,
+        # DERIVED, per design §12 M0: "gaps as calendar[start..end] - present". Writing `[]`
+        # would claim a contiguous span the store may not have, and nothing downstream would
+        # catch it -- the day digest is over the days that ARE there, so it matches either way.
+        "gaps": sorted(set(block_manifest.calendar_span(insp.days[0], insp.days[-1]))
+                       - set(insp.days)),
+        "unknown": [], "day_list": None,
         "layout": block_manifest.segment_layout_from_inspection(insp),
         "variables": sorted(insp.vars),
         "fingerprint": {
@@ -90,6 +112,10 @@ def legacy_base_segment(monolith_path: str, manifest_root: str) -> Dict:
         "precedence": 0,
         "sealed": True,
         "supersedes": None,
+        # The barrier the fingerprints above do not provide. See
+        # `block_manifest.content_ledger`: change detection over file metadata, not a
+        # cryptographic seal, and the thing that makes an in-place value rewrite refuse.
+        "content_seal": block_manifest.content_ledger(monolith_path),
     }
     if insp.var_valid_implicit:
         segment["var_valid_mode"] = "implicit_all_true"
@@ -127,7 +153,11 @@ def build_generation_one(*, monolith_path: str, manifest_root: str, at_utc: str,
         # From the inspection, not from a caller: the grid is a property of the store.
         "grid": {"ny": insp.ny, "nx": insp.nx, "region": [0, insp.ny, 0, insp.nx]},
         "variables": sorted(insp.vars),
-        "block_grid": {"anchor_day": insp.days[0], "block_days": 90},
+        # §12 M0: the anchor is the day AFTER the audited end_day -- the calendar grid starts
+        # where the legacy base stops, so the first future block abuts it instead of
+        # overlapping it. `block_days` is policy (BLOCK_DAYS_S), not an observation.
+        "block_grid": {"anchor_day": block_manifest.add_days(insp.days[-1], 1),
+                       "block_days": BLOCK_DAYS_S},
         "segments": [segment], "superseded": [], "manifest_checksum": "",
     }
     manifest["manifest_checksum"] = block_manifest.compute_checksum(manifest)
@@ -142,6 +172,11 @@ def build_generation_one(*, monolith_path: str, manifest_root: str, at_utc: str,
         "first_day": insp.days[0], "last_day": insp.days[-1],
         "variables": sorted(insp.vars),
         "var_valid_mode": segment.get("var_valid_mode", "explicit"),
+        "gaps": list(segment["gaps"]),
+        "block_grid": dict(manifest["block_grid"]),
+        "block_days_is_policy": True,
+        "block_days_is_provisional": BLOCK_DAYS_S_IS_PROVISIONAL,
+        "content_seal": dict(segment["content_seal"]),
         "fingerprint": dict(segment["fingerprint"]),
         "requires_runtime_allow_list": os.path.realpath(monolith_path),
         "note": ("Generation 1 over the existing monolith. The deployment must name "

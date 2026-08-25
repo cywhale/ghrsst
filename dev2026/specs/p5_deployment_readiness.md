@@ -289,30 +289,81 @@ refused unless it equals that value; and a compaction already running. Capacity 
 re-measured **under the lock**, because a binding taken before the lock is a binding to a
 different moment.
 
-#### It provisions roots only, and here is why
+#### What it does: roots, generation 1, and the WAL bound to it
 
-**It publishes no manifest and initializes no WAL.** Two findings force that scope:
+An earlier version published a block built from the **delta**. That would have been an invalid
+authority: `api/app.py` treats a configured manifest as *the* base — `if mf_dir:
+SegmentedCubeStore(mf_dir)` — and deliberately does not fall back to the monolith beside it.
+Production delta holds ~58 days; the monolith holds 1 331. A generation 1 whose only segment
+came from delta would have dropped roughly **1 273 days** of history from the served view the
+moment it was configured, under a `/healthz` that still answered.
 
-1. **A delta-only generation 1 would be an invalid authority.** `api/app.py` treats a configured
-   manifest as *the* base — `if mf_dir: SegmentedCubeStore(mf_dir)` — and deliberately does not
-   fall back to the monolith beside it. Production delta holds ~58 days; the monolith holds
-   1 331. A generation 1 whose only segment came from delta would therefore drop roughly
-   **1 273 days** of history from the served view the moment it was configured, under a
-   `/healthz` still reporting `ok`. A valid generation 1 is a **`legacy_base`** segment over the
-   existing monolith — the schema has that kind, and `ALLOWED_LEGACY_PATHS` exists to let such a
-   segment point outside the block root. Building one is a separate reviewed step.
-2. **`initialize_wal()` cannot precede that manifest.** It binds the log to a manifest authority
-   through `block_manifest.load_live()`, which raises when nothing is published. So "roots plus
-   WAL, without a manifest" is not reachable, and WAL initialization must follow generation 1.
+The version after that published nothing, which left a manifest root nothing could bind a WAL
+to: `initialize_wal()` binds through `block_manifest.load_live()` and raises when nothing is
+published. So "roots plus WAL, no manifest" was never reachable either.
 
-What it creates is therefore two empty directories, `p5_blocks` and `p5_repairs`, which nothing
-reads until a manifest exists — `GHRSST_BLOCK_MANIFEST_DIR` must stay unset until then. It
-performs no compaction, prune, swap, repair or deletion, and its cleanup is checked rather than
-best-effort: any created path it cannot remove keeps the ownership marker and raises
-`ProductionCleanupError` naming exactly what remains.
+The valid shape, and what the operation now does under §7.1b ordering:
 
-The compaction lock is held across the creation; the ingest lock is **validated but not taken**,
-because §7.1b scopes it to the publish critical section and this operation has none.
+```
+flock(p5_compaction.lock)  ->  create p5_blocks and p5_repairs
+   ->  acquire ingest lock  ->  assert compaction lock still held
+   ->  publish generation 1 (legacy_base over the monolith)  ->  release ingest lock
+   ->  initialize the WAL against that manifest and the external anchor
+   ->  release compaction lock
+```
+
+`monolith_path` is required, not optional: a provisioner that might or might not publish is two
+operations wearing one name.
+
+**It does NOT switch `GHRSST_BLOCK_MANIFEST_DIR`.** Provisioning the roots and pointing the
+service at them are different production changes with different blast radii. The deployment must
+also name the monolith in `GHRSST_ALLOWED_LEGACY_PATHS` before the published manifest can be
+served at all — the manifest does not authorize its own external path.
+
+**This has only ever run in a local synthetic fixture.** Running it against `$G` publishes a
+manifest and writes a WAL into production, and is a separate production operation requiring
+explicit approval that has not been requested.
+
+#### The monolith is not sealed by the fingerprints alone
+
+The design calls the monolith "immutable, NEVER rebuilt" (§4) — an intention about how the
+deployment is operated, not something any code enforces. So the question is what the read path
+notices, and it was measured rather than assumed:
+
+| change to the monolith after generation 1 | detected? | by what |
+|---|---|---|
+| a day appended or removed | yes | metadata fingerprint / day digest |
+| array layout, grid or axes changed | yes | layout and metadata fingerprint |
+| **a value rewritten in place inside an existing day** | **no** | nothing — it was served silently |
+
+The third row is the gap: neither fingerprint covers chunk bytes, so the manifest went on
+describing a store that no longer held what it said. `content_seal` closes it — a ledger digest
+over every file's path, size and mtime, recorded at build time and verified by
+`SegmentedCubeStore` at construction.
+
+**It is change detection, not a cryptographic seal**, and the code says so where it is defined.
+Hashing ~2 TB of chunk bytes at every service start is not available — which is exactly why the
+segment fingerprints are metadata-only. It catches a store that was written to; it would not
+catch a forgery that restored size and mtime. A true seal is an operational control (a read-only
+mount) and remains a deployment prerequisite.
+
+#### The block grid is policy, and S is still provisional
+
+`block_grid.block_days` is **S**, and there is no canonical S in the code to derive it from: the
+design carries `S = 90 / C = 30` as prose, and the generated blockers table says it is
+"provisional only; nothing has selected it". So it is one named constant,
+`p5_legacy_base.BLOCK_DAYS_S`, declared as policy and read by the builder, with a test binding
+the generated manifest to it. `BLOCK_DAYS_S_IS_PROVISIONAL` records that nothing has selected
+90 over any other value.
+
+Two values that ARE derived, per design §12 M0, and were wrong when hardcoded:
+
+* `block_grid.anchor_day` is **the day after the audited `end_day`** — the calendar grid starts
+  where the legacy base stops, so the first future block abuts it instead of overlapping it. It
+  had been the monolith's *first* day.
+* `gaps` is `calendar[start..end] − present`. It had been `[]`, which would have claimed a
+  contiguity the store may not have — and nothing downstream would catch it, because the day
+  digest is computed over the days that ARE there and matches either way.
 
 #### Interruption: recoverable, not atomic
 

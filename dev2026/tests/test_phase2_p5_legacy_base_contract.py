@@ -44,6 +44,7 @@ from store.segmented_cube import SegmentedCubeStore, SnapshotError  # noqa: E402
 from store.time_cube import TimeCubeStore  # noqa: E402
 from api import app as app_mod  # noqa: E402
 from ops import p5_legacy_base as lb  # noqa: E402
+from store import repair_wal as rw  # noqa: E402
 
 NY = NX = 16
 LON, LAT = 100.0, 1.0
@@ -889,3 +890,381 @@ class TestTheGenerationOneBuilder(unittest.TestCase):
         with self.assertRaises(bm.ManifestError) as caught:
             bm.publish(block_root, m)
         self.assertIn("legacy_base", str(caught.exception))
+
+
+class TestTheMonolithIsNotSealedByTheFingerprintsAlone(_LegacyBase):
+    """What the manifest's fingerprints do and do not cover, established rather than assumed.
+
+    The design calls the monolith "immutable, NEVER rebuilt" (§4) — an intention about how the
+    deployment is operated, not something any code enforces. Nothing in this project writes to
+    it, but nothing stops a write either, so the question is what the read path notices.
+
+    Measured: the metadata fingerprint catches a changed day set or array layout, and the day
+    digest catches a changed day list. **Neither covers chunk bytes.** A value rewritten in
+    place inside an existing day changed neither, and was served as though nothing happened —
+    the manifest still describing a store that no longer holds what it says.
+
+    `content_seal` closes that. It is change detection over file metadata (path, size, mtime),
+    not a cryptographic seal: hashing ~2 TB at every service start is not available, which is
+    why the fingerprints are metadata-only in the first place. It catches a store that was
+    written to, which is the failure that matters."""
+
+    def setUp(self):
+        super().setUp()
+        # `_LegacyBase.setUp` already published a generation into `self.mroot`, and archives are
+        # immutable -- so a class that builds its OWN generation needs a root nobody has used.
+        self.mroot = os.path.join(self.tmp, "built_blocks")
+        os.makedirs(self.mroot)
+        self.segment = legacy_base_segment(self.monolith, self.mroot)
+
+    def seal_of(self, root=None):
+        live = bm.load_live(root or self.mroot)
+        return live["segments"][0].get("content_seal")
+
+    def test_a_generation_one_carries_a_content_seal(self):
+        out = lb.build_generation_one(monolith_path=self.monolith, manifest_root=self.mroot,
+                                      at_utc="t", operator="tests")
+        seal = self.seal_of()
+        self.assertIsNotNone(seal, "the generation carries no content seal")
+        self.assertEqual(seal["algo"], "sha256-path-size-mtime")
+        self.assertGreater(seal["file_count"], 0)
+        self.assertEqual(out["content_seal"]["ledger_digest"], seal["ledger_digest"])
+
+    def test_it_is_named_as_change_detection_not_as_a_seal(self):
+        """The claim has to match what it does, or someone will rely on the stronger one."""
+        import inspect as _i
+        doc = _i.getdoc(bm.content_ledger) or ""
+        self.assertIn("not a cryptographic seal", doc)
+        self.assertIn("METADATA, not contents", doc)
+
+    def test_a_value_rewritten_in_place_is_REFUSED_not_served(self):
+        """The gap, closed. Before the seal this served the mutated value silently."""
+        import zarr
+        lb.build_generation_one(monolith_path=self.monolith, manifest_root=self.mroot,
+                                at_utc="t", operator="tests")
+        day_index = 3
+        before = self.allowed().point_series(
+            LON, LAT, [self.days[day_index]], ["sst"])[0]["sst"]
+        g = zarr.open_group(self.monolith, mode="a")
+        arr = np.asarray(g["sst"][day_index])
+        g["sst"][day_index] = arr + 100.0
+        with self.assertRaises(SnapshotError) as caught:
+            self.allowed()
+        self.assertIn("content_seal mismatch", str(caught.exception))
+        self.assertIn("changed since the manifest described it", str(caught.exception))
+        del before
+
+    def test_without_the_seal_that_same_mutation_is_invisible(self):
+        """The counter-example, so the seal is shown to be what refuses rather than something
+        else happening to. Same store, same mutation, seal removed from the segment."""
+        import zarr
+        lb.build_generation_one(monolith_path=self.monolith, manifest_root=self.mroot,
+                                at_utc="t", operator="tests")
+        seg = dict(bm.load_live(self.mroot)["segments"][0])
+        seg.pop("content_seal")
+        root = self.variant_root(seg, days=self.days)
+        g = zarr.open_group(self.monolith, mode="a")
+        g["sst"][3] = np.asarray(g["sst"][3]) + 100.0
+        served = self.allowed(root).point_series(LON, LAT, [self.days[3]], ["sst"])[0]["sst"]
+        self.assertIsNotNone(served,
+                             "without the seal the mutated value is served; that is the gap")
+
+    def test_a_day_appended_after_the_build_is_refused(self):
+        """Already covered by the metadata fingerprint, recorded so the seal is not credited
+        with a refusal that predates it."""
+        import zarr
+        lb.build_generation_one(monolith_path=self.monolith, manifest_root=self.mroot,
+                                at_utc="t", operator="tests")
+        g = zarr.open_group(self.monolith, mode="a")
+        for v in fx.VARS:
+            arr = np.asarray(g[v][:])
+            g[v].resize((arr.shape[0] + 1, arr.shape[1], arr.shape[2]))
+        g.attrs["days"] = list(self.days) + ["2026-01-21"]
+        with self.assertRaises(SnapshotError):
+            self.allowed()
+
+    def test_a_manifest_written_before_the_field_existed_still_loads(self):
+        """Additive: absent seal means nothing to check, not a refusal."""
+        seg = dict(self.segment)
+        seg.pop("content_seal", None)
+        root = self.variant_root(seg, days=self.days)
+        self.assertEqual(set(self.allowed(root).days), set(self.days))
+
+
+class TestTheBlockGridIsPolicyNotAnObservation(_LegacyBase):
+    """`block_days` is S, and S is not measured from the monolith.
+
+    There is no canonical S in the code to derive it from: the design carries `S = 90 / C = 30`
+    as prose, and the generated blockers table says it is "provisional only; nothing has
+    selected it". So it is one named constant, read by the builder, and bound by this test —
+    rather than a literal `90` sitting in a manifest builder where it reads like a measurement."""
+
+    def setUp(self):
+        super().setUp()
+        self.mroot = os.path.join(self.tmp, "built_blocks")
+        os.makedirs(self.mroot)
+
+    def build(self):
+        return lb.build_generation_one(monolith_path=self.monolith, manifest_root=self.mroot,
+                                       at_utc="t", operator="tests")
+
+    def test_the_generated_manifest_uses_the_declared_policy(self):
+        self.build()
+        live = bm.load_live(self.mroot)
+        self.assertEqual(live["block_grid"]["block_days"], lb.BLOCK_DAYS_S)
+
+    def test_changing_the_policy_changes_the_manifest(self):
+        """The binding, demonstrated: a literal would not move."""
+        self.addCleanup(setattr, lb, "BLOCK_DAYS_S", lb.BLOCK_DAYS_S)
+        lb.BLOCK_DAYS_S = 45
+        self.build()
+        self.assertEqual(bm.load_live(self.mroot)["block_grid"]["block_days"], 45)
+
+    def test_it_is_recorded_as_policy_and_as_provisional(self):
+        out = self.build()
+        self.assertIs(out["block_days_is_policy"], True)
+        self.assertIs(out["block_days_is_provisional"], True)
+        self.assertIs(lb.BLOCK_DAYS_S_IS_PROVISIONAL, True)
+
+    def test_the_anchor_is_the_day_after_the_audited_end_day(self):
+        """Design §12 M0: the calendar grid starts where the legacy base stops, so the first
+        future block abuts it instead of overlapping it."""
+        self.build()
+        live = bm.load_live(self.mroot)
+        self.assertEqual(live["block_grid"]["anchor_day"], bm.add_days(self.days[-1], 1))
+        self.assertNotEqual(live["block_grid"]["anchor_day"], self.days[0])
+
+    def test_gaps_are_derived_from_the_calendar_span(self):
+        """Design §12 M0: `gaps = calendar[start..end] - present`. Writing `[]` would claim a
+        contiguity the store may not have, and the day digest -- computed over the days that
+        ARE there -- matches either way, so nothing downstream would catch it."""
+        out = self.build()
+        insp = bm.inspect_store_contract(self.monolith)
+        expected = sorted(set(bm.calendar_span(insp.days[0], insp.days[-1])) - set(insp.days))
+        self.assertEqual(out["gaps"], expected)
+
+    def test_a_monolith_with_a_hole_reports_it(self):
+        """Built here rather than found: a store whose day set skips a calendar day."""
+        holed = os.path.join(self.G, "holed.zarr")
+        days = fx.days_from("2026-03-01", 6)
+        keep = days[:2] + days[3:]                       # days[2] is missing
+        fx.build_block(holed, keep, ny=NY, nx=NX)
+        root = os.path.join(self.tmp, "holed_blocks")
+        os.makedirs(root)
+        out = lb.build_generation_one(monolith_path=holed, manifest_root=root,
+                                      at_utc="t", operator="tests")
+        self.assertEqual(out["gaps"], [days[2]])
+        self.assertIn(days[2], bm.load_live(root)["segments"][0]["gaps"])
+
+
+class TestEndToEndIsolatedProvisionAndServe(unittest.TestCase):
+    """The whole path in one place, with no component stubbed.
+
+    The real production operation creates the roots, publishes generation 1 through the real
+    builder and publisher, and initializes the real WAL; then the real API lifespan loads that
+    manifest through `SegmentedCubeStore` under the real runtime allow-list, and the values a
+    client receives are compared against a `TimeCubeStore` oracle over the monolith.
+
+    Entirely inside a temporary directory. Nothing here is VM24, `$G`, or a service."""
+
+    ENV = ("GHRSST_ZARR_PATH", "GHRSST_BLOCK_MANIFEST_DIR", "GHRSST_TIMECUBE_PATH",
+           "GHRSST_DELTACUBE_PATH", "GHRSST_ALLOWED_LEGACY_PATHS")
+    RUN_ID = "20260826T090000Z"
+    FLOOR = 0.001
+
+    def setUp(self):
+        from store.zarr_paths import group_path
+        import zarr
+        from ops import p5_prod_provision as pp
+        from ops import p5s8_evidence as ev
+        self.pp = pp
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="p5-e2e-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.live = os.path.join(self.tmp, "G")
+        self.anchor = os.path.join(self.tmp, "anchor_domain")
+        os.makedirs(self.live)
+        os.makedirs(self.anchor)
+        rw.declare_anchor_domain(self.anchor, domain_id="p5-e2e-domain", at_utc="t",
+                                 operator="tests", note="unit-test domain")
+        self.monolith = os.path.join(self.live, "mur_timecube_s8_t90_sh128.zarr")
+        self.days = fx.days_from("2026-01-01", 14)
+        fx.build_block(self.monolith, self.days, ny=NY, nx=NX)
+        self.addCleanup(setattr, ev, "MINIMUM_FREE_GIB", ev.MINIMUM_FREE_GIB)
+        ev.MINIMUM_FREE_GIB = self.FLOOR
+        # A daily store so StoreAccess can boot.
+        self.daily = os.path.join(self.tmp, "daily")
+        g = zarr.open_group(group_path(self.daily, self.days[-1]), mode="w", zarr_format=3)
+        g.create_array("lon", shape=(NX,), dtype="float32", chunks=(NX,))
+        g.create_array("lat", shape=(NY,), dtype="float32", chunks=(NY,))
+        g["lon"][:] = np.linspace(100.0, 100.0 + NX - 1, NX, dtype=np.float32)
+        g["lat"][:] = np.linspace(0.0, NY - 1.0, NY, dtype=np.float32)
+        for v in fx.VARS:
+            g.create_array(v, shape=(1, NY, NX), dtype="float32", chunks=(1, 8, 8))
+            g[v][0] = np.full((NY, NX), 42.0, dtype=np.float32)
+        self.provisioned = self._provision()
+
+    def _provision(self):
+        """The REAL production operation, with only the anchor's device substituted."""
+        from tests.test_phase2_p5_prod_provision import dev_map
+        locks = self.pp.canonical_lock_paths(self.live)
+        approval = {"scope": self.pp.PRODUCTION_SCOPE, "approved_by": "cywhale",
+                    "approved_utc": "t", "live_root": self.live, "run_id": self.RUN_ID}
+        with dev_map({self.anchor: 4242}):
+            return self.pp.provision_production(
+                live_root=self.live, anchor_root=self.anchor, approval=approval,
+                monolith_path=self.monolith,
+                compaction_lock_path=locks["compaction"], ingest_lock_path=locks["ingest"],
+                run_id=self.RUN_ID, operator="tests", at_utc="2026-08-26T09:00:00Z",
+                min_free_gib=self.FLOOR)
+
+    def boot(self, **env):
+        from fastapi.testclient import TestClient
+        from api.app import app
+        saved = {k: os.environ.get(k) for k in self.ENV}
+        for k in self.ENV:
+            os.environ.pop(k, None)
+        os.environ["GHRSST_ZARR_PATH"] = self.daily
+        for k, v in env.items():
+            os.environ[k] = v
+        cm = TestClient(app)
+        client = cm.__enter__()
+
+        def restore():
+            cm.__exit__(None, None, None)
+            for k, v in saved.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        self.addCleanup(restore)
+        return client, app.state.router.cube
+
+    def serving(self):
+        return self.boot(GHRSST_BLOCK_MANIFEST_DIR=self.provisioned["manifest_root"],
+                         GHRSST_TIMECUBE_PATH=self.monolith,
+                         GHRSST_ALLOWED_LEGACY_PATHS=self.monolith)
+
+    # ---------------------------------------------------------------- what was provisioned
+    def test_the_operation_published_a_generation_and_bound_a_wal(self):
+        self.assertIs(self.provisioned["manifest_published"], True)
+        self.assertIs(self.provisioned["wal_initialized"], True)
+        self.assertEqual(self.provisioned["generation"], 1)
+
+    # ---------------------------------------------------------------- parity with the oracle
+    def test_every_day_and_variable_matches_the_oracle_through_the_store(self):
+        store = SegmentedCubeStore(self.provisioned["manifest_root"],
+                                   allowed_legacy_paths=[self.monolith])
+        variables = sorted(bm.inspect_store_contract(self.monolith).vars)
+        want = TimeCubeStore(self.monolith).point_series(LON, LAT, self.days, variables)
+        got = store.point_series(LON, LAT, self.days, variables)
+        self.assertEqual(len(got), len(want))
+        for a, b in zip(want, got):
+            with self.subTest(a.get("date")):
+                self.assertEqual(a, b)
+
+    def test_the_api_serves_the_oracles_values_including_boundaries(self):
+        client, cube = self.serving()
+        self.assertIsInstance(cube, SegmentedCubeStore)
+        oracle = TimeCubeStore(self.monolith)
+        for day in (self.days[0], self.days[len(self.days) // 2], self.days[-1]):
+            with self.subTest(day):
+                r = client.get(f"/api/ghrsst?lon0={LON}&lat0={LAT}"
+                               f"&start={day}&end={day}&append=sst")
+                self.assertEqual(r.status_code, 200, r.text)
+                self.assertAlmostEqual(r.json()[0]["sst"],
+                                       oracle.point_series(LON, LAT, [day], ["sst"])[0]["sst"],
+                                       places=5)
+
+    def test_nan_semantics_survive_the_whole_path(self):
+        """A monolith holding a NaN day BEFORE it is provisioned over.
+
+        The NaN cannot be introduced after provisioning and re-provisioned over: the content
+        seal refuses the changed store, and replacing the WAL root under the same anchor is
+        refused again as a rollback. Both refusals are correct, so the fixture puts the NaN in
+        first -- which is also the real case, since a monolith is not edited in place."""
+        import zarr
+        from tests.test_phase2_p5_prod_provision import dev_map
+        idx = 5
+        day = self.days[idx]
+        live2 = os.path.join(self.tmp, "G2")
+        anchor2 = os.path.join(self.tmp, "anchor2")
+        os.makedirs(live2)
+        os.makedirs(anchor2)
+        rw.declare_anchor_domain(anchor2, domain_id="p5-e2e-domain-2", at_utc="t",
+                                 operator="tests")
+        mono2 = os.path.join(live2, "mur_timecube_s8_t90_sh128.zarr")
+        fx.build_block(mono2, self.days, ny=NY, nx=NX)
+        g = zarr.open_group(mono2, mode="a")
+        arr = np.asarray(g["sst"][idx])
+        arr[:] = np.nan
+        g["sst"][idx] = arr
+        locks = self.pp.canonical_lock_paths(live2)
+        run = "20260826T091500Z"
+        with dev_map({anchor2: 4343}):
+            out = self.pp.provision_production(
+                live_root=live2, anchor_root=anchor2,
+                approval={"scope": self.pp.PRODUCTION_SCOPE, "approved_by": "cywhale",
+                          "approved_utc": "t", "live_root": live2, "run_id": run},
+                monolith_path=mono2, compaction_lock_path=locks["compaction"],
+                ingest_lock_path=locks["ingest"], run_id=run, operator="tests",
+                at_utc="t", min_free_gib=self.FLOOR)
+        store = SegmentedCubeStore(out["manifest_root"], allowed_legacy_paths=[mono2])
+        want = TimeCubeStore(mono2).point_series(LON, LAT, [day], ["sst"])[0]
+        got = store.point_series(LON, LAT, [day], ["sst"])[0]
+        a, b = want.get("sst"), got.get("sst")
+        self.assertEqual(a is None, b is None)
+        if isinstance(a, float) and isinstance(b, float):
+            self.assertEqual(math.isnan(a), math.isnan(b))
+
+    def test_replacing_the_wal_root_under_the_same_anchor_is_refused(self):
+        """The anchor doing its job, found while writing the test above.
+
+        Removing the P5 roots and provisioning again against the SAME anchor is a rollback of
+        the WAL root, and the anchor's durable high-water mark is what notices: the new log's
+        head is 0 while the anchor names seq 1. Recovering from that is an operator decision,
+        not something a provisioner should paper over."""
+        shutil.rmtree(os.path.join(self.live, self.pp.MANIFEST_DIRNAME))
+        shutil.rmtree(os.path.join(self.live, self.pp.WAL_DIRNAME))
+        os.remove(os.path.join(self.live, self.pp.marker_name(self.RUN_ID)))
+        with self.assertRaises(rw.WalRolledBack) as caught:
+            self._provision()
+        self.assertIn("anchor", str(caught.exception).lower())
+
+    # ---------------------------------------------------------------- fail closed
+    def test_absent_allow_list_is_degraded_and_never_falls_back(self):
+        client, cube = self.boot(GHRSST_BLOCK_MANIFEST_DIR=self.provisioned["manifest_root"],
+                                 GHRSST_TIMECUBE_PATH=self.monolith)
+        h = client.get("/healthz").json()
+        self.assertIsNone(cube)
+        self.assertEqual(h["status"], "degraded")
+        self.assertIsNone(h["cube_base_kind"], "the monolith was served as a fallback")
+
+    def test_a_wrong_allow_list_path_is_degraded(self):
+        other = os.path.join(self.live, "some_other_store.zarr")
+        os.makedirs(other)
+        client, cube = self.boot(GHRSST_BLOCK_MANIFEST_DIR=self.provisioned["manifest_root"],
+                                 GHRSST_TIMECUBE_PATH=self.monolith,
+                                 GHRSST_ALLOWED_LEGACY_PATHS=other)
+        h = client.get("/healthz").json()
+        self.assertIsNone(cube)
+        self.assertEqual(h["status"], "degraded")
+        self.assertIn("not the deployed monolith", h["cube_error"])
+
+    def test_a_monolith_changed_after_provisioning_is_degraded_not_served(self):
+        """The seal, end to end: the values on disk no longer match what the manifest
+        described, and the service refuses rather than serving them."""
+        import zarr
+        g = zarr.open_group(self.monolith, mode="a")
+        g["sst"][2] = np.asarray(g["sst"][2]) + 50.0
+        client, cube = self.serving()
+        h = client.get("/healthz").json()
+        self.assertIsNone(cube)
+        self.assertEqual(h["status"], "degraded")
+        self.assertIn("content_seal mismatch", h["cube_error"])
+        self.assertIsNone(h["cube_base_kind"])
+
+    def test_a_missing_monolith_after_provisioning_is_degraded(self):
+        shutil.rmtree(self.monolith)
+        client, cube = self.boot(GHRSST_BLOCK_MANIFEST_DIR=self.provisioned["manifest_root"],
+                                 GHRSST_TIMECUBE_PATH=self.monolith,
+                                 GHRSST_ALLOWED_LEGACY_PATHS=self.monolith)
+        h = client.get("/healthz").json()
+        self.assertIsNone(cube)
+        self.assertEqual(h["status"], "degraded")
