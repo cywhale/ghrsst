@@ -1554,15 +1554,32 @@ class TestTheProvisioningBlockerIsGenerated(unittest.TestCase):
         self.assertIn("ops/p5_provision.py", row)
         self.assertIn("deployment_tools", row)
 
-    def test_the_row_says_the_approved_deployment_does_not_carry_it(self):
+    def test_the_row_splits_the_approved_set_by_who_carries_the_tool(self):
+        """Being approved and being equipped are different, and the row must not blur them now
+        that the approved set contains one commit of each kind."""
+        from ops import p5_readiness as rd
         row = ev._provisioning_blocker()
-        self.assertIn("BLOCKED", row)
-        self.assertIn("3223fba", row)
+        for sha in rd.REVIEWED_DEPLOY_SHAS:
+            with self.subTest(sha[:7]):
+                self.assertIn(sha[:7], row)
+        self.assertIn("carrying `ops/p5_provision.py`: `708058e`", row)
+        self.assertIn("not carrying it: `3223fba`", row)
+        self.assertIn("BLOCKS", row)
 
-    def test_the_row_names_the_proposed_revision_and_calls_it_unapproved(self):
+    def test_the_row_names_the_recommended_commit_without_authorizing_a_deployment(self):
         row = ev._provisioning_blocker()
-        self.assertIn("708058e", row)
-        self.assertIn("proposed is not approved", row)
+        self.assertIn("Recommended for a new deployment: `708058e`", row)
+        self.assertIn("not authorized by this document", row)
+
+    def test_the_row_follows_the_approved_set_rather_than_naming_commits(self):
+        """Take the equipped commit out of the approved set and the row goes back to refusing
+        outright. A literal would keep saying one is available."""
+        from ops import p5_readiness as rd
+        self.addCleanup(setattr, rd, "REVIEWED_DEPLOY_SHAS", rd.REVIEWED_DEPLOY_SHAS)
+        rd.REVIEWED_DEPLOY_SHAS = ("3223fba37da5d292ea6acb58ccef0da2b5138d31",)
+        row = ev._provisioning_blocker()
+        self.assertIn("**BLOCKED**", row)
+        self.assertIn("no approved commit", row)
 
     def test_the_row_follows_the_declaration_rather_than_repeating_it(self):
         """Change what is declared and the row changes. A literal would not."""

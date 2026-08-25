@@ -279,19 +279,24 @@ def _provisioning_blocker() -> str:
     way and this is where it is written down."""
     from ops import p5_readiness as rd
     tools = ", ".join(f"`{t}`" for t in rd.DEPLOYMENT_TOOLS) or "**nothing declared**"
-    approved = ", ".join(f"`{sha[:7]}`" for sha in rd.REVIEWED_DEPLOY_SHAS)
     carried = [sha for sha in rd.REVIEWED_DEPLOY_SHAS
                if rd.deployment_tools_problem(sha) is None]
-    proposed = ", ".join(f"`{sha[:7]}`" for sha in rd.PROPOSED_DEPLOY_SHAS) or "none"
-    if carried:
-        state = (f"the approved deployment carries {tools}; the `deployment_tools` requirement "
-                 f"still checks each reported digest against that commit")
-    else:
-        state = (f"**BLOCKED** — the approved deployment ({approved}) does not carry {tools}, "
-                 f"so it cannot provision the P5 roots every store requirement then inspects. "
-                 f"Enforced by the `deployment_tools` readiness requirement, not by a note. "
-                 f"Proposed revision carrying it: {proposed} — proposed is not approved")
-    return state
+    lacking = [sha for sha in rd.REVIEWED_DEPLOY_SHAS
+               if rd.deployment_tools_problem(sha) is not None]
+    def _short(shas):
+        return ", ".join(f"`{sha[:7]}`" for sha in shas) or "none"
+    if not carried:
+        return (f"**BLOCKED** — no approved commit ({_short(lacking)}) carries {tools}, so none "
+                f"can provision the P5 roots every store requirement then inspects. Enforced by "
+                f"the `deployment_tools` readiness requirement, not by a note. Proposed and "
+                f"therefore not approved: {_short(rd.PROPOSED_DEPLOY_SHAS)}")
+    # Some approved commit carries it. That is not "solved": the requirement still refuses a
+    # deployment made from one that does not, and says which.
+    current = f"`{rd.CURRENT_DEPLOY_SHA[:7]}`" if rd.CURRENT_DEPLOY_SHA else "none named"
+    return (f"approved commits carrying {tools}: {_short(carried)}; not carrying it: "
+            f"{_short(lacking)} — `deployment_tools` **BLOCKS** a deployment made from those. "
+            f"Recommended for a new deployment: {current}. Deploying is a production change and "
+            f"is not authorized by this document")
 
 
 def render_blockers(evidence: dict) -> str:

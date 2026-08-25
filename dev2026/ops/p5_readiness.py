@@ -66,21 +66,46 @@ QUALIFYING_LABEL = "VM24_PRODUCTION_READ_ONLY"
 #: collected JSON, so anything that could write that file could declare its own commit
 #: reviewed. An approved set is only worth anything if the thing being approved cannot edit it.
 REVIEWED_DEPLOY_SHAS = (
+    # RETAINED, not retired. Three reasons, recorded because removing it would have changed
+    # what this tuple MEANS without saying so:
+    #
+    #  1. Review is a historical fact. `3223fba` completed review; dropping it would assert
+    #     something false about the past.
+    #  2. This tuple is not only "may be deployed". `_check_failure_semantics` reads it twice
+    #     more -- for which commits an executed result may be READ FROM, and which deploy
+    #     commit a recorded run may be ABOUT. Removing `3223fba` would retroactively invalidate
+    #     every result ever recorded against it.
+    #  3. Retention is not a loophole. `3223fba` predates `ops/p5_provision.py`, so
+    #     `deployment_tools` BLOCKS it and it cannot reach `compaction_ready` however long it
+    #     stays here.
     "3223fba37da5d292ea6acb58ccef0da2b5138d31",
+    # The deployment candidate. Its 23 runtime modules are byte-identical to `3223fba` -- it
+    # adds `ops/p5_provision.py`, the assessor, tests, docs and evidence artifacts, and
+    # modifies nothing.
+    "708058e15b37a02e1d7aa5a66b9978c6e13bd446",
 )
+
+#: Which of the approved commits a NEW deployment should be made from.
+#:
+#: Separate from `REVIEWED_DEPLOY_SHAS` because the two answer different questions. "Was this
+#: reviewed" is historical and does not expire; "which should be deployed now" is a current
+#: recommendation and moves. Collapsing them into one tuple is what made retaining `3223fba`
+#: look like endorsing it.
+#:
+#: This is a recommendation recorded in reviewed code. It authorizes no deployment by itself:
+#: deploying is a production change and needs its own approval.
+CURRENT_DEPLOY_SHA = "708058e15b37a02e1d7aa5a66b9978c6e13bd446"
 
 #: Revisions PROPOSED for deployment review, and approved by nothing. Kept apart from
 #: `REVIEWED_DEPLOY_SHAS` on purpose: `_check_identity` reads only that tuple, so a revision
 #: named here can be measured, argued about and rejected without ever being deployable. Adding
 #: one of these to the approved set is a review decision and a separate commit.
 #:
-#: `708058e` carries `ops/p5_provision.py`, which the approved `3223fba` predates, and a runtime
-#: byte-identical to it: the 23 lifecycle/API modules do not differ by one byte between the two
-#: commits, so proposing it changes what the deployment CARRIES and not what it RUNS. Measured
-#: from that commit, not from this tree -- see `TestTheProposedDeploymentRevision`.
-PROPOSED_DEPLOY_SHAS = (
-    "708058e15b37a02e1d7aa5a66b9978c6e13bd446",
-)
+#: Empty: `708058e` was reviewed and moved into `REVIEWED_DEPLOY_SHAS` above. Nothing is
+#: currently proposed. The mechanism stays because the next candidate will need it, and a test
+#: keeps this set disjoint from the approved one -- an overlap would mean a proposal had been
+#: promoted without the commit that promotes it.
+PROPOSED_DEPLOY_SHAS = ()
 
 #: What the deployment must CARRY but no runtime stage imports.
 #:

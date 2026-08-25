@@ -3802,22 +3802,17 @@ class TestTheApprovalRecordIsDocumentedAsATranscription(unittest.TestCase):
         self.assertIn("signed_tag", approval)
 
 
-class TestTheProposedDeploymentRevision(_RecordWritingMixin, unittest.TestCase):
-    """What `PROPOSED_DEPLOY_SHAS` claims, measured from the proposed commit itself.
+class TestTheDeploymentCandidate(_RecordWritingMixin, unittest.TestCase):
+    """What `CURRENT_DEPLOY_SHA` recommends, measured from that commit itself.
 
-    A proposal is worth no more than the evidence attached to it, and "I built a revision that
-    includes the provisioner" is a claim about a commit -- so it is checked against that commit,
-    materialized from git blobs, exactly as the approved deployment is.
+    A recommendation is worth no more than the evidence attached to it, so "the candidate adds
+    the provisioner and changes nothing that runs" is checked against the commit, materialized
+    from git blobs, exactly as any deployment is.
 
-    The three things the proposal rests on:
-
-      * it carries `ops/p5_provision.py`, which the approved `3223fba` predates;
-      * its runtime is byte-identical to the approved deployment's, so nothing about what a
-        compaction RUNS is being changed under cover of adding a tool;
-      * its lifecycle and API closures still match the declared inventories both ways.
-
-    And the thing it must not do: become deployable. `_check_identity` reads
-    `REVIEWED_DEPLOY_SHAS`, this is not that, and a test says so."""
+    The candidate was `PROPOSED_DEPLOY_SHAS` and is now in `REVIEWED_DEPLOY_SHAS`: `identity`
+    can adjudicate it. That is a promotion in what may be DEPLOYED, and deliberately not a
+    promotion in what is ready -- every store requirement is still unadjudicated off-host and
+    `api_parity` still needs a person."""
 
     REVIEWED = "3223fba37da5d292ea6acb58ccef0da2b5138d31"
 
@@ -3826,49 +3821,66 @@ class TestTheProposedDeploymentRevision(_RecordWritingMixin, unittest.TestCase):
             self.addCleanup(setattr, rd, name, getattr(rd, name))
         root, _head, record = approved_assessor_repo()
         rd.ASSESSOR_REPO_ROOT, rd.APPROVAL_RECORD_PATH = root, record
-        self.assertEqual(len(rd.PROPOSED_DEPLOY_SHAS), 1,
-                         "this test describes exactly one proposed revision")
-        self.proposed = rd.PROPOSED_DEPLOY_SHAS[0]
+        self.candidate = rd.CURRENT_DEPLOY_SHA
 
-    def test_the_proposed_revision_exists_and_is_a_commit(self):
+    # ------------------------------------------------- the recommendation is a real commit
+    def test_the_candidate_exists_and_is_a_commit(self):
         import subprocess
-        self.assertTrue(rd._is_sha1(self.proposed))
-        rc = subprocess.run(["git", "cat-file", "-e", f"{self.proposed}^{{commit}}"],
+        self.assertTrue(rd._is_sha1(self.candidate))
+        rc = subprocess.run(["git", "cat-file", "-e", f"{self.candidate}^{{commit}}"],
                             cwd=rd.REPO_ROOT, capture_output=True).returncode
-        self.assertEqual(rc, 0, "PROPOSED_DEPLOY_SHAS names a commit that is not in this repo")
+        self.assertEqual(rc, 0, "CURRENT_DEPLOY_SHA names a commit that is not in this repo")
 
-    def test_the_proposed_revision_descends_from_the_approved_deployment(self):
-        """A proposal that forked away from the reviewed deployment would be a different
-        lineage, not a revision of it."""
-        self.assertTrue(rd.commit_descends_from(self.REVIEWED, self.proposed),
-                        "the proposed revision does not descend from the approved deployment")
+    def test_the_candidate_is_one_of_the_approved_commits(self):
+        """A recommendation to deploy something unreviewed would be the whole failure in one
+        line."""
+        self.assertIn(self.candidate, rd.REVIEWED_DEPLOY_SHAS)
 
-    def test_the_proposed_revision_carries_the_provisioner(self):
-        self.assertIsNone(rd.deployment_tools_problem(self.proposed))
+    def test_the_candidate_descends_from_the_earlier_approved_deployment(self):
+        self.assertTrue(rd.commit_descends_from(self.REVIEWED, self.candidate),
+                        "the candidate does not descend from the earlier approved deployment")
 
-    def test_the_approved_deployment_still_does_not(self):
-        """The blocker this proposal exists to close, still true where it was true."""
+    # ------------------------------------------------- what it changes, and what it does not
+    def test_the_candidate_carries_the_provisioner(self):
+        self.assertIsNone(rd.deployment_tools_problem(self.candidate))
+
+    def test_the_earlier_approved_deployment_still_does_not(self):
+        """Retained in the approved set and still refused by the tool gate. Retention is a
+        statement about review, not about capability."""
+        self.assertIn(self.REVIEWED, rd.REVIEWED_DEPLOY_SHAS)
         self.assertTrue(rd.deployment_tools_problem(self.REVIEWED))
 
-    def test_the_proposed_revisions_runtime_is_byte_identical_to_the_approved_one(self):
+    def test_the_candidates_runtime_is_byte_identical_to_the_earlier_one(self):
         """The load-bearing claim. Adding a tool must not smuggle a runtime change: if any of
-        the 23 modules differed, the proposal would need reviewing as a code change and not as
-        a packaging one."""
+        the 23 modules differed, this would need reviewing as a code change and not as a
+        packaging one."""
         for rel in rd.INVENTORY_MODULES:
             with self.subTest(rel):
-                approved = rd._git_blob(self.REVIEWED, rel)
-                proposed = rd._git_blob(self.proposed, rel)
-                self.assertIsNotNone(approved, "absent at the approved deployment")
-                self.assertIsNotNone(proposed, "absent at the proposed revision")
-                self.assertEqual(approved, proposed, f"{rel} differs from the approved runtime")
+                earlier = rd._git_blob(self.REVIEWED, rel)
+                candidate = rd._git_blob(self.candidate, rel)
+                self.assertIsNotNone(earlier, "absent at the earlier approved deployment")
+                self.assertIsNotNone(candidate, "absent at the candidate")
+                self.assertEqual(earlier, candidate, f"{rel} differs from the approved runtime")
 
-    def test_the_proposed_revisions_closure_matches_both_ways(self):
-        self.assertIsNone(rd.target_closure_problem(self.proposed))
-        self.assertEqual(rd.missing_inventory_modules(self.proposed), [])
+    def test_the_candidate_only_ADDS_paths(self):
+        """Nothing modified and nothing deleted between the two commits -- so "the runtime is
+        unchanged" is a property of the whole tree, not only of the 23 paths this assessor
+        happens to enumerate."""
+        import subprocess
+        out = subprocess.run(["git", "diff", "--name-status", self.REVIEWED, self.candidate],
+                             cwd=rd.REPO_ROOT, capture_output=True, text=True).stdout.strip()
+        statuses = {ln.split("\t")[0] for ln in out.split("\n") if ln}
+        self.assertEqual(statuses, {"A"}, f"the candidate does not only add paths: {out}")
+        added = sorted(ln.split("\t")[1] for ln in out.split("\n") if ln)
+        self.assertIn(f"{rd.DEV_PREFIX}/ops/p5_provision.py", added)
 
-    def test_the_proposed_revisions_lifecycle_actually_runs(self):
-        """Measured, not inherited from the approved commit's measurement."""
-        observed = rd.target_runtime_closure(self.proposed)
+    def test_the_candidates_closure_matches_both_ways(self):
+        self.assertIsNone(rd.target_closure_problem(self.candidate))
+        self.assertEqual(rd.missing_inventory_modules(self.candidate), [])
+
+    def test_the_candidates_lifecycle_actually_runs(self):
+        """Measured at the candidate, not inherited from the earlier commit's measurement."""
+        observed = rd.target_runtime_closure(self.candidate)
         self.assertEqual(observed["errors"], {})
         self.assertEqual(observed["executed"]["build"]["attested"], ["2026-06-27"])
         prune_swap = observed["executed"]["prune_swap"]
@@ -3878,19 +3890,45 @@ class TestTheProposedDeploymentRevision(_RecordWritingMixin, unittest.TestCase):
             with self.subTest(stage):
                 self.assertEqual(sorted(observed[stage]), sorted(declared))
 
-    def test_the_proposed_revision_is_not_deployable(self):
-        """Proposed is not approved, and nothing in this commit makes it so."""
-        self.assertNotIn(self.proposed, rd.REVIEWED_DEPLOY_SHAS)
-        import hashlib
-        modules = {rel: hashlib.sha256(rd._git_blob(self.proposed, rel)).hexdigest()
-                   for rel in rd.INVENTORY_MODULES}
-        target = {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
-                  "identity": {"reviewed_sha": self.proposed, "head_sha": self.proposed,
-                               "worktree_clean": True, "modules": modules}}
-        by_id = {r["id"]: r for r in rd.assess(target)["requirements"]}
-        self.assertEqual(by_id["identity"]["verdict"], rd.BLOCKED,
-                         "a proposed revision reached a deployable verdict")
+    # ------------------------------------------------- promoted to deployable, not to ready
+    def test_identity_can_now_adjudicate_the_candidate(self):
+        """The promotion, as a positive control: before it, `identity` refused the candidate
+        for not being in the approved set."""
+        verdict = self._identity_verdict(self.candidate)
+        self.assertEqual(verdict["verdict"], rd.READY, verdict["reason"])
 
+    def test_promotion_did_not_make_the_deployment_ready(self):
+        report = rd.assess(self._full_target(self.candidate))
+        self.assertFalse(report["compaction_ready"],
+                         "promoting a commit to deployable also made it ready")
+
+    def test_a_commit_outside_the_approved_set_is_still_refused(self):
+        """The set grew by one reviewed commit; it did not stop being a set."""
+        verdict = self._identity_verdict("d" * 40)
+        self.assertEqual(verdict["verdict"], rd.BLOCKED)
+
+    def test_nothing_is_currently_proposed(self):
+        self.assertEqual(rd.PROPOSED_DEPLOY_SHAS, ())
+        self.assertEqual(set(rd.PROPOSED_DEPLOY_SHAS) & set(rd.REVIEWED_DEPLOY_SHAS), set())
+
+    # ------------------------------------------------- fixture
+    def _full_target(self, sha):
+        import hashlib
+        def digests(paths):
+            out = {}
+            for rel in paths:
+                blob = rd._git_blob(sha, rel)
+                if blob is not None:
+                    out[rel] = hashlib.sha256(blob).hexdigest()
+            return out
+        return {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
+                "identity": {"reviewed_sha": sha, "head_sha": sha, "worktree_clean": True,
+                             "modules": digests(rd.INVENTORY_MODULES),
+                             "tools": digests(rd.DEPLOYMENT_TOOLS)}}
+
+    def _identity_verdict(self, sha):
+        by_id = {r["id"]: r for r in rd.assess(self._full_target(sha))["requirements"]}
+        return by_id["identity"]
 
 class TestDeploymentToolsIsAReadinessRequirement(_RecordWritingMixin, unittest.TestCase):
     """Provisioning is a prerequisite for P5 roots, so it is adjudicated, not annotated.
@@ -3914,7 +3952,9 @@ class TestDeploymentToolsIsAReadinessRequirement(_RecordWritingMixin, unittest.T
             self.addCleanup(setattr, rd, name, getattr(rd, name))
         root, _head, record = approved_assessor_repo()
         rd.ASSESSOR_REPO_ROOT, rd.APPROVAL_RECORD_PATH = root, record
-        self.proposed = rd.PROPOSED_DEPLOY_SHAS[0]
+        # The candidate is approved now, so it comes from the recommendation rather than from
+        # the proposed set -- which is empty.
+        self.proposed = rd.CURRENT_DEPLOY_SHA
 
     # ---------------------------------------------------------------- it is a requirement
     def test_it_is_declared_as_a_requirement(self):
@@ -3947,22 +3987,25 @@ class TestDeploymentToolsIsAReadinessRequirement(_RecordWritingMixin, unittest.T
         verdict, reason = rd._check_deployment_tools(self._target(self.proposed))
         self.assertEqual(verdict, rd.READY, reason)
 
-    def test_the_proposed_revision_passes_tools_and_still_fails_identity(self):
-        """Both at once, through the real `assess()`: the tool gate says yes, the approved set
-        says no, and the deployment is not ready. If passing tools ever moved identity, a
-        packaging revision would have promoted itself."""
+    def test_the_two_approved_commits_split_on_the_tool_gate(self):
+        """The requirement's whole point, read off the approved set itself: being reviewed does
+        not make a commit equipped. `3223fba` is approved and cannot provision; the candidate is
+        approved and can. If both passed, the gate would be measuring approval, not tools."""
+        verdicts = {sha[:7]: rd._check_deployment_tools(self._target(sha))[0]
+                    for sha in rd.REVIEWED_DEPLOY_SHAS}
+        self.assertEqual(verdicts["3223fba"], rd.BLOCKED)
+        self.assertEqual(verdicts[rd.CURRENT_DEPLOY_SHA[:7]], rd.READY)
+
+    def test_passing_the_tool_gate_does_not_by_itself_make_a_deployment_ready(self):
+        """Every store requirement is still unadjudicated off-host, and `api_parity` still needs
+        a person. A green tool gate moves none of them."""
         report = rd.assess(self._target(self.proposed))
         by_id = {r["id"]: r for r in report["requirements"]}
         self.assertEqual(by_id["deployment_tools"]["verdict"], rd.READY,
                          by_id["deployment_tools"]["reason"])
-        self.assertEqual(by_id["identity"]["verdict"], rd.BLOCKED)
         self.assertFalse(report["compaction_ready"])
-
-    def test_the_proposed_set_cannot_authorize_identity_or_readiness(self):
-        self.assertNotIn(self.proposed, rd.REVIEWED_DEPLOY_SHAS)
-        report = rd.assess(self._target(self.proposed))
-        self.assertFalse(report["compaction_ready"])
-        self.assertIn("identity", report["summary"][rd.BLOCKED])
+        self.assertTrue(report["summary"][rd.NOT_ADJUDICATED] or
+                        report["summary"][rd.BLOCKED])
 
     # ---------------------------------------------------------------- the digest is checked
     def test_a_falsely_reported_tool_digest_refuses(self):
@@ -4315,3 +4358,76 @@ class TestTheArchivedArtifactIsNotPresentedAsCurrentState(unittest.TestCase):
                          f"the transcript table has {len(rows)} rows, not eight")
         for row in rows:
             self.assertNotIn("deployment_tools", row)
+
+
+class TestTheApprovedSetSemanticsAreRecorded(unittest.TestCase):
+    """Two commits are approved and they are not equivalent. That has to be written down.
+
+    `REVIEWED_DEPLOY_SHAS` grew rather than being swapped, and a set that grows silently is how
+    "approved" drifts into "recommended". The distinction is now carried by two declarations --
+    the set, and `CURRENT_DEPLOY_SHA` -- and by a document that gives the reasoning for keeping
+    the older commit rather than leaving it to be inferred."""
+
+    OLD = "3223fba37da5d292ea6acb58ccef0da2b5138d31"
+
+    def _doc(self):
+        with open(os.path.join(_DEV, "specs", "p5_deployment_readiness.md")) as fh:
+            return fh.read()
+
+    def test_the_two_declarations_answer_different_questions(self):
+        self.assertIn(rd.CURRENT_DEPLOY_SHA, rd.REVIEWED_DEPLOY_SHAS)
+        self.assertGreater(len(rd.REVIEWED_DEPLOY_SHAS), 1,
+                           "with one approved commit the distinction cannot be tested")
+        self.assertNotEqual(rd.CURRENT_DEPLOY_SHA, self.OLD)
+
+    def test_the_older_commit_is_retained_in_the_approved_set(self):
+        """Retained, not retired: removing it would invalidate evidence recorded against it."""
+        self.assertIn(self.OLD, rd.REVIEWED_DEPLOY_SHAS)
+
+    def test_retention_does_not_make_the_older_commit_fit_to_deploy(self):
+        """The reason retention is safe, checked rather than argued."""
+        self.assertTrue(rd.deployment_tools_problem(self.OLD))
+        self.assertIsNone(rd.deployment_tools_problem(rd.CURRENT_DEPLOY_SHA))
+
+    def test_the_evidence_authority_still_covers_the_older_commit(self):
+        """Reason 2 for retention, as a check: the approved set is also what
+        `_check_failure_semantics` reads for which commits a result may be read from."""
+        with open(os.path.join(_DEV, "ops", "p5_readiness.py")) as fh:
+            source = fh.read()
+        checker = source[source.index("def _check_failure_semantics"):]
+        checker = checker[:checker.index("\ndef ")]
+        self.assertIn("REVIEWED_DEPLOY_SHAS", checker,
+                      "the approved set is no longer the evidence authority, so the recorded "
+                      "reasoning for retaining 3223fba is stale")
+
+    def test_the_document_records_why_the_older_commit_was_kept(self):
+        doc = self._doc()
+        self.assertIn("`3223fba` is retained, and this is the reasoning", doc)
+        self.assertIn("Review is a historical fact", doc)
+        self.assertIn("Retention is not a loophole", doc)
+
+    def test_the_document_says_the_recommendation_authorizes_no_deployment(self):
+        doc = self._doc()
+        self.assertIn("it authorizes no deployment", doc)
+        self.assertIn("Promoted to deployable is not promoted to ready", doc)
+
+    def test_the_document_records_the_byte_identical_runtime_claim(self):
+        """Derived from the declarations, not matched as a word.
+
+        `byte-identical` appears elsewhere on the page, so asserting the word passes even when
+        the row making the claim is gone -- which a mutation demonstrated. The row has to name
+        both commits and the module count the assessor actually compares, so softening it to
+        "the runtime | reviewed" stops matching."""
+        n = len(rd.INVENTORY_MODULES)
+        row = (f"| the {n} runtime modules, `{self.OLD[:7]}` vs "
+               f"`{rd.CURRENT_DEPLOY_SHA[:7]}` | **byte-identical**, all {n} |")
+        self.assertIn(row, self._doc(),
+                      "the document does not state the byte-identical claim for the commits "
+                      "and module count the assessor declares")
+        self.assertIn("**additions only** — no path modified, none deleted", self._doc())
+
+    def test_that_claim_is_actually_true_of_those_commits(self):
+        """And the claim is re-measured, so the document cannot be right about a lie."""
+        differing = [rel for rel in rd.INVENTORY_MODULES
+                     if rd._git_blob(self.OLD, rel) != rd._git_blob(rd.CURRENT_DEPLOY_SHA, rel)]
+        self.assertEqual(differing, [], "the runtime is not byte-identical after all")

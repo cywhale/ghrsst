@@ -303,12 +303,53 @@ The mechanism that would close the gap already exists and is unused: a record ma
 approved commit. It needs a real signing key on the assessor host. Until there is one, no signed
 tag is created — a fabricated signature would be worse than an acknowledged transcription.
 
-## A deployment revision has been proposed, and approved by nothing
+## The approved deploy set now holds two commits, and they are not equivalent
 
-`PROPOSED_DEPLOY_SHAS` names revisions put forward for deployment review. It is kept apart from
-`REVIEWED_DEPLOY_SHAS`, which `_check_identity` reads and which alone makes a commit deployable.
-A proposed revision can be measured, argued about and rejected without ever being deployable;
-moving one into the approved set is a review decision and its own commit.
+`708058e` completed review and moved from `PROPOSED_DEPLOY_SHAS` into `REVIEWED_DEPLOY_SHAS`, so
+`identity` can adjudicate it. Nothing is currently proposed; the mechanism stays for the next
+candidate, and a test keeps the two sets disjoint — an overlap would mean a proposal had been
+promoted without the commit that promotes it.
+
+What was verified from git blobs before the promotion, and is re-checked by tests:
+
+| claim | result |
+|---|---|
+| the 23 runtime modules, `3223fba` vs `708058e` | **byte-identical**, all 23 |
+| what the candidate changes | **additions only** — no path modified, none deleted |
+| what it adds | `ops/p5_provision.py`, the assessor, its tests, this document, evidence artifacts |
+| build / prune_swap / api closures at `708058e` | **10 / 16 / 12**, matching both ways, nothing shrunk |
+| lifecycle smoke at `708058e` | build attests `2026-06-27`; refold `refolded`; **`swap_performed: true`** |
+| descends from `3223fba` | yes |
+
+So the candidate changes what the deployment **carries** and not what it **runs**.
+
+### `3223fba` is retained, and this is the reasoning
+
+It stays in `REVIEWED_DEPLOY_SHAS`. Recorded here because removing it would have changed what
+that tuple means without saying so:
+
+1. **Review is a historical fact.** `3223fba` completed review. Dropping it would assert
+   something false about the past.
+2. **The tuple is not only "may be deployed".** `_check_failure_semantics` reads it twice more —
+   for which commits an executed result may be *read from*, and which deploy commit a recorded
+   run may be *about*. Removing `3223fba` would retroactively invalidate every result ever
+   recorded against it.
+3. **Retention is not a loophole.** `3223fba` predates `ops/p5_provision.py`, so
+   `deployment_tools` `BLOCKS` it. It cannot reach `compaction_ready` however long it stays.
+
+Being in the approved set and being fit to deploy are therefore different properties, and the
+set now contains one commit of each kind. `CURRENT_DEPLOY_SHA` names which one a new deployment
+should use — `708058e` — separately from `REVIEWED_DEPLOY_SHAS`, because "was this reviewed" does
+not expire and "which should be deployed now" moves.
+
+### Promoted to deployable is not promoted to ready
+
+`identity` can now reach `READY` for `708058e` given a matching module inventory. That is the
+only thing that changed. Every store requirement is still `NOT_ADJUDICATED` off-host, `api_parity`
+still needs a person, `capacity` is still short, and no collection has been run against the
+current nine-requirement checker. **`CURRENT_DEPLOY_SHA` is a recommendation recorded in reviewed
+code; it authorizes no deployment.** Deploying, provisioning `$G`, restarting or switching any
+service remain production changes needing their own approval.
 
 
 ## `p5_shadow` is verification-only, and that is a real limit
