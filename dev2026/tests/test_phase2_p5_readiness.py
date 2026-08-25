@@ -4046,6 +4046,85 @@ class TestDeploymentToolsIsAReadinessRequirement(_RecordWritingMixin, unittest.T
         _verdict, reason = rd._check_deployment_tools(self._target(self.proposed))
         self.assertIn("operator tool fingerprints recomputed", reason)
 
+    # ------------------------------------------------- which commit is it asked about
+    def test_it_asks_about_the_DEPLOYED_commit_not_the_reviewed_one(self):
+        """The two differ on VM24: the collected target reports reviewed_sha=3223fba beside
+        head_sha=a9db4b7. "Can this deployment run the provisioner" is a question about the
+        tree on that disk, so the answer must come from `head_sha`.
+
+        Isolated so only this choice can decide it: the reviewed commit CARRIES the tool and
+        the deployed one does not. Reading `reviewed_sha` would call this deployment equipped
+        while the tool is not on it."""
+        target = self._target(self.proposed)
+        target["identity"]["head_sha"] = self.REVIEWED      # deployed tree lacks the tool
+        verdict, reason = rd._check_deployment_tools(target)
+        self.assertEqual(verdict, rd.BLOCKED, reason)
+        self.assertIn(self.REVIEWED[:7], reason)
+        self.assertIn("does not carry", reason)
+
+    def test_the_deployed_commit_is_what_the_digests_are_compared_against(self):
+        """The mirror, and the reason the choice is not merely cosmetic: the collector takes
+        its digests FROM the deployed disk. Comparing them against a different commit's blobs
+        manufactures a mismatch the deployment never had."""
+        target = self._target(self.proposed)
+        target["identity"]["reviewed_sha"] = self.REVIEWED  # reviewed elsewhere, deployed here
+        verdict, reason = rd._check_deployment_tools(target)
+        self.assertEqual(verdict, rd.READY, reason)
+        self.assertIn(self.proposed[:7], reason)
+
+    def test_a_target_with_no_head_sha_is_not_adjudicated(self):
+        verdict, _r = rd._check_deployment_tools(
+            {"label": rd.QUALIFYING_LABEL, "identity": {"reviewed_sha": self.proposed}})
+        self.assertEqual(verdict, rd.NOT_ADJUDICATED)
+
+    # ------------------------------------------------- malformed evidence is not absent evidence
+    def test_a_tools_field_that_exists_but_is_unusable_is_BLOCKED(self):
+        """Only a field NOBODY WROTE is an evidence gap. A field that exists and cannot be used
+        is a collector that ran and produced rubbish -- reporting that as "not adjudicated"
+        would let a broken pipeline read the same as an old one, and stay broken quietly.
+
+        Each shape separately, because each is refused by its own branch: collapsing them into
+        one assertion would let three of the four be deleted unnoticed."""
+        cases = {
+            "null": (None, "null"),
+            "a list": ([], "list"),
+            "a string": ("ops/p5_provision.py", "str"),
+            "an integer": (1, "int"),
+            "an empty object": ({}, "empty tools object"),
+        }
+        for name, (value, expected_text) in cases.items():
+            with self.subTest(name):
+                target = self._target(self.proposed)
+                target["identity"]["tools"] = value
+                verdict, reason = rd._check_deployment_tools(target)
+                self.assertEqual(verdict, rd.BLOCKED, reason)
+                self.assertIn(expected_text, reason)
+
+    def test_a_tool_digest_that_is_not_a_sha256_is_BLOCKED(self):
+        """Not a mismatch -- a value that cannot be a digest at all. `True` is an `int` and
+        `""` is a `str`; neither is a fingerprint, and neither may be compared as one."""
+        for name, value in (("too short", "abc"), ("uppercase", "A" * 64),
+                            ("not hex", "z" * 64), ("a boolean", True),
+                            ("empty", ""), ("a number", 0)):
+            with self.subTest(name):
+                target = self._target(self.proposed)
+                target["identity"]["tools"] = {"ops/p5_provision.py": value}
+                verdict, reason = rd._check_deployment_tools(target)
+                self.assertEqual(verdict, rd.BLOCKED, reason)
+                self.assertIn("not SHA-256", reason)
+
+    def test_only_the_absent_field_is_an_evidence_gap(self):
+        """The line, stated once: absent is NOT_ADJUDICATED and every present-but-broken shape
+        is BLOCKED."""
+        absent = self._target(self.proposed)
+        absent["identity"].pop("tools")
+        self.assertEqual(rd._check_deployment_tools(absent)[0], rd.NOT_ADJUDICATED)
+        for value in (None, {}, [], "x", 3):
+            with self.subTest(repr(value)):
+                broken = self._target(self.proposed)
+                broken["identity"]["tools"] = value
+                self.assertEqual(rd._check_deployment_tools(broken)[0], rd.BLOCKED)
+
     # ---------------------------------------------------------------- the document agrees
     def _doc(self):
         with open(os.path.join(_DEV, "specs", "p5_deployment_readiness.md")) as fh:
@@ -4061,6 +4140,35 @@ class TestDeploymentToolsIsAReadinessRequirement(_RecordWritingMixin, unittest.T
     def test_the_document_says_an_evidence_gap_still_blocks_readiness(self):
         doc = self._doc()
         self.assertIn("`NOT_ADJUDICATED` still blocks readiness", doc)
+
+    def test_the_document_names_the_SAME_commit_the_checker_actually_reads(self):
+        """Doc and behaviour tied to each other, not to a string.
+
+        This is the defect that prompted the change: the document said the finding came from
+        `a9db4b7` while the checker was reading `reviewed_sha`, which is `3223fba` in the very
+        artifact being described. Both said BLOCKED, so the disagreement was invisible in the
+        verdict and visible only in what the evidence was claimed to be.
+
+        So the assertion runs the real checker over the real archived target, takes the commit
+        it names in its own reason, and requires the document to name that one. Move the
+        checker back to `reviewed_sha` and the reason names a different commit; edit the
+        document to name a different commit and it stops matching the checker. Either way this
+        fails."""
+        with open(os.path.join(_DEV, "bench", "results", "p5_readiness_runs",
+                               "20260821T130320Z", "target_live.json")) as fh:
+            archived = json.load(fh)
+        ident = archived["identity"]
+        self.assertNotEqual(ident["reviewed_sha"], ident["head_sha"],
+                            "the archived target no longer distinguishes the two SHAs, so this "
+                            "test can no longer tell them apart")
+        verdict, reason = rd._check_deployment_tools(archived)
+        self.assertEqual(verdict, rd.BLOCKED, reason)
+        named = ident["head_sha"][:7]
+        self.assertIn(named, reason, "the checker does not report the commit it read")
+        self.assertNotIn(ident["reviewed_sha"][:7], reason)
+        self.assertIn(f"`{named}` — the **deployed** commit — is the one the checker reads",
+                      self._doc(),
+                      "the document names a different evidence source than the checker reads")
 
     def test_the_document_states_why_the_archived_row_is_blocked(self):
         """`BLOCKED` there is the absent tool, read from git blobs -- not the missing field."""
@@ -4079,3 +4187,88 @@ class TestDeploymentToolsIsAReadinessRequirement(_RecordWritingMixin, unittest.T
         return {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
                 "identity": {"reviewed_sha": sha, "head_sha": sha,
                              "worktree_clean": True, "modules": {}, "tools": tools}}
+
+
+class TestTheArchivedArtifactIsNotPresentedAsCurrentState(unittest.TestCase):
+    """The document held an eight-row transcript and a nine-row heading over it.
+
+    Two counts are in play. The artifacts collected on 2026-08-21 were produced by an assessor
+    with eight requirements; `deployment_tools` was added afterwards and is in none of them. A
+    document that prints those eight rows under a "nine requirements" heading, with a ninth row
+    spliced in, is claiming a collection that never happened -- and the spliced row's verdict
+    would then look like something a run on VM24 produced.
+
+    The artifacts themselves are NOT rewritten to match the newer schema. An artifact is what
+    that run produced; editing it to carry a requirement the code did not have would be
+    forging evidence, and the whole phase turns on not doing that.
+
+    So: the transcript stays eight rows and says which run it is, the current count is stated
+    separately, and the document says outright that no nine-requirement collection exists."""
+
+    ARCHIVED = ("bench/results/p5_readiness.json",
+                "bench/results/p5_readiness_runs/20260821T130320Z/p5_readiness.json")
+    OLD_SCHEMA_IDS = ["identity", "manifest", "blocks", "wal_anchor", "locks", "api_parity",
+                      "capacity", "failure_semantics"]
+
+    def _doc(self):
+        with open(os.path.join(_DEV, "specs", "p5_deployment_readiness.md")) as fh:
+            return fh.read()
+
+    # ------------------------------------------------- the artifacts are left alone
+    def test_the_archived_artifacts_still_carry_the_eight_requirement_schema(self):
+        for rel in self.ARCHIVED:
+            with self.subTest(rel):
+                with open(os.path.join(_DEV, rel)) as fh:
+                    doc = json.load(fh)
+                ids = [r["id"] for r in doc["requirements"]]
+                self.assertEqual(ids, self.OLD_SCHEMA_IDS,
+                                 "an archived artifact was rewritten to a later schema")
+
+    def test_no_archived_artifact_claims_the_new_requirement(self):
+        """If one ever does, it was edited: no run has produced a `deployment_tools` row."""
+        for rel in self.ARCHIVED:
+            with self.subTest(rel):
+                with open(os.path.join(_DEV, rel)) as fh:
+                    raw = fh.read()
+                self.assertNotIn("deployment_tools", raw)
+
+    # ------------------------------------------------- the checker has moved on
+    def test_the_current_checker_has_one_more_requirement_than_the_artifacts(self):
+        current = [r["id"] for r in rd.REQUIREMENTS]
+        self.assertIn("deployment_tools", current)
+        self.assertEqual(len(current), len(self.OLD_SCHEMA_IDS) + 1)
+        self.assertEqual([r for r in current if r != "deployment_tools"], self.OLD_SCHEMA_IDS,
+                         "the requirement set changed by more than the documented addition")
+
+    # ------------------------------------------------- the document keeps them apart
+    def test_the_transcript_is_labelled_with_its_count_and_its_run(self):
+        doc = self._doc()
+        self.assertIn("## The eight requirements, as collected on 2026-08-21", doc)
+        self.assertIn("not a current state", doc)
+
+    def test_the_document_does_not_head_the_transcript_with_the_new_count(self):
+        """The exact regression: a nine-row heading over an eight-row artifact."""
+        doc = self._doc()
+        self.assertNotIn("## The nine requirements", doc)
+
+    def test_the_document_says_no_current_nine_requirement_artifact_exists(self):
+        doc = self._doc()
+        self.assertIn("no current nine-requirement readiness artifact", doc.lower())
+
+    def test_the_transcript_table_does_not_carry_the_new_requirement_row(self):
+        """Read the transcript table itself, not the page: a `deployment_tools` row inside it
+        would be a verdict presented as something that run reported."""
+        doc = self._doc()
+        start = doc.index("## The eight requirements, as collected on 2026-08-21")
+        section = doc[start:doc.index("\n### ", start)]
+        # The TABLE ROWS only. The prose above them names `deployment_tools` on purpose, to say
+        # it is not in this artifact -- matching the section would forbid the sentence that
+        # makes the distinction.
+        rows = [ln for ln in section.split("\n")
+                if ln.startswith("| ") and not ln.startswith("| requirement")]
+        self.assertTrue(any(r.startswith("| `identity` |") for r in rows),
+                        "the transcript table moved")
+        self.assertEqual(len(rows), len(self.OLD_SCHEMA_IDS),
+                         f"the transcript table has {len(rows)} rows, not eight")
+        for row in rows:
+            self.assertNotIn("deployment_tools", row)

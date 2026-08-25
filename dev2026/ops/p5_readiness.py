@@ -288,6 +288,12 @@ def _is_sha1(value) -> bool:
     return type(value) is str and bool(_SHA1.match(value))
 
 
+#: Absent, as distinct from present-and-wrong. `dict.get()` collapses the two into `None`, and
+#: for evidence they are opposite findings: a key nobody wrote is a collector that never looked,
+#: a key holding rubbish is a collector that ran and produced something unusable.
+_MISSING = object()
+
+
 def _is_sha256(value) -> bool:
     """Exactly 64 lowercase hex characters. Shape is not identity, but the wrong shape is not
     a digest at all, and 'non-empty' was the only test it previously had to pass."""
@@ -1002,41 +1008,66 @@ def _check_deployment_tools(t: Dict) -> tuple:
     what lets a packaging revision be measured on its merits while staying undeployable."""
     import hashlib
     ident = t.get("identity") or {}
-    reviewed = ident.get("reviewed_sha")
-    if not reviewed:
-        return NOT_ADJUDICATED, ("no identity preflight was collected, so there is no commit "
-                                 "to check the operator tools against")
-    if not _is_sha1(reviewed):
-        return BLOCKED, (f"the target reports reviewed_sha {reviewed!r}, which is not a commit "
+    # `head_sha`, deliberately, NOT `reviewed_sha`. The question is whether the tree that is
+    # DEPLOYED can run the provisioner, and on VM24 the two differ: the target reports
+    # reviewed_sha=3223fba beside head_sha=a9db4b7. Reading `reviewed_sha` would answer a
+    # question about a commit that is not on that disk, and would compare the digests the
+    # collector took FROM the disk against blobs from a different commit -- a mismatch
+    # manufactured by the assessor. Whether the deployed commit is allowed to be deployed is
+    # `identity`'s question, and identity refuses when head is not the reviewed commit.
+    deployed = ident.get("head_sha")
+    if not deployed:
+        return NOT_ADJUDICATED, ("no identity preflight was collected, so there is no deployed "
+                                 "commit to check the operator tools against")
+    if not _is_sha1(deployed):
+        return BLOCKED, (f"the target reports head_sha {deployed!r}, which is not a commit "
                          f"id, so no tool can be recomputed from it")
     # The declaration before the comparison. An empty tuple would make every check below pass
     # over nothing -- a gate disarmed by emptying the list it enforces.
     if not DEPLOYMENT_TOOLS:
         return BLOCKED, ("no operator tool is declared, so this requirement checks nothing; "
                          "an empty declaration is not a passing one")
-    problem = deployment_tools_problem(reviewed)
+    problem = deployment_tools_problem(deployed)
     if problem:
-        return BLOCKED, f"the deployment at {reviewed[:7]} {problem}"
-    reported = ident.get("tools")
-    if type(reported) is not dict or not reported:
-        # NOT_ADJUDICATED, not BLOCKED. A collector that never looked has not shown the tool
-        # to be missing -- and the artifact collected on 2026-08-21 predates this field
-        # entirely, so reading its silence as a defect would report a deployment fault where
-        # there is only evidence nobody gathered. It still blocks readiness: `assess()`
+        return BLOCKED, f"the deployment at {deployed[:7]} {problem}"
+    reported = ident.get("tools", _MISSING)
+    if reported is _MISSING:
+        # NOT_ADJUDICATED, not BLOCKED -- and ONLY for a field nobody wrote. A collector that
+        # never looked has not shown the tool to be missing, and the artifact collected on
+        # 2026-08-21 predates this field entirely. It still blocks readiness: `assess()`
         # requires every requirement READY, and this is not that.
         #
-        # The tool being ABSENT AT THE COMMIT is a different finding and is refused above,
-        # from git blobs, without the collector's help. `identity` draws the same line for an
-        # uncollected module inventory.
+        # The tool being ABSENT AT THE COMMIT is a different finding, refused above from git
+        # blobs without the collector's help. `identity` draws the same line for an uncollected
+        # module inventory.
         return NOT_ADJUDICATED, (f"no operator tool was fingerprinted by the collector, so "
-                                 f"what is present at {reviewed[:7]} says only what git holds "
+                                 f"what is present at {deployed[:7]} says only what git holds "
                                  f"and not what is on the deployment's disk; this is missing "
                                  f"evidence, not a tool shown to be missing")
+    # Everything below is a field that EXISTS and cannot be used. That is not an evidence gap:
+    # something wrote it, and what it wrote is unusable. Reporting that as "not adjudicated"
+    # would let a malformed collector read the same as an old one, which is how a broken
+    # pipeline stays broken quietly.
+    if reported is None:
+        return BLOCKED, ("the target reports tools=null; a field written as null is a collector "
+                         "that ran and recorded nothing, not one that never looked")
+    if type(reported) is not dict:
+        return BLOCKED, (f"the target reports tools as {type(reported).__name__}, which cannot "
+                         f"name a fingerprint per tool")
+    if not reported:
+        return BLOCKED, ("the target reports an empty tools object; something wrote it and put "
+                         "no fingerprint in it, which is malformed evidence rather than absent "
+                         "evidence")
+    malformed = sorted(k for k, v in reported.items() if not _is_sha256(v))
+    if malformed:
+        return BLOCKED, (f"the target reports tool fingerprints that are not SHA-256 digests: "
+                         f"{malformed}; a value that cannot be a digest cannot be compared "
+                         f"with one")
     expected = {}
     for rel in DEPLOYMENT_TOOLS:
-        blob = _git_blob(reviewed, rel)
+        blob = _git_blob(deployed, rel)
         if blob is None:                       # unreachable: deployment_tools_problem refused
-            return BLOCKED, f"{rel} vanished from {reviewed[:7]} between two reads"
+            return BLOCKED, f"{rel} vanished from {deployed[:7]} between two reads"
         expected[rel] = hashlib.sha256(blob).hexdigest()
     missing = sorted(set(expected) - set(reported))
     if missing:
@@ -1044,9 +1075,9 @@ def _check_deployment_tools(t: Dict) -> tuple:
                          f"as clean and is the easiest thing to leave out")
     wrong = sorted(k for k, v in expected.items() if reported.get(k) != v)
     if wrong:
-        return BLOCKED, (f"operator tool fingerprint mismatch against {reviewed[:7]}: {wrong}. "
+        return BLOCKED, (f"operator tool fingerprint mismatch against {deployed[:7]}: {wrong}. "
                          f"The deployed tool is not the approved tool")
-    return READY, (f"{len(expected)} operator tool fingerprints recomputed from {reviewed[:7]} "
+    return READY, (f"{len(expected)} operator tool fingerprints recomputed from {deployed[:7]} "
                    f"and matched: {sorted(expected)}")
 
 

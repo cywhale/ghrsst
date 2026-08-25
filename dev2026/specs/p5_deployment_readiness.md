@@ -122,12 +122,19 @@ only `api/app.py` exists there. `store/block_manifest.py`, `store/repair_wal.py`
 `store/compaction_lock.py`, `ingest/build_block.py` and `ingest/publish_manifest.py` are absent.
 The deployment cannot run a compaction because the code that performs one is not deployed.
 
-## The nine requirements
+## The eight requirements, as collected on 2026-08-21
+
+**This table is a transcript of the archived artifact, not a current state.** It was produced by
+the assessor as it stood on 2026-08-21, which had **eight** requirements. `deployment_tools` did
+not exist and is not in it. The artifacts are
+`bench/results/p5_readiness.json` and
+`bench/results/p5_readiness_runs/20260821T130320Z/p5_readiness.json`, both carrying eight
+requirement rows, and neither is rewritten to match a later schema — an artifact is what that run
+produced.
 
 | requirement | verdict | why |
 |---|---|---|
 | `identity` | **BLOCKED** | HEAD `a9db4b7` is not the reviewed `3223fba`, and the worktree carries 5 uncommitted modifications |
-| `deployment_tools` | **BLOCKED** | `ops/p5_provision.py` is absent at `a9db4b7` — established from git blobs, without the collector. See the note below on why this is `BLOCKED` and not merely unadjudicated |
 | `manifest` | **BLOCKED** | no manifest root at `$G/p5_blocks` |
 | `blocks` | **BLOCKED** | follows from `manifest`: there is nothing to check segments against |
 | `wal_anchor` | **BLOCKED** | no `$G/p5_repairs`; no anchor root is declared anywhere |
@@ -136,11 +143,34 @@ The deployment cannot run a compaction because the code that performs one is not
 | `capacity` | **READY** | 1260.7 GiB free against a 403.3 GiB minimum, measured in run `20260821T130320Z` |
 | `failure_semantics` | **NOT_ADJUDICATED** | the local suites prove the *code's* refusal/rollback behaviour, and that code is not deployed, so the property is not a property of this deployment |
 
-### Two different findings, kept apart: an absent tool and uncollected evidence
+### The checker now has nine requirements, and nothing has been collected against it
 
-The `deployment_tools` row above is `BLOCKED` for one reason only: `ops/p5_provision.py` is
-genuinely not at `a9db4b7`, and that is read from git blobs at the commit the target reports.
-No collector is involved, and no evidence gathered on the host could change it.
+`deployment_tools` was added after that collection. So there are two counts in play and they
+must not be read as one state:
+
+| | requirements | what it is |
+|---|---|---|
+| the archived artifacts (2026-08-21) | **8** | what that run produced; not rewritten |
+| the assessor as it stands now | **9** | `REQUIREMENTS` in `ops/p5_readiness.py` |
+
+**There is no current nine-requirement readiness artifact, and this document does not claim
+one.** No VM24 collection has run since `deployment_tools` was added, and running one needs its
+own authorization. Until then the ninth requirement's state on that host is *unknown to any
+artifact* — what follows is what the current checker would return for the evidence already in
+hand, which is reasoning about an old artifact, not a new one.
+
+Applied to the archived target, whose identity block reports `reviewed_sha` `3223fba` beside
+`head_sha` `a9db4b7`, the current checker returns **`BLOCKED`**: `ops/p5_provision.py` is
+genuinely not at `a9db4b7`, read from git blobs, with no collector involved.
+
+`a9db4b7` — the **deployed** commit — is the one the checker reads, not `reviewed_sha`. "Can this
+deployment run the provisioner" is a question about the tree on that disk. Reading `reviewed_sha`
+would answer it about a commit that is not there, and would compare digests the collector took
+*from* the disk against blobs from a different commit — a mismatch manufactured by the assessor.
+Whether the deployed commit is allowed to be deployed is `identity`'s question, and `identity`
+refuses precisely because head is not the reviewed commit.
+
+### Two different findings, kept apart: an absent tool and uncollected evidence
 
 The archived artifact **also** reports no `tools` fingerprints at all — the field postdates the
 2026-08-21 collection. That is a *separate* fact, and it does not prove anything about what is on
@@ -157,13 +187,19 @@ The consequence for sequencing: even once a revision carrying the provisioner is
 requirement cannot reach `READY` from the archived run. It needs a fresh collection that
 fingerprints the tools, and that collection has to be authorized separately.
 
-The verdicts the requirement can return:
+Only a field **nobody wrote** is an evidence gap. A field that exists and cannot be used is a
+collector that ran and produced rubbish; reporting that as "not adjudicated" would let a broken
+pipeline read the same as an old one, and stay broken quietly.
+
+The verdicts the requirement can return, and what each is established by:
 
 | finding | verdict | established by |
 |---|---|---|
 | the tool is absent at the reported commit | `BLOCKED` | git blob at that commit |
 | nothing declared in `DEPLOYMENT_TOOLS` | `BLOCKED` | the declaration itself — a gate is not disarmable by emptying it |
-| the collector reported no tools at all | `NOT_ADJUDICATED` | absence of evidence, named as such |
+| the `tools` field was never written | `NOT_ADJUDICATED` | absence of evidence, named as such |
+| `tools` written as null, a list, a string, a number, or an empty object | `BLOCKED` | malformed evidence — something wrote it and what it wrote is unusable |
+| a reported digest that is not a SHA-256 value | `BLOCKED` | a value that cannot be a digest cannot be compared with one |
 | a declared tool the report does not cover | `BLOCKED` | the report ran and is incomplete |
 | a reported digest that does not match the commit | `BLOCKED` | recomputed SHA-256 of the git blob |
 | every declared tool present and matching | `READY` | recomputed SHA-256 of the git blob |
