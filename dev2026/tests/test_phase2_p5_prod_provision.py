@@ -922,13 +922,32 @@ class TestTheDocumentsRecordTheCorrection(unittest.TestCase):
                                     "generation 1 would drop from the served view")
         self.assertIn("initialize_wal", doc)
 
-    def test_the_document_records_the_legacy_base_blocker(self):
-        """The second blocker: the deployed API cannot construct a legacy_base manifest."""
+    def test_the_document_separates_the_two_allow_lists(self):
+        """Runtime authorization and assessor configuration answer different questions, and a
+        document that names one `allow-list` teaches an operator to conflate them."""
+        flat = " ".join(self._doc().split())
+        self.assertIn("GHRSST_ALLOWED_LEGACY_PATHS", flat)
+        self.assertIn("p5_readiness.ALLOWED_LEGACY_PATHS", flat)
+        # In context. "neither implies the other" appears elsewhere on the page too, so the
+        # bare phrase was satisfied while the sentence distinguishing the two allow-lists had
+        # been changed to say they are the same.
+        self.assertIn('may this manifest claim that store" — and neither implies the other',
+                      flat)
+
+    def test_the_document_records_that_the_runtime_blocker_is_closed(self):
         doc = self._doc()
-        self.assertIn("the API cannot serve `legacy_base`", doc)
-        self.assertIn("allowed_legacy_paths", doc)
-        self.assertIn("daily-only", doc)
-        self.assertIn("No builder is shipped", doc)
+        # Whitespace-normalised: markdown wraps, and a claim split across two lines is still
+        # the claim. Matching the raw text made the test depend on where the paragraph broke.
+        flat = " ".join(doc.split())
+        self.assertIn("That blocker is closed", flat)
+        self.assertIn("no fallback to the monolith", flat)
+        self.assertIn("The manifest never authorizes its own external path", flat)
+
+    def test_the_document_keeps_publishing_a_generation_out_of_scope(self):
+        doc = self._doc()
+        self.assertIn("creates no roots, touches no WAL", doc)
+        self.assertIn("production change with its own approval, and none has been requested",
+                      doc)
 
     def test_the_document_says_empty_roots_move_nothing(self):
         doc = self._doc()

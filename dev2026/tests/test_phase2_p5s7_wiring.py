@@ -52,7 +52,8 @@ BASE_DAYS = 20
 LON, LAT = 104.0, 5.0
 
 _ENV_KEYS = ("GHRSST_ZARR_PATH", "GHRSST_BLOCK_MANIFEST_DIR",
-             "GHRSST_TIMECUBE_PATH", "GHRSST_DELTACUBE_PATH")
+             "GHRSST_TIMECUBE_PATH", "GHRSST_DELTACUBE_PATH",
+             "GHRSST_ALLOWED_LEGACY_PATHS")
 
 
 class _WiringFixture:
@@ -151,10 +152,22 @@ class _WiringCase(unittest.TestCase):
         return client, app.state.router.cube
 
     def assert_daily_only(self, client, cube):
-        """No cube of any kind was installed, and the API says so."""
+        """No cube of any kind was installed, and the API says so.
+
+        `status` is `degraded` whenever a manifest was CONFIGURED and did not load: that
+        deployment is not serving what it was told to serve, and a bare `ok` beside
+        `cube_loaded: false` reads as "no cube configured" -- a different deployment, and the
+        one an operator would not investigate. With no manifest configured the status stays
+        `ok`, because daily-only is then the intended shape."""
         self.assertIsNone(cube, f"a cube was silently installed: {type(cube).__name__}")
         h = client.get("/healthz").json()
-        self.assertEqual(h["status"], "ok")
+        if h.get("manifest_configured"):
+            self.assertEqual(h["status"], "degraded")
+            self.assertTrue(h.get("cube_error"),
+                            "a configured manifest failed to load and healthz says why not")
+        else:
+            self.assertEqual(h["status"], "ok")
+            self.assertIsNone(h.get("cube_error"))
         self.assertFalse(h["cube_loaded"])
         self.assertIsNone(h["cube_kind"])
         self.assertIsNone(h["cube_base_kind"])

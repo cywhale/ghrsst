@@ -51,6 +51,84 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+class LegacyAllowListError(Exception):
+    """The deployment's legacy allow-list is absent where it is needed, or unusable."""
+
+
+#: The ONE deployment-controlled setting that authorizes a `legacy_base` segment to point
+#: outside the block root. `os.pathsep`-separated, so a deployment can name more than one, and
+#: every entry is validated the same way.
+ALLOWED_LEGACY_ENV = "GHRSST_ALLOWED_LEGACY_PATHS"
+
+
+def resolve_allowed_legacy_paths(environ=None, *, timecube_path=None):
+    """The legacy paths this DEPLOYMENT authorizes, validated fail-closed.
+
+    A `legacy_base` segment legitimately lives outside the block root — production's monolith is
+    a sibling of it — and `SegmentedCubeStore` refuses such a path unless the deployment names
+    it. That naming has to come from configuration and never from the manifest: a manifest that
+    could authorize its own external path would be a document granting itself permission to read
+    anything on the host.
+
+    Absent is not an error. A manifest whose segments all live inside the block root needs no
+    allow-list, and returning `[]` lets that deployment run while still refusing an external
+    segment. What IS an error is a setting that exists and cannot be trusted, and every one of
+    these is a refusal rather than a skipped entry:
+
+    * an entry that is empty or not a string;
+    * a relative path — "which directory was the service started from" is not a security
+      boundary;
+    * a path that does not resolve to an existing directory;
+    * a path whose `realpath` differs from itself, i.e. reached through a symlink. The store
+      compares by `realpath`, so an alias would still work; it is refused because an operator
+      reading the configuration cannot see where it points, and a link that is re-pointed later
+      changes what is authorized without the configuration changing;
+    * an entry that is not the monolith this deployment is configured to serve. The allow-list
+      may confirm `GHRSST_TIMECUBE_PATH`; it may not introduce a different store.
+    """
+    environ = os.environ if environ is None else environ
+    raw = environ.get(ALLOWED_LEGACY_ENV)
+    if raw is None or (type(raw) is str and not raw.strip()):
+        return []
+    if type(raw) is not str:
+        raise LegacyAllowListError(
+            f"{ALLOWED_LEGACY_ENV} must be a string, got {type(raw).__name__}")
+    timecube_path = (environ.get("GHRSST_TIMECUBE_PATH") if timecube_path is None
+                     else timecube_path)
+    bound = os.path.realpath(timecube_path) if timecube_path else None
+    out = []
+    for entry in raw.split(os.pathsep):
+        entry = entry.strip()
+        if not entry:
+            raise LegacyAllowListError(
+                f"{ALLOWED_LEGACY_ENV} contains an empty entry; an allow-list with a blank in "
+                f"it is a configuration nobody wrote on purpose")
+        if not os.path.isabs(entry):
+            raise LegacyAllowListError(
+                f"{ALLOWED_LEGACY_ENV} entry {entry!r} is not absolute; what it names would "
+                f"depend on the directory the service happened to start in")
+        resolved = os.path.realpath(entry)
+        if not os.path.isdir(resolved):
+            raise LegacyAllowListError(
+                f"{ALLOWED_LEGACY_ENV} entry {entry!r} is not an existing directory")
+        if resolved != os.path.normpath(entry):
+            raise LegacyAllowListError(
+                f"{ALLOWED_LEGACY_ENV} entry {entry!r} resolves to {resolved!r}; name the "
+                f"store directly. A link can be re-pointed without this configuration "
+                f"changing, which would move what is authorized silently")
+        if bound is None:
+            raise LegacyAllowListError(
+                f"{ALLOWED_LEGACY_ENV} is set but GHRSST_TIMECUBE_PATH is not, so there is "
+                f"nothing to check the entry against")
+        if resolved != bound:
+            raise LegacyAllowListError(
+                f"{ALLOWED_LEGACY_ENV} entry {entry!r} is not the deployed monolith "
+                f"({bound!r}). The allow-list may confirm the store this deployment already "
+                f"declares; it may not introduce another one")
+        out.append(resolved)
+    return out
+
+
 class Cfg:
     # Allow "one year" queries across leap years without forcing clients to split.
     MAX_DAYS = _env_int("GHRSST_MAX_DAYS", 366)
@@ -157,7 +235,13 @@ async def lifespan(app: FastAPI):
         # authority, so every failure under it is fail-closed (the constructor raises, and the
         # handler below leaves `cube` None => explicitly daily-only).
         if mf_dir:
-            cube = SegmentedCubeStore(mf_dir)
+            # Deployment configuration, never the manifest. An absent list is legal and means
+            # "no external segment is authorized"; a present but invalid one raises here and
+            # the handler below leaves `cube` None -- there is deliberately NO fallback to the
+            # monolith, because falling back would serve a base the manifest did not describe.
+            cube = SegmentedCubeStore(
+                mf_dir, allowed_legacy_paths=resolve_allowed_legacy_paths(
+                    os.environ, timecube_path=tc_path))
         elif tc_path and os.path.isdir(tc_path):
             cube = TimeCubeStore(tc_path)
         if cube is not None:
@@ -171,6 +255,14 @@ async def lifespan(app: FastAPI):
         # under a healthy /healthz. Serve daily-only and say so.
         print(f"[GHRSST] cube load skipped: {e}")
         cube = None
+        cube_error = f"{type(e).__name__}: {e}"
+    else:
+        cube_error = None
+    # Recorded so /healthz can describe the ACTUAL state. A deployment that configured a
+    # manifest and could not load it is misconfigured, and reporting a bare "ok" for it is how
+    # a base silently disappears from the served view.
+    app.state.cube_error = cube_error
+    app.state.manifest_configured = bool(mf_dir)
     app.state.router = HybridRouter(app.state.store, cube)
     app.state.bex = BoundedExecutor(cfg.ZARR_WORKERS, cfg.OVERLOAD_QUEUE_MAX, cfg.OVERLOAD_WAIT_MS)
 
@@ -619,7 +711,16 @@ async def healthz(request: Request):
     e, l = (pt_days[0], pt_days[-1]) if pt_days else (None, None)
     pe, pl = router.point_primary_bounds()
     de, dl = store.bounds()                                   # daily staging window (explicit)
-    return {"status": "ok", "earliest": e, "latest": l,
+    # A manifest was configured and did not load: the deployment is not serving what it was
+    # told to serve. `cube_loaded: false` alone reads as "no cube configured", which is a
+    # different deployment.
+    manifest_configured = getattr(request.app.state, "manifest_configured", False)
+    cube_error = getattr(request.app.state, "cube_error", None)
+    degraded = bool(manifest_configured and cube is None)
+    return {"status": ("degraded" if degraded else "ok"),
+            "cube_error": cube_error,
+            "manifest_configured": manifest_configured,
+            "earliest": e, "latest": l,
             "primary_earliest": pe, "primary_latest": pl,
             # point availability, named explicitly (same as earliest/latest; unambiguous for clients)
             "point_earliest": e, "point_latest": l, "point_day_count": len(pt_days),

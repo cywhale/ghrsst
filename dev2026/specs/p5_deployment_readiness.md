@@ -338,63 +338,54 @@ The two directories are a precondition, not evidence. `manifest`, `blocks` and `
 keep refusing until a valid generation 1 and an initialized WAL exist, and tests pin that.
 Provisioning roots is not progress toward `compaction_ready`.
 
-### A second blocker, found while attempting generation 1: the API cannot serve `legacy_base`
+### Generation 1 over the monolith: the runtime path, and the builder
 
-A valid generation 1 is a `legacy_base` segment over the existing monolith. It cannot be
-deployed today, and the reason is in the serving code rather than in the manifest:
+An earlier round found that a `legacy_base` generation 1 could not be served at all:
+`api/app.py` constructed `SegmentedCubeStore(mf_dir)` with no `allowed_legacy_paths`, so a
+segment pointing at the production monolith — a sibling of `p5_blocks`, therefore outside the
+block root — was refused, and the service degraded to daily-only. **That blocker is closed.**
 
-* `api/app.py` constructs the store as `SegmentedCubeStore(mf_dir)` — with **no
-  `allowed_legacy_paths`**.
-* `SegmentedCubeStore` refuses an absolute segment path outright, and refuses a `legacy_base`
-  path that resolves outside the block root unless the deployment names it explicitly.
-* The production monolith is a sibling of `p5_blocks`, so it resolves outside. The construction
-  raises, the startup handler leaves `cube = None`, and the service degrades to **daily-only**
-  under a `/healthz` that still answers.
+#### Two allow-lists, and they are not the same thing
 
-So a `legacy_base` generation 1 needs an API change that passes the deployment's allow-list —
-its own review, its own deployment commit. `p5_readiness.ALLOWED_LEGACY_PATHS` is still `()`,
-which fails closed, so the deployment would also have to name the monolith explicitly.
+| | where | what it does |
+|---|---|---|
+| **runtime** | `GHRSST_ALLOWED_LEGACY_PATHS`, read by `api.app.resolve_allowed_legacy_paths` | authorizes the **serving deployment** to follow a `legacy_base` segment out of the block root |
+| **assessor** | `p5_readiness.ALLOWED_LEGACY_PATHS`, still `()` | what the **assessor** will accept in a manifest it is adjudicating, when reading collected evidence |
 
-`tests/test_phase2_p5_legacy_base_contract.py` settles the semantics in an isolated fixture so
-that change has a specification: the segment path must be **relative**, the allow-list is matched
-by `realpath`, layout and fingerprints are derived from disk through `block_manifest`, and with
-the allow-list supplied `SegmentedCubeStore.point_series()` matches a `TimeCubeStore` oracle on
-every day and every variable, boundaries included, with NaN preserved.
+They answer different questions — "may this service read that store" and "may this manifest
+claim that store" — and neither implies the other. Both fail closed when unset.
 
-Two guarantees found while establishing that, both worth recording:
+The runtime setting is validated before anything is served, and every way of getting it wrong is
+a refusal rather than a skipped entry: not a string; an empty entry; a relative path; not an
+existing directory; reached through a symlink (the store would accept the alias, but a reader of
+the configuration cannot see where it points, and re-pointing the link would move what is
+authorized without the configuration changing); or naming anything other than the monolith the
+deployment already declares in `GHRSST_TIMECUBE_PATH`. **The manifest never authorizes its own
+external path** — it names the path, and the deployment decides whether it may be followed.
 
-* a `legacy_base` segment that **under-declares** the store it points at is refused as a
-  `STALE MANIFEST` — a partially covering legacy base cannot be served at all;
-* the real hazard is a **`block`** segment over delta-only data: it is self-consistent, so
-  nothing refuses it, and it serves only the delta tail. That is precisely the manifest the
-  earlier version of the provisioner would have published.
+When a manifest is configured and cannot be loaded, `/healthz` reports `status: "degraded"` with
+`cube_error` and `manifest_configured: true`, and there is **no fallback to the monolith**. A
+bare `ok` beside `cube_loaded: false` reads as "no cube configured", which is a different
+deployment and the one nobody investigates. With no manifest configured the monolith fallback is
+unchanged and the status stays `ok`.
 
-**No builder is shipped.** Building one now would produce a manifest the deployed API cannot
-load.
+#### The builder
 
-**`708058e` is therefore not sufficient for production provisioning.** It carries only the
-isolated tool. Closing this blocker needs a **new reviewed deployment commit** carrying
-`ops/p5_prod_provision.py`, reviewed and approved on its own terms.
+`ops/p5_legacy_base.py` builds generation 1 over the existing monolith. Everything is derived
+from `inspect_store_contract()` reading that store — day domain, variables, `var_valid` mode,
+grid, layout and both fingerprints — and it publishes through `block_manifest.publish()`, which
+validates and archives. There is no second manifest format and no second validator. The segment
+path is relative, because an absolute one is refused outright.
 
-The older statement, kept because it is still true of `3223fba`:
+Proved through the real read path, in an isolated fixture: every day and every variable matches
+a `TimeCubeStore` oracle, first and last days included, with NaN preserved; the app's own
+lifespan serves the monolith's values through the manifest; an under-declared manifest is
+refused as `STALE MANIFEST` at construction rather than at the first request; and a delta-only
+block cannot claim the legacy waiver.
 
-The reviewed deployment SHA `3223fba` does **not** contain `ops/p5_provision.py`. Provisioning is
-therefore not deployable at that commit whatever this assessment says about the compaction
-runtime, and closing the lifecycle-closure gap did not change that. It is listed here rather than
-folded into `identity` because it is a different fact: the compaction runtime at `3223fba` is
-complete and runs; the provisioning tool is simply not in it.
-
-This is now a check rather than a paragraph. `DEPLOYMENT_TOOLS` declares what a deployment must
-**carry** without any stage importing it, and `deployment_tools_problem(sha)` answers it per
-commit. The provisioner is deliberately **not** in `INVENTORY_MODULES`: nothing on the runtime
-path imports it, and `deployment_inventory_problem()` refuses a declared module no stage runs —
-correctly, because a declaration nothing executes is not a check. "Carried by the deployment" and
-"on the runtime path" are different claims, so they are checked separately.
-
-It is also deliberately **not** wired into `identity`. `3223fba` predates the module entirely, so
-folding it in would put `identity` at `BLOCKED` for a reason that has nothing to do with whether
-the deployed code matches its commit — one blocker restated as another. Promoting it to a
-readiness requirement is a review decision, not one this module should take on its own.
+It publishes into a manifest root it is given. It creates no roots, touches no WAL, and is
+connected to neither `ops/p5_prod_provision.py` nor VM24. **Publishing a generation into a live
+deployment is a production change with its own approval, and none has been requested.**
 
 ## The external approval record is a transcription, not a cryptographic signature
 
@@ -469,9 +460,9 @@ it requires a **new assessor approval record**, because every commit since `5e6b
 
 ### `708058e` is deployable, and is not sufficient for production provisioning
 
-Both statements hold at once and neither implies the other. `identity` can adjudicate `708058e`;
-`deployment_tools` refuses it, because it carries the isolated provisioner and not the production
-one. A **new reviewed deployment commit** carrying `ops/p5_prod_provision.py` is required before
+**`708058e` is therefore not sufficient for production provisioning.** Both statements hold at
+once and neither implies the other: `identity` can adjudicate `708058e`, and `deployment_tools`
+refuses it, because it carries the isolated provisioner and not the production one. A **new reviewed deployment commit** carrying `ops/p5_prod_provision.py` is required before
 P5 roots can be provisioned in `$G`, and this document does not treat the current candidate as
 closing that.
 
