@@ -409,7 +409,7 @@ artifact cannot bypass that check; and the 2026-08-20 / 364-row request remains 
 | **S8 execution** | `legacy_baseline` **COMPLETED** — executed 2026-08-20 at deploy SHA 96ee79c; artifacts assembled on VM24 and copied back; NO gate adjudicated by this run |
 | **S9 / shadow execution** | **NOT_STARTED** — requires its own separate human approval |
 | **S10** | not authorized; needs its own fresh written approval |
-| **Provisioning tool** | approved commits carrying `ops/p5_provision.py`: `708058e`; not carrying it: `3223fba` — `deployment_tools` **BLOCKS** a deployment made from those. Recommended for a new deployment: `708058e`. Deploying is a production change and is not authorized by this document |
+| **Provisioning tool** | **BLOCKED** — no approved commit (`3223fba`, `708058e`) carries `ops/p5_prod_provision.py`, so none can provision the P5 roots every store requirement then inspects. The isolated staging tool `ops/p5_provision.py` is carried by the candidate and is NOT this: it refuses any root inside the live root by design, so a deployment holding only it cannot provision production. Enforced by the `deployment_tools` readiness requirement, not by a note. A new reviewed deployment commit carrying `ops/p5_prod_provision.py` is required. Proposed and therefore not approved: none |
 
 <!-- generated:blockers:end -->
 

@@ -285,11 +285,16 @@ def _provisioning_blocker() -> str:
                if rd.deployment_tools_problem(sha) is not None]
     def _short(shas):
         return ", ".join(f"`{sha[:7]}`" for sha in shas) or "none"
+    staging = ", ".join(f"`{t}`" for t in getattr(rd, "STAGING_TOOLS", ())) or "none"
     if not carried:
         return (f"**BLOCKED** — no approved commit ({_short(lacking)}) carries {tools}, so none "
-                f"can provision the P5 roots every store requirement then inspects. Enforced by "
-                f"the `deployment_tools` readiness requirement, not by a note. Proposed and "
-                f"therefore not approved: {_short(rd.PROPOSED_DEPLOY_SHAS)}")
+                f"can provision the P5 roots every store requirement then inspects. The "
+                f"isolated staging tool {staging} is carried by the candidate and is NOT this: "
+                f"it refuses any root inside the live root by design, so a deployment holding "
+                f"only it cannot provision production. Enforced by the `deployment_tools` "
+                f"readiness requirement, not by a note. A new reviewed deployment commit "
+                f"carrying {tools} is required. Proposed and therefore not approved: "
+                f"{_short(rd.PROPOSED_DEPLOY_SHAS)}")
     # Some approved commit carries it. That is not "solved": the requirement still refuses a
     # deployment made from one that does not, and says which.
     current = f"`{rd.CURRENT_DEPLOY_SHA[:7]}`" if rd.CURRENT_DEPLOY_SHA else "none named"

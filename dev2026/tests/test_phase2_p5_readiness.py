@@ -3675,8 +3675,11 @@ class TestTheDeploymentCarriesItsProvisioningTool(unittest.TestCase):
         self.addCleanup(setattr, rd, "REPO_ROOT", rd.REPO_ROOT)
 
     def test_the_provisioner_is_declared_as_a_tool_not_as_runtime(self):
-        self.assertIn("ops/p5_provision.py", rd.DEPLOYMENT_TOOLS)
-        self.assertNotIn("ops/p5_provision.py", rd.INVENTORY_MODULES)
+        self.assertIn("ops/p5_prod_provision.py", rd.DEPLOYMENT_TOOLS)
+        self.assertNotIn("ops/p5_prod_provision.py", rd.INVENTORY_MODULES)
+        # And the isolated tool is named, separately, as not gated on.
+        self.assertNotIn("ops/p5_provision.py", rd.DEPLOYMENT_TOOLS)
+        self.assertIn("ops/p5_provision.py", rd.STAGING_TOOLS)
         for stage, (_entries, declared, _smoke) in rd.RUNTIME_GROUPS.items():
             with self.subTest(stage):
                 self.assertNotIn("ops/p5_provision.py", declared)
@@ -3685,15 +3688,15 @@ class TestTheDeploymentCarriesItsProvisioningTool(unittest.TestCase):
         """Why it is a separate declaration, demonstrated rather than asserted: the inventory
         guard refuses a module no stage runs, and the provisioner is exactly that."""
         self.addCleanup(setattr, rd, "INVENTORY_MODULES", rd.INVENTORY_MODULES)
-        rd.INVENTORY_MODULES = tuple(rd.INVENTORY_MODULES) + ("ops/p5_provision.py",)
+        rd.INVENTORY_MODULES = tuple(rd.INVENTORY_MODULES) + ("ops/p5_prod_provision.py",)
         problem = rd.deployment_inventory_problem()
         self.assertTrue(problem, "a declared module nothing runs was accepted")
-        self.assertIn("p5_provision.py", problem)
+        self.assertIn("p5_prod_provision.py", problem)
 
     def test_the_reviewed_deployment_does_not_carry_it(self):
         problem = rd.deployment_tools_problem(self.REVIEWED)
         self.assertTrue(problem, "the reviewed deployment was said to carry the provisioner")
-        self.assertIn("ops/p5_provision.py", problem)
+        self.assertIn("ops/p5_prod_provision.py", problem)
 
     def test_a_revision_that_carries_it_is_accepted(self):
         """Positive control: the check must not be a blanket refusal."""
@@ -3702,7 +3705,7 @@ class TestTheDeploymentCarriesItsProvisioningTool(unittest.TestCase):
     def test_a_revision_missing_it_is_refused(self):
         problem = rd.deployment_tools_problem(self._revision(with_tool=False))
         self.assertTrue(problem)
-        self.assertIn("ops/p5_provision.py", problem)
+        self.assertIn("ops/p5_prod_provision.py", problem)
 
     # ------------------------------------------------- proposed is not approved
     def test_the_proposed_set_is_disjoint_from_the_approved_set(self):
@@ -3733,8 +3736,11 @@ class TestTheDeploymentCarriesItsProvisioningTool(unittest.TestCase):
         with open(os.path.join(dev, "unrelated.py"), "w") as fh:
             fh.write("# so the commit is never empty\n")
         if with_tool:
-            with open(os.path.join(dev, "p5_provision.py"), "w") as fh:
-                fh.write("# the provisioner\n")
+            for rel in rd.DEPLOYMENT_TOOLS:
+                path = os.path.join(repo, rd.DEV_PREFIX, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as fh:
+                    fh.write("# the production provisioner\n")
         for args in (("init", "-q"), ("config", "user.email", "t@example.invalid"),
                      ("config", "user.name", "t"), ("add", "-A"),
                      ("commit", "-qm", "a revision")):
@@ -3841,12 +3847,26 @@ class TestTheDeploymentCandidate(_RecordWritingMixin, unittest.TestCase):
                         "the candidate does not descend from the earlier approved deployment")
 
     # ------------------------------------------------- what it changes, and what it does not
-    def test_the_candidate_carries_the_provisioner(self):
-        self.assertIsNone(rd.deployment_tools_problem(self.candidate))
+    def test_the_candidate_carries_the_ISOLATED_provisioner_only(self):
+        """What `708058e` actually adds, stated precisely.
 
-    def test_the_earlier_approved_deployment_still_does_not(self):
-        """Retained in the approved set and still refused by the tool gate. Retention is a
-        statement about review, not about capability."""
+        It carries `ops/p5_provision.py`, which refuses any stage root inside the live root and
+        therefore cannot provision production. That was worth adding and is not the production
+        capability the tool gate asks about."""
+        self.assertIsNotNone(rd._git_blob(self.candidate, "ops/p5_provision.py"))
+        for rel in rd.STAGING_TOOLS:
+            with self.subTest(rel):
+                self.assertIsNotNone(rd._git_blob(self.candidate, rel))
+
+    def test_the_candidate_does_NOT_carry_the_production_provisioner(self):
+        """And so it does not satisfy `deployment_tools`. Before the split it appeared to."""
+        problem = rd.deployment_tools_problem(self.candidate)
+        self.assertTrue(problem, "the candidate still looks production-capable")
+        self.assertIn("ops/p5_prod_provision.py", problem)
+
+    def test_the_earlier_approved_deployment_still_does_not_either(self):
+        """Retained in the approved set and still refused. Retention is a statement about
+        review, not about capability."""
         self.assertIn(self.REVIEWED, rd.REVIEWED_DEPLOY_SHAS)
         self.assertTrue(rd.deployment_tools_problem(self.REVIEWED))
 
@@ -3952,9 +3972,14 @@ class TestDeploymentToolsIsAReadinessRequirement(_RecordWritingMixin, unittest.T
             self.addCleanup(setattr, rd, name, getattr(rd, name))
         root, _head, record = approved_assessor_repo()
         rd.ASSESSOR_REPO_ROOT, rd.APPROVAL_RECORD_PATH = root, record
-        # The candidate is approved now, so it comes from the recommendation rather than from
-        # the proposed set -- which is empty.
         self.proposed = rd.CURRENT_DEPLOY_SHA
+        # This class is about how the checker handles DIGESTS -- absent, malformed, mismatched.
+        # `DEPLOYMENT_TOOLS` now names `ops/p5_prod_provision.py`, which no committed candidate
+        # carries yet, so every case here would be refused by the tool-absent branch before
+        # reaching the branch it is about. Declaring a tool the fixture commit really has puts
+        # each guard back in front of its own test. WHICH tool the contract names is a separate
+        # question, and `TestTheReadinessContractNamesTheProductionTool` asks it.
+        rd.DEPLOYMENT_TOOLS = ("ops/p5_provision.py",)
 
     # ---------------------------------------------------------------- it is a requirement
     def test_it_is_declared_as_a_requirement(self):
@@ -4384,10 +4409,13 @@ class TestTheApprovedSetSemanticsAreRecorded(unittest.TestCase):
         """Retained, not retired: removing it would invalidate evidence recorded against it."""
         self.assertIn(self.OLD, rd.REVIEWED_DEPLOY_SHAS)
 
-    def test_retention_does_not_make_the_older_commit_fit_to_deploy(self):
-        """The reason retention is safe, checked rather than argued."""
-        self.assertTrue(rd.deployment_tools_problem(self.OLD))
-        self.assertIsNone(rd.deployment_tools_problem(rd.CURRENT_DEPLOY_SHA))
+    def test_neither_approved_commit_is_fit_to_provision_production(self):
+        """Retention is safe because the tool gate refuses BOTH: the older commit predates even
+        the isolated tool, and the candidate carries only that one. No approved commit can
+        provision production, which is the blocker a new reviewed deployment must close."""
+        for sha in rd.REVIEWED_DEPLOY_SHAS:
+            with self.subTest(sha[:7]):
+                self.assertTrue(rd.deployment_tools_problem(sha))
 
     def test_the_evidence_authority_still_covers_the_older_commit(self):
         """Reason 2 for retention, as a check: the approved set is also what

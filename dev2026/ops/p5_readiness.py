@@ -109,12 +109,25 @@ PROPOSED_DEPLOY_SHAS = ()
 
 #: What the deployment must CARRY but no runtime stage imports.
 #:
-#: `ops/p5_provision.py` builds the P5 roots. An operator runs it as a command; a compaction
-#: never imports it, and it is therefore deliberately NOT in `INVENTORY_MODULES` --
-#: `deployment_inventory_problem()` refuses a declared module nothing runs, and it is right to:
-#: a declaration nothing executes is not a check. "Present at the deployment commit" is a
-#: different claim from "on the runtime path", so it is checked as a different one.
-DEPLOYMENT_TOOLS = ("ops/p5_provision.py",)
+#: What the deployment must CARRY to provision the P5 roots IN PRODUCTION.
+#:
+#: `ops/p5_prod_provision.py`, not `ops/p5_provision.py`. The latter is an isolated-staging
+#: tool and refuses any stage root inside the declared live root, so a deployment carrying only
+#: it cannot provision anything in `$G` -- and the gate was reading its presence as though it
+#: could. It also declares its anchor with `allow_same_filesystem=True`, which is correct for a
+#: throwaway root and invalid for a deployment. Carrying a tool that refuses the job is not
+#: carrying the tool for the job.
+#:
+#: An operator runs these as commands; a compaction never imports them, so they are
+#: deliberately NOT in `INVENTORY_MODULES` -- `deployment_inventory_problem()` refuses a
+#: declared module nothing runs, and it is right to. "Present at the deployment commit" is a
+#: different claim from "on the runtime path", checked as a different one.
+DEPLOYMENT_TOOLS = ("ops/p5_prod_provision.py",)
+
+#: The isolated-staging tool, named separately and NOT gated on. It proves the provisioning
+#: recipe in a throwaway root; it is useful, it is not a production capability, and conflating
+#: the two is what this split exists to prevent. Nothing requires a deployment to carry it.
+STAGING_TOOLS = ("ops/p5_provision.py",)
 
 #: Where the assessor's repository lives, and the directory prefix inside it. Module-level so
 #: tests can point the whole git-backed path at a purpose-built repository instead of stubbing

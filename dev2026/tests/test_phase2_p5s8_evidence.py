@@ -1551,43 +1551,53 @@ class TestTheProvisioningBlockerIsGenerated(unittest.TestCase):
 
     def test_the_row_names_the_declared_tool_and_the_requirement_that_enforces_it(self):
         row = ev._provisioning_blocker()
-        self.assertIn("ops/p5_provision.py", row)
+        self.assertIn("ops/p5_prod_provision.py", row)
         self.assertIn("deployment_tools", row)
 
-    def test_the_row_splits_the_approved_set_by_who_carries_the_tool(self):
-        """Being approved and being equipped are different, and the row must not blur them now
-        that the approved set contains one commit of each kind."""
-        from ops import p5_readiness as rd
+    def test_the_row_distinguishes_the_isolated_tool_from_the_production_one(self):
+        """The candidate carries the isolated tool. Naming only the missing one would leave a
+        reader thinking nothing had been built; naming them as the same thing is the error this
+        split corrects."""
         row = ev._provisioning_blocker()
-        for sha in rd.REVIEWED_DEPLOY_SHAS:
-            with self.subTest(sha[:7]):
-                self.assertIn(sha[:7], row)
-        self.assertIn("carrying `ops/p5_provision.py`: `708058e`", row)
-        self.assertIn("not carrying it: `3223fba`", row)
-        self.assertIn("BLOCKS", row)
+        self.assertIn("ops/p5_provision.py", row)
+        self.assertIn("refuses any root inside the live root", row)
+        self.assertIn("new reviewed deployment commit", row)
 
-    def test_the_row_names_the_recommended_commit_without_authorizing_a_deployment(self):
-        row = ev._provisioning_blocker()
-        self.assertIn("Recommended for a new deployment: `708058e`", row)
-        self.assertIn("not authorized by this document", row)
-
-    def test_the_row_follows_the_approved_set_rather_than_naming_commits(self):
-        """Take the equipped commit out of the approved set and the row goes back to refusing
-        outright. A literal would keep saying one is available."""
+    def test_no_approved_commit_carries_the_production_tool(self):
+        """Both approved commits are named as lacking it: `3223fba` predates even the isolated
+        tool, and `708058e` carries only that one."""
         from ops import p5_readiness as rd
-        self.addCleanup(setattr, rd, "REVIEWED_DEPLOY_SHAS", rd.REVIEWED_DEPLOY_SHAS)
-        rd.REVIEWED_DEPLOY_SHAS = ("3223fba37da5d292ea6acb58ccef0da2b5138d31",)
         row = ev._provisioning_blocker()
         self.assertIn("**BLOCKED**", row)
         self.assertIn("no approved commit", row)
+        for sha in rd.REVIEWED_DEPLOY_SHAS:
+            with self.subTest(sha[:7]):
+                self.assertIn(sha[:7], row)
+
+    def test_the_row_follows_the_approved_set_rather_than_naming_commits(self):
+        """Give the approved set a commit that really carries the production tool and the row
+        stops refusing. A literal would keep saying none does."""
+        from ops import p5_readiness as rd
+        self.addCleanup(setattr, rd, "deployment_tools_problem", rd.deployment_tools_problem)
+        rd.deployment_tools_problem = lambda sha: None
+        row = ev._provisioning_blocker()
+        self.assertNotIn("no approved commit", row)
+        self.assertIn("approved commits carrying", row)
 
     def test_the_row_follows_the_declaration_rather_than_repeating_it(self):
-        """Change what is declared and the row changes. A literal would not."""
+        """Change what is declared and the row changes. A literal would not.
+
+        Both declarations move, because the row now names the production tool AND the isolated
+        one it must not be confused with; leaving either as a literal is the drift this guards."""
         from ops import p5_readiness as rd
-        self.addCleanup(setattr, rd, "DEPLOYMENT_TOOLS", rd.DEPLOYMENT_TOOLS)
+        for name in ("DEPLOYMENT_TOOLS", "STAGING_TOOLS"):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
         rd.DEPLOYMENT_TOOLS = ("ops/some_other_tool.py",)
+        rd.STAGING_TOOLS = ("ops/some_staging_tool.py",)
         row = ev._provisioning_blocker()
         self.assertIn("ops/some_other_tool.py", row)
+        self.assertIn("ops/some_staging_tool.py", row)
+        self.assertNotIn("ops/p5_prod_provision.py", row)
         self.assertNotIn("ops/p5_provision.py", row)
 
     def test_an_empty_declaration_does_not_read_as_satisfied(self):

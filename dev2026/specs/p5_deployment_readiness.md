@@ -173,7 +173,7 @@ artifact* — what follows is what the current checker would return for the evid
 hand, which is reasoning about an old artifact, not a new one.
 
 Applied to the archived target, whose identity block reports `reviewed_sha` `3223fba` beside
-`head_sha` `a9db4b7`, the current checker returns **`BLOCKED`**: `ops/p5_provision.py` is
+`head_sha` `a9db4b7`, the current checker returns **`BLOCKED`**: `ops/p5_prod_provision.py` is
 genuinely not at `a9db4b7`, read from git blobs, with no collector involved.
 
 `a9db4b7` — the **deployed** commit — is the one the checker reads, not `reviewed_sha`. "Can this
@@ -260,7 +260,37 @@ The match is required **in both directions**. A module the stage runs and the in
 declare is a hole; a module the inventory declares and the stage never runs is a check that
 cannot fire. Either one refuses.
 
-### A separate blocker: `ops/p5_provision.py` is not at the reviewed commit
+### A separate blocker: no approved commit carries a PRODUCTION provisioning tool
+
+**Corrected 2026-08-25.** `DEPLOYMENT_TOOLS` used to name `ops/p5_provision.py`, and the gate
+read its presence as "this deployment can provision production". It cannot. That module refuses
+any stage root inside the declared live root — deliberately, and the refusal must not be made
+optional — and it declares its anchor with `allow_same_filesystem=True`, which is right for a
+throwaway root on one filesystem and invalid for a deployment whose anchor is supposed to
+outlive that filesystem. **A tool that refuses the job is not the tool for the job**, and the
+gate was measuring the wrong thing.
+
+So there are now two tools, named separately:
+
+| declaration | module | what it can do |
+|---|---|---|
+| `DEPLOYMENT_TOOLS` | `ops/p5_prod_provision.py` | provisions the P5 roots **under the live root**, under an explicit production-scoped approval |
+| `STAGING_TOOLS` | `ops/p5_provision.py` | provisions an **isolated** throwaway root; refuses the live root; not gated on |
+
+`ops/p5_prod_provision.py` is a separate module rather than a flag, because a flag would make
+the isolation guarantee optional and an optional guarantee is not one. It refuses, before
+writing anything: an approval that is absent or not for this live root and this run; an anchor
+that is inside the live root, on the live root's device, undeclared, or carrying the
+same-filesystem waiver; P5 roots that already exist — it neither adopts nor deletes them; free
+space below the operator's floor, or a device that moved between the preflight and the lock; and
+a compaction already running. It takes the compaction lock outermost and holds the ingest lock
+only across the publish, per §7.1b. It performs no compaction, prune, swap, repair or deletion.
+
+**`708058e` is therefore not sufficient for production provisioning.** It carries only the
+isolated tool. Closing this blocker needs a **new reviewed deployment commit** carrying
+`ops/p5_prod_provision.py`, reviewed and approved on its own terms.
+
+The older statement, kept because it is still true of `3223fba`:
 
 The reviewed deployment SHA `3223fba` does **not** contain `ops/p5_provision.py`. Provisioning is
 therefore not deployable at that commit whatever this assessment says about the compaction
@@ -316,7 +346,7 @@ What was verified from git blobs before the promotion, and is re-checked by test
 |---|---|
 | the 23 runtime modules, `3223fba` vs `708058e` | **byte-identical**, all 23 |
 | what the candidate changes | **additions only** — no path modified, none deleted |
-| what it adds | `ops/p5_provision.py`, the assessor, its tests, this document, evidence artifacts |
+| what it adds | `ops/p5_provision.py` (the **isolated** tool), the assessor, its tests, this document, evidence artifacts |
 | build / prune_swap / api closures at `708058e` | **10 / 16 / 12**, matching both ways, nothing shrunk |
 | lifecycle smoke at `708058e` | build attests `2026-06-27`; refold `refolded`; **`swap_performed: true`** |
 | descends from `3223fba` | yes |
@@ -334,13 +364,21 @@ that tuple means without saying so:
    for which commits an executed result may be *read from*, and which deploy commit a recorded
    run may be *about*. Removing `3223fba` would retroactively invalidate every result ever
    recorded against it.
-3. **Retention is not a loophole.** `3223fba` predates `ops/p5_provision.py`, so
-   `deployment_tools` `BLOCKS` it. It cannot reach `compaction_ready` however long it stays.
+3. **Retention is not a loophole.** `deployment_tools` `BLOCKS` `3223fba` — and, since the tool
+   split, `708058e` as well. Neither can reach `compaction_ready` however long either stays.
 
 Being in the approved set and being fit to deploy are therefore different properties, and the
 set now contains one commit of each kind. `CURRENT_DEPLOY_SHA` names which one a new deployment
 should use — `708058e` — separately from `REVIEWED_DEPLOY_SHAS`, because "was this reviewed" does
 not expire and "which should be deployed now" moves.
+
+### `708058e` is deployable, and is not sufficient for production provisioning
+
+Both statements hold at once and neither implies the other. `identity` can adjudicate `708058e`;
+`deployment_tools` refuses it, because it carries the isolated provisioner and not the production
+one. A **new reviewed deployment commit** carrying `ops/p5_prod_provision.py` is required before
+P5 roots can be provisioned in `$G`, and this document does not treat the current candidate as
+closing that.
 
 ### Promoted to deployable is not promoted to ready
 
@@ -388,9 +426,11 @@ In dependency order. Each is reversible on its own.
    they belong in a reviewed commit, or unwanted, in which case the deployment has drifted.
    Nobody can say which from here; this needs the operator.
 3. **Provision P5 roots** — `p5_blocks` with a published generation, `p5_repairs` initialized
-   against that manifest authority, and an anchor declaring a rollback domain. `ops/p5_provision.py`
-   does this reversibly in an isolated root today. Doing it in `$G` is a production change and
-   needs approval.
+   against that manifest authority, and an anchor declaring a rollback domain.
+   `ops/p5_prod_provision.py` is the operation that does this **in production**;
+   `ops/p5_provision.py` does it reversibly in an isolated root and refuses to do it here.
+   Doing it in `$G` is a production change, needs its own production-scoped approval, and needs
+   a deployed commit that carries the production tool — which no approved commit does yet.
 
    **This is machine-enforced, not a note.** The `deployment_tools` requirement adjudicates it:
    every entry in `DEPLOYMENT_TOOLS` must be present at the commit the target reports, and the
