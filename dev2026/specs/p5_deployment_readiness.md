@@ -127,7 +127,7 @@ The deployment cannot run a compaction because the code that performs one is not
 | requirement | verdict | why |
 |---|---|---|
 | `identity` | **BLOCKED** | HEAD `a9db4b7` is not the reviewed `3223fba`, and the worktree carries 5 uncommitted modifications |
-| `deployment_tools` | **BLOCKED** | `ops/p5_provision.py` is absent at `a9db4b7` — and at the reviewed `3223fba`. The archived collection also reports no tool fingerprints at all: the field postdates it, so this requirement needs a fresh collection even once a revision carrying the tool is deployed |
+| `deployment_tools` | **BLOCKED** | `ops/p5_provision.py` is absent at `a9db4b7` — established from git blobs, without the collector. See the note below on why this is `BLOCKED` and not merely unadjudicated |
 | `manifest` | **BLOCKED** | no manifest root at `$G/p5_blocks` |
 | `blocks` | **BLOCKED** | follows from `manifest`: there is nothing to check segments against |
 | `wal_anchor` | **BLOCKED** | no `$G/p5_repairs`; no anchor root is declared anywhere |
@@ -135,6 +135,38 @@ The deployment cannot run a compaction because the code that performs one is not
 | `api_parity` | **NEEDS_HUMAN_APPROVAL** | proving it needs a service serving a manifest — a live switchover or a second isolated service, both production changes |
 | `capacity` | **READY** | 1260.7 GiB free against a 403.3 GiB minimum, measured in run `20260821T130320Z` |
 | `failure_semantics` | **NOT_ADJUDICATED** | the local suites prove the *code's* refusal/rollback behaviour, and that code is not deployed, so the property is not a property of this deployment |
+
+### Two different findings, kept apart: an absent tool and uncollected evidence
+
+The `deployment_tools` row above is `BLOCKED` for one reason only: `ops/p5_provision.py` is
+genuinely not at `a9db4b7`, and that is read from git blobs at the commit the target reports.
+No collector is involved, and no evidence gathered on the host could change it.
+
+The archived artifact **also** reports no `tools` fingerprints at all — the field postdates the
+2026-08-21 collection. That is a *separate* fact, and it does not prove anything about what is on
+that disk. A collector that never looked has not shown a tool to be missing. So the requirement
+returns **`NOT_ADJUDICATED`** for an uncollected report, not `BLOCKED`, and says so in as many
+words. `identity` draws the line in the same place for an uncollected module inventory.
+
+`NOT_ADJUDICATED` still blocks readiness — `compaction_ready` requires every requirement `READY`
+— so nothing is loosened by the distinction. What changes is what the artifact *claims*: a
+deployment defect and an evidence gap are different things to hand an operator, and collapsing
+them is the error this phase has spent weeks pulling apart.
+
+The consequence for sequencing: even once a revision carrying the provisioner is deployed, this
+requirement cannot reach `READY` from the archived run. It needs a fresh collection that
+fingerprints the tools, and that collection has to be authorized separately.
+
+The verdicts the requirement can return:
+
+| finding | verdict | established by |
+|---|---|---|
+| the tool is absent at the reported commit | `BLOCKED` | git blob at that commit |
+| nothing declared in `DEPLOYMENT_TOOLS` | `BLOCKED` | the declaration itself — a gate is not disarmable by emptying it |
+| the collector reported no tools at all | `NOT_ADJUDICATED` | absence of evidence, named as such |
+| a declared tool the report does not cover | `BLOCKED` | the report ran and is incomplete |
+| a reported digest that does not match the commit | `BLOCKED` | recomputed SHA-256 of the git blob |
+| every declared tool present and matching | `READY` | recomputed SHA-256 of the git blob |
 
 ## What "the deployment" means: three stages, measured by running them
 

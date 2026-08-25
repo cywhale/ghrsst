@@ -1019,9 +1019,19 @@ def _check_deployment_tools(t: Dict) -> tuple:
         return BLOCKED, f"the deployment at {reviewed[:7]} {problem}"
     reported = ident.get("tools")
     if type(reported) is not dict or not reported:
-        return BLOCKED, (f"the target fingerprinted no operator tool, so a tool present at "
-                         f"{reviewed[:7]} says only what git holds, not what is on the "
-                         f"deployment's disk")
+        # NOT_ADJUDICATED, not BLOCKED. A collector that never looked has not shown the tool
+        # to be missing -- and the artifact collected on 2026-08-21 predates this field
+        # entirely, so reading its silence as a defect would report a deployment fault where
+        # there is only evidence nobody gathered. It still blocks readiness: `assess()`
+        # requires every requirement READY, and this is not that.
+        #
+        # The tool being ABSENT AT THE COMMIT is a different finding and is refused above,
+        # from git blobs, without the collector's help. `identity` draws the same line for an
+        # uncollected module inventory.
+        return NOT_ADJUDICATED, (f"no operator tool was fingerprinted by the collector, so "
+                                 f"what is present at {reviewed[:7]} says only what git holds "
+                                 f"and not what is on the deployment's disk; this is missing "
+                                 f"evidence, not a tool shown to be missing")
     expected = {}
     for rel in DEPLOYMENT_TOOLS:
         blob = _git_blob(reviewed, rel)

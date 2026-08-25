@@ -3991,11 +3991,35 @@ class TestDeploymentToolsIsAReadinessRequirement(_RecordWritingMixin, unittest.T
         self.assertIn("does not fingerprint", reason)
         self.assertNotIn("mismatch", reason)
 
-    def test_a_target_reporting_no_tools_at_all_refuses(self):
+    def test_a_target_reporting_no_tools_is_NOT_ADJUDICATED_not_blocked(self):
+        """Missing evidence is not a missing tool.
+
+        The VM24 artifact collected on 2026-08-21 predates the `tools` field, so its silence
+        says nothing about what is on that disk. Calling it BLOCKED would report a deployment
+        defect where there is only a collector that never looked -- the same collapse this
+        phase has spent weeks pulling apart. `identity` draws the line in the same place for an
+        uncollected module inventory.
+
+        It still blocks readiness, which is the property that matters for safety."""
         target = self._target(self.proposed)
         target["identity"].pop("tools")
         verdict, reason = rd._check_deployment_tools(target)
+        self.assertEqual(verdict, rd.NOT_ADJUDICATED, reason)
+        self.assertIn("missing evidence", reason)
+        report = rd.assess(target)
+        self.assertFalse(report["compaction_ready"],
+                         "uncollected evidence let a deployment read as ready")
+        self.assertIn("deployment_tools", report["summary"][rd.NOT_ADJUDICATED])
+
+    def test_an_absent_tool_is_still_BLOCKED_not_merely_unadjudicated(self):
+        """The other side of the line, so the softening above cannot swallow it: absence at
+        the commit is established from git blobs, without the collector, and is a fact about
+        the deployment rather than about the evidence."""
+        target = self._target(self.REVIEWED)
+        target["identity"]["tools"] = {"ops/p5_provision.py": "b" * 64}
+        verdict, reason = rd._check_deployment_tools(target)
         self.assertEqual(verdict, rd.BLOCKED, reason)
+        self.assertIn("does not carry", reason)
 
     def test_a_target_with_no_identity_preflight_is_not_adjudicated(self):
         """Nothing collected is not the same as something wrong, and saying BLOCKED here would
@@ -4021,6 +4045,27 @@ class TestDeploymentToolsIsAReadinessRequirement(_RecordWritingMixin, unittest.T
         """So the closure probe can evidence that this checker ran, not that it was listed."""
         _verdict, reason = rd._check_deployment_tools(self._target(self.proposed))
         self.assertIn("operator tool fingerprints recomputed", reason)
+
+    # ---------------------------------------------------------------- the document agrees
+    def _doc(self):
+        with open(os.path.join(_DEV, "specs", "p5_deployment_readiness.md")) as fh:
+            return fh.read()
+
+    def test_the_document_separates_an_absent_tool_from_uncollected_evidence(self):
+        """The status wording has to draw the same line the code does, or the artifact says one
+        thing and the prose beside it says another."""
+        doc = self._doc()
+        self.assertIn("uncollected evidence", doc)
+        self.assertIn("has not shown a tool to be missing", doc)
+
+    def test_the_document_says_an_evidence_gap_still_blocks_readiness(self):
+        doc = self._doc()
+        self.assertIn("`NOT_ADJUDICATED` still blocks readiness", doc)
+
+    def test_the_document_states_why_the_archived_row_is_blocked(self):
+        """`BLOCKED` there is the absent tool, read from git blobs -- not the missing field."""
+        doc = self._doc()
+        self.assertIn("genuinely not at `a9db4b7`", doc)
 
     # ---------------------------------------------------------------- fixture
     def _target(self, sha):
