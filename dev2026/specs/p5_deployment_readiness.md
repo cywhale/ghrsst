@@ -122,11 +122,12 @@ only `api/app.py` exists there. `store/block_manifest.py`, `store/repair_wal.py`
 `store/compaction_lock.py`, `ingest/build_block.py` and `ingest/publish_manifest.py` are absent.
 The deployment cannot run a compaction because the code that performs one is not deployed.
 
-## The eight requirements
+## The nine requirements
 
 | requirement | verdict | why |
 |---|---|---|
 | `identity` | **BLOCKED** | HEAD `a9db4b7` is not the reviewed `3223fba`, and the worktree carries 5 uncommitted modifications |
+| `deployment_tools` | **BLOCKED** | `ops/p5_provision.py` is absent at `a9db4b7` — and at the reviewed `3223fba`. The archived collection also reports no tool fingerprints at all: the field postdates it, so this requirement needs a fresh collection even once a revision carrying the tool is deployed |
 | `manifest` | **BLOCKED** | no manifest root at `$G/p5_blocks` |
 | `blocks` | **BLOCKED** | follows from `manifest`: there is nothing to check segments against |
 | `wal_anchor` | **BLOCKED** | no `$G/p5_repairs`; no anchor root is declared anywhere |
@@ -268,6 +269,18 @@ In dependency order. Each is reversible on its own.
    against that manifest authority, and an anchor declaring a rollback domain. `ops/p5_provision.py`
    does this reversibly in an isolated root today. Doing it in `$G` is a production change and
    needs approval.
+
+   **This is machine-enforced, not a note.** The `deployment_tools` requirement adjudicates it:
+   every entry in `DEPLOYMENT_TOOLS` must be present at the commit the target reports, and the
+   digest the target reports for it must equal the digest recomputed from that commit's git
+   blob. Absent tool, unreported digest, or mismatched digest are each `BLOCKED`. So a
+   deployment that cannot run the provisioner cannot reach `compaction_ready`, and steps 3–5
+   below cannot be reached by remembering to check something.
+
+   It is a separate requirement from `identity` on purpose. `identity` asks whether the deployed
+   bytes are the reviewed bytes; this asks whether the deployment carries the tool that creates
+   what every store requirement then inspects. The reviewed `3223fba` predates the module
+   entirely, so folding the two together would report one blocker as the other.
 4. **Declare the anchor on a different failure domain.** The staging path uses
    `allow_same_filesystem=True`, which is correct for a throwaway root and wrong for a deployment:
    an anchor on the volume it witnesses is lost with it. A real deployment needs a declared

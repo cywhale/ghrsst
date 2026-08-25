@@ -1539,3 +1539,49 @@ class TestTheNextApprovalSectionMatchesWhatHasRun(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheProvisioningBlockerIsGenerated(unittest.TestCase):
+    """The blockers table must carry provisioning, derived rather than restated.
+
+    Everything else in this table was hand-maintained once and drifted; the rule since is that
+    a row repeating a fact held elsewhere is generated from that fact. The provisioning row's
+    source of truth is the assessor's `DEPLOYMENT_TOOLS` and its approved/proposed deploy sets,
+    so emptying or satisfying the declaration changes the row without anyone editing prose."""
+
+    def test_the_row_names_the_declared_tool_and_the_requirement_that_enforces_it(self):
+        row = ev._provisioning_blocker()
+        self.assertIn("ops/p5_provision.py", row)
+        self.assertIn("deployment_tools", row)
+
+    def test_the_row_says_the_approved_deployment_does_not_carry_it(self):
+        row = ev._provisioning_blocker()
+        self.assertIn("BLOCKED", row)
+        self.assertIn("3223fba", row)
+
+    def test_the_row_names_the_proposed_revision_and_calls_it_unapproved(self):
+        row = ev._provisioning_blocker()
+        self.assertIn("708058e", row)
+        self.assertIn("proposed is not approved", row)
+
+    def test_the_row_follows_the_declaration_rather_than_repeating_it(self):
+        """Change what is declared and the row changes. A literal would not."""
+        from ops import p5_readiness as rd
+        self.addCleanup(setattr, rd, "DEPLOYMENT_TOOLS", rd.DEPLOYMENT_TOOLS)
+        rd.DEPLOYMENT_TOOLS = ("ops/some_other_tool.py",)
+        row = ev._provisioning_blocker()
+        self.assertIn("ops/some_other_tool.py", row)
+        self.assertNotIn("ops/p5_provision.py", row)
+
+    def test_an_empty_declaration_does_not_read_as_satisfied(self):
+        from ops import p5_readiness as rd
+        self.addCleanup(setattr, rd, "DEPLOYMENT_TOOLS", rd.DEPLOYMENT_TOOLS)
+        rd.DEPLOYMENT_TOOLS = ()
+        self.assertIn("nothing declared", ev._provisioning_blocker())
+
+    def test_the_generated_memo_carries_the_row(self):
+        """End to end: the row reaches the published artifact, not just the renderer."""
+        with open(os.path.join(_DEV, "specs", "p5_critical_path_memo.md")) as fh:
+            memo = fh.read()
+        self.assertIn("Provisioning tool", memo)
+        self.assertIn("deployment_tools", memo)

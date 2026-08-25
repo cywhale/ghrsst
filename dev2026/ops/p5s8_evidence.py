@@ -270,6 +270,30 @@ def execution_bound_to(evidence: dict):
     return S8_EXECUTION
 
 
+def _provisioning_blocker() -> str:
+    """The provisioning prerequisite, as the ASSESSOR currently declares and enforces it.
+
+    Imported inside the function, not at module scope: `ops/p5_readiness.py` reads this
+    module's capacity policy at call time, and a module-level import in the other direction
+    would make the pair's import order load-bearing for no gain. The dependency is real either
+    way and this is where it is written down."""
+    from ops import p5_readiness as rd
+    tools = ", ".join(f"`{t}`" for t in rd.DEPLOYMENT_TOOLS) or "**nothing declared**"
+    approved = ", ".join(f"`{sha[:7]}`" for sha in rd.REVIEWED_DEPLOY_SHAS)
+    carried = [sha for sha in rd.REVIEWED_DEPLOY_SHAS
+               if rd.deployment_tools_problem(sha) is None]
+    proposed = ", ".join(f"`{sha[:7]}`" for sha in rd.PROPOSED_DEPLOY_SHAS) or "none"
+    if carried:
+        state = (f"the approved deployment carries {tools}; the `deployment_tools` requirement "
+                 f"still checks each reported digest against that commit")
+    else:
+        state = (f"**BLOCKED** — the approved deployment ({approved}) does not carry {tools}, "
+                 f"so it cannot provision the P5 roots every store requirement then inspects. "
+                 f"Enforced by the `deployment_tools` readiness requirement, not by a note. "
+                 f"Proposed revision carrying it: {proposed} — proposed is not approved")
+    return state
+
+
 def render_blockers(evidence: dict) -> str:
     """The `Remaining blockers` table, GENERATED.
 
@@ -306,6 +330,10 @@ def render_blockers(evidence: dict) -> str:
          f"**{S8_EXECUTION['s9_shadow_execution']['status']}** — "
          f"{S8_EXECUTION['s9_shadow_execution']['detail']}"),
         ("**S10**", "not authorized; needs its own fresh written approval"),
+        # Derived from the assessor's own declaration, never restated here. A blocker table
+        # that repeats a list held elsewhere is the thing that drifts -- which is why the
+        # capacity row above reads its verdict from the evidence instead of a literal.
+        ("**Provisioning tool**", _provisioning_blocker()),
     ]
     body = "\n".join(f"| {a} | {b} |" for a, b in rows)
     return (f"{BLOCKERS_START}\n"

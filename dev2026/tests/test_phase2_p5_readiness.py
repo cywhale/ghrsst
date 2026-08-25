@@ -163,7 +163,11 @@ def build_probe_workspace(case):
         "root": root, "manifest_root": manifest_root, "wal_root": wal_root,
         "anchor_root": anchor_root,
         "identity": {"reviewed_sha": deploy_sha, "head_sha": deploy_sha,
-                     "worktree_clean": True, "modules": {suite_rel: suite_digest}},
+                     "worktree_clean": True, "modules": {suite_rel: suite_digest},
+                     # The synthetic deployment's "operator tool" is the recorded suite: the
+                     # probe needs a path that commit really carries, and inventing a second
+                     # file would only test the fixture.
+                     "tools": {suite_rel: suite_digest}},
         "capacity": {"label": rd.QUALIFYING_LABEL, "run_id": "CLOSURE_RUN",
                      "measured_utc": now, "free_now_gib": 1.0,
                      "minimum_free_gib": 0.001, "recommended_free_gib": 0.001,
@@ -188,6 +192,7 @@ def build_probe_workspace(case):
             # union of the two runtimes, so overriding one alone is a self-inconsistent
             # declaration -- which it would rightly refuse.
             "INVENTORY_MODULES": [suite_rel],
+            "DEPLOYMENT_TOOLS": [suite_rel],
             "COMPACTION_RUNTIME_MODULES": [suite_rel],
             "API_RUNTIME_MODULES": [suite_rel],
             # The target-closure check imports these FROM the target commit, so they must name
@@ -2209,6 +2214,7 @@ print(json.dumps({"closure": sorted(out), "verdicts": verdicts, "reasons": reaso
         "wal_anchor": "anchor=",
         "locks": "acquired and released by",
         "identity": "module fingerprints recomputed",
+        "deployment_tools": "operator tool fingerprints recomputed",
         "failure_semantics": "tests_run=",
         "manifest": "generation=",
     }
@@ -3884,3 +3890,147 @@ class TestTheProposedDeploymentRevision(_RecordWritingMixin, unittest.TestCase):
         by_id = {r["id"]: r for r in rd.assess(target)["requirements"]}
         self.assertEqual(by_id["identity"]["verdict"], rd.BLOCKED,
                          "a proposed revision reached a deployable verdict")
+
+
+class TestDeploymentToolsIsAReadinessRequirement(_RecordWritingMixin, unittest.TestCase):
+    """Provisioning is a prerequisite for P5 roots, so it is adjudicated, not annotated.
+
+    `deployment_tools_problem()` existed and nothing called it: a fact recorded next to the
+    verdict rather than inside it. A prerequisite that only appears in prose is one an operator
+    can read past, and the whole point of this artifact is that a machine says no.
+
+    The requirement is deliberately NOT identity's business, and it is deliberately not gated on
+    the approved set either. It asks one question of whatever commit the target reports: does
+    this deployment carry the operator tools, and are the bytes it reports the bytes at that
+    commit? A target lying about `reviewed_sha` is identity's problem and identity catches it;
+    overall readiness needs every requirement READY, so the tool gate cannot authorize anything
+    on its own -- which is exactly what lets `708058e` pass it while remaining undeployable."""
+
+    REVIEWED = "3223fba37da5d292ea6acb58ccef0da2b5138d31"
+
+    def setUp(self):
+        for name in ("REVIEWED_DEPLOY_SHAS", "ASSESSOR_REPO_ROOT", "APPROVAL_RECORD_PATH",
+                     "DEPLOYMENT_TOOLS"):
+            self.addCleanup(setattr, rd, name, getattr(rd, name))
+        root, _head, record = approved_assessor_repo()
+        rd.ASSESSOR_REPO_ROOT, rd.APPROVAL_RECORD_PATH = root, record
+        self.proposed = rd.PROPOSED_DEPLOY_SHAS[0]
+
+    # ---------------------------------------------------------------- it is a requirement
+    def test_it_is_declared_as_a_requirement(self):
+        ids = [r["id"] for r in rd.REQUIREMENTS]
+        self.assertIn("deployment_tools", ids)
+        self.assertIn("deployment_tools", rd.CHECKERS)
+
+    def test_it_appears_in_the_readiness_artifact(self):
+        report = rd.assess(self._target(self.REVIEWED))
+        ids = [r["id"] for r in report["requirements"]]
+        self.assertIn("deployment_tools", ids)
+        row = next(r for r in report["requirements"] if r["id"] == "deployment_tools")
+        for field in ("title", "why", "evidence_kind", "verdict", "reason"):
+            self.assertTrue(row.get(field), f"the artifact row has no {field}")
+
+    def test_it_is_adjudicable_without_the_host(self):
+        """Git blobs and reported digests, no filesystem: it must not be deferred off-host the
+        way the store checks are, or the prerequisite would never be enforced from here."""
+        self.assertNotIn("deployment_tools", rd.FILESYSTEM_BACKED)
+        self.assertNotIn("deployment_tools", rd.APPROVAL_REQUIRED)
+
+    # ---------------------------------------------------------------- the two commits
+    def test_the_approved_deployment_is_blocked_because_the_provisioner_is_absent(self):
+        verdict, reason = rd._check_deployment_tools(self._target(self.REVIEWED))
+        self.assertEqual(verdict, rd.BLOCKED, reason)
+        self.assertIn("ops/p5_provision.py", reason)
+
+    def test_the_proposed_revision_passes_the_tool_gate(self):
+        """The positive control the reviewer asked for."""
+        verdict, reason = rd._check_deployment_tools(self._target(self.proposed))
+        self.assertEqual(verdict, rd.READY, reason)
+
+    def test_the_proposed_revision_passes_tools_and_still_fails_identity(self):
+        """Both at once, through the real `assess()`: the tool gate says yes, the approved set
+        says no, and the deployment is not ready. If passing tools ever moved identity, a
+        packaging revision would have promoted itself."""
+        report = rd.assess(self._target(self.proposed))
+        by_id = {r["id"]: r for r in report["requirements"]}
+        self.assertEqual(by_id["deployment_tools"]["verdict"], rd.READY,
+                         by_id["deployment_tools"]["reason"])
+        self.assertEqual(by_id["identity"]["verdict"], rd.BLOCKED)
+        self.assertFalse(report["compaction_ready"])
+
+    def test_the_proposed_set_cannot_authorize_identity_or_readiness(self):
+        self.assertNotIn(self.proposed, rd.REVIEWED_DEPLOY_SHAS)
+        report = rd.assess(self._target(self.proposed))
+        self.assertFalse(report["compaction_ready"])
+        self.assertIn("identity", report["summary"][rd.BLOCKED])
+
+    # ---------------------------------------------------------------- the digest is checked
+    def test_a_falsely_reported_tool_digest_refuses(self):
+        target = self._target(self.proposed)
+        target["identity"]["tools"]["ops/p5_provision.py"] = "0" * 64
+        verdict, reason = rd._check_deployment_tools(target)
+        self.assertEqual(verdict, rd.BLOCKED, reason)
+        self.assertIn("ops/p5_provision.py", reason)
+
+    def test_a_tool_the_target_does_not_fingerprint_refuses(self):
+        """It reports tools -- just not the declared one.
+
+        Emptying the dict instead would be refused by the "fingerprinted nothing" guard above,
+        and this test would pass without the coverage check existing at all. It has to be a
+        non-empty report that fails to cover what is declared."""
+        target = self._target(self.proposed)
+        target["identity"]["tools"] = {"ops/some_other_tool.py": "a" * 64}
+        verdict, reason = rd._check_deployment_tools(target)
+        self.assertEqual(verdict, rd.BLOCKED, reason)
+        self.assertIn("ops/p5_provision.py", reason)
+        # AS SUCH. An unreported tool is also a digest mismatch, so the refusal itself proves
+        # nothing about this branch -- drop it and the mismatch check refuses anyway. What is
+        # lost is the diagnosis, and the two are different repairs: "you never reported this
+        # tool" sends someone to the collector, "you reported different bytes" sends them to
+        # the deployment. The message is the thing being checked here.
+        self.assertIn("does not fingerprint", reason)
+        self.assertNotIn("mismatch", reason)
+
+    def test_a_target_reporting_no_tools_at_all_refuses(self):
+        target = self._target(self.proposed)
+        target["identity"].pop("tools")
+        verdict, reason = rd._check_deployment_tools(target)
+        self.assertEqual(verdict, rd.BLOCKED, reason)
+
+    def test_a_target_with_no_identity_preflight_is_not_adjudicated(self):
+        """Nothing collected is not the same as something wrong, and saying BLOCKED here would
+        report a deployment defect where there is only missing evidence."""
+        verdict, _reason = rd._check_deployment_tools({"label": rd.QUALIFYING_LABEL})
+        self.assertEqual(verdict, rd.NOT_ADJUDICATED)
+
+    def test_declaring_no_tools_at_all_refuses(self):
+        """The gate must not be disarmable by emptying its own declaration.
+
+        The target is built BEFORE the declaration is emptied, so it still reports a real tool
+        and a real digest. Building it after would leave the report empty, and the
+        "fingerprinted nothing" guard would refuse first -- the declaration guard never
+        reached, and this test passing on somebody else's work."""
+        target = self._target(self.proposed)
+        self.assertTrue(target["identity"]["tools"], "the fixture reports no tool")
+        rd.DEPLOYMENT_TOOLS = ()
+        verdict, reason = rd._check_deployment_tools(target)
+        self.assertEqual(verdict, rd.BLOCKED, reason)
+        self.assertIn("empty declaration", reason)
+
+    def test_the_reason_carries_this_checkers_own_signature(self):
+        """So the closure probe can evidence that this checker ran, not that it was listed."""
+        _verdict, reason = rd._check_deployment_tools(self._target(self.proposed))
+        self.assertIn("operator tool fingerprints recomputed", reason)
+
+    # ---------------------------------------------------------------- fixture
+    def _target(self, sha):
+        """A target reporting `sha`, with honest tool digests taken from that commit."""
+        import hashlib
+        tools = {}
+        for rel in rd.DEPLOYMENT_TOOLS:
+            blob = rd._git_blob(sha, rel)
+            if blob is not None:
+                tools[rel] = hashlib.sha256(blob).hexdigest()
+        return {"label": rd.QUALIFYING_LABEL, "host": "nowhere",
+                "identity": {"reviewed_sha": sha, "head_sha": sha,
+                             "worktree_clean": True, "modules": {}, "tools": tools}}

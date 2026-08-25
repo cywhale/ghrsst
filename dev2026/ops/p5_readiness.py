@@ -302,6 +302,12 @@ REQUIREMENTS: List[Dict] = [
      "title": "the reviewed commit, checked out clean and detached",
      "why": ("a compaction is run BY code. If the deployed tree is not exactly the reviewed "
              "commit, the review adjudicated something else.")},
+    {"id": "deployment_tools", "evidence_kind": "preflight",
+     "title": "the operator tools the deployment must carry, at the commit it reports",
+     "why": ("provisioning the P5 roots is a prerequisite for every store requirement below, "
+             "and it is run FROM the deployment. A deployment missing `ops/p5_provision.py` "
+             "cannot create the manifest, WAL and anchor the rest of this list asks for -- so "
+             "it is adjudicated here rather than left as a note somebody has to remember.")},
     {"id": "manifest", "evidence_kind": "store",
      "title": "a live segmented manifest the store would accept",
      "why": ("the manifest is the authority for what is served. Without one there is no "
@@ -987,6 +993,53 @@ def _check_identity(t: Dict) -> tuple:
                    f"recomputed from the approved commit and matched")
 
 
+def _check_deployment_tools(t: Dict) -> tuple:
+    """Does the deployment carry its operator tools, and are they the approved bytes?
+
+    Asked of whatever commit the target REPORTS, not of the approved set. Whether that commit
+    may be deployed at all is `identity`'s question and identity answers it; readiness needs
+    every requirement READY, so this one cannot promote anything by passing. That separation is
+    what lets a packaging revision be measured on its merits while staying undeployable."""
+    import hashlib
+    ident = t.get("identity") or {}
+    reviewed = ident.get("reviewed_sha")
+    if not reviewed:
+        return NOT_ADJUDICATED, ("no identity preflight was collected, so there is no commit "
+                                 "to check the operator tools against")
+    if not _is_sha1(reviewed):
+        return BLOCKED, (f"the target reports reviewed_sha {reviewed!r}, which is not a commit "
+                         f"id, so no tool can be recomputed from it")
+    # The declaration before the comparison. An empty tuple would make every check below pass
+    # over nothing -- a gate disarmed by emptying the list it enforces.
+    if not DEPLOYMENT_TOOLS:
+        return BLOCKED, ("no operator tool is declared, so this requirement checks nothing; "
+                         "an empty declaration is not a passing one")
+    problem = deployment_tools_problem(reviewed)
+    if problem:
+        return BLOCKED, f"the deployment at {reviewed[:7]} {problem}"
+    reported = ident.get("tools")
+    if type(reported) is not dict or not reported:
+        return BLOCKED, (f"the target fingerprinted no operator tool, so a tool present at "
+                         f"{reviewed[:7]} says only what git holds, not what is on the "
+                         f"deployment's disk")
+    expected = {}
+    for rel in DEPLOYMENT_TOOLS:
+        blob = _git_blob(reviewed, rel)
+        if blob is None:                       # unreachable: deployment_tools_problem refused
+            return BLOCKED, f"{rel} vanished from {reviewed[:7]} between two reads"
+        expected[rel] = hashlib.sha256(blob).hexdigest()
+    missing = sorted(set(expected) - set(reported))
+    if missing:
+        return BLOCKED, (f"the target does not fingerprint {missing}; an unreported tool reads "
+                         f"as clean and is the easiest thing to leave out")
+    wrong = sorted(k for k, v in expected.items() if reported.get(k) != v)
+    if wrong:
+        return BLOCKED, (f"operator tool fingerprint mismatch against {reviewed[:7]}: {wrong}. "
+                         f"The deployed tool is not the approved tool")
+    return READY, (f"{len(expected)} operator tool fingerprints recomputed from {reviewed[:7]} "
+                   f"and matched: {sorted(expected)}")
+
+
 def _live_manifest(manifest_root: str):
     """The live manifest, via the shipped reader. Returns (manifest, None) or (None, reason)."""
     if not manifest_root or not os.path.isdir(manifest_root):
@@ -1422,6 +1475,7 @@ def _on_host(target: Dict) -> tuple:
 
 CHECKERS = {
     "identity": _check_identity,
+    "deployment_tools": _check_deployment_tools,
     "manifest": _check_manifest,
     "blocks": _check_blocks,
     "wal_anchor": _check_wal_anchor,

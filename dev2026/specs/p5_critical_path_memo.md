@@ -409,6 +409,7 @@ artifact cannot bypass that check; and the 2026-08-20 / 364-row request remains 
 | **S8 execution** | `legacy_baseline` **COMPLETED** — executed 2026-08-20 at deploy SHA 96ee79c; artifacts assembled on VM24 and copied back; NO gate adjudicated by this run |
 | **S9 / shadow execution** | **NOT_STARTED** — requires its own separate human approval |
 | **S10** | not authorized; needs its own fresh written approval |
+| **Provisioning tool** | **BLOCKED** — the approved deployment (`3223fba`) does not carry `ops/p5_provision.py`, so it cannot provision the P5 roots every store requirement then inspects. Enforced by the `deployment_tools` readiness requirement, not by a note. Proposed revision carrying it: `708058e` — proposed is not approved |
 
 <!-- generated:blockers:end -->
 
