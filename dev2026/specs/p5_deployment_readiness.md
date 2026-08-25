@@ -279,12 +279,40 @@ So there are now two tools, named separately:
 
 `ops/p5_prod_provision.py` is a separate module rather than a flag, because a flag would make
 the isolation guarantee optional and an optional guarantee is not one. It refuses, before
-writing anything: an approval that is absent or not for this live root and this run; an anchor
-that is inside the live root, on the live root's device, undeclared, or carrying the
-same-filesystem waiver; P5 roots that already exist — it neither adopts nor deletes them; free
-space below the operator's floor, or a device that moved between the preflight and the lock; and
-a compaction already running. It takes the compaction lock outermost and holds the ingest lock
-only across the publish, per §7.1b. It performs no compaction, prune, swap, repair or deletion.
+writing anything: an approval that is absent or not for this live root and this run; lock paths
+that are not the canonical production ones, compared by `realpath` so an alias to the right
+inode is accepted and one pointing away is not; an anchor that is inside the live root, on the
+live root's device, undeclared, or carrying the same-filesystem waiver; P5 roots that already
+exist — it neither adopts nor deletes them; free space below the **canonical** G18 floor, read
+from `ops/p5s8_evidence.py` exactly as `p5_readiness` reads it, with a caller-supplied figure
+refused unless it equals that value; and a compaction already running. Capacity and device are
+re-measured **under the lock**, because a binding taken before the lock is a binding to a
+different moment.
+
+#### It provisions roots only, and here is why
+
+**It publishes no manifest and initializes no WAL.** Two findings force that scope:
+
+1. **A delta-only generation 1 would be an invalid authority.** `api/app.py` treats a configured
+   manifest as *the* base — `if mf_dir: SegmentedCubeStore(mf_dir)` — and deliberately does not
+   fall back to the monolith beside it. Production delta holds ~58 days; the monolith holds
+   1 331. A generation 1 whose only segment came from delta would therefore drop roughly
+   **1 273 days** of history from the served view the moment it was configured, under a
+   `/healthz` still reporting `ok`. A valid generation 1 is a **`legacy_base`** segment over the
+   existing monolith — the schema has that kind, and `ALLOWED_LEGACY_PATHS` exists to let such a
+   segment point outside the block root. Building one is a separate reviewed step.
+2. **`initialize_wal()` cannot precede that manifest.** It binds the log to a manifest authority
+   through `block_manifest.load_live()`, which raises when nothing is published. So "roots plus
+   WAL, without a manifest" is not reachable, and WAL initialization must follow generation 1.
+
+What it creates is therefore two empty directories, `p5_blocks` and `p5_repairs`, which nothing
+reads until a manifest exists — `GHRSST_BLOCK_MANIFEST_DIR` must stay unset until then. It
+performs no compaction, prune, swap, repair or deletion, and its cleanup is checked rather than
+best-effort: any created path it cannot remove keeps the ownership marker and raises
+`ProductionCleanupError` naming exactly what remains.
+
+The compaction lock is held across the creation; the ingest lock is **validated but not taken**,
+because §7.1b scopes it to the publish critical section and this operation has none.
 
 **`708058e` is therefore not sufficient for production provisioning.** It carries only the
 isolated tool. Closing this blocker needs a **new reviewed deployment commit** carrying

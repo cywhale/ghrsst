@@ -1,52 +1,70 @@
-"""dev2026 — P5 PRODUCTION root provisioning.
+"""dev2026 — P5 PRODUCTION root provisioning: create the roots, and nothing else.
 
 `ops/p5_provision.py` cannot do this, and must not be made to. It refuses any stage root inside
-the declared live root, and it declares its anchor with `allow_same_filesystem=True` — correct
-for a throwaway root on one filesystem, invalid for a deployment whose anchor is supposed to
-survive the loss of the volume it witnesses. Adding a bypass flag there would make the
-isolation guarantee optional, and an optional guarantee is not one. So production provisioning
-is a separate operation with its own scope, its own approval and its own refusals.
+the declared live root, and it declares its anchor with the same-filesystem waiver — correct for
+a throwaway root on one filesystem, invalid for a deployment whose anchor is supposed to survive
+the loss of the volume it witnesses. Adding a bypass there would make the isolation guarantee
+optional, and an optional guarantee is not one. So production provisioning is a separate
+operation with its own scope, its own approval and its own refusals.
 
-## What this does
+## Why this does NOT publish a manifest
 
-Creates, under the live data root, exactly two P5 roots — `p5_blocks` (manifest authority) and
-`p5_repairs` (repair WAL) — seeds generation 1 from the delta, and initializes the WAL against
-an anchor the operator supplies. That is all. It never prunes, swaps, compacts, repairs or
-deletes production data, and it holds no opinion about whether a compaction should follow.
-Provisioning roots and running a compaction are different operations with different blast
-radii, and the runbook sequences them separately.
+The first version of this module built a block from the delta and published it as generation 1.
+That is wrong, and the reason is worth writing down:
+
+* `api/app.py` treats a configured manifest as **the** authority — `if mf_dir:
+  SegmentedCubeStore(mf_dir)` — and deliberately does not fall back to the monolith beside it,
+  because "silently preferring the monolith would serve a generation nobody published".
+* The production delta holds ~58 days. The monolith holds ~1331. A generation 1 whose only
+  segment came from delta would therefore **remove roughly 1 273 days of history from the served
+  view** the moment it was configured, under a `/healthz` that still said `ok`.
+
+A valid generation 1 is a **`legacy_base` segment over the existing monolith** — the schema has
+that kind (`store/block_manifest.py`: `kind must be legacy_base|block`), and
+`p5_readiness.ALLOWED_LEGACY_PATHS` exists to allow exactly such a segment to point outside the
+block root. Building one is real work — layout, metadata fingerprint and day digest derived from
+the monolith on disk — and it is a separate reviewed step, not something to synthesize here.
+
+## Why this does NOT initialize the WAL
+
+`repair_wal.initialize_wal()` binds the log to a manifest authority, and
+`manifest_authority()` calls `block_manifest.load_live()`, which raises when there is no
+published manifest. So "roots plus WAL, without a manifest" is not reachable: WAL initialization
+must follow a valid generation 1, and cannot precede it.
+
+## What this does, therefore
+
+Creates exactly two empty directories under the live root — `p5_blocks` and `p5_repairs` —
+after verifying every precondition, and stops. They are inert: nothing reads them until a
+manifest is published, and `GHRSST_BLOCK_MANIFEST_DIR` must stay unset until then.
 
 ## What it refuses, before writing anything
 
-Every one of these is a refusal rather than a warning, and none is waivable by a flag:
+None of these is waivable by a flag: no production-scoped approval naming this live root and
+this run; a live root that is missing or not a directory; lock paths that are not the canonical
+production ones; P5 roots that already exist — neither adopted nor deleted; free space below the
+**canonical** G18 floor, measured fresh and bound to the device holding the live root and
+re-checked under the lock; a compaction already running; an anchor inside the live root, on the
+live root's device, undeclared, or carrying the same-filesystem waiver.
 
-* no explicit production approval naming this live root and this run;
-* a live root that is missing, or not a directory;
-* P5 roots that already exist — it will not adopt them, and it will not delete them;
-* an anchor inside the live root, on the live root's device, undeclared, or declared with
-  `allow_same_filesystem=True`;
-* free space below the operator's floor, measured fresh, bound to the device actually holding
-  the live root;
-* a compaction already running.
+The anchor is verified here even though the WAL is initialized later: an operator who cannot
+produce a valid anchor should learn it before roots exist, not after.
 
 ## What it does not promise
 
-A process crash between two writes is not covered. The marker is written first so the state is
-always identifiably this run's, and `rollback_production()` removes only what this run created —
-never the live root, never pre-existing data. Nothing here makes provisioning atomic against
-power loss or SIGKILL; recovering from that is a person reading a marker that says
-`complete: false`.
+A process crash between two writes is not covered. The marker records each path as it is
+created, so it is never behind what exists on disk, and cleanup is checked rather than
+best-effort: a path that cannot be removed keeps the marker and raises
+`ProductionCleanupError` naming exactly what remains.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
-import socket
-from typing import Dict, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
-from ingest.build_block import build_block
-from store import block_manifest
 from store import compaction_lock
 from store import repair_wal
 
@@ -58,14 +76,15 @@ PRODUCTION_LABEL = "P5_PRODUCTION_PROVISION"
 #: a shadow run — is not an approval for writing into the live data root.
 PRODUCTION_SCOPE = "p5_production_provisioning"
 
-#: The ONLY two directory names this creates, and it computes them itself. Taking them from the
-#: caller would make "which path" a parameter, and the whole containment argument rests on it
-#: not being one.
+#: The ONLY names this creates, and the canonical lock names, all relative to the live root.
+#: Computed from it, never taken from the caller: containment is only an argument if the path
+#: cannot be pointed elsewhere.
 MANIFEST_DIRNAME = "p5_blocks"
 WAL_DIRNAME = "p5_repairs"
+COMPACTION_LOCK_NAME = "p5_compaction.lock"
+INGEST_LOCK_NAME = "mur_delta.ingest.lock"
 
-#: Ownership marker, in the live root, named for the run. Two runs cannot collide, and a
-#: rollback names the run it is rolling back.
+#: Ownership marker, in the live root, named for the run.
 MARKER_PREFIX = ".p5_prod_provision"
 
 
@@ -78,13 +97,20 @@ class ProductionApprovalRefused(ProductionProvisionRefused):
 
 
 class ProductionCleanupError(Exception):
-    """Provisioning failed AND the partial state could not be removed. Both are reported."""
+    """Provisioning failed AND some created path could not be removed.
+
+    Carries the live root and the exact paths still present, and chains the original
+    provisioning failure as `__cause__`. The ownership marker is deliberately left in place:
+    it is what a person needs to finish the cleanup."""
+
+    def __init__(self, message: str, *, live_root: str, unrestored: Sequence[str]):
+        super().__init__(message)
+        self.live_root = live_root
+        self.unrestored = list(unrestored)
 
 
 def _inside(path: str, root: str) -> bool:
-    """Is `path` inside `root`? By path components, never by string prefix.
-
-    `/data/ghrsst-stage` is not inside `/data/ghrsst`, and a `startswith` test says it is."""
+    """Is `path` inside `root`? By path components, never by string prefix."""
     path = os.path.realpath(path)
     root = os.path.realpath(root)
     return path == root or path.startswith(root + os.sep)
@@ -99,18 +125,33 @@ def marker_name(run_id: str) -> str:
     return f"{MARKER_PREFIX}_{run_id}.json"
 
 
+def canonical_minimum_free_gib() -> float:
+    """The G18 floor, from the ONE policy source readiness also reads.
+
+    Imported at call time from `ops/p5s8_evidence.py`, where it is derived as
+    `HARD_RESERVE + additional`. A copy here would be a second threshold to keep in step, and
+    the copy is what goes stale — which is the whole reason `p5_readiness` reads it this way."""
+    from ops import p5s8_evidence
+    return p5s8_evidence.MINIMUM_FREE_GIB
+
+
+def canonical_lock_paths(live_root: str) -> Dict[str, str]:
+    """The two production lock paths, derived from the live root."""
+    return {"compaction": os.path.join(live_root, COMPACTION_LOCK_NAME),
+            "ingest": os.path.join(live_root, INGEST_LOCK_NAME)}
+
+
 # ---------------------------------------------------------------- preconditions
 def check_production_approval(approval, *, live_root: str, run_id: str) -> Dict:
     """The approval, validated. Returns it; raises `ProductionApprovalRefused`.
 
-    Writing into the live data root is the one thing this module does that cannot be undone by
-    deleting a directory — the manifest it publishes becomes the store's authority. So the
-    approval is checked field by field, against THIS root and THIS run, rather than for mere
-    presence. An approval for a different root is an approval for a different act."""
+    Checked field by field against THIS root and THIS run rather than for mere presence. An
+    approval for a different root is an approval for a different act, and a reusable one is a
+    standing permission to write into production."""
     if type(approval) is not dict:
         raise ProductionApprovalRefused(
-            f"no production approval was supplied (got {type(approval).__name__}); writing P5 "
-            f"roots into the live data root is a production change and needs one")
+            f"no production approval was supplied (got {type(approval).__name__}); creating P5 "
+            f"roots in the live data root is a production change and needs one")
     for field in ("scope", "approved_by", "approved_utc", "live_root", "run_id"):
         if field not in approval:
             raise ProductionApprovalRefused(
@@ -135,15 +176,87 @@ def check_production_approval(approval, *, live_root: str, run_id: str) -> Dict:
     return dict(approval)
 
 
+def check_lock_paths(*, live_root: str, compaction_lock_path: str,
+                     ingest_lock_path: str) -> Dict[str, str]:
+    """Both supplied paths must BE the canonical production locks, by realpath.
+
+    They are parameters so an operator states which locks are being taken and can be refused
+    when that is wrong — not so the locks can be moved. Compared through `realpath`, so a
+    symlink pointing at the canonical file is accepted and a symlink pointing away is not:
+    string equality would accept an alias that locks a different inode, which is the one
+    two-writer state the compaction posture cannot survive."""
+    canonical = canonical_lock_paths(live_root)
+    supplied = {"compaction": compaction_lock_path, "ingest": ingest_lock_path}
+    for role, path in supplied.items():
+        if not _exact_str(path):
+            raise ProductionProvisionRefused(
+                f"no {role} lock path was supplied; the lock a production operation takes is "
+                f"not left implicit")
+        want = canonical[role]
+        if os.path.realpath(path) != os.path.realpath(want):
+            raise ProductionProvisionRefused(
+                f"the {role} lock path {path!r} is not the canonical production lock "
+                f"{want!r} (compared by realpath, so an alias to it would be accepted). "
+                f"Taking a different lock excludes nobody")
+    return canonical
+
+
+def check_capacity_floor(min_free_gib) -> float:
+    """The caller must state the floor, and it must be the canonical one.
+
+    A floor the caller can lower is not a floor. This takes the value so the request records
+    which policy it believed it was operating under, and refuses anything that is not exactly
+    the canonical figure — including the shapes that compare equal or slip past a naive
+    comparison: `True` is an `int`, `NaN` fails every comparison, and infinities are not
+    thresholds."""
+    canonical = canonical_minimum_free_gib()
+    if type(min_free_gib) is bool:
+        raise ProductionProvisionRefused(
+            f"min_free_gib must be a number, got bool {min_free_gib!r}; True is an int and "
+            f"would compare as 1 GiB")
+    if not isinstance(min_free_gib, (int, float)):
+        raise ProductionProvisionRefused(
+            f"min_free_gib must be a number, got {type(min_free_gib).__name__}")
+    if isinstance(min_free_gib, float) and (math.isnan(min_free_gib)
+                                            or math.isinf(min_free_gib)):
+        raise ProductionProvisionRefused(
+            f"min_free_gib is {min_free_gib!r}, which is not a threshold: NaN fails every "
+            f"comparison and an infinity is not a quantity of disk")
+    if float(min_free_gib) != float(canonical):
+        raise ProductionProvisionRefused(
+            f"min_free_gib is {min_free_gib!r}, not the canonical G18 floor {canonical!r}. "
+            f"The floor is policy, read from ops/p5s8_evidence.py; a caller-supplied one is "
+            f"a bypass with an extra step")
+    return float(canonical)
+
+
+def measure_capacity(live_root: str, *, min_free_gib: float) -> Dict:
+    """Free space and device, measured NOW against the root about to be written."""
+    floor = check_capacity_floor(min_free_gib)
+    st = os.statvfs(live_root)
+    free_gib = st.f_bavail * st.f_frsize / (1024 ** 3)
+    binding = {"data_root": os.path.realpath(live_root),
+               "filesystem_dev": os.stat(live_root).st_dev,
+               "free_now_gib": round(free_gib, 1),
+               "min_free_gib": floor,
+               "canonical_min_free_gib": floor,
+               "inodes_free": st.f_favail}
+    if free_gib < floor:
+        raise ProductionProvisionRefused(
+            f"free space on {live_root!r} is {free_gib:.1f} GiB, below the canonical G18 floor "
+            f"of {floor:.1f} GiB. Provisioning roots on a volume that cannot hold the build "
+            f"they exist for is a partial state waiting to happen")
+    return binding
+
+
 def check_anchor_domain(anchor_root: str, live_root: str) -> Dict:
     """The anchor, validated against the live root. Returns what was verified.
 
-    `resolve_anchor_root()` enforces most of this at WAL time, and accepts an
-    `allow_same_filesystem=True` declaration as an auditable waiver. That waiver is correct for
-    a throwaway staging root and wrong here: the anchor is the only thing that can notice the
-    live volume being rolled back underneath the WAL, and one that shares the volume is
-    restored with it. So production refuses the waiver outright, before any write, rather than
-    discovering it inside `initialize_wal`."""
+    `resolve_anchor_root()` accepts an `allow_same_filesystem=True` declaration as an auditable
+    waiver. That is right for a throwaway staging root and wrong here: the anchor is the only
+    thing that can notice the live volume being rolled back underneath the WAL, and one that
+    shares the volume is restored with it. Production refuses the waiver outright, before any
+    write, rather than discovering it later."""
     if not _exact_str(anchor_root):
         raise ProductionProvisionRefused(
             "no anchor_root was supplied. Production provisioning will not choose one: the "
@@ -184,29 +297,6 @@ def check_anchor_domain(anchor_root: str, live_root: str) -> Dict:
             "live_dev": live_dev, "allow_same_filesystem": False}
 
 
-def measure_capacity(live_root: str, *, min_free_gib: float) -> Dict:
-    """Free space and device, measured NOW against the root about to be written.
-
-    Bound to the device actually holding `live_root`, not to a figure someone passed in: a
-    roomy unrelated volume produced a passing number while the volume that mattered was full."""
-    if type(min_free_gib) is bool or not isinstance(min_free_gib, (int, float)):
-        raise ProductionProvisionRefused(
-            f"min_free_gib must be a number, got {type(min_free_gib).__name__}")
-    st = os.statvfs(live_root)
-    free_gib = st.f_bavail * st.f_frsize / (1024 ** 3)
-    binding = {"data_root": os.path.realpath(live_root),
-               "filesystem_dev": os.stat(live_root).st_dev,
-               "free_now_gib": round(free_gib, 1),
-               "min_free_gib": float(min_free_gib),
-               "inodes_free": st.f_favail}
-    if free_gib < min_free_gib:
-        raise ProductionProvisionRefused(
-            f"free space on {live_root!r} is {free_gib:.1f} GiB, below the required "
-            f"{float(min_free_gib):.1f} GiB. A build that runs out part-way leaves exactly the "
-            f"partial state this refuses to create")
-    return binding
-
-
 def _refuse_existing_roots(manifest_root: str, wal_root: str) -> None:
     """Never adopt, never delete. Both are the same refusal from opposite directions."""
     for path in (manifest_root, wal_root):
@@ -221,18 +311,15 @@ def _refuse_existing_roots(manifest_root: str, wal_root: str) -> None:
 # ---------------------------------------------------------------- the operation
 def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
                          compaction_lock_path: str, ingest_lock_path: str,
-                         delta_path: str, start_day: str, end_day: str,
-                         days: Sequence[str], grid: Dict, run_id: str, operator: str,
-                         at_utc: str, min_free_gib: float,
-                         block_name: str = "block_v1.zarr",
-                         domain_id: Optional[str] = None,
+                         run_id: str, operator: str, at_utc: str,
+                         min_free_gib: float,
                          cleanup_on_failure: bool = True) -> Dict:
-    """Create the P5 roots under `live_root` and seed generation 1. Returns what was made.
+    """Create the two P5 roots under `live_root`. Returns what was made.
 
-    Lock ordering follows the runbook's normative sequence: the compaction lock is taken FIRST
-    and held across the whole operation, and the ingest lock is taken only for the publish
-    critical section and released before the compaction lock. Publishing is the moment the
-    store's authority changes, and it is the only moment ingest must be excluded from."""
+    Publishes no manifest and initializes no WAL — see the module docstring for why neither is
+    reachable here. The compaction lock is held across the creation so no compaction can be
+    running against roots appearing underneath it; the ingest lock is NOT taken, because §7.1b
+    scopes it to the publish critical section and this operation has none."""
     approval = check_production_approval(approval, live_root=live_root, run_id=run_id)
     if not os.path.isdir(live_root):
         raise ProductionProvisionRefused(
@@ -241,9 +328,9 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
     for name, value in (("run_id", run_id), ("operator", operator), ("at_utc", at_utc)):
         if not _exact_str(value):
             raise ProductionProvisionRefused(f"{name} must be a non-empty string")
+    locks = check_lock_paths(live_root=live_root, compaction_lock_path=compaction_lock_path,
+                             ingest_lock_path=ingest_lock_path)
 
-    # Computed here, never taken from the caller: containment is only an argument if the path
-    # cannot be pointed elsewhere.
     manifest_root = os.path.join(live_root, MANIFEST_DIRNAME)
     wal_root = os.path.join(live_root, WAL_DIRNAME)
     for path in (manifest_root, wal_root):
@@ -256,18 +343,18 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
     capacity = measure_capacity(live_root, min_free_gib=min_free_gib)
 
     busy = compaction_lock.refuse_if_compaction_running(
-        compaction_lock_path, operation="p5 production provisioning")
+        locks["compaction"], operation="p5 production provisioning")
     if busy:
         raise ProductionProvisionRefused(
             f"a compaction is running ({busy}); provisioning the roots underneath it would "
-            f"change the authority it is building against")
+            f"change what it is building against")
 
     marker_path = os.path.join(live_root, marker_name(run_id))
     marker = f"{PRODUCTION_LABEL}:{run_id}:{at_utc}:{operator}"
     stamp = {"label": PRODUCTION_LABEL, "marker": marker, "run_id": run_id,
              "live_root": os.path.realpath(live_root), "manifest_root": manifest_root,
              "wal_root": wal_root, "anchor_root": anchor["anchor_root"],
-             "provisioned_utc": at_utc, "operator": operator,
+             "locks": locks, "provisioned_utc": at_utc, "operator": operator,
              "approved_by": approval["approved_by"], "approved_utc": approval["approved_utc"],
              "capacity_at_start": capacity, "anchor_verified": anchor,
              "created_paths": [], "complete": False, "failed_step": None}
@@ -275,163 +362,138 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
     # Ownership before the first thing worth owning. The marker is itself a write and can fail;
     # if it does, nothing has been created and there is nothing to own.
     _write_marker(marker_path, stamp)
-    created: list = []
+    created: List[str] = []
     try:
-        result = _provision_production_contents(
-            live_root=live_root, manifest_root=manifest_root, wal_root=wal_root,
-            anchor=anchor, capacity=capacity, delta_path=delta_path, start_day=start_day,
-            end_day=end_day, days=days, grid=grid, run_id=run_id, operator=operator,
-            at_utc=at_utc, block_name=block_name, domain_id=domain_id,
-            compaction_lock_path=compaction_lock_path, ingest_lock_path=ingest_lock_path,
-            approval=approval, marker=marker, created=created)
+        _create_roots(live_root=live_root, manifest_root=manifest_root, wal_root=wal_root,
+                      capacity=capacity, locks=locks, run_id=run_id, created=created,
+                      marker_path=marker_path, stamp=stamp)
+        # The completion write is INSIDE the recovery path. Outside it, a failure here left the
+        # roots on disk under a marker still saying `created_paths: []` and `complete: false` --
+        # a marker that authorized removing nothing while two directories existed.
+        _write_marker(marker_path, {**stamp, "created_paths": list(created), "complete": True})
     except BaseException as failure:
-        partial = {**stamp, "created_paths": list(created), "failed_step": repr(failure)}
-        try:
-            _write_marker(marker_path, partial)
-        except Exception:                                     # noqa: BLE001
-            _discard(created, marker_path)
-            raise failure
-        if not cleanup_on_failure:
-            raise
-        try:
-            rollback_production(partial)
-        except Exception as cleanup_failure:
-            raise ProductionCleanupError(
-                f"production provisioning failed ({failure!r}) and the partial state could not "
-                f"be removed ({cleanup_failure!r}). It is marked as this run's and incomplete: "
-                f"roll it back once the cause is understood. Nothing pre-existing was touched."
-            ) from failure
+        _recover(failure, marker_path=marker_path, stamp=stamp, created=created,
+                 live_root=live_root, cleanup_on_failure=cleanup_on_failure)
         raise
-    result["created_paths"] = list(created)
-    _write_marker(marker_path, {**stamp, "created_paths": list(created), "complete": True,
-                                "generation": result.get("generation")})
-    result["marker_path"] = marker_path
-    return result
-
-
-def _provision_production_contents(*, live_root, manifest_root, wal_root, anchor, capacity,
-                                   delta_path, start_day, end_day, days, grid, run_id,
-                                   operator, at_utc, block_name, domain_id,
-                                   compaction_lock_path, ingest_lock_path, approval, marker,
-                                   created) -> Dict:
-    """Everything after ownership is established. Any failure here is the caller's to clean up.
-
-    Runbook §7.1b ordering:
-
-        flock(p5_compaction.lock, LOCK_EX)  ->  create roots  ->  build
-           ->  acquire ingest lock  ->  assert compaction lock still held
-           ->  publish  ->  release ingest lock  ->  initialize WAL
-           ->  release compaction lock
-    """
-    holder = f"p5_prod_provision/{run_id}"
-    with compaction_lock.CompactionLock(compaction_lock_path, holder=holder) as clock:
-        # Re-measured INSIDE the lock. The device could have been remounted between the
-        # preflight and here, and a binding taken before the lock is a binding to a different
-        # moment than the one being written in.
-        now_dev = os.stat(live_root).st_dev
-        if now_dev != capacity["filesystem_dev"]:
-            raise ProductionProvisionRefused(
-                f"the live root moved device between preflight ({capacity['filesystem_dev']}) "
-                f"and the lock ({now_dev}); the capacity reading is about a different volume")
-
-        for path in (manifest_root, wal_root):
-            os.makedirs(path)                       # no exist_ok: refuse a racing creator
-            created.append(path)
-
-        artifacts = os.path.join(manifest_root, "artifacts")
-        os.makedirs(artifacts, exist_ok=True)
-        block_path = os.path.join(manifest_root, block_name)
-        plan = build_block(block_path, start_day=start_day, end_day=end_day,
-                           classification_target=list(days), delta_path=delta_path,
-                           artifacts_dir=artifacts, lock=clock,
-                           hard_reserve_bytes=int(capacity["min_free_gib"] * (1024 ** 3)))
-
-        manifest = _seed_manifest(plan, grid=grid, at_utc=at_utc, operator=operator,
-                                  run_id=run_id, start_day=start_day, end_day=end_day)
-        # The publish critical section, and the only part ingest must be excluded from.
-        with compaction_lock.CompactionLock(ingest_lock_path,
-                                            holder=f"{holder}/publish") as ingest:
-            clock.assert_still_held()
-            block_manifest.publish(manifest_root, manifest)
-            ingest.release()
-
-        # After the publish, still under the compaction lock: the WAL binds to the manifest
-        # authority that now exists.
-        repair_wal.initialize_wal(wal_root, manifest_root=manifest_root, at_utc=at_utc,
-                                  operator=operator, anchor_root=anchor["anchor_root"])
-        clock.assert_still_held()
 
     return {
         "label": PRODUCTION_LABEL, "is_production_state": True,
         "run_id": run_id, "live_root": os.path.realpath(live_root),
         "manifest_root": manifest_root, "wal_root": wal_root,
         "anchor_root": anchor["anchor_root"], "anchor_domain_id": anchor["domain_id"],
-        "block_path": block_path, "artifacts": artifacts,
-        "generation": manifest["generation"],
-        "locks": {"compaction": compaction_lock_path, "ingest": ingest_lock_path,
-                  "order": "compaction outermost; ingest held only across publish"},
+        "created_paths": list(created), "marker": marker, "marker_path": marker_path,
+        "locks": {**locks, "order": ("compaction lock held across creation; ingest lock NOT "
+                                     "taken -- §7.1b scopes it to the publish critical "
+                                     "section and this operation publishes nothing")},
         "capacity_at_start": capacity, "anchor_verified": anchor,
         "approved_by": approval["approved_by"], "approved_utc": approval["approved_utc"],
-        "provisioned_utc": at_utc, "operator": operator, "marker": marker,
-        "days": list(days), "start_day": start_day, "end_day": end_day,
+        "provisioned_utc": at_utc, "operator": operator,
+        "manifest_published": False, "wal_initialized": False,
+        "generation": None,
         "complete": True, "failed_step": None,
-        "note": ("P5 roots and generation 1 only. This performs no compaction, prune, swap, "
-                 "repair or deletion, and makes no claim that one is safe to run."),
+        "note": ("Empty P5 roots only. No manifest is published and no WAL is initialized: a "
+                 "generation 1 must be a legacy_base segment over the existing monolith, and "
+                 "initialize_wal() binds to a published authority, so both are later reviewed "
+                 "steps. Nothing reads these roots until then, and "
+                 "GHRSST_BLOCK_MANIFEST_DIR must stay unset."),
     }
 
 
-def _seed_manifest(plan: Dict, *, grid: Dict, at_utc: str, operator: str, run_id: str,
-                   start_day: str, end_day: str) -> Dict:
-    """Generation 1, built through `store.block_manifest` — never a second manifest format."""
-    segment = plan["segment"]
-    manifest = {
-        "format": block_manifest.MANIFEST_FORMAT,
-        "version": block_manifest.SCHEMA_VERSION,
-        "generation": 1, "generation_id": f"gen000001-{run_id}",
-        "created_utc": at_utc,
-        "created_by": f"ops/p5_prod_provision.py ({operator})",
-        "predecessor_generation": None, "predecessor_manifest": None,
-        "grid": {"ny": grid["ny"], "nx": grid["nx"],
-                 "region": grid.get("region", [0, grid["ny"], 0, grid["nx"]])},
-        "variables": list(segment.get("variables") or ()) or None,
-        "block_grid": segment.get("block_grid") or {
-            "anchor_day": start_day,
-            "block_days": len(block_manifest.calendar_span(start_day, end_day))},
-        "segments": [dict(segment)], "superseded": [], "manifest_checksum": "",
-    }
-    if manifest["variables"] is None:
-        from ingest.build_block import VARS
-        manifest["variables"] = list(VARS)
-    manifest["manifest_checksum"] = block_manifest.compute_checksum(manifest)
-    return manifest
+def _create_roots(*, live_root, manifest_root, wal_root, capacity, locks, run_id, created,
+                  marker_path, stamp) -> None:
+    """Create the roots under the compaction lock, recording each as it appears."""
+    holder = f"p5_prod_provision/{run_id}"
+    with compaction_lock.CompactionLock(locks["compaction"], holder=holder):
+        # Re-measured INSIDE the lock. A binding taken before the lock is a binding to a
+        # different moment than the one being written in.
+        now_dev = os.stat(live_root).st_dev
+        if now_dev != capacity["filesystem_dev"]:
+            raise ProductionProvisionRefused(
+                f"the live root moved device between preflight ({capacity['filesystem_dev']}) "
+                f"and the lock ({now_dev}); the capacity reading is about a different volume")
+        st = os.statvfs(live_root)
+        free_gib = st.f_bavail * st.f_frsize / (1024 ** 3)
+        if free_gib < capacity["min_free_gib"]:
+            raise ProductionProvisionRefused(
+                f"free space fell to {free_gib:.1f} GiB under the lock, below the canonical "
+                f"floor {capacity['min_free_gib']:.1f} GiB")
+        for path in (manifest_root, wal_root):
+            os.makedirs(path)                       # no exist_ok: refuse a racing creator
+            created.append(path)
+            # The marker is brought up to date the moment the path exists, so it is never
+            # behind the filesystem. A crash between these two writes leaves a marker naming
+            # one root while two exist -- which is why the recovery path uses the in-memory
+            # list as well.
+            _write_marker(marker_path, {**stamp, "created_paths": list(created)})
 
 
-def _write_marker(path: str, payload: Dict) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(payload, fh, indent=1, sort_keys=True)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+def _recover(failure: BaseException, *, marker_path, stamp, created, live_root,
+             cleanup_on_failure: bool) -> None:
+    """Record the failure accurately, then clean up if asked. Never silently."""
+    partial = {**stamp, "created_paths": list(created), "failed_step": repr(failure)}
+    try:
+        _write_marker(marker_path, partial)
+    except Exception:                                         # noqa: BLE001
+        # The marker cannot be written, so nothing on disk can describe what exists. Remove
+        # what was created, checked, and say so if that fails too.
+        _discard(created, marker_path, live_root=live_root, cause=failure)
+        return
+    if not cleanup_on_failure:
+        return
+    rollback_production(partial, cause=failure)
 
 
-def _discard(created: Sequence[str], marker_path: str) -> None:
-    """Best effort removal of exactly what was created, when the marker itself cannot be kept."""
-    for path in reversed(list(created)):
-        shutil.rmtree(path, ignore_errors=True)
+def _remove_checked(paths: Sequence[str]) -> List[str]:
+    """Remove each path and report the ones that are still there.
+
+    `ignore_errors=True` reported success for a directory it had not removed, so a failed
+    cleanup read as a clean one. Every path is attempted — one failure must not skip the rest —
+    and the result is what `os.path.exists` says afterwards, not what `rmtree` returned."""
+    unrestored = []
+    for path in reversed(list(paths)):
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            pass                                   # verified below, not trusted here
+        if os.path.exists(path):
+            unrestored.append(path)
+    return sorted(unrestored)
+
+
+def _discard(created: Sequence[str], marker_path: str, *, live_root: str,
+             cause: Optional[BaseException] = None) -> None:
+    """Remove what was created when the marker itself cannot be kept — checked, not silent.
+
+    The marker is removed only after every created path is verified absent; while anything
+    remains it is the only record of what to finish, so it stays."""
+    unrestored = _remove_checked(created)
+    if unrestored:
+        raise ProductionCleanupError(
+            f"provisioning failed and its marker could not be written; these created paths "
+            f"could not be removed either and are still present under {live_root!r}: "
+            f"{unrestored}. Remove them by hand once the cause is understood",
+            live_root=live_root, unrestored=unrestored) from cause
     try:
         os.remove(marker_path)
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        raise ProductionCleanupError(
+            f"every created path was removed, but the ownership marker {marker_path!r} could "
+            f"not be ({exc}). Nothing is left to clean up under {live_root!r}; delete the "
+            f"marker by hand",
+            live_root=live_root, unrestored=[marker_path]) from cause
 
 
-def rollback_production(provisioned: Dict) -> None:
+def rollback_production(provisioned: Dict, *, cause: Optional[BaseException] = None) -> None:
     """Remove exactly what this run created under the live root, and nothing else.
 
-    The only call here that deletes, so the most suspicious of its argument. It removes the
-    paths the marker RECORDS having created — not the live root, not `p5_blocks` because it is
-    called `p5_blocks`, and never a path this run did not make. A run that created nothing
-    removes nothing."""
+    The only call here that deletes, so the most suspicious of its argument: it removes the
+    paths the marker RECORDS creating — not the live root, not `p5_blocks` because of its name,
+    and never a path this run did not make. Fail-closed: if any recorded path is still there
+    afterwards, the marker STAYS and `ProductionCleanupError` names what remains."""
     live_root = provisioned.get("live_root")
     run_id = provisioned.get("run_id")
     if not (_exact_str(live_root) and _exact_str(run_id)):
@@ -452,7 +514,14 @@ def rollback_production(provisioned: Dict) -> None:
         raise ProductionProvisionRefused(
             f"refusing to roll back: the marker records live_root "
             f"{recorded.get('live_root')!r}, not {live_root!r}")
-    for path in reversed(list(recorded.get("created_paths") or [])):
+    # The union of what the marker records and what the caller holds: a crash between creating
+    # a root and re-writing the marker leaves the marker one behind, and the caller's list is
+    # the more complete of the two.
+    recorded_paths = list(recorded.get("created_paths") or [])
+    for path in (provisioned.get("created_paths") or []):
+        if path not in recorded_paths:
+            recorded_paths.append(path)
+    for path in recorded_paths:
         if not _inside(path, live_root):
             raise ProductionProvisionRefused(
                 f"refusing to remove {path!r}: the marker records it as created but it is not "
@@ -460,5 +529,20 @@ def rollback_production(provisioned: Dict) -> None:
         if os.path.realpath(path) == os.path.realpath(live_root):
             raise ProductionProvisionRefused(
                 f"refusing to remove the live root itself ({path!r})")
-        shutil.rmtree(path, ignore_errors=True)
+    unrestored = _remove_checked(recorded_paths)
+    if unrestored:
+        raise ProductionCleanupError(
+            f"rollback could not remove {unrestored} under {live_root!r}. The ownership marker "
+            f"{marker_path!r} is left in place: it is the record of what still has to be "
+            f"finished, and removing it would leave the state unowned",
+            live_root=live_root, unrestored=unrestored) from cause
     os.remove(marker_path)
+
+
+def _write_marker(path: str, payload: Dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(payload, fh, indent=1, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
