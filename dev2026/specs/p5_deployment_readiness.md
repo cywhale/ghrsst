@@ -381,6 +381,14 @@ The post-compaction gates are **enforced** now — `ops/p5_oneshot_compaction.co
 assembles them from its own state and refuses the run if any fails. What they gate is a
 **finalization clearance**, not a deletion.
 
+`one_shot_compaction` additionally requires a **deployment identity artifact** — an approved
+`deploy_sha`, HEAD at that commit, a clean tree, and module fingerprints matching the blobs git
+holds there — because a production approval names a root and a run and does not make the code
+that runs reviewed. Parity results must be **executed, bound artifacts** from a fingerprinted
+producer; a callable returning `mismatches: 0` is refused. And a generation that fails its
+post-publish gates is **quarantined**: every later publish, switch and finalization refuses until
+a person reconciles it, and the predecessor archive stays intact for a rollback they may choose.
+
 **Releasing the old space is a separate operation, and it does not exist yet.** When it is
 written it must call `refuse_destructive_step()`, which requires the clearance *and* a separate
 human approval — because "this generation is trustworthy" and "the old data should go" are

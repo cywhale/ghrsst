@@ -83,6 +83,20 @@ def record(**over):
         "expires_utc": iso(3000), "approved_by": "cywhale", "approved_utc": iso(-600),
         "reason": ("one fold wanted before the storage team can move the monolith to its own "
                    "read-only mount; VM-level backups make it recoverable"),
+        "residual_writer_risk": residual_risk(),
+    }
+    r.update(over)
+    return r
+
+
+def residual_risk(**over):
+    r = {
+        "acknowledged": True,
+        "unrecoverable_outcome_possible": True,
+        "statement": ("an unfenced writer can change the monolith during the scan-to-publish "
+                      "interval; the parity gates detect it afterwards and a VM restore does "
+                      "not undo what was served in between. Accepted for this one run."),
+        "accepted_by": "cywhale",
     }
     r.update(over)
     return r
@@ -706,6 +720,64 @@ class TestThePreCompactionContract(unittest.TestCase):
         quiescence = dict(pre()["quiescence"], reader_policy="  ")
         self.assertIn("reader policy", self.problem(quiescence=quiescence))
 
+    # ---------------------------------------------------------------- the residual risk
+    def test_the_record_requires_the_residual_writer_risk_acknowledgement(self):
+        """The fence stops the writers that obey it. An arbitrary one does not, and three
+        probes are samples rather than continuous proof. That residue cannot be engineered
+        away, so it is accepted explicitly or the operation stays ineligible."""
+        problem = ex.exception_problem(record(residual_writer_risk=None), host=HOST,
+                                       run_id=RUN_ID, operation=ex.OP_PROVISION,
+                                       observed=observed())
+        self.assertTrue(problem)
+
+    def test_a_complete_acknowledgement_passes(self):
+        self.assertIsNone(ex.residual_risk_problem(residual_risk()))
+
+    def test_every_acknowledgement_field_is_required(self):
+        for field in ex.RESIDUAL_RISK_FIELDS:
+            with self.subTest(field):
+                block = residual_risk()
+                del block[field]
+                problem = ex.residual_risk_problem(block)
+                self.assertTrue(problem)
+                self.assertIn(field, problem)
+
+    def test_an_unacknowledged_residue_is_refused(self):
+        for value in (False, None, "yes", 1):
+            with self.subTest(repr(value)):
+                problem = ex.residual_risk_problem(residual_risk(acknowledged=value))
+                self.assertTrue(problem)
+                if value is not None:
+                    self.assertIn("stays ineligible unless a person accepts", problem)
+
+    def test_denying_the_unrecoverable_outcome_is_refused(self):
+        """Recording `false` records a belief the code does not share."""
+        problem = ex.residual_risk_problem(
+            residual_risk(unrecoverable_outcome_possible=False))
+        self.assertIn("a belief this code does not share", problem)
+
+    def test_a_statement_that_is_not_a_statement_is_refused(self):
+        for value in ("ok", "accepted", "fine by me", "   "):
+            with self.subTest(value):
+                problem = ex.residual_risk_problem(residual_risk(statement=value))
+                self.assertIn("words a reviewer can weigh", problem)
+
+    def test_an_unattributed_acceptance_is_refused(self):
+        problem = ex.residual_risk_problem(residual_risk(accepted_by="  "))
+        self.assertIn("who accepted it", problem)
+
+    def test_a_truthy_value_is_not_an_acknowledgement(self):
+        for value in (True, 1, "accepted", []):
+            with self.subTest(repr(value)):
+                problem = ex.residual_risk_problem(value)
+                self.assertIn("not an acknowledgement", problem)
+
+    def test_the_record_refuses_a_bad_acknowledgement_end_to_end(self):
+        problem = ex.exception_problem(
+            record(residual_writer_risk=residual_risk(unrecoverable_outcome_possible=False)),
+            host=HOST, run_id=RUN_ID, operation=ex.OP_PROVISION, observed=observed())
+        self.assertIn("residual writer risk acknowledgement", problem)
+
     # ---------------------------------------------------------------- the writer fence
     def test_the_preflight_requires_the_writer_fence(self):
         """A writer COUNT is an observation about an instant. The fence is what holds."""
@@ -972,6 +1044,7 @@ class _OneShotBase(_ProdBase):
             "expires_utc": iso(3000), "approved_by": "cywhale", "approved_utc": iso(-600),
             "reason": ("one generation-1 publish wanted before the storage team can move the "
                        "monolith to its own read-only mount; VM backups make it recoverable"),
+            "residual_writer_risk": residual_risk(),
         }
         rec.update(over)
         return rec

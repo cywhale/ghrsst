@@ -6,6 +6,8 @@ implementation deliberately removes nothing at all.
 
 ## What it does, in order
 
+    verify the DEPLOYMENT IDENTITY                  before any lock, before any scan
+    refuse if a generation is QUARANTINED
     flock(p5_compaction.lock, LOCK_EX)              outermost, held across everything
       -> writer-fence probe BEFORE anything is read
       -> flock(mur_delta.ingest.lock, LOCK_EX)      BEFORE the scan, not before the publish
@@ -14,17 +16,56 @@ implementation deliberately removes nothing at all.
            -> build_block(...)                      the expensive scan
            -> re-probe the fence; it must not have moved
            -> re-measure the monolith; it must not have moved either
-           -> PRE-PUBLISH gates: point-series parity against the PER-DAY oracle
-              (first and last days included), source-map completeness, and
-              base/delta disjointness on the PLANNED manifest. A failure here
-              refuses with NOTHING published.
+           -> plan generation N+1 in memory (writes nothing)
+           -> PRE-PUBLISH gates: a bound point-series parity ARTIFACT against the
+              per-day oracle (first and last days included), source-map
+              completeness, and base/delta disjointness on the PLANNED manifest.
+              A failure here refuses with NOTHING published.
            -> execute_publication (borrowing both locks)
       <- ingest lock released
       -> POST-PUBLISH gates: manifest checksum/generation, WAL and anchor binding,
-         API parity, fresh capacity, and a second inventory
+         a bound API parity ARTIFACT, freshly stamped capacity, second inventory
       -> post_compaction_problem(evidence, expected=<this run's own state>)
-      -> a finalization clearance, if and only if every gate passed
-    release
+      -> a finalization clearance, if and only if every gate passed;
+         otherwise QUARANTINE the generation and refuse
+
+## The identity, and why an approval is not enough
+
+A production approval names a live root and a run. It says nothing about whether the code about
+to publish a served authority was ever reviewed — and this operation publishes one. So an
+identity artifact is **required**: an approved `deploy_sha`, `HEAD` at that commit, a clean
+worktree, and module fingerprints compared against the blobs **git holds at that commit**, exact
+in both directions. Checked before any lock is taken, so an operator with a dirty checkout learns
+it before a multi-minute scan rather than after.
+
+There is deliberately no `expected_module_fingerprints` parameter. One existed, was accepted, and
+was never read — an optional argument that does nothing is worse than an absent one, because a
+reader passing it believes a check is happening.
+
+## Parity evidence is executed and bound
+
+The producers are injected, because they must read the deployment's own stores through the
+deployment's own reader. What they RETURN is not taken on trust: each result is an artifact
+carrying host, run, `deploy_sha`, the candidate generation and manifest checksum, the source-map
+digest, an execution time, real sample and mismatch counts, and written provenance — and its
+`producer_digest` must belong to a module the identity artifact fingerprinted. A callable
+returning `{"mismatches": 0}` is refused: reviewed code has a digest git holds, and a callable
+defined in a shell does not. Zero mismatches out of zero samples is an absent check, not a
+passing one.
+
+## A failed generation is quarantined, not left lying about
+
+Post-publish gates run after generation N+1 exists. Raising alone would leave it live and
+unclassified — the next run would read the live manifest, plan N+2 on top of it, and the failure
+would sit underneath a generation nobody questioned. So `.p5_generation_quarantine.json` is
+written durably **before** the raise, and every later publish, switch and finalization refuses
+while it exists, including one holding a valid clearance and a human approval.
+
+Not an automatic rollback, deliberately: restoring the predecessor is itself an authority change,
+and making one in the failure path on the strength of a gate this run could not satisfy is a
+second unreviewed change chasing the first. The predecessor archive is immutable (§9.3) and
+intact, so a person can still roll back — what the record guarantees is that nobody proceeds
+*without* deciding.
 
 ## What it does NOT do, and why that is the design rather than an omission
 
@@ -94,6 +135,277 @@ class OneShotCompactionRefused(Exception):
 
 def _exact_str(value) -> bool:
     return type(value) is str and bool(value.strip())
+
+
+# ---------------------------------------------------------------- the quarantine state
+#: Written into the manifest root when a generation is published and then FAILS its
+#: post-publish gates. Named with a leading dot so it sits beside the manifest rather than
+#: inside the generation archives, which are immutable (§9.3).
+QUARANTINE_NAME = ".p5_generation_quarantine.json"
+
+
+class GenerationQuarantined(OneShotCompactionRefused):
+    """A published generation failed its gates and has not been reconciled."""
+
+
+def quarantine_path(manifest_root: str) -> str:
+    return os.path.join(manifest_root, QUARANTINE_NAME)
+
+
+def read_quarantine(manifest_root: str) -> Optional[Dict]:
+    """The quarantine record, or `None`. Unreadable is NOT the same as absent."""
+    path = quarantine_path(manifest_root)
+    if not os.path.isfile(path):
+        return None
+    import json
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def quarantine_problem(manifest_root: str) -> Optional[str]:
+    """The refusal every later operation owes an unreconciled generation, or `None`.
+
+    A post-publish gate failure leaves generation N+1 on disk and unverified. Doing nothing
+    about it is the dangerous option: the next run reads the live manifest, sees generation N+1,
+    plans N+2 on top of it, and the failure is now underneath a generation nobody questioned.
+    So the state is written down, and everything that could build on it refuses until a person
+    reconciles it."""
+    try:
+        record = read_quarantine(manifest_root)
+    except Exception as exc:                                        # noqa: BLE001
+        return (f"the quarantine record at {quarantine_path(manifest_root)!r} could not be "
+                f"read ({exc!r}). An unreadable quarantine is not an absent one: refusing")
+    if record is None:
+        return None
+    return (f"generation {record.get('generation')} in {manifest_root!r} is QUARANTINED: "
+            f"{record.get('reasons')}. It was published by run {record.get('run_id')!r} and "
+            f"then failed its post-publish gates, so what the manifest points at has not been "
+            f"verified. The predecessor archive {record.get('predecessor_archive')!r} is intact "
+            f"and is what a rollback would restore. Nothing may publish, switch or finalize "
+            f"over this state until a person reconciles it and removes "
+            f"{quarantine_path(manifest_root)!r}")
+
+
+def quarantine_generation(manifest_root: str, *, generation: int, predecessor_generation,
+                          run_id: str, host: str, operator: str, reasons,
+                          block_path: str, now=None) -> Dict:
+    """Record the unverified generation durably, so nothing can build on it unnoticed.
+
+    Deliberately NOT a rollback. Restoring the predecessor is itself a manifest publication --
+    it changes what the service resolves -- and doing that automatically, in the failure path,
+    on the strength of a gate this run could not satisfy, is a second unreviewed authority
+    change chasing the first. The archive for the predecessor is immutable and still on disk, so
+    a rollback remains available to a person who decides on it; what this guarantees is that
+    nobody proceeds *without* deciding."""
+    import json
+    record = {
+        "scope": "p5_generation_quarantine",
+        "generation": int(generation),
+        "predecessor_generation": (None if predecessor_generation is None
+                                   else int(predecessor_generation)),
+        "predecessor_archive": (None if predecessor_generation is None
+                                else bm.archive_name(int(predecessor_generation))),
+        "run_id": run_id, "host": host, "operator": operator,
+        "block_path": block_path,
+        "reasons": reasons,
+        "quarantined_utc": ex._now(now).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "nothing_deleted": True,
+        "service_switched": False,
+        "how_to_reconcile": (
+            "Either roll the manifest back to the predecessor generation with "
+            "ingest.publish_manifest.execute_rollback (its archive is immutable and intact), or "
+            "establish by review that the published generation is in fact sound. Then remove "
+            "this file. Until it is removed every publish, switch and finalization refuses."),
+    }
+    path = quarantine_path(manifest_root)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(record, fh, indent=2, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    # The rename has to reach disk too, or a crash can lose a quarantine whose contents were
+    # durable -- and a lost quarantine is exactly the silent reuse this exists to prevent.
+    fd = os.open(manifest_root, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return record
+
+
+# ---------------------------------------------------------------- the deployment identity
+#: What an identity artifact must carry. A production approval names a root and a run; it says
+#: nothing about whether the code about to run was ever reviewed, and those are different
+#: questions. An approval for the right root executing unreviewed code is the failure this
+#: closes.
+IDENTITY_FIELDS = ("host", "run_id", "deploy_sha", "head_sha", "worktree_clean",
+                   "module_fingerprints", "collected_utc", "verified_by")
+
+
+def identity_problem(artifact, *, host: str, run_id: str, now=None):
+    """The first thing wrong with the deployment identity artifact, or `None`.
+
+    Four independent things, none of which implies another:
+
+    * the commit is in `p5_readiness.REVIEWED_DEPLOY_SHAS` — a deployment cannot declare its
+      own commit reviewed;
+    * `HEAD` is that commit, and the worktree is clean — otherwise what runs is the reviewed
+      commit plus whatever someone edited, which is how the live checkout came to be running
+      `a9db4b7` plus five modified files;
+    * the module fingerprints match the blobs **git holds at that commit** — recomputed here
+      from the repository rather than compared against a list the artifact supplies, because a
+      matching SHA proves what git says and fingerprints prove what is on disk;
+    * and it was collected for THIS host and THIS run, inside the freshness window.
+
+    The comparison is exact in both directions. A shrunken inventory makes every check pass on a
+    subset, which is exactly how a hand-written module list came to omit
+    `store/source_provenance.py`."""
+    from ops import p5_readiness as rd
+    problem = ex._missing(artifact, IDENTITY_FIELDS, "the identity artifact")
+    if problem:
+        return problem
+    max_age_s, max_lead_s = ex._policy()
+
+    if artifact["host"] != host:
+        return (f"was collected on {artifact['host']!r}, not {host!r}; an identity established "
+                f"on another machine says nothing about this one")
+    if artifact["run_id"] != run_id:
+        return (f"was collected in run {artifact['run_id']!r}, not {run_id!r}; a checkout that "
+                f"was clean in another run may not be clean now")
+    collected = ex._parse_utc(artifact["collected_utc"])
+    if collected is None:
+        return f"records collected_utc {artifact['collected_utc']!r}, which is not a timestamp"
+    age = (ex._now(now) - collected).total_seconds()
+    if age < -max_lead_s:
+        return f"was collected {int(-age)}s in the future; that is not a reading"
+    if age > max_age_s:
+        return (f"was collected {int(age)}s ago, past the {max_age_s}s window. A deploy can be "
+                f"restarted onto a different tree at any time")
+
+    sha = artifact["deploy_sha"]
+    if sha not in rd.REVIEWED_DEPLOY_SHAS:
+        return (f"declares deploy_sha {sha!r}, which is not in the approved deploy set. A "
+                f"production approval names a root and a run; it does not make the code that "
+                f"runs reviewed, and this operation publishes a served authority")
+    if artifact["head_sha"] != sha:
+        return (f"records HEAD {artifact['head_sha']!r}, which is not the reviewed commit "
+                f"{sha!r}; what would run is not what was approved")
+    if artifact["worktree_clean"] is not True:
+        return ("records a checkout that is not clean. The reviewed commit plus uncommitted "
+                "edits is a tree no review has seen")
+
+    reported = artifact["module_fingerprints"]
+    if type(reported) is not dict or not reported:
+        return ("records no module fingerprints. A matching commit id says what git holds; "
+                "fingerprints say what is on disk, and only the second is what executes")
+    for name, digest in sorted(reported.items()):
+        if not ex._is_sha256(digest):
+            return f"records module fingerprint {name}={digest!r}, which is not a SHA-256"
+
+    expected = rd.expected_module_digests(sha)
+    if not expected:
+        return (f"cannot be checked: the module blobs for {sha} are not readable from this "
+                f"repository, so there is nothing to compare the fingerprints against")
+    drifted = sorted(n for n, d in expected.items() if n in reported and reported[n] != d)
+    if drifted:
+        return (f"records module fingerprints that do not match {sha}: {drifted}. What is on "
+                f"disk is not what was reviewed")
+    absent = sorted(set(expected) - set(reported))
+    if absent:
+        return (f"fingerprints no {absent}. An unmeasured module is one nobody compared, and a "
+                f"shrunken inventory makes every other comparison pass on a subset")
+    extra = sorted(set(reported) - set(expected))
+    if extra:
+        return (f"fingerprints {extra}, which the approved commit does not contain. A module "
+                f"the review never saw is running alongside the ones it did")
+    if not _exact_str(artifact["verified_by"]):
+        return "does not say who established it; an unattributed identity is not provenance"
+    return None
+
+
+# ---------------------------------------------------------------- parity evidence
+#: What an executed parity artifact must carry. A callable that returns `{"mismatches": 0}`
+#: satisfies a gate reading only that key while having measured nothing at all -- so the gate
+#: reads a bound RESULT instead, and the operation checks every binding against its own state.
+PARITY_ARTIFACT_FIELDS = ("kind", "host", "run_id", "deploy_sha",
+                          "producer", "producer_digest",
+                          "generation", "manifest_checksum", "source_map_digest",
+                          "executed_utc", "samples", "mismatches", "provenance")
+
+#: The two parity kinds, named so an artifact for one cannot be presented for the other.
+PARITY_POINT_SERIES = "point_series_parity"
+PARITY_API = "api_parity"
+
+
+def parity_artifact_problem(artifact, *, kind: str, host: str, run_id: str, deploy_sha: str,
+                            generation: int, manifest_checksum: str, source_map_digest: str,
+                            module_fingerprints: Dict, now=None):
+    """The first thing wrong with an executed parity artifact, or `None`.
+
+    The producer is injected -- it has to be, since it reads the deployment's own stores through
+    the deployment's own reader, and a parity check written inside this module would be this
+    module comparing its own output against its own idea of the truth. What is NOT optional is
+    that the producer be reviewed code and that its result be bound to this act:
+
+    * `producer_digest` must be the SHA-256 of a module the identity artifact fingerprinted,
+      which is to say a module `git` holds at the approved commit. An ad-hoc callable defined
+      in a shell has no such digest and cannot acquire one.
+    * the artifact names the candidate generation, the manifest checksum and the source-map
+      digest THIS run produced, so a green result from another run or another generation is
+      refused rather than reused.
+    * `samples` must be a positive count. Zero mismatches out of zero samples is not a passing
+      check, it is an absent one."""
+    problem = ex._missing(artifact, PARITY_ARTIFACT_FIELDS, f"the {kind} artifact")
+    if problem:
+        return problem
+    max_age_s, max_lead_s = ex._policy()
+
+    if artifact["kind"] != kind:
+        return (f"declares kind {artifact['kind']!r}; this gate needs {kind!r}. An artifact for "
+                f"one parity check is not evidence for another")
+    for field, want in (("host", host), ("run_id", run_id), ("deploy_sha", deploy_sha),
+                        ("generation", generation),
+                        ("manifest_checksum", manifest_checksum),
+                        ("source_map_digest", source_map_digest)):
+        if artifact[field] != want:
+            return (f"records {field}={artifact[field]!r} while this run produced {want!r}. A "
+                    f"green result about another act reads exactly like one about this act")
+
+    digest = artifact["producer_digest"]
+    if not ex._is_sha256(digest):
+        return f"records producer_digest {digest!r}, which is not a SHA-256 digest"
+    if digest not in set(module_fingerprints.values()):
+        return (f"was produced by something whose digest {digest[:12]}… is not any module the "
+                f"identity artifact fingerprinted. The producer has to be reviewed code: a "
+                f"callable that merely returns `mismatches: 0` measured nothing, and nothing "
+                f"in a returned dict can distinguish the two")
+    if not _exact_str(artifact["producer"]):
+        return "does not name its producer"
+    if not _exact_str(artifact["provenance"]):
+        return ("states no verification provenance -- what was read, from where, and how it "
+                "was compared. Without it the counts below are two integers")
+
+    executed = ex._parse_utc(artifact["executed_utc"])
+    if executed is None:
+        return f"records executed_utc {artifact['executed_utc']!r}, which is not a timestamp"
+    age = (ex._now(now) - executed).total_seconds()
+    if age < -max_lead_s:
+        return f"records an execution {int(-age)}s in the future"
+    if age > max_age_s:
+        return (f"was executed {int(age)}s ago, past the {max_age_s}s window; it describes a "
+                f"store that has had time to move")
+
+    samples = artifact["samples"]
+    if not ex._raw_int(samples) or samples <= 0:
+        return (f"records samples={samples!r}. Zero mismatches out of zero samples is not a "
+                f"passing check, it is an absent one")
+    mismatches = artifact["mismatches"]
+    if not ex._raw_int(mismatches) or mismatches < 0:
+        return f"records mismatches={mismatches!r}, which is not a count"
+    if mismatches != 0:
+        return f"reports {mismatches} mismatch(es) out of {samples} sample(s)"
+    return None
 
 
 # ---------------------------------------------------------------- the fence probe
@@ -182,17 +494,27 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
                      start_day: str, end_day: str, classification_target: Sequence[str],
                      artifacts_dir: str, hard_reserve_bytes: int,
                      block_out_path: str,
+                     identity_artifact: Dict,
                      writer_fence_probe: Callable = refusing_fence_probe,
                      point_series_parity: Callable,
                      api_parity: Callable,
-                     expected_module_fingerprints: Optional[Dict] = None,
                      now=None) -> Dict:
     """Build one block from the monolith, publish it, verify it, and delete nothing.
 
-    `point_series_parity` and `api_parity` are injected rather than implemented here. Both need
-    to read the deployment's own stores through the deployment's own reader, and a parity check
+    `identity_artifact` is REQUIRED and is checked before any compaction work begins. A
+    production approval names a root and a run; it does not establish that the code about to
+    publish a served authority was ever reviewed. There is deliberately no
+    `expected_module_fingerprints` parameter any more: it was accepted, never read, and an
+    optional argument that does nothing is worse than an absent one, because a reader passing it
+    believes a check is happening.
+
+    `point_series_parity` and `api_parity` are injected rather than implemented here — both must
+    read the deployment's own stores through the deployment's own reader, and a parity check
     written inside this module would be this module comparing its own output against its own
-    idea of the truth. Each must return a record; the gates below adjudicate it.
+    idea of the truth. What they RETURN, though, is not taken on trust: each must be a fully
+    bound artifact (see `parity_artifact_problem`), produced by a module the identity artifact
+    fingerprinted. A callable that returns `{"mismatches": 0}` is refused, because nothing in
+    that dict distinguishes a check that passed from one that never ran.
 
     There is no `force`, no `skip`, no `unsafe_*` parameter, and this operation never passes one
     to `execute_publication` either — a test asserts that by AST."""
@@ -207,6 +529,20 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
 
     # ---- approval, scoped to THIS operation ------------------------------------------------
     approval = _check_approval(approval, live_root=live_root, run_id=run_id)
+
+    # ---- and the code that would run, BEFORE any compaction work --------------------------
+    # Checked here rather than under the locks on purpose: an operator whose checkout is dirty
+    # should learn it before a lock is taken and a multi-minute scan begins, not after.
+    problem = identity_problem(identity_artifact, host=_hostname(), run_id=run_id, now=now)
+    if problem:
+        raise OneShotCompactionRefused(f"the deployment identity artifact {problem}")
+    deploy_sha = identity_artifact["deploy_sha"]
+    module_fingerprints = dict(identity_artifact["module_fingerprints"])
+
+    # ---- a quarantined generation stops everything ----------------------------------------
+    problem = quarantine_problem(manifest_root)
+    if problem:
+        raise OneShotCompactionRefused(problem)
 
     # ---- the record must name this operation, before anything is read ----------------------
     problem = ex.operation_problem(
@@ -300,14 +636,32 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
             # the delta it was read from, not the monolith, which never held it. The source map
             # is what says which; handing the probe a single `monolith_path` would have made it
             # compare most days against a store that does not contain them.
+            candidate = _plan(plan, manifest_root=manifest_root)
+            candidate_generation = int(candidate["manifest"]["generation"])
+            candidate_checksum = candidate["manifest"]["manifest_checksum"]
+            source_map_digest = _source_map_digest(source_map)
             parity = point_series_parity(block_path=plan["out_path"],
                                          source_map=source_map,
                                          monolith_path=monolith_path,
-                                         days=list(classification_target))
-            # Planned, not published: `plan_publication` composes generation N+1 in memory and
-            # writes nothing, so the candidate manifest can be checked for a day claimed twice
-            # while the block is still unreferenced.
-            candidate = _plan(plan, manifest_root=manifest_root)
+                                         days=list(classification_target),
+                                         host=_hostname(), run_id=run_id,
+                                         deploy_sha=deploy_sha,
+                                         generation=candidate_generation,
+                                         manifest_checksum=candidate_checksum,
+                                         source_map_digest=source_map_digest)
+            problem = parity_artifact_problem(
+                parity, kind=PARITY_POINT_SERIES, host=_hostname(), run_id=run_id,
+                deploy_sha=deploy_sha, generation=candidate_generation,
+                manifest_checksum=candidate_checksum, source_map_digest=source_map_digest,
+                module_fingerprints=module_fingerprints, now=now)
+            if problem:
+                raise OneShotCompactionRefused(
+                    f"refusing to publish: the point-series parity artifact {problem}. The "
+                    f"block is built and unreferenced; nothing was published")
+            # `candidate` was composed above, before the parity call, because the parity
+            # artifact must be BOUND to the generation and checksum this run is about to
+            # publish. `plan_publication` writes nothing, so composing it early costs nothing
+            # and is what lets the binding exist before the authority changes.
             pre_gates = {
                 "point_series_parity": parity,
                 "source_map_complete": _source_map_complete(source_map, classification_target),
@@ -336,6 +690,20 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
             raise OneShotCompactionRefused(
                 f"the writer fence did not hold across the whole window: {problem}")
 
+        api_evidence = api_parity(
+            manifest_root=manifest_root, monolith_path=monolith_path,
+            allowed_legacy_paths=[os.path.realpath(monolith_path)],
+            host=_hostname(), run_id=run_id, deploy_sha=deploy_sha,
+            generation=int(live["generation"]),
+            manifest_checksum=live["manifest_checksum"],
+            source_map_digest=source_map_digest)
+        api_problem = parity_artifact_problem(
+            api_evidence, kind=PARITY_API, host=_hostname(), run_id=run_id,
+            deploy_sha=deploy_sha, generation=int(live["generation"]),
+            manifest_checksum=live["manifest_checksum"],
+            source_map_digest=source_map_digest,
+            module_fingerprints=module_fingerprints, now=now)
+
         evidence = {
             "host": _hostname(), "run_id": run_id,
             "manifest": {"generation": int(live["generation"]),
@@ -345,11 +713,9 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
                                                anchor_root=anchor_root),
             "source_map_complete": pre_gates["source_map_complete"],
             "base_delta_disjoint": pre_gates["base_delta_disjoint"],
-            "source_map_digest": _source_map_digest(source_map),
+            "source_map_digest": source_map_digest,
             "point_series_parity": parity,
-            "api_parity": api_parity(manifest_root=manifest_root,
-                                     monolith_path=monolith_path,
-                                     allowed_legacy_paths=[os.path.realpath(monolith_path)]),
+            "api_parity": api_evidence,
             # Stamped HERE. `measure_capacity` returns free space and a device and no time, so
             # a reading of it is indistinguishable from the preflight's -- which is exactly what
             # `capacity_after` must not be. The stamp is taken at the moment of the call.
@@ -371,10 +737,12 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
             "host": _hostname(), "run_id": run_id,
             "generation": int(live["generation"]),
             "manifest_checksum": live["manifest_checksum"],
-            "source_map_digest": _source_map_digest(source_map),
+            "source_map_digest": source_map_digest,
             "monolith_state": remeasured,
         }
-        problem = ex.post_compaction_problem(evidence, expected=expected)
+        # The API parity artifact's own binding failure is a post-gate failure like any other,
+        # and must reach the quarantine path rather than raising past it.
+        problem = api_problem or ex.post_compaction_problem(evidence, expected=expected)
         result.update({
             "run_id": run_id, "operator": operator, "at_utc": at_utc,
             "generation": int(live["generation"]),
@@ -390,13 +758,31 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
             "post_compaction_problem": problem,
         })
         if problem:
-            # Published but NOT cleared. The new generation exists and is unverified; the old
-            # data is untouched, which is exactly why refusing here is survivable.
-            raise OneShotCompactionRefused(
+            # Published but NOT verified. Raising alone would leave generation N+1 live and
+            # unclassified: the next run would read it, plan N+2 on top of it, and the failure
+            # would sit underneath a generation nobody questioned. So the state is written down
+            # FIRST, durably, and only then does the run fail -- the record is what makes every
+            # later publish, switch and finalization refuse.
+            #
+            # Deliberately not an automatic rollback. Restoring the predecessor is itself an
+            # authority change, and performing one in the failure path on the strength of a gate
+            # this run could not satisfy is a second unreviewed change chasing the first. The
+            # predecessor archive is immutable and intact, so a person can still roll back.
+            quarantine = quarantine_generation(
+                manifest_root, generation=int(live["generation"]),
+                predecessor_generation=published.get("predecessor_generation")
+                or candidate.get("predecessor_generation"),
+                run_id=run_id, host=_hostname(), operator=operator,
+                reasons=problem, block_path=plan["out_path"], now=now)
+            result["quarantine"] = quarantine
+            raise GenerationQuarantined(
                 f"the post-compaction gates did not pass: {problem}. Generation "
-                f"{live['generation']} is published and NOT cleared: nothing was deleted, no "
-                f"service was switched, and no finalization clearance was issued. Rolling the "
-                f"generation back is an operator decision -- see execute_rollback")
+                f"{live['generation']} is published, NOT verified, and now QUARANTINED: nothing "
+                f"was deleted, no service was switched, and no finalization clearance was "
+                f"issued. The predecessor archive "
+                f"{quarantine['predecessor_archive']!r} is intact. Every publish, switch and "
+                f"finalization refuses until a person reconciles this and removes "
+                f"{quarantine_path(manifest_root)!r}")
 
         result["finalization_clearance"] = ex.issue_finalization_clearance(
             host=_hostname(), run_id=run_id, generation=int(live["generation"]),

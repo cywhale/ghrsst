@@ -43,6 +43,7 @@ from ops import p5_legacy_base as lb  # noqa: E402
 from ops import p5_oneshot_compaction as oc  # noqa: E402
 from ops import p5_oneshot_exception as ex  # noqa: E402
 from ops import p5_prod_provision as prod  # noqa: E402
+from ops import p5_readiness as rd  # noqa: E402
 from ops import p5s8_evidence as evd  # noqa: E402
 from store import block_manifest as bm  # noqa: E402
 from store import compaction_lock as cl  # noqa: E402
@@ -159,6 +160,14 @@ class _CompactionBase(unittest.TestCase):
             "expires_utc": iso(3000), "approved_by": "cywhale", "approved_utc": iso(-600),
             "reason": ("one fold wanted before the storage team can move the monolith to its "
                        "own read-only mount; VM backups make it recoverable"),
+            "residual_writer_risk": {
+                "acknowledged": True,
+                "unrecoverable_outcome_possible": True,
+                "statement": ("an unfenced writer can change the monolith during the "
+                              "scan-to-publish interval; the gates detect it afterwards and a "
+                              "VM restore does not undo what was served in between"),
+                "accepted_by": "cywhale",
+            },
         }
         r.update(over)
         return r
@@ -201,30 +210,84 @@ class _CompactionBase(unittest.TestCase):
         a.update(over)
         return a
 
+    def _identity(self, **over):
+        """A real identity artifact: the fingerprints are the blobs git holds at the approved
+        commit, so nothing here describes itself."""
+        sha = rd.REVIEWED_DEPLOY_SHAS[-1]
+        a = {
+            "host": socket.gethostname(), "run_id": self.RUN_ID,
+            "deploy_sha": sha, "head_sha": sha, "worktree_clean": True,
+            "module_fingerprints": rd.expected_module_digests(sha),
+            "collected_utc": iso(-30),
+            "verified_by": "ops tooling on the deployment host",
+        }
+        a.update(over)
+        return a
+
+    def _producer_digest(self):
+        """A digest belonging to a module the identity artifact actually fingerprinted.
+
+        A real parity producer is reviewed code shipped with the deployment; here that is
+        represented by an inventory module, so the binding is exercised for real rather than
+        against a value invented for the test."""
+        return self._identity()["module_fingerprints"]["store/source_provenance.py"]
+
     # ---------------------------------------------------------------- injected probes
     def _fence_probe(self):
         self.probe_calls.append(iso())
         return self._fence()
 
     def _parity(self, **over):
-        def probe(*, block_path, source_map, monolith_path, days):
+        """A producer returning a fully BOUND artifact, as a reviewed one would."""
+        def probe(*, block_path, source_map, monolith_path, days, host, run_id, deploy_sha,
+                  generation, manifest_checksum, source_map_digest):
             # A real probe reads each day from the store the source map names and compares it
             # point-wise against the block. The oracle differs per day, which is the whole
             # reason the map is passed in.
             oracles = sorted({r["source_path"] for r in source_map.values()})
-            out = {"days_checked": len(days), "mismatches": 0, "boundaries_included": True,
-                   "first_day": days[0], "last_day": days[-1],
-                   "block_path": block_path, "oracles": oracles}
+            out = {
+                "kind": oc.PARITY_POINT_SERIES,
+                "host": host, "run_id": run_id, "deploy_sha": deploy_sha,
+                "producer": "store/source_provenance.compare_days",
+                "producer_digest": self._producer_digest(),
+                "generation": generation, "manifest_checksum": manifest_checksum,
+                "source_map_digest": source_map_digest,
+                "executed_utc": iso(), "samples": len(days) * 8, "mismatches": 0,
+                "provenance": (f"per-day window fingerprints read from {oracles} and compared "
+                               f"point-wise against {block_path}"),
+                # the shape the pre-publish gate reads
+                "days_checked": len(days), "boundaries_included": True,
+                "first_day": days[0], "last_day": days[-1],
+            }
             out.update(over)
             return out
         return probe
 
     def _api_parity(self, **over):
-        def probe(*, manifest_root, monolith_path, allowed_legacy_paths):
-            out = {"routes_checked": 4, "mismatches": 0, "manifest_root": manifest_root}
+        def probe(*, manifest_root, monolith_path, allowed_legacy_paths, host, run_id,
+                  deploy_sha, generation, manifest_checksum, source_map_digest):
+            out = {
+                "kind": oc.PARITY_API,
+                "host": host, "run_id": run_id, "deploy_sha": deploy_sha,
+                "producer": "store/source_provenance.compare_days",
+                "producer_digest": self._producer_digest(),
+                "generation": generation, "manifest_checksum": manifest_checksum,
+                "source_map_digest": source_map_digest,
+                "executed_utc": iso(), "samples": 24, "mismatches": 0,
+                "provenance": (f"the deployment reader over {manifest_root}, compared against "
+                               f"the pre-publish baseline"),
+                "routes_checked": 4,
+            }
             out.update(over)
             return out
         return probe
+
+    def _next_block_path(self):
+        """A fresh path per call. `build_block` refuses to reuse one, correctly: a block path is
+        written once and never reused, so a test that calls the operation twice must not ask it
+        to break that."""
+        self._block_seq = getattr(self, "_block_seq", 0) + 1
+        return os.path.join(self.manifest_root, f"block_gen2_{self._block_seq}.zarr")
 
     # ---------------------------------------------------------------- the call
     def compact(self, **over):
@@ -237,11 +300,13 @@ class _CompactionBase(unittest.TestCase):
             start_day=self.grid[0], end_day=self.grid[-1],
             classification_target=list(self.days), delta_path=self.delta,
             artifacts_dir=self.artifacts, hard_reserve_bytes=1024,
-            block_out_path=os.path.join(self.manifest_root, "block_gen2.zarr"),
+            block_out_path=self._next_block_path(),
             writer_fence_probe=self._fence_probe,
             point_series_parity=self._parity(),
             api_parity=self._api_parity(),
         )
+        if "identity_artifact" not in over:
+            kw["identity_artifact"] = self._identity()
         if "one_shot_exception" not in over:
             kw["one_shot_exception"] = self._record()
         if "one_shot_pre_compaction" not in over:
@@ -362,6 +427,10 @@ class TestAFailedGateStopsEverythingDownstream(_CompactionBase):
 
     def _assert_refused_without_clearance(self, **over):
         gen_before = self.manifest_generation()
+        # Each test cleans up its own quarantine, so the next assertion in the same test is not
+        # answered by a leftover record from the previous one.
+        self.addCleanup(lambda: os.path.exists(oc.quarantine_path(self.manifest_root))
+                        and os.remove(oc.quarantine_path(self.manifest_root)))
         with self.assertRaises(oc.OneShotCompactionRefused) as caught:
             self.compact(**over)
         # Whatever happened, no clearance exists -- so nothing downstream can be unlocked.
@@ -377,7 +446,7 @@ class TestAFailedGateStopsEverythingDownstream(_CompactionBase):
         gen = self.manifest_generation()
         message = self._assert_refused_without_clearance(
             point_series_parity=self._parity(mismatches=3))
-        self.assertIn("point-series mismatch", message)
+        self.assertIn("mismatch(es) out of", message)
         self.assertEqual(self.manifest_generation(), gen,
                          "a parity failure must be caught while the block is unreferenced")
 
@@ -397,7 +466,7 @@ class TestAFailedGateStopsEverythingDownstream(_CompactionBase):
     def test_an_api_parity_mismatch_refuses_and_issues_no_clearance(self):
         message = self._assert_refused_without_clearance(
             api_parity=self._api_parity(mismatches=2))
-        self.assertIn("API response mismatch", message)
+        self.assertIn("mismatch(es) out of", message)
 
     def test_a_wal_that_is_not_bound_refuses_and_issues_no_clearance(self):
         """The gate, exercised through the operation.
@@ -504,9 +573,10 @@ class TestAFailedGateStopsEverythingDownstream(_CompactionBase):
         with self.assertRaises(oc.OneShotCompactionRefused) as caught:
             self.compact(api_parity=self._api_parity(mismatches=1))
         message = str(caught.exception)
-        self.assertIn("published and NOT cleared", message)
+        self.assertIn("published, NOT verified, and now QUARANTINED", message)
         self.assertIn("nothing was deleted", message)
         self.assertIn("no service was switched", message)
+        self.assertIn("is intact", message)
 
 
 class TestTheWalEvidenceIsRead(_CompactionBase):
@@ -1162,3 +1232,383 @@ class TestTheBorrowedIngestFenceIsValidated(_CompactionBase):
         contender = cl.CompactionLock(self.ilock, holder="competing-ingest")
         with self.assertRaises(cl.CompactionLockBusy):
             contender.acquire()
+
+
+class TestTheDeploymentIdentityIsRequired(_CompactionBase):
+    """A production approval names a root and a run. It does not review the code.
+
+    `expected_module_fingerprints` used to be accepted and never read: an optional parameter
+    that did nothing, which is worse than an absent one because a reader passing it believes a
+    check is happening. It is gone, and this is what replaced it."""
+
+    def test_the_misleading_parameter_is_gone(self):
+        params = set(inspect.signature(oc.compact_one_shot).parameters)
+        self.assertNotIn("expected_module_fingerprints", params)
+        self.assertIn("identity_artifact", params)
+
+    def test_the_identity_artifact_is_required(self):
+        self.assertIs(inspect.signature(oc.compact_one_shot)
+                      .parameters["identity_artifact"].default, inspect.Parameter.empty)
+
+    def test_a_complete_identity_passes(self):
+        self.assertIsNone(oc.identity_problem(self._identity(),
+                                              host=socket.gethostname(), run_id=self.RUN_ID))
+
+    def test_every_field_is_required(self):
+        for field in oc.IDENTITY_FIELDS:
+            with self.subTest(field):
+                artifact = self._identity()
+                del artifact[field]
+                problem = oc.identity_problem(artifact, host=socket.gethostname(),
+                                              run_id=self.RUN_ID)
+                self.assertTrue(problem)
+                self.assertIn(field, problem)
+
+    def test_an_unreviewed_deploy_sha_refuses(self):
+        """The blocker in one line: approved root, approved run, unreviewed code."""
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(identity_artifact=self._identity(deploy_sha="a" * 40,
+                                                          head_sha="a" * 40))
+        self.assertIn("not in the approved deploy set", str(caught.exception))
+        self.assertEqual(self.manifest_generation(), 1)
+
+    def test_head_that_is_not_the_reviewed_commit_refuses(self):
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(identity_artifact=self._identity(head_sha="b" * 40))
+        self.assertIn("not the reviewed commit", str(caught.exception))
+
+    def test_a_dirty_checkout_refuses(self):
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(identity_artifact=self._identity(worktree_clean=False))
+        self.assertIn("not clean", str(caught.exception))
+
+    def test_a_drifted_module_fingerprint_refuses(self):
+        """The check a matching SHA cannot make: what is on disk, not what git says."""
+        prints = dict(self._identity()["module_fingerprints"])
+        prints["store/segmented_cube.py"] = "9" * 64
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(identity_artifact=self._identity(module_fingerprints=prints))
+        self.assertIn("do not match", str(caught.exception))
+
+    def test_a_shrunken_inventory_refuses(self):
+        """A subset makes every comparison pass on a subset."""
+        prints = dict(self._identity()["module_fingerprints"])
+        del prints["store/block_manifest.py"]
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(identity_artifact=self._identity(module_fingerprints=prints))
+        self.assertIn("fingerprints no", str(caught.exception))
+
+    def test_a_module_the_review_never_saw_refuses(self):
+        prints = dict(self._identity()["module_fingerprints"])
+        prints["ops/something_new.py"] = "c" * 64
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(identity_artifact=self._identity(module_fingerprints=prints))
+        self.assertIn("the approved commit does not contain", str(caught.exception))
+
+    def test_an_identity_from_another_run_or_host_refuses(self):
+        for field, wrong in (("run_id", "another-run"), ("host", "elsewhere")):
+            with self.subTest(field):
+                with self.assertRaises(oc.OneShotCompactionRefused):
+                    self.compact(identity_artifact=self._identity(**{field: wrong}))
+
+    def test_a_stale_identity_refuses(self):
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(identity_artifact=self._identity(collected_utc=iso(-4 * 3600)))
+        self.assertIn("past the", str(caught.exception))
+
+    def test_identity_is_checked_before_any_lock_or_scan(self):
+        """An operator with a dirty checkout should learn it before a multi-minute scan."""
+        with mock.patch.object(oc, "_build", side_effect=AssertionError("must not run")) \
+                as build:
+            with self.assertRaises(oc.OneShotCompactionRefused):
+                self.compact(identity_artifact=self._identity(worktree_clean=False))
+        self.assertFalse(build.called)
+
+
+class TestParityEvidenceMustBeExecutedAndBound(_CompactionBase):
+    """A callable that returns `{"mismatches": 0}` measured nothing, and says nothing.
+
+    The producer stays injectable — it must read the deployment's own stores through the
+    deployment's own reader — but what it returns is a bound artifact, and the producer itself
+    must be a module the identity artifact fingerprinted."""
+
+    def test_a_green_fake_callable_is_refused(self):
+        """The negative test the review asked for, on the production entry point."""
+        green = lambda **kw: {"mismatches": 0, "days_checked": 5,  # noqa: E731
+                              "boundaries_included": True}
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(point_series_parity=green)
+        self.assertIn("point-series parity artifact", str(caught.exception))
+        self.assertEqual(self.manifest_generation(), 1,
+                         "a green fake reached the publish")
+
+    def test_a_green_fake_api_callable_is_refused(self):
+        green = lambda **kw: {"mismatches": 0, "routes_checked": 4}  # noqa: E731
+        with self.assertRaises(oc.OneShotCompactionRefused):
+            self.compact(api_parity=green)
+
+    def test_an_unfingerprinted_producer_is_refused(self):
+        """Reviewed code has a digest git holds. A callable defined in a shell does not."""
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(point_series_parity=self._parity(producer_digest="e" * 64))
+        self.assertIn("not any module the identity artifact fingerprinted",
+                      str(caught.exception))
+
+    def test_an_artifact_bound_to_another_generation_is_refused(self):
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(point_series_parity=self._parity(generation=99))
+        self.assertIn("about another act", str(caught.exception))
+
+    def test_an_artifact_bound_to_another_run_or_host_or_sha_is_refused(self):
+        for field, wrong in (("run_id", "another-run"), ("host", "elsewhere"),
+                             ("deploy_sha", "f" * 40),
+                             ("manifest_checksum", "0" * 64),
+                             ("source_map_digest", "1" * 64)):
+            with self.subTest(field):
+                with self.assertRaises(oc.OneShotCompactionRefused):
+                    self.compact(point_series_parity=self._parity(**{field: wrong}))
+
+    def test_an_artifact_for_the_wrong_kind_is_refused(self):
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(point_series_parity=self._parity(kind=oc.PARITY_API))
+        self.assertIn("is not evidence for another", str(caught.exception))
+
+    def test_zero_samples_is_an_absent_check_not_a_passing_one(self):
+        for value in (0, -1, True):
+            with self.subTest(repr(value)):
+                with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                    self.compact(point_series_parity=self._parity(samples=value))
+                self.assertIn("is not a passing check", str(caught.exception))
+
+    def test_an_artifact_with_no_provenance_is_refused(self):
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(point_series_parity=self._parity(provenance="  "))
+        self.assertIn("verification provenance", str(caught.exception))
+
+    def test_a_stale_execution_is_refused(self):
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(point_series_parity=self._parity(executed_utc=iso(-4 * 3600)))
+        self.assertIn("past the", str(caught.exception))
+
+    def test_every_artifact_field_is_required(self):
+        for field in oc.PARITY_ARTIFACT_FIELDS:
+            with self.subTest(field):
+                def missing(_field=field, **kw):
+                    out = self._parity()(**kw)
+                    del out[_field]
+                    return out
+                with self.assertRaises(oc.OneShotCompactionRefused):
+                    self.compact(point_series_parity=missing)
+
+    def test_the_bound_producer_passes(self):
+        """The positive control: every refusal above is about its own defect."""
+        self.assertEqual(self.compact()["generation"], 2)
+
+
+class TestAFailedGenerationIsQuarantined(_CompactionBase):
+    """Blocker 3: a published-but-unverified generation must not be silently reusable.
+
+    Raising alone would leave generation N+1 live and unclassified — the next run would read it,
+    plan N+2 on top of it, and the failure would sit underneath a generation nobody questioned."""
+
+    def _fail_post_gates(self, **over):
+        kw = {"api_parity": self._api_parity(mismatches=1)}
+        kw.update(over)
+        with self.assertRaises(oc.GenerationQuarantined) as caught:
+            self.compact(**kw)
+        return caught.exception
+
+    def test_a_post_gate_failure_writes_a_quarantine(self):
+        self._fail_post_gates()
+        record = oc.read_quarantine(self.manifest_root)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["generation"], 2)
+        self.assertEqual(record["run_id"], self.RUN_ID)
+        self.assertFalse(record["service_switched"])
+        self.assertTrue(record["nothing_deleted"])
+
+    def test_the_quarantine_names_the_intact_predecessor_archive(self):
+        self._fail_post_gates()
+        record = oc.read_quarantine(self.manifest_root)
+        self.assertEqual(record["predecessor_generation"], 1)
+        archive = os.path.join(self.manifest_root, record["predecessor_archive"])
+        self.assertTrue(os.path.isfile(archive),
+                        "the predecessor archive is what a rollback restores; it must survive")
+
+    def test_the_old_generation_remains_recoverable(self):
+        """The archive is immutable (§9.3) and still parses as generation 1."""
+        self._fail_post_gates()
+        record = oc.read_quarantine(self.manifest_root)
+        with open(os.path.join(self.manifest_root, record["predecessor_archive"])) as fh:
+            archived = json.load(fh)
+        self.assertEqual(int(archived["generation"]), 1)
+        self.assertEqual(archived["manifest_checksum"],
+                         bm.compute_checksum(archived))
+
+    def test_the_next_compaction_refuses_over_an_unresolved_quarantine(self):
+        self._fail_post_gates()
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(run_id=self.RUN_ID)
+        self.assertIn("QUARANTINED", str(caught.exception))
+        self.assertIn("until a person reconciles it", str(caught.exception))
+
+    def test_finalization_refuses_over_an_unresolved_quarantine(self):
+        """Even with a clearance and an approval: removing data underneath an unverified
+        authority is the worst available order of operations."""
+        self._fail_post_gates()
+        clearance = ex.issue_finalization_clearance(
+            host=socket.gethostname(), run_id=self.RUN_ID, generation=2,
+            manifest_checksum="f" * 64, monolith_day_digest="d" * 64,
+            source_map_digest="9" * 64, issued_by="tests", gates_passed=True)
+        with self.assertRaises(ex.FinalizationRefused) as caught:
+            ex.refuse_destructive_step("prune", clearance, host=socket.gethostname(),
+                                       run_id=self.RUN_ID, generation=2,
+                                       manifest_checksum="f" * 64, approval=True,
+                                       manifest_root=self.manifest_root)
+        self.assertIn("QUARANTINED", str(caught.exception))
+
+    def test_no_clearance_is_issued(self):
+        exc = self._fail_post_gates()
+        self.assertIn("no finalization clearance", str(exc))
+
+    def test_nothing_was_deleted(self):
+        before = ex.measure_monolith(self.monolith)
+        self._fail_post_gates()
+        after = ex.measure_monolith(self.monolith)
+        self.assertEqual(before["monolith_content_ledger"]["ledger_digest"],
+                         after["monolith_content_ledger"]["ledger_digest"])
+
+    def test_an_unreadable_quarantine_is_not_an_absent_one(self):
+        with open(oc.quarantine_path(self.manifest_root), "w") as fh:
+            fh.write("{not json")
+        problem = oc.quarantine_problem(self.manifest_root)
+        self.assertIn("could not be read", problem)
+
+    def test_a_clean_root_has_no_quarantine(self):
+        self.assertIsNone(oc.quarantine_problem(self.manifest_root))
+        self.assertIsNone(oc.read_quarantine(self.manifest_root))
+
+    def test_reconciling_by_removing_the_record_lets_work_resume(self):
+        """The record is the gate; removing it is the operator's explicit act."""
+        self._fail_post_gates()
+        os.remove(oc.quarantine_path(self.manifest_root))
+        self.assertIsNone(oc.quarantine_problem(self.manifest_root))
+
+    def test_the_quarantine_says_how_to_reconcile(self):
+        self._fail_post_gates()
+        record = oc.read_quarantine(self.manifest_root)
+        self.assertIn("execute_rollback", record["how_to_reconcile"])
+        self.assertIn("Until it is removed", record["how_to_reconcile"])
+
+
+class TestEveryPostGateReachesTheQuarantine(_CompactionBase):
+    """Failure injection per gate, as the review asked. Each must quarantine, not just raise."""
+
+    def _assert_quarantined(self, **over):
+        with self.assertRaises(oc.GenerationQuarantined):
+            self.compact(**over)
+        record = oc.read_quarantine(self.manifest_root)
+        self.assertIsNotNone(record, "the generation was left unclassified")
+        self.assertEqual(record["generation"], 2)
+        # And the predecessor is still there to go back to.
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.manifest_root, record["predecessor_archive"])))
+        return record
+
+    def test_api_parity_failure_quarantines(self):
+        record = self._assert_quarantined(api_parity=self._api_parity(mismatches=4))
+        self.assertIn("mismatch", str(record["reasons"]))
+
+    def test_a_wal_binding_failure_quarantines(self):
+        with mock.patch.object(oc, "_wal_anchor_evidence",
+                               return_value={"bound": False, "anchor_intact": True,
+                                             "reason": "bound to a previous manifest root"}):
+            record = self._assert_quarantined()
+        self.assertIn("WAL", str(record["reasons"]))
+
+    def test_a_missing_wal_anchor_quarantines(self):
+        with mock.patch.object(oc, "_wal_anchor_evidence",
+                               return_value={"bound": True, "anchor_intact": False}):
+            record = self._assert_quarantined()
+        self.assertIn("anchor", str(record["reasons"]))
+
+    def test_a_capacity_after_failure_quarantines(self):
+        """A `capacity_after` the gate cannot read reaches the quarantine like any other.
+
+        `free_now_gib` is made a bool rather than a bad timestamp: the operation stamps the
+        time itself, so a stale stamp is unreachable through it — and `True` is an `int` that
+        would compare against a floor without complaint, which is the case the raw-type check
+        exists for."""
+        real = prod.measure_capacity
+        calls = {"n": 0}
+
+        def bad_after(*a, **kw):
+            calls["n"] += 1
+            out = dict(real(*a, **kw))
+            if calls["n"] > 1:
+                out["free_now_gib"] = True
+            return out
+
+        with mock.patch.object(prod, "measure_capacity", side_effect=bad_after):
+            record = self._assert_quarantined()
+        self.assertIn("capacity_after", str(record["reasons"]))
+
+    def test_a_source_map_failure_quarantines(self):
+        """Source-map completeness is a PRE-publish gate, so it cannot reach the quarantine —
+        and that is the stronger outcome, not a gap: nothing is published at all.
+
+        Asserted here rather than left implicit, because "it did not quarantine" and "it did not
+        publish" look the same from outside if nobody checks which."""
+        with mock.patch.object(oc, "_source_map_complete", return_value=False):
+            with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                self.compact()
+        self.assertNotIsInstance(caught.exception, oc.GenerationQuarantined)
+        self.assertIsNone(oc.read_quarantine(self.manifest_root))
+        self.assertEqual(self.manifest_generation(), 1,
+                         "a pre-publish gate must refuse before the authority changes")
+
+    def test_a_post_source_map_failure_quarantines(self):
+        """The post-gate copy of the same field, which CAN be reached after publication."""
+        real = ex.post_compaction_problem
+
+        def failing(evidence, **kw):
+            evidence = dict(evidence, source_map_complete=False)
+            return real(evidence, **kw)
+
+        with mock.patch.object(ex, "post_compaction_problem", side_effect=failing):
+            record = self._assert_quarantined()
+        self.assertIn("source map", str(record["reasons"]))
+
+
+class TestTheModuleDocumentsWhatItActuallyDoes(unittest.TestCase):
+    """The header is the first thing a reviewer reads, and it aged twice in this file."""
+
+    def _doc(self):
+        return " ".join((inspect.getdoc(oc) or "").split())
+
+    def test_it_documents_the_identity_check_and_its_position(self):
+        doc = self._doc()
+        self.assertIn("verify the DEPLOYMENT IDENTITY", doc)
+        self.assertIn("before any lock, before any scan", doc)
+        self.assertIn("an approval is not enough", doc)
+
+    def test_it_records_that_the_misleading_parameter_is_gone(self):
+        doc = self._doc()
+        self.assertIn("no `expected_module_fingerprints` parameter", doc)
+        self.assertIn("worse than an absent one", doc)
+
+    def test_it_documents_parity_as_bound_artifacts(self):
+        doc = self._doc()
+        self.assertIn("Parity evidence is executed and bound", doc)
+        self.assertIn('returning `{"mismatches": 0}` is refused', doc)
+
+    def test_it_documents_the_quarantine_and_why_it_is_not_a_rollback(self):
+        doc = self._doc()
+        self.assertIn("A failed generation is quarantined", doc)
+        self.assertIn("Not an automatic rollback", doc)
+        self.assertIn("nobody proceeds *without* deciding", doc)
+
+    def test_it_still_says_it_deletes_nothing(self):
+        doc = self._doc()
+        self.assertIn("It deletes nothing", doc)
+        self.assertIn("It does not switch the service", doc)

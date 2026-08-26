@@ -106,7 +106,18 @@ EXCEPTION_FIELDS = (
     "monolith_content_ledger",
     "backup_id", "backup_completed_utc", "backup_verified", "backup_retention_ref",
     "expires_utc", "approved_by", "approved_utc", "reason",
+    "residual_writer_risk",
 )
+
+#: What the residual-risk acknowledgement must carry. The fence stops the writers anyone knows
+#: about; an arbitrary one -- a shell, a stray script, a service restarted by hand -- obeys
+#: neither the lock nor the service posture, and three probes are samples rather than
+#: continuous proof. That residue cannot be engineered away here, so the only honest options
+#: are to remain ineligible or to have a person accept it EXPLICITLY, in writing, having been
+#: told what it is. This is that decision, and it is part of the approved record rather than a
+#: parameter, because it is a judgement and not a setting.
+RESIDUAL_RISK_FIELDS = ("acknowledged", "unrecoverable_outcome_possible", "statement",
+                        "accepted_by")
 
 #: Fields the fresh pre-compaction evidence must carry, each answering a question that cannot
 #: be answered from a document.
@@ -303,6 +314,9 @@ def exception_problem(record, *, host: str, run_id: str, operation: str,
                   "backup_retention_ref", "approved_by", "reason"):
         if not _exact_str(record[field]):
             return f"records {field} {record[field]!r}, which is not a non-empty string"
+    problem = residual_risk_problem(record["residual_writer_risk"])
+    if problem:
+        return f"the residual writer risk acknowledgement {problem}"
     if len(record["reason"].split()) < 5:
         return (f"records reason {record['reason']!r}, which is not a reason. The whole point "
                 f"of an exception is that someone said why in words a reviewer can weigh")
@@ -378,6 +392,39 @@ def exception_problem(record, *, host: str, run_id: str, operation: str,
     if when >= expires:
         return (f"expired at {record['expires_utc']}. An exception that outlives its window is "
                 f"a standing permission, which is what it was written not to be")
+    return None
+
+
+def residual_risk_problem(block):
+    """The first thing wrong with the residual-writer-risk acknowledgement, or `None`.
+
+    Not a checkbox. `unrecoverable_outcome_possible` must be `True` -- the person accepting has
+    to have been told, and to have recorded, that a writer nobody fenced can corrupt the served
+    authority in a way no gate here prevents and no rollback fully undoes. Recording `False`
+    would be recording a belief the code does not share, and the refusal says so."""
+    if type(block) is not dict:
+        return (f"is {type(block).__name__}, not an acknowledgement. There is no form of this "
+                f"that is merely truthy")
+    for field in RESIDUAL_RISK_FIELDS:
+        if field not in block:
+            return f"records no {field}"
+    if block["acknowledged"] is not True:
+        return (f"records acknowledged={block['acknowledged']!r}. The fence stops the writers "
+                f"that obey it; an arbitrary one does not, and the operation stays ineligible "
+                f"unless a person accepts that explicitly")
+    if block["unrecoverable_outcome_possible"] is not True:
+        return (f"records unrecoverable_outcome_possible="
+                f"{block['unrecoverable_outcome_possible']!r}. "
+                f"A writer nobody fenced can change the store between the samples, and neither "
+                f"the parity gates nor a VM restore fully undo what was served in between. "
+                f"Recording otherwise is recording a belief this code does not share")
+    if not _exact_str(block["accepted_by"]):
+        return "does not say who accepted it"
+    if not _exact_str(block["statement"]) or len(block["statement"].split()) < 8:
+        return ("carries no statement in words a reviewer can weigh. What is being accepted is "
+                "specific -- an unfenced writer, during a minutes-long interval, against the "
+                "store that is about to become the served authority -- and a person accepting "
+                "it should be able to say so")
     return None
 
 
@@ -1295,11 +1342,15 @@ def clearance_problem(clearance, *, host, run_id, generation, manifest_checksum,
 
 
 def refuse_destructive_step(operation, clearance=None, *, host=None, run_id=None,
-                            generation=None, manifest_checksum=None, approval=None, now=None):
+                            generation=None, manifest_checksum=None, approval=None,
+                            manifest_root=None, now=None):
     """The gate a future prune / swap / delete / switch MUST call before touching anything.
 
-    Two independent things are required and neither substitutes for the other:
+    Three independent things are required and none substitutes for another:
 
+    * **no quarantined generation** in the manifest root. A generation that was published and
+      then failed its gates is unverified, and removing the data underneath an unverified
+      authority is the worst available order of operations;
     * a **clearance** proving the post-compaction gates passed for exactly this generation, and
     * a separate **human approval** for the destructive step itself.
 
@@ -1313,6 +1364,11 @@ def refuse_destructive_step(operation, clearance=None, *, host=None, run_id=None
         raise FinalizationRefused(
             f"{operation!r} is not a destructive step; this gate is for "
             f"{list(DESTRUCTIVE_FAMILY)}")
+    if manifest_root is not None:
+        from ops.p5_oneshot_compaction import quarantine_problem
+        quarantined = quarantine_problem(manifest_root)
+        if quarantined:
+            raise FinalizationRefused(f"{operation!r} refused: {quarantined}")
     problem = clearance_problem(clearance, host=host, run_id=run_id, generation=generation,
                                 manifest_checksum=manifest_checksum, now=now)
     if problem:

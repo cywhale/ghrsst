@@ -260,6 +260,61 @@ clearance and a separate human approval. The gates passing means the new generat
 trustworthy; it does not mean anyone decided the old data should go, and those are different
 judgements.
 
+### The executing code must be reviewed, and that is a separate question from approval
+
+A production approval names a live root and a run. It says nothing about whether the code about
+to publish a served authority was ever reviewed, and an approval for the right root running
+unreviewed code is a real failure mode — the live checkout was once observed at HEAD plus five
+uncommitted edits.
+
+So `one_shot_compaction` **requires an identity artifact** and checks it before any lock is taken
+or any scan begins:
+
+| bound to | refused when |
+|---|---|
+| `deploy_sha` | it is not in `p5_readiness.REVIEWED_DEPLOY_SHAS` — a deployment cannot declare its own commit reviewed |
+| `head_sha`, `worktree_clean` | HEAD is not that commit, or the tree carries uncommitted edits |
+| `module_fingerprints` | any digest differs from the blob **git holds at that commit**, or the inventory is short by one module, or it contains one the commit does not |
+| `host`, `run_id`, `collected_utc` | another machine, another run, or past the freshness window |
+
+The comparison is exact in both directions and recomputed from the repository, not against a
+list the artifact supplies. A matching commit id says what git holds; fingerprints say what is
+on disk, and only the second is what executes.
+
+### Parity evidence is executed and bound, not a callable that says yes
+
+The parity producers stay injectable — they must read the deployment's own stores through the
+deployment's own reader, and a parity check written inside the operation would be the operation
+comparing its output against its own idea of the truth. What is **not** optional is what they
+return.
+
+A callable returning `{"mismatches": 0}` is refused. Each result must be an artifact carrying
+host, run, `deploy_sha`, the **candidate** generation and manifest checksum, the source-map
+digest, an execution timestamp, real sample and mismatch counts, and written verification
+provenance — and its `producer_digest` must be the digest of a module the identity artifact
+fingerprinted. Reviewed code has a digest git holds; a callable defined in a shell does not, and
+cannot acquire one. Zero mismatches out of zero samples is refused as an absent check rather
+than accepted as a passing one.
+
+### A generation that fails its gates is QUARANTINED
+
+Post-publish gates run after generation N+1 exists. If one fails, raising alone would leave that
+generation live and unclassified: the next run reads the live manifest, plans N+2 on top of it,
+and the failure now sits underneath a generation nobody questioned.
+
+So the operation writes `.p5_generation_quarantine.json` into the manifest root — durably, and
+**before** it raises — naming the generation, the run, the reasons, and the predecessor archive.
+Every later publish, switch and finalization refuses while it exists, including a finalization
+holding a valid clearance and a human approval: removing data underneath an unverified authority
+is the worst available order of operations.
+
+It is deliberately **not** an automatic rollback. Restoring the predecessor is itself an
+authority change, and performing one in the failure path on the strength of a gate the run could
+not satisfy is a second unreviewed change chasing the first. The predecessor archive is immutable
+(§9.3) and intact, so a person can still roll back with `execute_rollback` — what the record
+guarantees is that nobody proceeds *without* deciding. Reconciling means rolling back or
+establishing by review that the generation is sound, and then removing the file.
+
 ### The gates are enforced now
 
 `post_compaction_problem()` is no longer merely callable.
@@ -303,6 +358,7 @@ The record binds to:
 | `backup_id`, `backup_completed_utc`, `backup_verified`, `backup_retention_ref` | unattested, or completed *after* the approval was signed |
 | `expires_utc` | now is past it, it expires at or before approval, or it outlives the capacity reading it rests on |
 | `approved_by`, `approved_utc`, `reason` | the reason is not written in words a reviewer can weigh |
+| `residual_writer_risk` | the unfenced-writer residue was not explicitly accepted, in writing, as possibly unrecoverable |
 
 ### The measurement is taken, not accepted
 
@@ -340,6 +396,14 @@ entirely between two of them is invisible to all of them, and nothing here can c
 proving a posture held continuously needs something watching continuously. The fence is a
 precondition an operator arranges, not a guarantee this code provides, which is why the
 content-ledger recheck and the parity gates sit behind it.
+
+**So the residue is accepted explicitly or the operation stays ineligible.** The record carries
+`residual_writer_risk`: a written acknowledgement, naming who accepted it, that an unfenced
+writer can change the store during the interval and that the outcome may be **unrecoverable** —
+the parity gates detect such a change afterwards, and a VM restore does not undo what was served
+in between. `unrecoverable_outcome_possible: false` is refused rather than accepted, because it
+records a belief the code does not share. This is a judgement in the approved record, not a
+parameter, because it is a decision and not a setting.
 
 `flock` is advisory and the fence must say so: the ingest lock excludes the ingest path because
 the ingest path takes it, and it excludes nothing else. An arbitrary writer — a shell, a stray
