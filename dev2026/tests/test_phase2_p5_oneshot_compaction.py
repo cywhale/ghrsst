@@ -28,6 +28,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 
@@ -1393,20 +1394,20 @@ class TestParityEvidenceMustBeExecutedAndBound(_CompactionBase):
         with self.assertRaises(oc.OneShotCompactionRefused) as caught:
             self.compact(point_series_parity=convincing_fake)
         message = str(caught.exception)
-        self.assertIn("is not the same as being the approved producer", message)
+        self.assertIn("is not the reviewed", message)
         self.assertEqual(self.manifest_generation(), 1, "a green fake reached the publish")
 
     def test_a_callable_defined_in_a_test_is_refused(self):
         with self.assertRaises(oc.OneShotCompactionRefused) as caught:
             self.compact(api_parity=self._bare_fake)
-        self.assertIn("the reviewed producer for this kind is", str(caught.exception))
+        self.assertIn("is not the reviewed", str(caught.exception))
 
     def test_a_genuine_but_unregistered_function_is_refused(self):
         """Being in an approved module is not being the approved producer."""
         from store import source_provenance as real_module
         with self.assertRaises(oc.OneShotCompactionRefused) as caught:
             self.compact(point_series_parity=real_module.artifact_checksum)
-        self.assertIn("the reviewed producer for this kind is", str(caught.exception))
+        self.assertIn("is not the reviewed", str(caught.exception))
 
     def test_a_producer_whose_module_is_not_fingerprinted_is_refused(self):
         prints = {k: v for k, v in self._identity()["module_fingerprints"].items()
@@ -2223,18 +2224,14 @@ class TestTheProducerDerivationEdges(_CompactionBase):
         return self._identity()["module_fingerprints"]
 
     def test_a_callable_with_no_module_file_is_refused(self):
-        """A function built from a code object — what a REPL or an `exec` produces.
-
-        It is not an exotic case: it is what an operator gets by defining a producer at an
-        interactive prompt, which is exactly the "reviewed code has a source file and this does
-        not" boundary the guard is about."""
+        """A function built from a code object — what a REPL or an `exec` produces."""
         import types
         source = compile("def f(**kw):\n    return {}", "<interactive>", "exec")
         nowhere = types.FunctionType(source.co_consts[0], {})
         identity, problem = oc.producer_identity(
             nowhere, kind=oc.PARITY_POINT_SERIES, module_fingerprints=self._fingerprints())
         self.assertIsNone(identity)
-        self.assertIn("does not resolve to a module file", problem)
+        self.assertIn("is not the reviewed", problem)
 
     def test_the_operation_refuses_such_a_callable_too(self):
         import types
@@ -2242,7 +2239,7 @@ class TestTheProducerDerivationEdges(_CompactionBase):
         nowhere = types.FunctionType(source.co_consts[0], {})
         with self.assertRaises(oc.OneShotCompactionRefused) as caught:
             self.compact(api_parity=nowhere)
-        self.assertIn("does not resolve to a module file", str(caught.exception))
+        self.assertIn("is not the reviewed", str(caught.exception))
 
     def test_an_unregistered_kind_is_refused(self):
         """`producer_identity` is public and its kind is an argument; a caller asking about a
@@ -2254,13 +2251,15 @@ class TestTheProducerDerivationEdges(_CompactionBase):
         self.assertIn("no reviewed producer is registered", problem)
 
     def test_a_callable_outside_the_tree_is_refused(self):
-        """A function from an installed package resolves to a file, just not one of ours."""
+        """A function from an installed package. Every one of these converges on the same
+        refusal now, and that is the improvement: the question is no longer "where did this
+        come from" but "is this the reviewed function", which has one answer."""
         import json as stdlib_json
         identity, problem = oc.producer_identity(
             stdlib_json.dumps, kind=oc.PARITY_API,
             module_fingerprints=self._fingerprints())
         self.assertIsNone(identity)
-        self.assertIn("outside this tree", problem)
+        self.assertIn("is not the reviewed", problem)
 
 
 class TestASingleServedReadFailureIsAMismatch(_CompactionBase):
@@ -2342,3 +2341,231 @@ class TestASingleServedReadFailureIsAMismatch(_CompactionBase):
             with self.assertRaises(oc.GenerationQuarantined):
                 self.compact()
         self.assertIsNotNone(oc.read_quarantine(self.manifest_root))
+
+
+class TestTheProducerCannotBeImpersonated(_CompactionBase):
+    """`__module__` and `__qualname__` are WRITABLE. Deriving identity from them was forgeable.
+
+        fake.__module__  = "ops.p5_parity_producers"
+        fake.__qualname__ = "point_series_parity"
+
+    was enough for a stub returning `{"mismatches": 0}` to obtain a valid identity carrying the
+    real module's digest — `inspect.getmodule` consults `__module__` first, so it resolved the
+    genuine module and everything downstream agreed the result came from reviewed code.
+
+    The registry is now resolved first and the callable must BE that object."""
+
+    def _fingerprints(self):
+        return self._identity()["module_fingerprints"]
+
+    @staticmethod
+    def _green_artifact(**kw):
+        return {
+            "kind": oc.PARITY_POINT_SERIES,
+            "host": kw["host"], "run_id": kw["run_id"], "deploy_sha": kw["deploy_sha"],
+            "producer": "ops/p5_parity_producers.py:point_series_parity",
+            "generation": kw["generation"], "manifest_checksum": kw["manifest_checksum"],
+            "source_map_digest": kw["source_map_digest"],
+            "executed_utc": iso(), "samples": 40, "mismatches": 0,
+            "provenance": "compared point-wise against each day's own source",
+            "days_checked": len(kw.get("days") or [1]), "boundaries_included": True,
+        }
+
+    # ---------------------------------------------------------------- 1. a plain green fake
+    def test_a_fake_returning_a_complete_green_artifact_is_refused(self):
+        def fake(**kw):
+            return dict(self._green_artifact(**kw),
+                        producer_digest=oc._file_digest(
+                            os.path.join(_DEV, "ops/p5_parity_producers.py")))
+
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(point_series_parity=fake)
+        self.assertIn("is not the reviewed", str(caught.exception))
+        self.assertEqual(self.manifest_generation(), 1)
+
+    # ---------------------------------------------------------------- 2. the forgery
+    def test_a_fake_forging_module_qualname_and_digest_is_refused(self):
+        """The exact impersonation the previous revision accepted."""
+        legitimate = self._fingerprints()["ops/p5_parity_producers.py"]
+
+        def forged(**kw):
+            return dict(self._green_artifact(**kw), producer_digest=legitimate)
+
+        forged.__module__ = "ops.p5_parity_producers"
+        forged.__qualname__ = "point_series_parity"
+
+        identity, problem = oc.producer_identity(
+            forged, kind=oc.PARITY_POINT_SERIES,
+            module_fingerprints=self._fingerprints())
+        self.assertIsNone(identity, "a forged __module__/__qualname__ obtained an identity")
+        self.assertIn("writable attributes", problem)
+
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(point_series_parity=forged)
+        self.assertIn("is not the reviewed", str(caught.exception))
+        self.assertEqual(self.manifest_generation(), 1)
+
+    def test_the_forgery_is_refused_for_the_api_kind_too(self):
+        def forged(**kw):
+            return {"kind": oc.PARITY_API, "mismatches": 0, "samples": 4}
+        forged.__module__ = "ops.p5_parity_producers"
+        forged.__qualname__ = "api_parity"
+        identity, problem = oc.producer_identity(
+            forged, kind=oc.PARITY_API, module_fingerprints=self._fingerprints())
+        self.assertIsNone(identity)
+        self.assertIn("is not the reviewed", problem)
+
+    def test_a_copy_of_the_real_function_is_still_refused(self):
+        """Same code, same name, same module — a different object.
+
+        `is`, not equality: a copy is not the function the review read, and accepting one would
+        let a wrapper that filters the result stand in for the producer."""
+        import types
+        real = ppd.point_series_parity
+        clone = types.FunctionType(real.__code__, real.__globals__, real.__name__,
+                                   real.__defaults__, real.__closure__)
+        clone.__module__ = real.__module__
+        clone.__qualname__ = real.__qualname__
+        identity, problem = oc.producer_identity(
+            clone, kind=oc.PARITY_POINT_SERIES, module_fingerprints=self._fingerprints())
+        self.assertIsNone(identity)
+        self.assertIn("is not the reviewed", problem)
+
+    def test_a_wrapper_around_the_real_function_is_refused(self):
+        """The subtlest impersonation: it really does call the reviewed producer, then edits
+        the result. `functools.wraps` copies `__module__` and `__qualname__` for free."""
+        import functools
+
+        @functools.wraps(ppd.point_series_parity)
+        def wrapper(**kw):
+            out = ppd.point_series_parity(**kw)
+            out["mismatches"] = 0
+            return out
+
+        identity, problem = oc.producer_identity(
+            wrapper, kind=oc.PARITY_POINT_SERIES,
+            module_fingerprints=self._fingerprints())
+        self.assertIsNone(identity)
+        self.assertIn("is not the reviewed", problem)
+
+    # ---------------------------------------------------------------- 3. the positive control
+    def test_both_reviewed_producers_still_pass(self):
+        for kind, fn in ((oc.PARITY_POINT_SERIES, ppd.point_series_parity),
+                         (oc.PARITY_API, ppd.api_parity)):
+            with self.subTest(kind):
+                identity, problem = oc.producer_identity(
+                    fn, kind=kind, module_fingerprints=self._fingerprints())
+                self.assertIsNone(problem)
+                self.assertEqual(identity["producer"],
+                                 f"ops/p5_parity_producers.py:{kind}")
+
+    def test_the_operation_completes_through_the_reviewed_producers(self):
+        result = self.compact()
+        self.assertEqual(result["generation"], 2)
+        self.assertIsNotNone(result["finalization_clearance"])
+
+    # ---------------------------------------------------------------- 4. digest disagreement
+    def test_a_producer_digest_that_does_not_match_the_approved_identity_is_refused(self):
+        """The module resolves, the object IS the reviewed one, and the file has changed."""
+        prints = dict(self._fingerprints())
+        prints["ops/p5_parity_producers.py"] = "0" * 64
+        identity, problem = oc.producer_identity(
+            ppd.point_series_parity, kind=oc.PARITY_POINT_SERIES,
+            module_fingerprints=prints)
+        self.assertIsNone(identity)
+        self.assertIn("is not the one that would run", problem)
+
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(identity_artifact=self._identity(module_fingerprints=prints))
+        self.assertIn("is not the one that would run", str(caught.exception))
+        self.assertEqual(self.manifest_generation(), 1)
+
+    def test_an_identity_that_does_not_fingerprint_the_producer_module_is_refused(self):
+        prints = {k: v for k, v in self._fingerprints().items()
+                  if k != "ops/p5_parity_producers.py"}
+        identity, problem = oc.producer_identity(
+            ppd.api_parity, kind=oc.PARITY_API, module_fingerprints=prints)
+        self.assertIsNone(identity)
+        self.assertIn("does not fingerprint", problem)
+
+    # ---------------------------------------------------------------- the registry itself
+    def test_an_unresolvable_registry_entry_fails_closed(self):
+        with mock.patch.dict(oc.REVIEWED_PRODUCERS,
+                             {oc.PARITY_POINT_SERIES: ("ops/nothing_here.py", "nope")}):
+            identity, problem = oc.producer_identity(
+                ppd.point_series_parity, kind=oc.PARITY_POINT_SERIES,
+                module_fingerprints=self._fingerprints())
+        self.assertIsNone(identity)
+        self.assertIn("could not be resolved", problem)
+
+    def test_a_registry_entry_naming_a_missing_attribute_fails_closed(self):
+        with mock.patch.dict(oc.REVIEWED_PRODUCERS,
+                             {oc.PARITY_API: ("ops/p5_parity_producers.py", "not_a_function")}):
+            identity, problem = oc.producer_identity(
+                ppd.api_parity, kind=oc.PARITY_API,
+                module_fingerprints=self._fingerprints())
+        self.assertIsNone(identity)
+        self.assertIn("could not be resolved", problem)
+
+    def test_a_registry_entry_that_is_not_a_module_path_is_refused(self):
+        with mock.patch.dict(oc.REVIEWED_PRODUCERS,
+                             {oc.PARITY_API: ("ops/p5_parity_producers", "api_parity")}):
+            with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                oc.producer_identity(ppd.api_parity, kind=oc.PARITY_API,
+                                     module_fingerprints=self._fingerprints())
+        self.assertIn("not a module path", str(caught.exception))
+
+    def test_the_identity_never_consults_what_the_callable_claims(self):
+        """By AST over the CODE, not the source text.
+
+        A text scan would trip on the docstring, which names the forgeable attributes in order
+        to explain why they are not used. This walks the function body and asserts no attribute
+        is read off the `fn` parameter at all."""
+        tree = ast.parse(textwrap.dedent(inspect.getsource(oc.producer_identity)))
+        reads = {node.attr for node in ast.walk(tree)
+                 if isinstance(node, ast.Attribute)
+                 and isinstance(node.value, ast.Name) and node.value.id == "fn"}
+        self.assertEqual(reads, set(),
+                         f"the derivation reads {sorted(reads)} off the callable it is meant "
+                         f"to be checking")
+        body = ast.parse(textwrap.dedent(inspect.getsource(oc.producer_identity)))
+        called = {getattr(n.func, "attr", None) for n in ast.walk(body)
+                  if isinstance(n, ast.Call)}
+        self.assertNotIn("getmodule", called)
+
+    def test_a_reviewed_module_with_no_file_fails_closed(self):
+        """Guards the REVIEWED module, not the caller's callable.
+
+        Reachable if the registry ever names something importable without a source file — a
+        namespace package, a frozen or builtin module. There is then nothing to fingerprint,
+        and proceeding would mean running a producer whose bytes nobody can check."""
+        with mock.patch.object(ppd, "__file__", None):
+            identity, problem = oc.producer_identity(
+                ppd.api_parity, kind=oc.PARITY_API,
+                module_fingerprints=self._fingerprints())
+        self.assertIsNone(identity)
+        self.assertIn("no file on disk to fingerprint", problem)
+
+    def test_an_import_resolving_outside_the_registry_path_fails_closed(self):
+        """`sys.path` shadowing: the name imports, but not from where the registry says.
+
+        Another `ops/p5_parity_producers.py` earlier on the path would be imported instead, and
+        the digest check would then compare the SHADOW against the fingerprint — which is the
+        wrong file to be reassured about. The path the import actually resolved to has to be
+        the path the registry named."""
+        with mock.patch.object(ppd, "__file__", "/somewhere/else/p5_parity_producers.py"):
+            identity, problem = oc.producer_identity(
+                ppd.point_series_parity, kind=oc.PARITY_POINT_SERIES,
+                module_fingerprints=self._fingerprints())
+        self.assertIsNone(identity)
+        self.assertIn("not where the registry says it lives", problem)
+
+    def test_an_import_resolving_elsewhere_inside_the_tree_also_fails_closed(self):
+        """Inside the tree but at the wrong path is still the wrong file."""
+        with mock.patch.object(ppd, "__file__",
+                               os.path.join(_DEV, "ops", "p5_readiness.py")):
+            identity, problem = oc.producer_identity(
+                ppd.api_parity, kind=oc.PARITY_API,
+                module_fingerprints=self._fingerprints())
+        self.assertIsNone(identity)
+        self.assertIn("not where the registry says it lives", problem)

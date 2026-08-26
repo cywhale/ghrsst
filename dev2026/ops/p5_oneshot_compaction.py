@@ -551,44 +551,70 @@ def _file_digest(path: str) -> str:
         return hashlib.sha256(fh.read()).hexdigest()
 
 
+def _import_registered(relpath: str, qualname: str):
+    """Import the reviewed module and resolve the registered attribute. `(module, fn)`.
+
+    Imported BY PATH from the registry, never from anything the caller handed over. This is the
+    difference between "what is the reviewed producer" and "what does this object say it is",
+    and only the first is a fact."""
+    import importlib
+    if not relpath.endswith(".py"):
+        raise OneShotCompactionRefused(
+            f"the registry names {relpath!r}, which is not a module path")
+    module_name = relpath[:-3].replace(os.sep, ".").replace("/", ".")
+    module = importlib.import_module(module_name)
+    resolved = module
+    for part in qualname.split("."):
+        resolved = getattr(resolved, part)
+    return module, resolved
+
+
 def producer_identity(fn, *, kind: str, module_fingerprints: Dict):
-    """Who this callable ACTUALLY is: `(relpath, qualname, on-disk digest)`, or a refusal.
+    """Who this callable ACTUALLY is: `(identity, None)` or `(None, problem)`.
 
-    Derived from the callable, never read from what it returns. An artifact claiming a producer
-    is a string the artifact chose; `fn.__module__` and `fn.__qualname__` are what Python
-    resolved, and the digest is what is on disk under that module's path right now.
+    **The callable must BE the registered function, not merely describe itself as it.** An
+    earlier revision read `__module__` and `__qualname__` off the object and looked the module
+    up from them — and both are plain writable attributes, so:
 
-    Three things must hold, and none implies another:
+        fake.__module__  = "ops.p5_parity_producers"
+        fake.__qualname__ = "point_series_parity"
 
-    * the callable resolves to a file inside this tree — a lambda defined in a shell, a
-      test, or a notebook does not;
-    * `(relpath, qualname)` is the entry `REVIEWED_PRODUCERS` names for this kind — a genuine
-      but unreviewed function in an approved module is still not a parity producer;
-    * the file's digest NOW equals the fingerprint the identity artifact recorded for it, so
-      the reviewed code is also the code that ran.
+    was enough for a stub returning `{"mismatches": 0}` to obtain a valid identity carrying the
+    real module's digest. Everything downstream then agreed it came from reviewed code.
 
-    Returns `(identity_dict, None)` or `(None, problem)`."""
-    import inspect as _inspect
+    So the registry is resolved FIRST: the module is imported by the path the registry names,
+    the attribute is fetched from it, and the callable must be that same object — `is`, not
+    equality, because a copy with the same code is still not the function the review read. What
+    the object claims about itself is never consulted.
+
+    Then the file behind that module must hash to the fingerprint the identity artifact
+    recorded, so the reviewed producer is also the code on disk right now."""
     registered = REVIEWED_PRODUCERS.get(kind)
     if registered is None:
         return None, (f"no reviewed producer is registered for {kind!r}; the operation cannot "
                       f"adjudicate a parity result it has no approved producer for")
-    module = _inspect.getmodule(fn)
+    relpath, qualname = registered
+    try:
+        module, resolved = _import_registered(relpath, qualname)
+    except OneShotCompactionRefused:
+        raise
+    except BaseException as exc:                                    # noqa: BLE001
+        return None, (f"the reviewed {kind} producer {relpath}:{qualname} could not be "
+                      f"resolved ({exc!r}); with nothing to compare against, no callable can "
+                      f"be shown to be it")
+    if fn is not resolved:
+        return None, (f"the {kind} producer is not the reviewed "
+                      f"{relpath}:{qualname}. `__module__` and `__qualname__` are writable "
+                      f"attributes, so a callable saying it is that function proves nothing; "
+                      f"this compares the object itself")
+
     source_file = getattr(module, "__file__", None)
     if not source_file:
-        return None, (f"the {kind} producer {getattr(fn, '__qualname__', fn)!r} does not "
-                      f"resolve to a module file. A callable defined in a shell, a test or a "
-                      f"lambda has no reviewed source, and its result is indistinguishable "
-                      f"from one that measured nothing")
-    relpath = _repo_relative(source_file)
-    if relpath is None:
-        return None, (f"the {kind} producer comes from {source_file!r}, which is outside this "
-                      f"tree; nothing here can say what it contains")
-    qualname = getattr(fn, "__qualname__", None)
-    if (relpath, qualname) != registered:
-        return None, (f"the {kind} producer is {relpath}:{qualname}, and the reviewed producer "
-                      f"for this kind is {registered[0]}:{registered[1]}. Being in an approved "
-                      f"module is not the same as being the approved producer")
+        return None, (f"the reviewed module {relpath} has no file on disk to fingerprint")
+    resolved_relpath = _repo_relative(source_file)
+    if resolved_relpath != relpath:
+        return None, (f"{relpath} imported from {source_file!r}, which is not where the "
+                      f"registry says it lives; the import resolved somewhere else on the path")
     fingerprint = module_fingerprints.get(relpath)
     if fingerprint is None:
         return None, (f"the identity artifact does not fingerprint {relpath}, so the producer "
@@ -600,6 +626,55 @@ def producer_identity(fn, *, kind: str, module_fingerprints: Dict):
                       f"would run")
     return {"producer": f"{relpath}:{qualname}", "producer_digest": on_disk,
             "module": relpath, "qualname": qualname}, None
+
+
+# ---------------------------------------------------------------- parity evidence
+#: What an executed parity artifact must carry. A callable that returns `{"mismatches": 0}`
+#: satisfies a gate reading only that key while having measured nothing at all -- so the gate
+#: reads a bound RESULT instead, and the operation checks every binding against its own state.
+PARITY_ARTIFACT_FIELDS = ("kind", "host", "run_id", "deploy_sha",
+                          "producer", "producer_digest",
+                          "generation", "manifest_checksum", "source_map_digest",
+                          "executed_utc", "samples", "mismatches", "provenance")
+
+#: The two parity kinds, named so an artifact for one cannot be presented for the other.
+PARITY_POINT_SERIES = "point_series_parity"
+PARITY_API = "api_parity"
+
+#: The reviewed producers, per kind: (module path relative to the dev2026 tree, qualname).
+#:
+#: A digest carried IN the artifact was forgeable -- a lambda could copy the digest of any
+#: approved module and present itself as that module, returning a fully green result while
+#: measuring nothing. So the identity is DERIVED from the callable the operation holds, and this
+#: registry is the reviewed list of what may be called. Both halves matter: derivation stops an
+#: artifact naming a producer it did not come from, and the registry stops a genuine but
+#: unreviewed function in an approved module standing in for a parity check.
+REVIEWED_PRODUCERS = {
+    PARITY_POINT_SERIES: ("ops/p5_parity_producers.py", "point_series_parity"),
+    PARITY_API: ("ops/p5_parity_producers.py", "api_parity"),
+}
+
+#: Modules that hold the producers. They are part of the OPERATION rather than of the
+#: deployment inventory `p5_readiness.INVENTORY_MODULES` describes, so the identity artifact is
+#: allowed to fingerprint them in addition to the inventory -- and their on-disk digest is
+#: checked against that fingerprint. See `identity_problem`, and the limitation recorded there.
+REVIEWED_PRODUCER_MODULES = ("ops/p5_parity_producers.py",)
+
+
+def _repo_relative(path: str) -> Optional[str]:
+    """`/…/dev2026/ops/x.py` -> `ops/x.py`, or `None` when it is not in the tree."""
+    dev = os.path.dirname(os.path.abspath(__file__))          # …/dev2026/ops
+    dev = os.path.dirname(dev)                                # …/dev2026
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.realpath(dev) + os.sep):
+        return None
+    return os.path.relpath(real, os.path.realpath(dev))
+
+
+def _file_digest(path: str) -> str:
+    import hashlib
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
 
 
 def parity_artifact_problem(artifact, *, kind: str, host: str, run_id: str, deploy_sha: str,
