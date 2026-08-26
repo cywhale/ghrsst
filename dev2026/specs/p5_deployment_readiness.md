@@ -362,7 +362,26 @@ Each step is gated by the one before it, and none of them is code:
 
 **Step 1 is not a formality, and it blocks everything after it.** The requirement handed to
 storage, and the read-only checklist that establishes whether it has been met, are in
-[`p5_monolith_mount_barrier_requirement.md`](p5_monolith_mount_barrier_requirement.md). The monolith is
+[`p5_monolith_mount_barrier_requirement.md`](p5_monolith_mount_barrier_requirement.md).
+
+#### The one-shot exception is a detour around step 1, and only step 1
+
+A human has accepted the risk of running **one** compaction before that mount layout exists,
+because VM24 has full automated VM backups. It changes exactly one thing about the path above:
+step 7 may be reached once without step 1. Steps 2–6 are untouched, and each still needs its own
+approval.
+
+It is a **record**, not a flag — bound to one host, one run, one monolith at one measured state,
+one verified backup and one expiry — and it is reported in its own field,
+`one_shot_compaction_exception`. It never makes `monolith_barrier` READY and never makes
+`compaction_ready` true; an eligible exception beside a `BLOCKED` barrier is the expected shape.
+The backup makes a failure **recoverable**, not unlikely, and restoring it rolls back the whole
+machine, loses delta days and WAL repairs in the interval, and cannot recall answers already
+served. §6a of the requirement document holds the binding table, the pre- and post-compaction
+checks, and the full rollback limits. **The read-only mount remains the preferred route**, and
+step 1 stays on the critical path for every run after this one.
+
+The monolith is
 `$G/mur_timecube_s8_t90_sh128.zarr`, and `$G` is on `/dev/sdc1` mounted at
 `/home/odbadmin/Data`. The delta lives on that mount and the P5 roots would. Making it
 read-only would freeze the delta and the WAL along with the monolith, leaving a deployment that

@@ -259,7 +259,7 @@ RUNTIME_GROUPS = {}         # populated at the end of this section, once the smo
 #: unguarded -- which is exactly what happened to `store/segmented_cube.py`, the module
 #: `_check_blocks` takes its verdict from.
 ASSESSOR_MODULES = (
-    "ops/p5_readiness.py", "ops/p5s8_evidence.py",
+    "ops/p5_readiness.py", "ops/p5_oneshot_exception.py", "ops/p5s8_evidence.py",
     "ops/p5_roadmap.py", "ops/p5s8_report.py", "ops/quiescence.py",
     "store/__init__.py", "store/block_manifest.py", "store/durable_jsonl.py",
     "store/repair_wal.py", "store/segmented_cube.py", "store/time_cube.py",
@@ -1700,6 +1700,34 @@ CHECKERS = {
 }
 
 
+def _one_shot_exception(target: Dict, results: List[Dict], now=None) -> Dict:
+    """Adjudicate a one-shot compaction risk acceptance, if one was supplied.
+
+    Absent is the normal state and is reported as such rather than as a failure: almost every
+    assessment has no exception, and an assessment without one is not deficient.
+
+    Eligibility here NEVER implies readiness. `monolith_barrier` keeps whatever verdict it
+    earned, `compaction_ready` keeps whatever value it had, and this field says only that a
+    person bound an acceptance to this host, this run and this monolith state, and that the
+    fresh operational checks passed."""
+    from ops import p5_oneshot_exception as ex
+    record = target.get("one_shot_exception")
+    if record is None:
+        return {"supplied": False, "eligible": False,
+                "note": ("no one-shot exception was supplied, which is the normal state. "
+                         "Compaction waits for the read-only mount barrier")}
+    verdict = ex.evaluate(
+        record=record, host=target.get("host"), run_id=target.get("run_id"),
+        observed=target.get("monolith_state"), pre=target.get("pre_compaction"),
+        post=target.get("post_compaction"), now=now)
+    verdict["supplied"] = True
+    # The barrier's own verdict is carried alongside so nobody has to infer it: an eligible
+    # exception beside a BLOCKED barrier is the expected shape, not a contradiction.
+    barrier = next((r for r in results if r["id"] == "monolith_barrier"), None)
+    verdict["monolith_barrier_verdict"] = barrier["verdict"] if barrier else None
+    return verdict
+
+
 def assess(target: Dict, now=None) -> Dict:
     """Adjudicate one deployment target and return a machine-readable report.
 
@@ -1753,6 +1781,12 @@ def assess(target: Dict, now=None) -> Dict:
         "requirements": results,
         "summary": summary,
         "compaction_ready": ready,
+        #: SEPARATE from `compaction_ready`, and deliberately not folded into it. A human may
+        #: accept the risk of one compaction without the read-only mount; that acceptance does
+        #: not make the deployment ready, does not make `monolith_barrier` READY, and does not
+        #: authorize a second run. Reporting the two in one field would lose exactly the
+        #: distinction the exception exists to preserve.
+        "one_shot_compaction_exception": _one_shot_exception(target, results, now=now),
         #: Stated, not implied: this report describes one collection. Past this timestamp the
         #: capacity reading it rests on must be taken again -- a schedule tick, a restart or an
         #: overnight pause all move free space without announcing it here.

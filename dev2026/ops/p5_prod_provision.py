@@ -50,6 +50,18 @@ live root's device, undeclared, or carrying the same-filesystem waiver.
 The anchor is verified here even though the WAL is initialized later: an operator who cannot
 produce a valid anchor should learn it before roots exist, not after.
 
+## The one-shot exception, if one is supplied
+
+`one_shot_exception` is a human risk acceptance for **one** compaction without the read-only
+mount barrier — a record, not a flag, and this operation is stricter with it than with anything
+else it is handed. There is no `force`, `skip_seal`, `allow_unsealed` or `require_sealed=False`
+parameter and no environment variable; a test asserts none appears. Supplying a record that does
+not hold **refuses the whole run** rather than warning, and the `subject_realpath` the record is
+checked against comes from this operation's own `monolith_path`, never from the caller's
+evidence: a record and an `observed` that agree with each other prove only that whoever
+assembled them was consistent, not that either describes the store about to be published over.
+See `ops/p5_oneshot_exception.py` and §6a of `specs/p5_monolith_mount_barrier_requirement.md`.
+
 ## Interruption: recoverable, NOT atomic
 
 This is not atomic and does not claim to be. A crash can leave a root on disk. What it
@@ -99,9 +111,11 @@ import json
 import math
 import os
 import shutil
+import socket
 from typing import Dict, List, Optional, Sequence
 
 from ops import p5_legacy_base
+from ops import p5_oneshot_exception
 from store import compaction_lock
 from store import repair_wal
 
@@ -351,6 +365,9 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
                          compaction_lock_path: str, ingest_lock_path: str,
                          run_id: str, operator: str, at_utc: str,
                          min_free_gib: float,
+                         one_shot_exception: Optional[Dict] = None,
+                         one_shot_observed: Optional[Dict] = None,
+                         one_shot_pre_compaction: Optional[Dict] = None,
                          cleanup_on_failure: bool = True) -> Dict:
     """Create the P5 roots, publish generation 1 over the monolith, initialize the WAL.
 
@@ -376,6 +393,24 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
             raise ProductionProvisionRefused(f"{name} must be a non-empty string")
     locks = check_lock_paths(live_root=live_root, compaction_lock_path=compaction_lock_path,
                              ingest_lock_path=ingest_lock_path)
+    # There is NO `force`, `skip_seal`, `allow_unsealed` or `require_sealed=False` here, and a
+    # test asserts none appears. The only way past a monolith that is not sealed is a complete
+    # record bound to this host, this run, this monolith's current state, a verified backup and
+    # an expiry -- validated field by field, refusing on any mismatch.
+    exception_verdict = None
+    if one_shot_exception is not None:
+        # `subject_realpath` comes from THIS operation's own monolith_path, not from the
+        # caller's evidence: a record and an `observed` that agree with each other prove only
+        # that whoever assembled them was consistent.
+        exception_verdict = p5_oneshot_exception.evaluate(
+            record=one_shot_exception, host=socket.gethostname(), run_id=run_id,
+            observed=one_shot_observed,
+            subject_realpath=os.path.realpath(monolith_path),
+            pre=one_shot_pre_compaction)
+        if not exception_verdict["eligible"]:
+            raise ProductionProvisionRefused(
+                f"the one-shot compaction exception does not hold: "
+                f"{exception_verdict['problems']}")
 
     manifest_root = os.path.join(live_root, MANIFEST_DIRNAME)
     wal_root = os.path.join(live_root, WAL_DIRNAME)
@@ -408,7 +443,8 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
     stamp = {"label": PRODUCTION_LABEL, "marker": marker, "run_id": run_id,
              "live_root": os.path.realpath(live_root), "manifest_root": manifest_root,
              "wal_root": wal_root, "anchor_root": anchor["anchor_root"],
-             "monolith_path": os.path.realpath(monolith_path), "locks": locks, "provisioned_utc": at_utc, "operator": operator,
+             "monolith_path": os.path.realpath(monolith_path), "locks": locks,
+             "provisioned_utc": at_utc, "operator": operator,
              "approved_by": approval["approved_by"], "approved_utc": approval["approved_utc"],
              "capacity_at_start": capacity, "anchor_verified": anchor,
              # PLANNED before anything exists, because "what may be on disk" cannot be learned
@@ -456,6 +492,7 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
         "capacity_at_start": capacity, "anchor_verified": anchor,
         "approved_by": approval["approved_by"], "approved_utc": approval["approved_utc"],
         "provisioned_utc": at_utc, "operator": operator,
+        "one_shot_exception": exception_verdict,
         "manifest_published": True, "wal_initialized": True,
         "generation": published.get("generation"),
         "generation_id": published.get("generation_id"),

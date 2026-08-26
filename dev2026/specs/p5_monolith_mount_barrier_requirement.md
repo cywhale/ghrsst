@@ -231,6 +231,72 @@ the record as meaningful, and they belong in the run's notes.
   readiness figure expires two hours after collection and a collection nobody is ready to act on
   expires unused.
 
+## 6a. The one-shot exception path, and what it does not buy
+
+A human has accepted the risk of running **one** compaction without this barrier, because VM24
+has full automated VM backups. That is a claim about **recoverability**, not about likelihood,
+and nothing in the code treats it as the latter. It does not weaken anything in §1–§5: the
+requirement above stands, and the read-only mount remains the preferred and stronger route.
+
+The acceptance is a **record**, not a flag. There is no `force`, no `skip_seal`, no
+`allow_unsealed`, no `require_sealed=False` and no environment variable — a test asserts none
+exists — because every one of those is reusable by the next caller who finds it and unauditable
+afterwards. The record binds to:
+
+| bound to | refused when |
+|---|---|
+| `scope` = one-shot compaction risk acceptance | it approves anything else |
+| `host`, `run_id` | another machine, or another run — **one-shot means one run** |
+| `monolith_realpath`, `monolith_metadata_fingerprint`, `monolith_day_digest`, `monolith_content_ledger` | the store changed after the risk was accepted |
+| `backup_id`, `backup_completed_utc`, `backup_verified`, `backup_retention_ref` | unverified, or completed *after* the approval was signed |
+| `expires_utc` | now is past it, or it expires at or before approval |
+| `approved_by`, `approved_utc`, `reason` | the reason is not written in words a reviewer can weigh |
+
+Verification against the record alone is refused: a fresh measurement of the monolith must be
+supplied, or the record is only being checked against itself.
+
+Nor is a self-consistent pair enough. The record and the measurement agreeing proves only that
+whoever assembled them was consistent — both could describe a store this run is not touching.
+So the **operation** supplies the realpath it is about to publish over, from its own argument,
+and a record naming a different store is refused however well it matches its own evidence.
+
+### It never becomes readiness
+
+`monolith_barrier` keeps whatever verdict it earned, `compaction_ready` stays `false`, and the
+exception is reported in its own field — `one_shot_compaction_exception`. An eligible exception
+beside a `BLOCKED` barrier is the expected shape, not a contradiction: the two say *"a person
+accepted this risk once"* and *"this deployment is safe to compact"*, which are different
+claims.
+
+### The surrounding checks are not relaxed
+
+**Before**: fresh capacity and device binding · current healthz/latest · identity on a clean
+reviewed commit · process/PM2/cron quiescence · **no process holds the monolith for writing** ·
+compaction and ingest lock state · fresh monolith fingerprints and content ledger · the verified
+backup · the exact source map and destination manifest plan.
+
+**After**, all of which must pass **before anything is deleted or any service is switched**:
+manifest checksum and generation · WAL/anchor binding · source-map completeness · base/delta
+disjointness · point-series parity against the monolith oracle **including the first and last
+days** · API response parity · a fresh capacity measurement · and an explicit
+`nothing_deleted: true`. The ordering is the point — a parity failure found after the old data
+is gone is a parity failure with nothing to go back to.
+
+### Rollback limits
+
+The acceptance rests on the backup, so what the backup cannot undo is part of it:
+
+* restoring the VM rolls back the **whole machine**, not the P5 roots alone — every other
+  service on it loses the same interval;
+* delta days appended between the backup and the restore are lost, and the ingest cron will not
+  re-fetch them on its own;
+* any repair committed to the WAL in that interval is lost with it, and the anchor's
+  high-water mark will refuse the restored log as rolled back — which is correct, and is manual
+  recovery;
+* requests already answered from a bad generation cannot be recalled;
+* the restore is decided and started by a person, so the exposure is **detection time plus
+  restore time**, not restore time alone.
+
 ## 7. Where this sits
 
 ```
