@@ -33,6 +33,7 @@ approval; this builds the generation.
 from __future__ import annotations
 
 import os
+import stat
 from typing import Dict, Optional
 
 from store import block_manifest
@@ -122,16 +123,58 @@ def legacy_base_segment(monolith_path: str, manifest_root: str) -> Dict:
     return segment
 
 
-def build_generation_one(*, monolith_path: str, manifest_root: str, at_utc: str,
-                         operator: str, generation_id: Optional[str] = None) -> Dict:
-    """Build and publish generation 1 over `monolith_path`. Returns what was published.
+def check_monolith_sealed(monolith_path: str) -> Dict:
+    """Refuse a monolith that is still writable. Returns what was observed.
 
-    Published through `block_manifest.publish()`, which validates and archives it — there is no
-    second manifest format here and no second validator. `publish()` refuses to rewrite an
-    existing generation archive, so this cannot quietly replace a generation someone else
-    made."""
+    **A necessary barrier, not a sufficient one.** It reads the store root's permission bits:
+    if the owner, group or world can write it, the store is not sealed and nothing downstream
+    can assume it will hold still. What it cannot establish is the converse — a subdirectory
+    could carry different bits, a process running as root ignores permissions entirely, and a
+    filesystem remounted read-write later changes the answer without changing this record.
+
+    The real barrier is an operational one: the monolith on a read-only mount, which is a
+    deployment prerequisite and not something this process can arrange. This refuses the
+    obviously-unsealed case and records the evidence for the case it cannot settle.
+
+    `immutable: true` in the segment is a DECLARATION and is not treated as proof of anything;
+    this is the check that stands behind it."""
     if not os.path.isdir(monolith_path):
-        raise LegacyBaseRefused(f"monolith_path {monolith_path!r} is not an existing directory")
+        raise LegacyBaseRefused(
+            f"monolith_path {monolith_path!r} is not an existing directory")
+    st = os.stat(monolith_path)
+    writable = bool(st.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+    evidence = {
+        "path": os.path.realpath(monolith_path),
+        "mode": oct(stat.S_IMODE(st.st_mode)),
+        "writable_bits": writable,
+        "checked": "store root permission bits only",
+        "not_established": ("subdirectory bits, a root process ignoring permissions, or a "
+                            "later remount read-write. The barrier that would establish those "
+                            "is a read-only mount, which is a deployment prerequisite"),
+    }
+    if writable:
+        raise LegacyBaseRefused(
+            f"{monolith_path!r} is writable (mode {evidence['mode']}); a legacy base must be "
+            f"sealed before a manifest describes it. The content seal detects a store that "
+            f"changed, and detecting it after the fact is not the same as it not changing")
+    return evidence
+
+
+def prepare_generation_one(*, monolith_path: str, manifest_root: str, at_utc: str,
+                           operator: str, generation_id: Optional[str] = None,
+                           require_sealed: bool = True) -> Dict:
+    """Everything expensive, done OUTSIDE any lock the ingest path needs.
+
+    `inspect_store_contract()` reads the store's metadata and `content_ledger()` walks every
+    file in it. On a ~2 TB monolith the second is minutes of `stat` calls, and it was running
+    inside the ingest lock — which on VM24 means the daily-append cron blocked behind a scan
+    that has nothing to do with it. The ingest lock exists to exclude ingest from the moment
+    the store's authority CHANGES, and that moment is the publish.
+
+    So this prepares; `publish_prepared()` publishes. Between the two the monolith could in
+    principle change, which is what `check_monolith_sealed()` and the final validation in
+    `publish_prepared()` are for."""
+    seal_evidence = check_monolith_sealed(monolith_path) if require_sealed else None
     if not os.path.isdir(manifest_root):
         raise LegacyBaseRefused(
             f"manifest_root {manifest_root!r} is not an existing directory; this builds a "
@@ -148,7 +191,14 @@ def build_generation_one(*, monolith_path: str, manifest_root: str, at_utc: str,
         "generation": 1,
         "generation_id": generation_id or f"gen000001-{SEGMENT_ID}",
         "created_utc": at_utc,
-        "created_by": f"ops/p5_legacy_base.py ({operator})",
+        # The provenance line says WHERE block_days came from, because the manifest schema has
+        # no field for "this number is policy" and a bare 90 in `block_grid` reads like a
+        # measurement of the store.
+        "created_by": (f"ops/p5_legacy_base.py ({operator}); "
+                       f"block_days={BLOCK_DAYS_S} is POLICY (BLOCK_DAYS_S), not derived from "
+                       f"the store"
+                       + (", and PROVISIONAL: nothing has selected it"
+                          if BLOCK_DAYS_S_IS_PROVISIONAL else "")),
         "predecessor_generation": None, "predecessor_manifest": None,
         # From the inspection, not from a caller: the grid is a property of the store.
         "grid": {"ny": insp.ny, "nx": insp.nx, "region": [0, insp.ny, 0, insp.nx]},
@@ -161,13 +211,20 @@ def build_generation_one(*, monolith_path: str, manifest_root: str, at_utc: str,
         "segments": [segment], "superseded": [], "manifest_checksum": "",
     }
     manifest["manifest_checksum"] = block_manifest.compute_checksum(manifest)
-    block_manifest.publish(manifest_root, manifest)
     return {
+        "manifest": manifest,
+        "segment": segment,
         "manifest_root": manifest_root,
         "monolith_path": os.path.realpath(monolith_path),
-        "segment_path_relative": segment["path"],
-        "generation": 1,
-        "generation_id": manifest["generation_id"],
+        "seal_evidence": seal_evidence,
+        "require_sealed": require_sealed,
+        # What the cheap final validation re-checks. Deliberately NOT the content ledger: that
+        # is the expensive walk this refactor exists to keep out of the ingest lock.
+        "recheck": {
+            "metadata": segment["fingerprint"]["metadata"],
+            "day_digest": segment["fingerprint"]["day_digest"],
+            "layout": segment["layout"],
+        },
         "days": len(insp.days),
         "first_day": insp.days[0], "last_day": insp.days[-1],
         "variables": sorted(insp.vars),
@@ -178,8 +235,75 @@ def build_generation_one(*, monolith_path: str, manifest_root: str, at_utc: str,
         "block_days_is_provisional": BLOCK_DAYS_S_IS_PROVISIONAL,
         "content_seal": dict(segment["content_seal"]),
         "fingerprint": dict(segment["fingerprint"]),
+        "generation": 1,
+        "generation_id": manifest["generation_id"],
+        "segment_path_relative": segment["path"],
         "requires_runtime_allow_list": os.path.realpath(monolith_path),
-        "note": ("Generation 1 over the existing monolith. The deployment must name "
-                 "`requires_runtime_allow_list` in GHRSST_ALLOWED_LEGACY_PATHS before this "
-                 "manifest can be served; the manifest does not authorize its own path."),
     }
+
+
+def validate_prepared(prepared: Dict) -> None:
+    """The final check, immediately before the publish. CHEAP by construction.
+
+    Between `prepare_generation_one()` and here the monolith could in principle have changed,
+    so something has to look again — but re-walking every file would put the expensive scan
+    back inside the ingest lock, which is the whole defect being fixed. So this re-reads the
+    store's METADATA, which is O(arrays) rather than O(files), and re-checks the seal barrier.
+
+    What it therefore does not re-verify is the content ledger. That gap is closed by the
+    monolith being sealed, not by this function, and `check_monolith_sealed()` is what refuses
+    a store that is not."""
+    monolith = prepared["monolith_path"]
+    if prepared.get("require_sealed"):
+        now = check_monolith_sealed(monolith)
+        was = prepared.get("seal_evidence") or {}
+        if now["mode"] != was.get("mode"):
+            raise LegacyBaseRefused(
+                f"{monolith!r} changed permissions between preparation ({was.get('mode')}) and "
+                f"publish ({now['mode']}); a store that became writable while a manifest was "
+                f"being prepared for it is not the store that was prepared")
+    insp = block_manifest.inspect_store_contract(monolith)
+    recheck = prepared["recheck"]
+    now_meta = block_manifest.metadata_fingerprint_from_inspection(insp)
+    if now_meta != recheck["metadata"]:
+        raise LegacyBaseRefused(
+            f"{monolith!r} metadata changed between preparation and publish "
+            f"({recheck['metadata'][:12]}\u2026 -> {now_meta[:12]}\u2026); the manifest "
+            f"describes a store that no longer exists in that shape")
+    now_days = block_manifest.day_digest(insp.days)
+    if now_days != recheck["day_digest"]:
+        raise LegacyBaseRefused(
+            f"{monolith!r} day set changed between preparation and publish; the manifest "
+            f"describes a different day domain from the one on disk")
+    now_layout = block_manifest.segment_layout_from_inspection(insp)
+    if now_layout != recheck["layout"]:
+        raise LegacyBaseRefused(
+            f"{monolith!r} layout changed between preparation and publish")
+
+
+def publish_prepared(prepared: Dict) -> Dict:
+    """Validate once more, then publish. This is ALL that belongs inside the ingest lock.
+
+    `block_manifest.publish()` validates the manifest and archives the generation, and refuses
+    to rewrite an existing archive — so this cannot quietly replace a generation someone else
+    made."""
+    validate_prepared(prepared)
+    block_manifest.publish(prepared["manifest_root"], prepared["manifest"])
+    out = {k: v for k, v in prepared.items() if k not in ("manifest", "segment", "recheck")}
+    out["note"] = ("Generation 1 over the existing monolith. The deployment must name "
+                   "`requires_runtime_allow_list` in GHRSST_ALLOWED_LEGACY_PATHS before this "
+                   "manifest can be served; the manifest does not authorize its own path.")
+    return out
+
+
+def build_generation_one(*, monolith_path: str, manifest_root: str, at_utc: str,
+                         operator: str, generation_id: Optional[str] = None,
+                         require_sealed: bool = True) -> Dict:
+    """Prepare and publish in one call, for a caller holding no locks.
+
+    `ops/p5_prod_provision.py` does NOT use this: it prepares outside the ingest lock and
+    publishes inside, which is the whole point of the split."""
+    prepared = prepare_generation_one(
+        monolith_path=monolith_path, manifest_root=manifest_root, at_utc=at_utc,
+        operator=operator, generation_id=generation_id, require_sealed=require_sealed)
+    return publish_prepared(prepared)

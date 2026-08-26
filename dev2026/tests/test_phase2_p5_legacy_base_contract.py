@@ -50,6 +50,22 @@ NY = NX = 16
 LON, LAT = 100.0, 1.0
 
 
+def seal(case, path):
+    """Make a store read-only, as a production legacy base must be, and restore it on cleanup.
+
+    Registered after the tempdir cleanup so it runs BEFORE it -- `rmtree` cannot remove a
+    read-only directory."""
+    os.chmod(path, 0o555)
+    case.addCleanup(unseal, path)
+
+
+def unseal(path):
+    try:
+        os.chmod(path, 0o755)
+    except OSError:
+        pass
+
+
 def legacy_base_segment(monolith: str, manifest_root: str) -> dict:
     """A `legacy_base` segment over `monolith`, derived from disk through `block_manifest`.
 
@@ -108,6 +124,7 @@ class _LegacyBase(unittest.TestCase):
         os.makedirs(self.mroot)
         self.days = fx.days_from("2026-01-01", 20)
         fx.build_block(self.monolith, self.days, ny=NY, nx=NX)
+        seal(self, self.monolith)
         self.segment = legacy_base_segment(self.monolith, self.mroot)
         bm.publish(self.mroot, legacy_base_manifest(self.segment, days=self.days))
 
@@ -716,6 +733,7 @@ class TestTheGenerationOneBuilder(unittest.TestCase):
         os.makedirs(self.mroot)
         self.days = fx.days_from("2026-01-01", 15)
         fx.build_block(self.monolith, self.days, ny=NY, nx=NX)
+        seal(self, self.monolith)
 
     def build(self, **over):
         kw = dict(monolith_path=self.monolith, manifest_root=self.mroot,
@@ -850,6 +868,7 @@ class TestTheGenerationOneBuilder(unittest.TestCase):
         g["lat"][:] = np.linspace(0.0, NY - 1.0, NY, dtype=np.float32)
         for v in fx.VARS:
             g.create_array(v, shape=(0, NY, NX), dtype="float32", chunks=(1, 8, 8))
+        seal(self, dayless)
         with self.assertRaises(Exception) as inspected:
             bm.inspect_store_contract(dayless)
         with self.assertRaises(type(inspected.exception)):
@@ -942,6 +961,7 @@ class TestTheMonolithIsNotSealedByTheFingerprintsAlone(_LegacyBase):
         import zarr
         lb.build_generation_one(monolith_path=self.monolith, manifest_root=self.mroot,
                                 at_utc="t", operator="tests")
+        unseal(self.monolith)                 # the mutation these tests exist to catch
         day_index = 3
         before = self.allowed().point_series(
             LON, LAT, [self.days[day_index]], ["sst"])[0]["sst"]
@@ -960,6 +980,7 @@ class TestTheMonolithIsNotSealedByTheFingerprintsAlone(_LegacyBase):
         import zarr
         lb.build_generation_one(monolith_path=self.monolith, manifest_root=self.mroot,
                                 at_utc="t", operator="tests")
+        unseal(self.monolith)
         seg = dict(bm.load_live(self.mroot)["segments"][0])
         seg.pop("content_seal")
         root = self.variant_root(seg, days=self.days)
@@ -975,6 +996,7 @@ class TestTheMonolithIsNotSealedByTheFingerprintsAlone(_LegacyBase):
         import zarr
         lb.build_generation_one(monolith_path=self.monolith, manifest_root=self.mroot,
                                 at_utc="t", operator="tests")
+        unseal(self.monolith)
         g = zarr.open_group(self.monolith, mode="a")
         for v in fx.VARS:
             arr = np.asarray(g[v][:])
@@ -1049,6 +1071,7 @@ class TestTheBlockGridIsPolicyNotAnObservation(_LegacyBase):
         days = fx.days_from("2026-03-01", 6)
         keep = days[:2] + days[3:]                       # days[2] is missing
         fx.build_block(holed, keep, ny=NY, nx=NX)
+        seal(self, holed)
         root = os.path.join(self.tmp, "holed_blocks")
         os.makedirs(root)
         out = lb.build_generation_one(monolith_path=holed, manifest_root=root,
@@ -1089,6 +1112,7 @@ class TestEndToEndIsolatedProvisionAndServe(unittest.TestCase):
         self.monolith = os.path.join(self.live, "mur_timecube_s8_t90_sh128.zarr")
         self.days = fx.days_from("2026-01-01", 14)
         fx.build_block(self.monolith, self.days, ny=NY, nx=NX)
+        seal(self, self.monolith)
         self.addCleanup(setattr, ev, "MINIMUM_FREE_GIB", ev.MINIMUM_FREE_GIB)
         ev.MINIMUM_FREE_GIB = self.FLOOR
         # A daily store so StoreAccess can boot.
@@ -1195,6 +1219,7 @@ class TestEndToEndIsolatedProvisionAndServe(unittest.TestCase):
         arr = np.asarray(g["sst"][idx])
         arr[:] = np.nan
         g["sst"][idx] = arr
+        seal(self, mono2)                     # sealed BEFORE the manifest describes it
         locks = self.pp.canonical_lock_paths(live2)
         run = "20260826T091500Z"
         with dev_map({anchor2: 4343}):
@@ -1251,6 +1276,7 @@ class TestEndToEndIsolatedProvisionAndServe(unittest.TestCase):
         """The seal, end to end: the values on disk no longer match what the manifest
         described, and the service refuses rather than serving them."""
         import zarr
+        unseal(self.monolith)
         g = zarr.open_group(self.monolith, mode="a")
         g["sst"][2] = np.asarray(g["sst"][2]) + 50.0
         client, cube = self.serving()
@@ -1261,6 +1287,7 @@ class TestEndToEndIsolatedProvisionAndServe(unittest.TestCase):
         self.assertIsNone(h["cube_base_kind"])
 
     def test_a_missing_monolith_after_provisioning_is_degraded(self):
+        unseal(self.monolith)
         shutil.rmtree(self.monolith)
         client, cube = self.boot(GHRSST_BLOCK_MANIFEST_DIR=self.provisioned["manifest_root"],
                                  GHRSST_TIMECUBE_PATH=self.monolith,
@@ -1268,3 +1295,36 @@ class TestEndToEndIsolatedProvisionAndServe(unittest.TestCase):
         h = client.get("/healthz").json()
         self.assertIsNone(cube)
         self.assertEqual(h["status"], "degraded")
+
+
+class TestTheGeneratedManifestSaysBlockDaysIsPolicy(_LegacyBase):
+    """The artifact itself must not present a policy number as a measurement."""
+
+    def setUp(self):
+        super().setUp()
+        self.mroot = os.path.join(self.tmp, "policy_blocks")
+        os.makedirs(self.mroot)
+
+    def test_the_provenance_line_names_it_as_policy_and_provisional(self):
+        lb.build_generation_one(monolith_path=self.monolith, manifest_root=self.mroot,
+                                at_utc="t", operator="tests")
+        created_by = bm.load_live(self.mroot)["created_by"]
+        self.assertIn(f"block_days={lb.BLOCK_DAYS_S} is POLICY", created_by)
+        self.assertIn("not derived from the store", created_by)
+        self.assertIn("PROVISIONAL", created_by)
+
+    def test_the_provenance_follows_the_policy_constant(self):
+        self.addCleanup(setattr, lb, "BLOCK_DAYS_S", lb.BLOCK_DAYS_S)
+        lb.BLOCK_DAYS_S = 30
+        lb.build_generation_one(monolith_path=self.monolith, manifest_root=self.mroot,
+                                at_utc="t", operator="tests")
+        live = bm.load_live(self.mroot)
+        self.assertEqual(live["block_grid"]["block_days"], 30)
+        self.assertIn("block_days=30 is POLICY", live["created_by"])
+
+    def test_the_document_does_not_claim_S_is_selected(self):
+        with open(os.path.join(_DEV, "specs", "p5_deployment_readiness.md")) as fh:
+            flat = " ".join(fh.read().split())
+        self.assertIn("S = 90 / C = 30 is not selected", flat)
+        self.assertIn("explicit operator decision recorded in the roadmap, and there is none",
+                      flat)

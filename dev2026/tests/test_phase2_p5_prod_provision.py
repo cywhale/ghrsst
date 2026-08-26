@@ -117,12 +117,27 @@ class _ProdBase(unittest.TestCase):
         self.monolith = os.path.join(self.live, "mur_timecube_s8_t90_sh128.zarr")
         self.mono_days = fx.days_from("2026-01-01", 6)
         fx.build_block(self.monolith, self.mono_days, ny=8, nx=8)
+        self.seal_monolith()
         self.locks = pp.canonical_lock_paths(self.live)
         self.clock = self.locks["compaction"]
         self.ilock = self.locks["ingest"]
         self.devs = {self.anchor: 4242}
         self.addCleanup(setattr, ev, "MINIMUM_FREE_GIB", ev.MINIMUM_FREE_GIB)
         ev.MINIMUM_FREE_GIB = self.TEST_FLOOR
+
+    def seal_monolith(self):
+        """Make the monolith read-only, as a production legacy base must be.
+
+        Registered after the tempdir cleanup so it runs BEFORE it: `rmtree` cannot remove a
+        read-only directory."""
+        os.chmod(self.monolith, 0o555)
+        self.addCleanup(self.unseal_monolith)
+
+    def unseal_monolith(self):
+        try:
+            os.chmod(self.monolith, 0o755)
+        except OSError:
+            pass
 
     def approval(self, **over):
         a = {"scope": pp.PRODUCTION_SCOPE, "approved_by": "cywhale",
@@ -509,7 +524,7 @@ class TestTheLockPathsAreCanonical(_ProdBase):
         because "both were acquired at some point" says nothing about the scope."""
         real_acquire = cl.CompactionLock.acquire
         real_release = cl.CompactionLock.release
-        real_publish = pp.p5_legacy_base.build_generation_one
+        real_publish = pp.p5_legacy_base.publish_prepared
         real_wal = pp.repair_wal.initialize_wal
         order = []
 
@@ -537,7 +552,7 @@ class TestTheLockPathsAreCanonical(_ProdBase):
 
         with mock.patch.object(cl.CompactionLock, "acquire", rec_acquire), \
                 mock.patch.object(cl.CompactionLock, "release", rec_release), \
-                mock.patch.object(pp.p5_legacy_base, "build_generation_one",
+                mock.patch.object(pp.p5_legacy_base, "publish_prepared",
                                   side_effect=rec_publish), \
                 mock.patch.object(pp.repair_wal, "initialize_wal", side_effect=rec_wal):
             self.provision()
@@ -1009,6 +1024,20 @@ class TestTheDocumentsRecordTheCorrection(unittest.TestCase):
         self.assertIn("a value rewritten in place inside an existing day", flat)
         self.assertIn("change detection, not a cryptographic seal", flat)
 
+    def test_the_document_records_the_lock_scope_correction(self):
+        """The defect and its fix both belong on the page: "prepare then publish" reads as an
+        arbitrary structure unless the reason is recorded beside it."""
+        flat = " ".join(self._doc().split())
+        self.assertIn("The preparation used to run inside the ingest lock.", flat)
+        self.assertIn("the daily-append cron is blocked behind a scan", flat)
+        self.assertIn("Only the second is inside the lock", flat)
+
+    def test_the_document_records_the_seal_precondition(self):
+        flat = " ".join(self._doc().split())
+        self.assertIn("The monolith must be sealed BEFORE it becomes an authority", flat)
+        self.assertIn("necessary, not sufficient", flat)
+        self.assertIn("production readiness stays blocked on it", flat)
+
     def test_the_document_records_the_block_grid_policy(self):
         flat = " ".join(self._doc().split())
         self.assertIn("BLOCK_DAYS_S", flat)
@@ -1310,7 +1339,7 @@ class TestFailureAtEveryNewStep(_ProdBase):
         self.assertEqual(sorted(error.unrestored), sorted(roots_present))
 
     def test_a_failure_publishing_the_manifest_leaves_nothing(self):
-        with mock.patch.object(pp.p5_legacy_base, "build_generation_one",
+        with mock.patch.object(pp.p5_legacy_base, "publish_prepared",
                                side_effect=RuntimeError("injected: publish failed")):
             with self.assertRaises(RuntimeError):
                 self.provision()
@@ -1339,7 +1368,7 @@ class TestFailureAtEveryNewStep(_ProdBase):
 
     def test_a_publish_failure_whose_cleanup_also_fails_is_typed_and_accurate(self):
         boom = RuntimeError("injected: publish failed")
-        with mock.patch.object(pp.p5_legacy_base, "build_generation_one", side_effect=boom), \
+        with mock.patch.object(pp.p5_legacy_base, "publish_prepared", side_effect=boom), \
                 mock.patch.object(pp.shutil, "rmtree",
                                   side_effect=OSError("injected: cannot remove")):
             with self.assertRaises(pp.ProductionCleanupError) as caught:
@@ -1389,7 +1418,7 @@ class TestTheFenceBeforePublishing(_ProdBase):
 
     def test_a_fence_check_immediately_precedes_the_publish(self):
         real_assert = cl.CompactionLock.assert_still_held
-        real_publish = pp.p5_legacy_base.build_generation_one
+        real_publish = pp.p5_legacy_base.publish_prepared
         order = []
 
         def rec_assert(self_):
@@ -1401,7 +1430,7 @@ class TestTheFenceBeforePublishing(_ProdBase):
             return real_publish(*a, **kw)
 
         with mock.patch.object(cl.CompactionLock, "assert_still_held", rec_assert), \
-                mock.patch.object(pp.p5_legacy_base, "build_generation_one",
+                mock.patch.object(pp.p5_legacy_base, "publish_prepared",
                                   side_effect=rec_publish):
             self.provision()
         self.assertIn("publish", order)
@@ -1419,7 +1448,7 @@ class TestTheFenceBeforePublishing(_ProdBase):
         assert that comes after it."""
         real_assert = cl.CompactionLock.assert_still_held
         real_wal = pp.repair_wal.initialize_wal
-        real_publish = pp.p5_legacy_base.build_generation_one
+        real_publish = pp.p5_legacy_base.publish_prepared
         order = []
 
         def rec_assert(self_):
@@ -1435,7 +1464,7 @@ class TestTheFenceBeforePublishing(_ProdBase):
             return real_wal(*a, **kw)
 
         with mock.patch.object(cl.CompactionLock, "assert_still_held", rec_assert), \
-                mock.patch.object(pp.p5_legacy_base, "build_generation_one",
+                mock.patch.object(pp.p5_legacy_base, "publish_prepared",
                                   side_effect=rec_publish), \
                 mock.patch.object(pp.repair_wal, "initialize_wal", side_effect=rec_wal):
             self.provision()
@@ -1468,3 +1497,276 @@ class TestThePartialSealIsRefused(_ProdBase):
         out = self.provision()
         full = bm.load_live(out["manifest_root"])["segments"][0]["content_seal"]
         self.assertIsNone(bm.verify_content_seal(self.monolith, full))
+
+
+class TestTheExpensiveScanIsOutsideTheIngestLock(_ProdBase):
+    """The ingest lock covers the authority change, not the audit that precedes it.
+
+    `content_ledger()` walks every file in the monolith and `inspect_store_contract()` reads
+    its metadata. Both ran INSIDE the ingest lock, which on VM24 means the daily-append cron
+    blocks behind a scan of ~2 TB that has nothing to do with it. Instrumentation showed all
+    four events — two inspections, the ledger, and the publish — with the ingest lock held.
+
+    Order is not enough to prove this: what matters is whether the lock was HELD at the moment
+    each ran, so each wrapper asks."""
+
+    def _held(self, path):
+        return cl.refuse_if_compaction_running(path, operation="probe") is not None
+
+    def _observe(self):
+        events = []
+        real = {"insp": bm.inspect_store_contract, "led": bm.content_ledger,
+                "pub": bm.publish}
+
+        def wrap(name, fn):
+            def inner(*a, **kw):
+                events.append((name, self._held(self.ilock), self._held(self.clock)))
+                return fn(*a, **kw)
+            return inner
+
+        with mock.patch.object(bm, "inspect_store_contract",
+                               side_effect=wrap("inspect", real["insp"])), \
+                mock.patch.object(bm, "content_ledger",
+                                  side_effect=wrap("ledger", real["led"])), \
+                mock.patch.object(bm, "publish", side_effect=wrap("publish", real["pub"])):
+            self.provision()
+        return events
+
+    def test_the_content_ledger_runs_without_the_ingest_lock(self):
+        for name, ingest_held, _c in self._observe():
+            if name == "ledger":
+                self.assertFalse(ingest_held,
+                                 "the whole-store file walk ran inside the ingest lock")
+
+    def test_the_store_inspection_runs_without_the_ingest_lock(self):
+        """Except the final cheap re-read immediately before the publish, which is the point of
+        splitting prepare from publish: metadata only, O(arrays) not O(files)."""
+        events = self._observe()
+        pub = [i for i, e in enumerate(events) if e[0] == "publish"][0]
+        for i, (name, ingest_held, _c) in enumerate(events):
+            if name == "inspect" and i < pub - 1:
+                with self.subTest(index=i):
+                    self.assertFalse(ingest_held,
+                                     "a store inspection ran inside the ingest lock")
+
+    def test_the_publish_runs_WITH_the_ingest_lock(self):
+        events = self._observe()
+        published = [e for e in events if e[0] == "publish"]
+        self.assertEqual(len(published), 1)
+        self.assertTrue(published[0][1], "the publish ran without the ingest lock")
+
+    def test_the_compaction_lock_is_held_for_all_of_it(self):
+        for name, _i, compaction_held in self._observe():
+            with self.subTest(name):
+                self.assertTrue(compaction_held,
+                                f"{name} ran without the compaction lock")
+
+    def test_the_final_validation_precedes_the_publish_inside_the_lock(self):
+        """Something must look again between preparing and publishing, or the manifest could
+        describe a store that changed in between."""
+        order = []
+        real_validate = pp.p5_legacy_base.validate_prepared
+        real_publish = bm.publish
+
+        def rec_validate(prepared):
+            order.append(("validate", self._held(self.ilock)))
+            return real_validate(prepared)
+
+        def rec_publish(*a, **kw):
+            order.append(("publish", self._held(self.ilock)))
+            return real_publish(*a, **kw)
+
+        with mock.patch.object(pp.p5_legacy_base, "validate_prepared",
+                               side_effect=rec_validate), \
+                mock.patch.object(bm, "publish", side_effect=rec_publish):
+            self.provision()
+        self.assertEqual([n for n, _ in order], ["validate", "publish"])
+        self.assertTrue(all(held for _, held in order),
+                        "the final validation must be inside the lock, with the publish")
+
+    def test_a_monolith_that_changes_between_prepare_and_publish_refuses(self):
+        """The window the split opens, closed by the final validation."""
+        import zarr
+        real_prepare = pp.p5_legacy_base.prepare_generation_one
+
+        def prepare_then_change(**kw):
+            prepared = real_prepare(**kw)
+            self.unseal_monolith()
+            # A WELL-FORMED change: the lon axis moves, so the store still satisfies the
+            # contract and `inspect_store_contract` still succeeds -- but its metadata
+            # fingerprint differs. Resizing the day arrays instead leaves `var_valid` one flag
+            # short, and the inspection refuses with a different error before the drift
+            # comparison is reached.
+            g = zarr.open_group(self.monolith, mode="a")
+            g["lon"][:] = np.asarray(g["lon"][:]) + 0.5
+            # Re-sealed at the SAME mode, so the seal check passes and the drift comparison is
+            # what refuses. Leaving it writable would be caught by `check_monolith_sealed`
+            # first, and this test would pass without exercising the branch it is about.
+            os.chmod(self.monolith, 0o555)
+            return prepared
+
+        with mock.patch.object(pp.p5_legacy_base, "prepare_generation_one",
+                               side_effect=prepare_then_change):
+            with self.assertRaises(pp.p5_legacy_base.LegacyBaseRefused) as caught:
+                self.provision()
+        self.assertIn("between preparation and publish", str(caught.exception))
+        for path in self.roots():
+            with self.subTest(path):
+                self.assertFalse(os.path.exists(path), "a root survived the refusal")
+
+
+class TestTheMonolithMustBeSealedFirst(_ProdBase):
+    """`immutable: true` is a declaration. This is the check that stands behind it."""
+
+    def test_a_writable_monolith_is_refused(self):
+        self.unseal_monolith()
+        with self.assertRaises(pp.p5_legacy_base.LegacyBaseRefused) as caught:
+            self.provision()
+        self.assertIn("is writable", str(caught.exception))
+
+    def test_the_refusal_happens_before_the_roots_survive(self):
+        self.unseal_monolith()
+        with self.assertRaises(pp.p5_legacy_base.LegacyBaseRefused):
+            self.provision()
+        for path in self.roots():
+            with self.subTest(path):
+                self.assertFalse(os.path.exists(path))
+
+    def test_the_seal_evidence_is_recorded_with_what_it_does_not_establish(self):
+        out = self.provision()
+        evidence = out["legacy_base"]["seal_evidence"]
+        self.assertIs(evidence["writable_bits"], False)
+        self.assertIn("store root permission bits only", evidence["checked"])
+        self.assertIn("read-only mount", evidence["not_established"])
+
+    def test_becoming_writable_between_prepare_and_publish_refuses(self):
+        real_prepare = pp.p5_legacy_base.prepare_generation_one
+
+        def prepare_then_unseal(**kw):
+            prepared = real_prepare(**kw)
+            self.unseal_monolith()
+            return prepared
+
+        with mock.patch.object(pp.p5_legacy_base, "prepare_generation_one",
+                               side_effect=prepare_then_unseal):
+            with self.assertRaises(pp.p5_legacy_base.LegacyBaseRefused) as caught:
+                self.provision()
+        self.assertIn("is writable", str(caught.exception))
+
+    def test_a_DIFFERENT_read_only_mode_between_prepare_and_publish_refuses(self):
+        """The mode comparison, isolated.
+
+        Becoming writable is caught by the seal check first, so it says nothing about this
+        branch. A store that went 0o555 -> 0o500 is still sealed, and is still not the store
+        that was prepared."""
+        real_prepare = pp.p5_legacy_base.prepare_generation_one
+
+        def prepare_then_chmod(**kw):
+            prepared = real_prepare(**kw)
+            os.chmod(self.monolith, 0o500)
+            return prepared
+
+        with mock.patch.object(pp.p5_legacy_base, "prepare_generation_one",
+                               side_effect=prepare_then_chmod):
+            with self.assertRaises(pp.p5_legacy_base.LegacyBaseRefused) as caught:
+                self.provision()
+        self.assertIn("changed permissions", str(caught.exception))
+
+    def test_the_seal_check_is_documented_as_necessary_not_sufficient(self):
+        import inspect as _i
+        doc = _i.getdoc(pp.p5_legacy_base.check_monolith_sealed) or ""
+        self.assertIn("necessary barrier, not a sufficient one", doc)
+        self.assertIn("root ignores permissions", doc)
+        self.assertIn("read-only mount", doc)
+
+    def test_the_content_seal_cannot_see_a_restored_mtime_and_size(self):
+        """The documented limitation, demonstrated rather than asserted.
+
+        The ledger hashes path, size and mtime. A write that restores all three is invisible to
+        it — which is why the seal is called change detection and why the read-only barrier is
+        the thing that actually matters."""
+        import zarr
+        out = self.provision()
+        seal = bm.load_live(out["manifest_root"])["segments"][0]["content_seal"]
+        self.assertIsNone(bm.verify_content_seal(self.monolith, seal))
+        self.unseal_monolith()
+        target = None
+        for dirpath, _d, files in os.walk(self.monolith):
+            for name in files:
+                full = os.path.join(dirpath, name)
+                if os.path.getsize(full) > 0:
+                    target = full
+                    break
+            if target:
+                break
+        self.assertIsNotNone(target)
+        st = os.stat(target)
+        with open(target, "r+b") as fh:
+            data = bytearray(fh.read())
+            data[0] = (data[0] + 1) % 256          # same length, different bytes
+            fh.seek(0)
+            fh.write(bytes(data))
+        os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(os.stat(target).st_size, st.st_size)
+        self.assertIsNone(bm.verify_content_seal(self.monolith, seal),
+                          "the ledger detected a restored-metadata write; the documented "
+                          "limitation no longer holds and the docs should change")
+        del zarr
+
+
+class TestDaySetDriftIsCaughtOnItsOwn(_ProdBase):
+    """The day-digest branch of the final validation, isolated.
+
+    `metadata_fingerprint` deliberately excludes the day set — but it includes array shape and
+    `var_valid` length, so ADDING a day trips the metadata branch and says nothing about this
+    one. RENAMING a day keeps the shape, the flag count and the flag contents identical, so the
+    metadata fingerprint is unchanged and only `day_digest` differs."""
+
+    def test_a_renamed_day_between_prepare_and_publish_refuses(self):
+        import zarr
+        real_prepare = pp.p5_legacy_base.prepare_generation_one
+        observed = {}
+
+        def prepare_then_rename(**kw):
+            prepared = real_prepare(**kw)
+            observed["before"] = prepared["recheck"]["metadata"]
+            self.unseal_monolith()
+            g = zarr.open_group(self.monolith, mode="a")
+            renamed = list(self.mono_days)
+            renamed[-1] = "2026-12-31"                 # same count, different day set
+            g.attrs["days"] = renamed
+            os.chmod(self.monolith, 0o555)
+            observed["after"] = bm.metadata_fingerprint_from_inspection(
+                bm.inspect_store_contract(self.monolith))
+            return prepared
+
+        with mock.patch.object(pp.p5_legacy_base, "prepare_generation_one",
+                               side_effect=prepare_then_rename):
+            with self.assertRaises(pp.p5_legacy_base.LegacyBaseRefused) as caught:
+                self.provision()
+        self.assertEqual(observed["before"], observed["after"],
+                         "the metadata fingerprint moved too; this does not isolate the "
+                         "day-digest branch")
+        self.assertIn("day set changed between preparation and publish",
+                      str(caught.exception))
+
+    def test_that_refusal_leaves_no_roots(self):
+        real_prepare = pp.p5_legacy_base.prepare_generation_one
+
+        def rename(**kw):
+            import zarr as z
+            prepared = real_prepare(**kw)
+            self.unseal_monolith()
+            g = z.open_group(self.monolith, mode="a")
+            renamed = list(self.mono_days)
+            renamed[0] = "2025-01-01"
+            g.attrs["days"] = renamed
+            os.chmod(self.monolith, 0o555)
+            return prepared
+
+        with mock.patch.object(pp.p5_legacy_base, "prepare_generation_one", side_effect=rename):
+            with self.assertRaises(pp.p5_legacy_base.LegacyBaseRefused):
+                self.provision()
+        for path in self.roots():
+            with self.subTest(path):
+                self.assertFalse(os.path.exists(path))

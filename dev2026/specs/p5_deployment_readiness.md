@@ -306,11 +306,31 @@ The valid shape, and what the operation now does under §7.1b ordering:
 
 ```
 flock(p5_compaction.lock)  ->  create p5_blocks and p5_repairs
+   ->  PREPARE generation 1        <-- the expensive audit, ingest lock NOT held
+        inspect_store_contract() + content_ledger() over the whole monolith
    ->  acquire ingest lock  ->  assert compaction lock still held
-   ->  publish generation 1 (legacy_base over the monolith)  ->  release ingest lock
+        ->  final cheap validation (metadata only)  ->  publish  <-- authority changes here
+   ->  release ingest lock
    ->  initialize the WAL against that manifest and the external anchor
    ->  release compaction lock
 ```
+
+**The preparation used to run inside the ingest lock.** Instrumentation showed both store
+inspections *and* the whole-store file walk with the lock held — on a ~2 TB monolith that is
+minutes of `stat` calls during which the daily-append cron is blocked behind a scan that has
+nothing to do with it. The ingest lock exists to exclude ingest from the moment the store's
+authority **changes**, and that moment is the publish.
+
+So the builder is split: `prepare_generation_one()` does the audit and assembles the manifest,
+`publish_prepared()` validates once more and publishes. Only the second is inside the lock, and
+an event-order test asserts the ledger and the inspections run with the lock **not** held while
+the publish runs with it held.
+
+The split opens a window in which the monolith could change between preparing and publishing.
+`validate_prepared()` closes it with a **cheap** re-check — metadata fingerprint, day digest,
+layout and the seal barrier, all `O(arrays)` rather than `O(files)` — deliberately not the
+content ledger, which is the expensive walk the split exists to keep out of the lock. What the
+ledger cannot re-verify in that window is covered by the monolith being sealed.
 
 `monolith_path` is required, not optional: a provisioner that might or might not publish is two
 operations wearing one name.
@@ -323,6 +343,19 @@ served at all — the manifest does not authorize its own external path.
 **This has only ever run in a local synthetic fixture.** Running it against `$G` publishes a
 manifest and writes a WAL into production, and is a separate production operation requiring
 explicit approval that has not been requested.
+
+#### The monolith must be sealed BEFORE it becomes an authority
+
+`immutable: true` in the segment is a declaration, and it is not treated as proof of anything.
+`check_monolith_sealed()` is the check that stands behind it: it refuses a monolith whose store
+root still carries write bits, before any manifest describes it, and records what it observed.
+
+It is **necessary, not sufficient**, and says so where it is defined: it reads the store root's
+permission bits only. A subdirectory could carry different ones, a process running as root
+ignores permissions entirely, and a filesystem remounted read-write later changes the answer
+without changing the record. **The barrier that would settle it is a read-only mount, which is a
+deployment prerequisite this code cannot arrange** — so production readiness stays blocked on it
+rather than being inferred from `immutable: true`.
 
 #### The monolith is not sealed by the fingerprints alone
 
@@ -344,8 +377,9 @@ over every file's path, size and mtime, recorded at build time and verified by
 **It is change detection, not a cryptographic seal**, and the code says so where it is defined.
 Hashing ~2 TB of chunk bytes at every service start is not available — which is exactly why the
 segment fingerprints are metadata-only. It catches a store that was written to; it would not
-catch a forgery that restored size and mtime. A true seal is an operational control (a read-only
-mount) and remains a deployment prerequisite.
+catch a forgery that restored size and mtime, and a test demonstrates precisely that limitation
+by rewriting a byte in place and restoring both. A true seal is an operational control (a
+read-only mount) and remains a deployment prerequisite.
 
 #### The block grid is policy, and S is still provisional
 
@@ -355,6 +389,13 @@ design carries `S = 90 / C = 30` as prose, and the generated blockers table says
 `p5_legacy_base.BLOCK_DAYS_S`, declared as policy and read by the builder, with a test binding
 the generated manifest to it. `BLOCK_DAYS_S_IS_PROVISIONAL` records that nothing has selected
 90 over any other value.
+
+The manifest schema has no field for "this number is policy", so the generated manifest says it
+in `created_by`: *"block_days=90 is POLICY (BLOCK_DAYS_S), not derived from the store, and
+PROVISIONAL: nothing has selected it"*. A reader of the artifact should not have to guess which
+numbers were measured. **S = 90 / C = 30 is not selected**, and nothing here treats it as
+selected; that would need an explicit operator decision recorded in the roadmap, and there is
+none.
 
 Two values that ARE derived, per design §12 M0, and were wrong when hardcoded:
 

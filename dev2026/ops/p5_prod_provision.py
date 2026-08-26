@@ -514,13 +514,20 @@ def _create_roots(*, live_root, manifest_root, wal_root, capacity, locks, run_id
             # list as well.
             _write_marker(marker_path, {**stamp, "created_paths": list(created)})
 
-        # The publish critical section -- the only part ingest must be excluded from.
+        # Everything expensive happens HERE, under the compaction lock and OUTSIDE the ingest
+        # lock. `content_ledger()` walks every file in the monolith; on ~2 TB that is minutes
+        # of stat calls, and it was running inside the ingest lock -- so the daily-append cron
+        # would have blocked behind a scan that has nothing to do with it.
+        prepared = p5_legacy_base.prepare_generation_one(
+            monolith_path=monolith_path, manifest_root=manifest_root,
+            at_utc=at_utc, operator=operator)
+
+        # The publish critical section: a final cheap validation and the authority change, and
+        # nothing else. This is the only moment ingest must be excluded from.
         with compaction_lock.CompactionLock(locks["ingest"],
                                             holder=f"{holder}/publish") as ingest:
             clock.assert_still_held()
-            published.update(p5_legacy_base.build_generation_one(
-                monolith_path=monolith_path, manifest_root=manifest_root,
-                at_utc=at_utc, operator=operator))
+            published.update(p5_legacy_base.publish_prepared(prepared))
         # The `with` block above is what releases the ingest lock, and it ends here -- before
         # the WAL is initialized. An explicit `release()` as the block's last statement was
         # redundant: removing it changed nothing, which is why a mutation deleting it survived.
