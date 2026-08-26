@@ -41,6 +41,7 @@ import p5_fixtures as fx  # noqa: E402
 from ingest import publish_manifest as pub  # noqa: E402
 from ops import p5_legacy_base as lb  # noqa: E402
 from ops import p5_oneshot_compaction as oc  # noqa: E402
+from ops import p5_parity_producers as ppd  # noqa: E402
 from ops import p5_oneshot_exception as ex  # noqa: E402
 from ops import p5_prod_provision as prod  # noqa: E402
 from ops import p5_readiness as rd  # noqa: E402
@@ -199,7 +200,13 @@ class _CompactionBase(unittest.TestCase):
             "backup": {"backup_id": "vm24-daily-20260826T0300Z", "verified": True,
                        "method": "restore-catalogue listing", "verified_utc": iso(-3600)},
             "plan": {"source_map": {d: "delta" for d in self.days},
-                     "destination_manifest": "gen000002", "days": list(self.days)},
+                     "destination_manifest": "gen000002", "days": list(self.days),
+                     # The external paths this run may read. The approval names the live root;
+                     # anything outside it has to be named by the approved preflight or the
+                     # block could be folded from a store nobody approved.
+                     "paths": {"monolith": os.path.realpath(self.monolith),
+                               "delta_path": os.path.realpath(self.delta),
+                               "daily_root": None}},
         }
         p.update(over)
         return p
@@ -217,7 +224,14 @@ class _CompactionBase(unittest.TestCase):
         a = {
             "host": socket.gethostname(), "run_id": self.RUN_ID,
             "deploy_sha": sha, "head_sha": sha, "worktree_clean": True,
-            "module_fingerprints": rd.expected_module_digests(sha),
+            # The deployment inventory at the approved commit, PLUS the operation's own
+            # producer module -- which postdates that commit, so it is fingerprinted from disk
+            # and checked against disk. See the limitation in `identity_problem`.
+            "module_fingerprints": {
+                **rd.expected_module_digests(sha),
+                **{m: oc._file_digest(os.path.join(_DEV, m))
+                   for m in oc.REVIEWED_PRODUCER_MODULES},
+            },
             "collected_utc": iso(-30),
             "verified_by": "ops tooling on the deployment host",
         }
@@ -282,6 +296,26 @@ class _CompactionBase(unittest.TestCase):
             return out
         return probe
 
+    # ---------------------------------------------------------------- forcing real failures
+    # The producers can no longer be faked -- `producer_identity` refuses anything that is not
+    # the registered module -- so a failure is injected INTO the real producer instead. Each of
+    # these makes the genuine code path report a genuine problem, which is a better test than
+    # a stub returning the answer.
+    def forced_api_mismatch(self):
+        """Make every served/oracle comparison disagree."""
+        return mock.patch.object(ppd, "_close", return_value=False)
+
+    def forced_point_series_mismatch(self):
+        """Make the comparison primitive report a difference for every day."""
+        return mock.patch.object(ppd.sp, "compare_days",
+                                 return_value=["forced difference"])
+
+    def forced_api_exception(self):
+        """Make the served reader itself blow up, inside the producer."""
+        import store.segmented_cube as sc
+        return mock.patch.object(sc, "SegmentedCubeStore",
+                                 side_effect=RuntimeError("served reader exploded"))
+
     def _next_block_path(self):
         """A fresh path per call. `build_block` refuses to reuse one, correctly: a block path is
         written once and never reused, so a test that calls the operation twice must not ask it
@@ -302,8 +336,10 @@ class _CompactionBase(unittest.TestCase):
             artifacts_dir=self.artifacts, hard_reserve_bytes=1024,
             block_out_path=self._next_block_path(),
             writer_fence_probe=self._fence_probe,
-            point_series_parity=self._parity(),
-            api_parity=self._api_parity(),
+            # The REAL reviewed producers. A fake is refused by `producer_identity`, which
+            # is the whole point -- so the positive control has to be the real path.
+            point_series_parity=ppd.point_series_parity,
+            api_parity=ppd.api_parity,
         )
         if "identity_artifact" not in over:
             kw["identity_artifact"] = self._identity()
@@ -444,28 +480,15 @@ class TestAFailedGateStopsEverythingDownstream(_CompactionBase):
 
     def test_a_point_series_mismatch_refuses_before_publishing(self):
         gen = self.manifest_generation()
-        message = self._assert_refused_without_clearance(
-            point_series_parity=self._parity(mismatches=3))
+        with self.forced_point_series_mismatch():
+            message = self._assert_refused_without_clearance()
         self.assertIn("mismatch(es) out of", message)
         self.assertEqual(self.manifest_generation(), gen,
                          "a parity failure must be caught while the block is unreferenced")
 
-    def test_parity_that_skipped_the_boundaries_refuses_before_publishing(self):
-        gen = self.manifest_generation()
-        message = self._assert_refused_without_clearance(
-            point_series_parity=self._parity(boundaries_included=False))
-        self.assertIn("first and last days", message)
-        self.assertEqual(self.manifest_generation(), gen)
-
-    def test_parity_over_zero_days_refuses_before_publishing(self):
-        gen = self.manifest_generation()
-        self._assert_refused_without_clearance(
-            point_series_parity=self._parity(days_checked=0))
-        self.assertEqual(self.manifest_generation(), gen)
-
     def test_an_api_parity_mismatch_refuses_and_issues_no_clearance(self):
-        message = self._assert_refused_without_clearance(
-            api_parity=self._api_parity(mismatches=2))
+        with self.forced_api_mismatch():
+            message = self._assert_refused_without_clearance()
         self.assertIn("mismatch(es) out of", message)
 
     def test_a_wal_that_is_not_bound_refuses_and_issues_no_clearance(self):
@@ -521,8 +544,13 @@ class TestAFailedGateStopsEverythingDownstream(_CompactionBase):
             return real(*a, **kw)
 
         with mock.patch.object(prod, "measure_capacity", side_effect=failing):
-            with self.assertRaises(prod.ProductionProvisionRefused):
+            with self.assertRaises(oc.GenerationQuarantined) as caught:
                 self.compact()
+        # It RAISED rather than returning a problem, and it still quarantined -- which is the
+        # point: after the authority changed, an escaping exception would leave the generation
+        # unclassified for the next run to build on.
+        self.assertIn("ProductionProvisionRefused", str(caught.exception))
+        self.assertIsNotNone(oc.read_quarantine(self.manifest_root))
         self.assertTrue(os.path.isdir(self.monolith))
 
     def test_the_gate_refuses_a_capacity_after_that_is_not_freshly_stamped(self):
@@ -563,15 +591,17 @@ class TestAFailedGateStopsEverythingDownstream(_CompactionBase):
     def test_a_post_gate_failure_leaves_the_old_data_untouched(self):
         """Why refusing after the publish is survivable: the base is still there."""
         before = ex.measure_monolith(self.monolith)
-        with self.assertRaises(oc.OneShotCompactionRefused):
-            self.compact(api_parity=self._api_parity(mismatches=1))
+        with self.forced_api_mismatch():
+            with self.assertRaises(oc.OneShotCompactionRefused):
+                self.compact()
         after = ex.measure_monolith(self.monolith)
         self.assertEqual(before["monolith_content_ledger"]["ledger_digest"],
                          after["monolith_content_ledger"]["ledger_digest"])
 
     def test_a_post_gate_failure_says_what_state_it_left(self):
-        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
-            self.compact(api_parity=self._api_parity(mismatches=1))
+        with self.forced_api_mismatch():
+            with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                self.compact()
         message = str(caught.exception)
         self.assertIn("published, NOT verified, and now QUARANTINED", message)
         self.assertIn("nothing was deleted", message)
@@ -1328,81 +1358,224 @@ class TestTheDeploymentIdentityIsRequired(_CompactionBase):
 class TestParityEvidenceMustBeExecutedAndBound(_CompactionBase):
     """A callable that returns `{"mismatches": 0}` measured nothing, and says nothing.
 
-    The producer stays injectable — it must read the deployment's own stores through the
-    deployment's own reader — but what it returns is a bound artifact, and the producer itself
-    must be a module the identity artifact fingerprinted."""
+    The producer's identity is DERIVED from the callable and checked against a reviewed
+    registry. An earlier revision read the digest out of the artifact and merely required it to
+    be *some* approved module's — which a fake could satisfy by copying one, returning a fully
+    green result while measuring nothing. That is the hole these close."""
 
+    @staticmethod
+    def _bare_fake(**kw):
+        return {}
+
+    # ---------------------------------------------------------------- the derivation
     def test_a_green_fake_callable_is_refused(self):
-        """The negative test the review asked for, on the production entry point."""
-        green = lambda **kw: {"mismatches": 0, "days_checked": 5,  # noqa: E731
-                              "boundaries_included": True}
+        """The negative test the review asked for, on the production entry point.
+
+        The fake returns EVERY required field, reports zero mismatches, and claims the producer
+        name and a legitimate fingerprint of an approved module. It is still refused, because
+        what it claims about itself is not where the identity comes from."""
+        legitimate = self._identity()["module_fingerprints"]["store/source_provenance.py"]
+
+        def convincing_fake(**kw):
+            return {
+                "kind": oc.PARITY_POINT_SERIES,
+                "host": kw["host"], "run_id": kw["run_id"], "deploy_sha": kw["deploy_sha"],
+                "producer": "ops/p5_parity_producers.py:point_series_parity",
+                "producer_digest": legitimate,
+                "generation": kw["generation"],
+                "manifest_checksum": kw["manifest_checksum"],
+                "source_map_digest": kw["source_map_digest"],
+                "executed_utc": iso(), "samples": 40, "mismatches": 0,
+                "provenance": "compared point-wise against each day's own source",
+                "days_checked": len(kw["days"]), "boundaries_included": True,
+            }
+
         with self.assertRaises(oc.OneShotCompactionRefused) as caught:
-            self.compact(point_series_parity=green)
-        self.assertIn("point-series parity artifact", str(caught.exception))
-        self.assertEqual(self.manifest_generation(), 1,
-                         "a green fake reached the publish")
+            self.compact(point_series_parity=convincing_fake)
+        message = str(caught.exception)
+        self.assertIn("is not the same as being the approved producer", message)
+        self.assertEqual(self.manifest_generation(), 1, "a green fake reached the publish")
 
-    def test_a_green_fake_api_callable_is_refused(self):
-        green = lambda **kw: {"mismatches": 0, "routes_checked": 4}  # noqa: E731
-        with self.assertRaises(oc.OneShotCompactionRefused):
-            self.compact(api_parity=green)
-
-    def test_an_unfingerprinted_producer_is_refused(self):
-        """Reviewed code has a digest git holds. A callable defined in a shell does not."""
+    def test_a_callable_defined_in_a_test_is_refused(self):
         with self.assertRaises(oc.OneShotCompactionRefused) as caught:
-            self.compact(point_series_parity=self._parity(producer_digest="e" * 64))
-        self.assertIn("not any module the identity artifact fingerprinted",
-                      str(caught.exception))
+            self.compact(api_parity=self._bare_fake)
+        self.assertIn("the reviewed producer for this kind is", str(caught.exception))
 
-    def test_an_artifact_bound_to_another_generation_is_refused(self):
+    def test_a_genuine_but_unregistered_function_is_refused(self):
+        """Being in an approved module is not being the approved producer."""
+        from store import source_provenance as real_module
         with self.assertRaises(oc.OneShotCompactionRefused) as caught:
-            self.compact(point_series_parity=self._parity(generation=99))
-        self.assertIn("about another act", str(caught.exception))
+            self.compact(point_series_parity=real_module.artifact_checksum)
+        self.assertIn("the reviewed producer for this kind is", str(caught.exception))
 
-    def test_an_artifact_bound_to_another_run_or_host_or_sha_is_refused(self):
-        for field, wrong in (("run_id", "another-run"), ("host", "elsewhere"),
-                             ("deploy_sha", "f" * 40),
+    def test_a_producer_whose_module_is_not_fingerprinted_is_refused(self):
+        prints = {k: v for k, v in self._identity()["module_fingerprints"].items()
+                  if k not in oc.REVIEWED_PRODUCER_MODULES}
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(identity_artifact=self._identity(module_fingerprints=prints))
+        self.assertIn("does not fingerprint", str(caught.exception))
+
+    def test_a_producer_module_that_changed_on_disk_is_refused(self):
+        prints = dict(self._identity()["module_fingerprints"])
+        prints["ops/p5_parity_producers.py"] = "a" * 64
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(identity_artifact=self._identity(module_fingerprints=prints))
+        self.assertIn("is not the one that would run", str(caught.exception))
+
+    def test_the_derivation_is_refused_before_any_lock_or_scan(self):
+        with mock.patch.object(oc, "_build", side_effect=AssertionError("must not run")) \
+                as build:
+            with self.assertRaises(oc.OneShotCompactionRefused):
+                self.compact(api_parity=self._bare_fake)
+        self.assertFalse(build.called)
+
+    def test_the_real_producers_pass(self):
+        """The positive control, through the actual reviewed producer path."""
+        for kind, fn in ((oc.PARITY_POINT_SERIES, ppd.point_series_parity),
+                         (oc.PARITY_API, ppd.api_parity)):
+            with self.subTest(kind):
+                identity, problem = oc.producer_identity(
+                    fn, kind=kind,
+                    module_fingerprints=self._identity()["module_fingerprints"])
+                self.assertIsNone(problem)
+                self.assertEqual(identity["module"], "ops/p5_parity_producers.py")
+
+    def test_the_registry_names_a_real_importable_producer(self):
+        """A registry entry pointing at nothing would refuse every run with a puzzling error."""
+        for kind, (relpath, qualname) in oc.REVIEWED_PRODUCERS.items():
+            with self.subTest(kind):
+                self.assertTrue(os.path.isfile(os.path.join(_DEV, relpath)))
+                self.assertTrue(callable(getattr(ppd, qualname, None)))
+
+
+class TestTheParityArtifactGate(unittest.TestCase):
+    """The artifact contract itself, fed directly.
+
+    Reached through the operation only by the real producers now, and they cannot be made to
+    emit a malformed artifact — so the shapes they would never produce are checked here."""
+
+    PRODUCER = {"producer": "ops/p5_parity_producers.py:point_series_parity",
+                "producer_digest": "b" * 64,
+                "module": "ops/p5_parity_producers.py",
+                "qualname": "point_series_parity"}
+
+    def artifact(self, **over):
+        a = {
+            "kind": oc.PARITY_POINT_SERIES, "host": "odb24", "run_id": "R1",
+            "deploy_sha": "d" * 40,
+            "producer": self.PRODUCER["producer"],
+            "producer_digest": self.PRODUCER["producer_digest"],
+            "generation": 2, "manifest_checksum": "f" * 64, "source_map_digest": "9" * 64,
+            "executed_utc": iso(), "samples": 40, "mismatches": 0,
+            "provenance": "read per-day and compared point-wise",
+        }
+        a.update(over)
+        return a
+
+    def problem(self, **over):
+        return oc.parity_artifact_problem(
+            self.artifact(**over), kind=oc.PARITY_POINT_SERIES, host="odb24", run_id="R1",
+            deploy_sha="d" * 40, generation=2, manifest_checksum="f" * 64,
+            source_map_digest="9" * 64, producer=self.PRODUCER)
+
+    def test_a_complete_artifact_passes(self):
+        self.assertIsNone(self.problem())
+
+    def test_every_field_is_required(self):
+        for field in oc.PARITY_ARTIFACT_FIELDS:
+            with self.subTest(field):
+                a = self.artifact()
+                del a[field]
+                problem = oc.parity_artifact_problem(
+                    a, kind=oc.PARITY_POINT_SERIES, host="odb24", run_id="R1",
+                    deploy_sha="d" * 40, generation=2, manifest_checksum="f" * 64,
+                    source_map_digest="9" * 64, producer=self.PRODUCER)
+                self.assertTrue(problem)
+                self.assertIn(field, problem)
+
+    def test_an_artifact_of_the_wrong_kind_is_refused(self):
+        self.assertIn("is not evidence for another", self.problem(kind=oc.PARITY_API))
+
+    def test_an_artifact_bound_to_another_act_is_refused(self):
+        for field, wrong in (("host", "elsewhere"), ("run_id", "R2"),
+                             ("deploy_sha", "e" * 40), ("generation", 99),
                              ("manifest_checksum", "0" * 64),
                              ("source_map_digest", "1" * 64)):
             with self.subTest(field):
-                with self.assertRaises(oc.OneShotCompactionRefused):
-                    self.compact(point_series_parity=self._parity(**{field: wrong}))
+                problem = self.problem(**{field: wrong})
+                self.assertIn("about another act", problem)
 
-    def test_an_artifact_for_the_wrong_kind_is_refused(self):
-        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
-            self.compact(point_series_parity=self._parity(kind=oc.PARITY_API))
-        self.assertIn("is not evidence for another", str(caught.exception))
+    def test_an_artifact_claiming_another_producer_is_refused(self):
+        problem = self.problem(producer="store/source_provenance.py:compare_days")
+        self.assertIn("a string it chose", problem)
+
+    def test_an_artifact_claiming_another_digest_is_refused(self):
+        problem = self.problem(producer_digest="c" * 64)
+        self.assertIn("on disk hashes to", problem)
 
     def test_zero_samples_is_an_absent_check_not_a_passing_one(self):
         for value in (0, -1, True):
             with self.subTest(repr(value)):
-                with self.assertRaises(oc.OneShotCompactionRefused) as caught:
-                    self.compact(point_series_parity=self._parity(samples=value))
-                self.assertIn("is not a passing check", str(caught.exception))
+                self.assertIn("is not a passing check", self.problem(samples=value))
+
+    def test_a_nonzero_mismatch_count_is_refused(self):
+        self.assertIn("mismatch(es) out of", self.problem(mismatches=3))
+
+    def test_a_negative_or_bool_mismatch_count_is_refused(self):
+        for value in (-1, True):
+            with self.subTest(repr(value)):
+                self.assertIn("not a count", self.problem(mismatches=value))
 
     def test_an_artifact_with_no_provenance_is_refused(self):
-        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
-            self.compact(point_series_parity=self._parity(provenance="  "))
-        self.assertIn("verification provenance", str(caught.exception))
+        self.assertIn("verification provenance", self.problem(provenance="   "))
 
     def test_a_stale_execution_is_refused(self):
-        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
-            self.compact(point_series_parity=self._parity(executed_utc=iso(-4 * 3600)))
-        self.assertIn("past the", str(caught.exception))
+        self.assertIn("past the", self.problem(executed_utc=iso(-4 * 3600)))
 
-    def test_every_artifact_field_is_required(self):
-        for field in oc.PARITY_ARTIFACT_FIELDS:
+    def test_an_execution_in_the_future_is_refused(self):
+        self.assertIn("in the future", self.problem(executed_utc=iso(3600)))
+
+    def test_an_unstamped_execution_is_refused(self):
+        self.assertIn("not a timestamp", self.problem(executed_utc="recently"))
+
+
+class TestThePrePublishGate(unittest.TestCase):
+    """The shapes `_pre_publish_problem` refuses, which the real producer will not emit."""
+
+    def gates(self, **over):
+        parity = {"days_checked": 5, "mismatches": 0, "boundaries_included": True}
+        parity.update(over.pop("parity", {}))
+        g = {"point_series_parity": parity, "source_map_complete": True,
+             "base_delta_disjoint": True}
+        g.update(over)
+        return g
+
+    def test_complete_gates_pass(self):
+        self.assertIsNone(oc._pre_publish_problem(self.gates()))
+
+    def test_parity_that_skipped_the_boundaries_is_refused(self):
+        problem = oc._pre_publish_problem(self.gates(parity={"boundaries_included": False}))
+        self.assertIn("first and last days", problem)
+
+    def test_parity_over_zero_days_is_refused(self):
+        for value in (0, -1, True):
+            with self.subTest(repr(value)):
+                problem = oc._pre_publish_problem(self.gates(parity={"days_checked": value}))
+                self.assertIn("checks nothing", problem)
+
+    def test_a_missing_parity_field_is_refused(self):
+        for field in ("days_checked", "mismatches", "boundaries_included"):
             with self.subTest(field):
-                def missing(_field=field, **kw):
-                    out = self._parity()(**kw)
-                    del out[_field]
-                    return out
-                with self.assertRaises(oc.OneShotCompactionRefused):
-                    self.compact(point_series_parity=missing)
+                parity = {"days_checked": 5, "mismatches": 0, "boundaries_included": True}
+                del parity[field]
+                g = {"point_series_parity": parity, "source_map_complete": True,
+                     "base_delta_disjoint": True}
+                self.assertIn(field, oc._pre_publish_problem(g))
 
-    def test_the_bound_producer_passes(self):
-        """The positive control: every refusal above is about its own defect."""
-        self.assertEqual(self.compact()["generation"], 2)
+    def test_a_parity_result_that_is_not_a_record_is_refused(self):
+        g = self.gates()
+        g["point_series_parity"] = "green"
+        self.assertIn("not a record", oc._pre_publish_problem(g))
 
 
 class TestAFailedGenerationIsQuarantined(_CompactionBase):
@@ -1412,10 +1585,9 @@ class TestAFailedGenerationIsQuarantined(_CompactionBase):
     plan N+2 on top of it, and the failure would sit underneath a generation nobody questioned."""
 
     def _fail_post_gates(self, **over):
-        kw = {"api_parity": self._api_parity(mismatches=1)}
-        kw.update(over)
-        with self.assertRaises(oc.GenerationQuarantined) as caught:
-            self.compact(**kw)
+        with self.forced_api_mismatch():
+            with self.assertRaises(oc.GenerationQuarantined) as caught:
+                self.compact(**over)
         return caught.exception
 
     def test_a_post_gate_failure_writes_a_quarantine(self):
@@ -1504,9 +1676,11 @@ class TestAFailedGenerationIsQuarantined(_CompactionBase):
 class TestEveryPostGateReachesTheQuarantine(_CompactionBase):
     """Failure injection per gate, as the review asked. Each must quarantine, not just raise."""
 
-    def _assert_quarantined(self, **over):
-        with self.assertRaises(oc.GenerationQuarantined):
-            self.compact(**over)
+    def _assert_quarantined(self, _ctx=None, **over):
+        import contextlib
+        with (_ctx or contextlib.nullcontext()):
+            with self.assertRaises(oc.GenerationQuarantined):
+                self.compact(**over)
         record = oc.read_quarantine(self.manifest_root)
         self.assertIsNotNone(record, "the generation was left unclassified")
         self.assertEqual(record["generation"], 2)
@@ -1516,20 +1690,19 @@ class TestEveryPostGateReachesTheQuarantine(_CompactionBase):
         return record
 
     def test_api_parity_failure_quarantines(self):
-        record = self._assert_quarantined(api_parity=self._api_parity(mismatches=4))
+        record = self._assert_quarantined(self.forced_api_mismatch())
         self.assertIn("mismatch", str(record["reasons"]))
 
     def test_a_wal_binding_failure_quarantines(self):
-        with mock.patch.object(oc, "_wal_anchor_evidence",
-                               return_value={"bound": False, "anchor_intact": True,
-                                             "reason": "bound to a previous manifest root"}):
-            record = self._assert_quarantined()
+        record = self._assert_quarantined(mock.patch.object(
+            oc, "_wal_anchor_evidence",
+            return_value={"bound": False, "anchor_intact": True,
+                          "reason": "bound to a previous manifest root"}))
         self.assertIn("WAL", str(record["reasons"]))
 
     def test_a_missing_wal_anchor_quarantines(self):
-        with mock.patch.object(oc, "_wal_anchor_evidence",
-                               return_value={"bound": True, "anchor_intact": False}):
-            record = self._assert_quarantined()
+        record = self._assert_quarantined(mock.patch.object(
+            oc, "_wal_anchor_evidence", return_value={"bound": True, "anchor_intact": False}))
         self.assertIn("anchor", str(record["reasons"]))
 
     def test_a_capacity_after_failure_quarantines(self):
@@ -1549,8 +1722,8 @@ class TestEveryPostGateReachesTheQuarantine(_CompactionBase):
                 out["free_now_gib"] = True
             return out
 
-        with mock.patch.object(prod, "measure_capacity", side_effect=bad_after):
-            record = self._assert_quarantined()
+        record = self._assert_quarantined(
+            mock.patch.object(prod, "measure_capacity", side_effect=bad_after))
         self.assertIn("capacity_after", str(record["reasons"]))
 
     def test_a_source_map_failure_quarantines(self):
@@ -1575,8 +1748,8 @@ class TestEveryPostGateReachesTheQuarantine(_CompactionBase):
             evidence = dict(evidence, source_map_complete=False)
             return real(evidence, **kw)
 
-        with mock.patch.object(ex, "post_compaction_problem", side_effect=failing):
-            record = self._assert_quarantined()
+        record = self._assert_quarantined(
+            mock.patch.object(ex, "post_compaction_problem", side_effect=failing))
         self.assertIn("source map", str(record["reasons"]))
 
 
@@ -1612,3 +1785,560 @@ class TestTheModuleDocumentsWhatItActuallyDoes(unittest.TestCase):
         doc = self._doc()
         self.assertIn("It deletes nothing", doc)
         self.assertIn("It does not switch the service", doc)
+
+
+class TestARaisedExceptionAfterThePublishAlsoQuarantines(_CompactionBase):
+    """Finding 1: a RETURNED bad artifact was covered; a RAISED exception was not.
+
+    Everything after the authority changed runs inside one guard, because the failure modes are
+    not symmetric: a gate that returns a problem was written to be handled, and a probe that
+    throws was not. Both leave generation N+1 live, and only the first used to be recorded.
+
+    Each test here injects a real exception from a different post-publish step and requires the
+    same three things: the run raises `GenerationQuarantined`, a durable record names the
+    generation and its predecessor archive, and the original exception survives as `__cause__`
+    so whoever reads the traceback sees what actually broke."""
+
+    def _assert_quarantined_from(self, patch, marker):
+        with patch:
+            with self.assertRaises(oc.GenerationQuarantined) as caught:
+                self.compact()
+        record = oc.read_quarantine(self.manifest_root)
+        self.assertIsNotNone(record, "an exception escaped without classifying the generation")
+        self.assertEqual(record["generation"], 2)
+        self.assertEqual(record["predecessor_generation"], 1)
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.manifest_root, record["predecessor_archive"])))
+        self.assertIn(marker, str(record["reasons"]))
+        self.assertIsNotNone(caught.exception.__cause__,
+                             "the original exception was discarded")
+        return caught.exception
+
+    def test_a_raising_fence_probe_quarantines(self):
+        """The third probe, after the publish."""
+        calls = {"n": 0}
+        fence = self._fence()
+
+        def probe():
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                raise RuntimeError("pm2 is unreachable")
+            return fence
+
+        with self.assertRaises(oc.GenerationQuarantined) as caught:
+            self.compact(writer_fence_probe=probe)
+        record = oc.read_quarantine(self.manifest_root)
+        self.assertIsNotNone(record)
+        self.assertIn("pm2 is unreachable", str(record["reasons"]))
+        self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+
+    def test_a_raising_load_live_quarantines(self):
+        """The manifest cannot be re-read after publishing it.
+
+        Armed only AFTER the publish: `bm.load_live` is the same function `plan_publication`
+        and `execute_publication` use, so patching it outright raised before anything was
+        published — which is a different (and safe) outcome, and would have made this test pass
+        while proving nothing about the post-publish guard."""
+        real_load, real_execute = oc.bm.load_live, oc._execute
+        armed = {"yes": False}
+
+        def execute(candidate, **kw):
+            out = real_execute(candidate, **kw)
+            armed["yes"] = True
+            return out
+
+        def load_live(root):
+            if armed["yes"]:
+                raise RuntimeError("manifest unreadable")
+            return real_load(root)
+
+        with mock.patch.object(oc, "_execute", side_effect=execute):
+            self._assert_quarantined_from(
+                mock.patch.object(oc.bm, "load_live", side_effect=load_live),
+                "manifest unreadable")
+
+    def test_a_raising_api_parity_producer_quarantines(self):
+        exc = self._assert_quarantined_from(self.forced_api_exception(),
+                                            "served reader exploded")
+        self.assertIn("QUARANTINED", str(exc))
+
+    def test_a_raising_wal_evidence_quarantines(self):
+        self._assert_quarantined_from(
+            mock.patch.object(oc, "_wal_anchor_evidence",
+                              side_effect=OSError("the WAL device went away")),
+            "the WAL device went away")
+
+    def test_a_raising_measure_capacity_on_the_after_call_quarantines(self):
+        real = prod.measure_capacity
+        calls = {"n": 0}
+
+        def failing(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise OSError("statvfs failed")
+            return real(*a, **kw)
+
+        self._assert_quarantined_from(
+            mock.patch.object(prod, "measure_capacity", side_effect=failing),
+            "statvfs failed")
+
+    def test_a_raising_inventory_on_the_after_call_quarantines(self):
+        real = oc.inventory
+        calls = {"n": 0}
+
+        def failing(paths):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise OSError("the store vanished mid-walk")
+            return real(paths)
+
+        self._assert_quarantined_from(
+            mock.patch.object(oc, "inventory", side_effect=failing),
+            "the store vanished mid-walk")
+
+    def test_a_raising_post_gate_check_quarantines(self):
+        self._assert_quarantined_from(
+            mock.patch.object(ex, "post_compaction_problem",
+                              side_effect=TypeError("the gate itself broke")),
+            "the gate itself broke")
+
+    def test_a_raising_clearance_issue_quarantines(self):
+        """The very last step. Even here the generation must not be left unclassified."""
+        self._assert_quarantined_from(
+            mock.patch.object(ex, "issue_finalization_clearance",
+                              side_effect=RuntimeError("clearance write failed")),
+            "clearance write failed")
+
+    def test_every_such_failure_still_stops_the_next_run(self):
+        with self.forced_api_exception():
+            with self.assertRaises(oc.GenerationQuarantined):
+                self.compact()
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact()
+        self.assertIn("QUARANTINED", str(caught.exception))
+
+    def test_every_such_failure_still_stops_finalization(self):
+        with self.forced_api_exception():
+            with self.assertRaises(oc.GenerationQuarantined):
+                self.compact()
+        clearance = ex.issue_finalization_clearance(
+            host=socket.gethostname(), run_id=self.RUN_ID, generation=2,
+            manifest_checksum="f" * 64, monolith_day_digest="d" * 64,
+            source_map_digest="9" * 64, issued_by="tests", gates_passed=True)
+        with self.assertRaises(ex.FinalizationRefused) as caught:
+            ex.refuse_destructive_step("prune", clearance, host=socket.gethostname(),
+                                       run_id=self.RUN_ID, generation=2,
+                                       manifest_checksum="f" * 64, approval=True,
+                                       manifest_root=self.manifest_root)
+        self.assertIn("QUARANTINED", str(caught.exception))
+
+    def test_nothing_is_deleted_on_any_of_these_paths(self):
+        before = ex.measure_monolith(self.monolith)
+        with self.forced_api_exception():
+            with self.assertRaises(oc.GenerationQuarantined):
+                self.compact()
+        after = ex.measure_monolith(self.monolith)
+        self.assertEqual(before["monolith_content_ledger"]["ledger_digest"],
+                         after["monolith_content_ledger"]["ledger_digest"])
+
+
+class TestAQuarantineThatCannotBeWrittenFailsClosedAndSaysSo(_CompactionBase):
+    """The worst state reachable: published, unverified, and no record on disk.
+
+    It gets its own exception type because reporting it as an ordinary quarantine would claim a
+    guarantee that does not exist — the next run would find a clean manifest root and proceed."""
+
+    def _break_the_write(self):
+        return mock.patch.object(oc, "quarantine_generation",
+                                 side_effect=OSError("read-only filesystem"))
+
+    def test_it_raises_the_typed_failure_not_a_quarantine(self):
+        with self._break_the_write(), self.forced_api_mismatch():
+            with self.assertRaises(oc.QuarantineWriteFailed) as caught:
+                self.compact()
+        self.assertNotIsInstance(caught.exception, oc.GenerationQuarantined)
+
+    def test_it_names_the_published_but_unquarantined_generation(self):
+        with self._break_the_write(), self.forced_api_mismatch():
+            with self.assertRaises(oc.QuarantineWriteFailed) as caught:
+                self.compact()
+        self.assertEqual(caught.exception.generation, 2)
+        self.assertEqual(caught.exception.manifest_root, self.manifest_root)
+        self.assertEqual(caught.exception.predecessor_archive, "manifest.gen000001.json")
+
+    def test_it_demands_manual_intervention_explicitly(self):
+        with self._break_the_write(), self.forced_api_mismatch():
+            with self.assertRaises(oc.QuarantineWriteFailed) as caught:
+                self.compact()
+        message = str(caught.exception)
+        self.assertIn("MANUAL INTERVENTION REQUIRED", message)
+        self.assertIn("PUBLISHED", message)
+        self.assertIn("no record on disk", message)
+        self.assertIn("read-only filesystem", message)
+
+    def test_it_does_not_claim_a_normal_quarantine(self):
+        with self._break_the_write(), self.forced_api_mismatch():
+            with self.assertRaises(oc.QuarantineWriteFailed):
+                self.compact()
+        self.assertIsNone(oc.read_quarantine(self.manifest_root),
+                          "a record exists, so this was not the fail-closed path at all")
+
+    def test_it_also_covers_a_raised_failure_not_only_a_returned_one(self):
+        with self._break_the_write(), self.forced_api_exception():
+            with self.assertRaises(oc.QuarantineWriteFailed) as caught:
+                self.compact()
+        self.assertIn("MANUAL INTERVENTION REQUIRED", str(caught.exception))
+
+    def test_it_still_deletes_nothing(self):
+        before = ex.measure_monolith(self.monolith)
+        with self._break_the_write(), self.forced_api_mismatch():
+            with self.assertRaises(oc.QuarantineWriteFailed):
+                self.compact()
+        after = ex.measure_monolith(self.monolith)
+        self.assertEqual(before["monolith_content_ledger"]["ledger_digest"],
+                         after["monolith_content_ledger"]["ledger_digest"])
+
+
+class TestTheApprovalDoesNotAuthorizeArbitraryPaths(_CompactionBase):
+    """Finding 3: an approval names a live root, and used to authorize writing anywhere.
+
+    Every one of these has a VALID approval for the real live root. What differs is where the
+    operation was pointed, and each must refuse before anything is written."""
+
+    def _elsewhere(self, name):
+        path = os.path.join(self.tmp, name)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _assert_refused_before_writing(self, **over):
+        gen = self.manifest_generation()
+        with mock.patch.object(oc, "_build", side_effect=AssertionError("must not run")) \
+                as build:
+            with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                self.compact(**over)
+        self.assertFalse(build.called, "a path was accepted far enough to start a build")
+        self.assertEqual(self.manifest_generation(), gen)
+        return str(caught.exception)
+
+    def test_an_alternate_manifest_root_refuses(self):
+        message = self._assert_refused_before_writing(
+            manifest_root=self._elsewhere("someone_elses_blocks"))
+        self.assertIn("is not the canonical", message)
+        self.assertIn("computed, not chosen", message)
+
+    def test_an_alternate_wal_root_refuses(self):
+        message = self._assert_refused_before_writing(
+            wal_root=self._elsewhere("someone_elses_wal"))
+        self.assertIn("is not the canonical", message)
+
+    def test_a_block_written_outside_the_manifest_root_refuses(self):
+        message = self._assert_refused_before_writing(
+            block_out_path=os.path.join(self.tmp, "loose_block.zarr"))
+        self.assertIn("not inside the manifest root", message)
+
+    def test_a_block_written_into_the_live_root_but_outside_the_roots_refuses(self):
+        message = self._assert_refused_before_writing(
+            block_out_path=os.path.join(self.live, "sneaky_block.zarr"))
+        self.assertIn("not inside the manifest root", message)
+
+    def test_a_relative_artifacts_dir_refuses(self):
+        message = self._assert_refused_before_writing(artifacts_dir="artifacts")
+        self.assertIn("must be an absolute path", message)
+
+    def test_an_anchor_inside_the_live_root_refuses(self):
+        message = self._assert_refused_before_writing(
+            anchor_root=self._elsewhere(os.path.join("G", "anchor_inside")))
+        self.assertIn("witnesses nothing", message)
+
+    def test_an_anchor_on_the_same_device_refuses(self):
+        """The existing anchor authority, reached through this operation."""
+        other = self._elsewhere("undeclared_anchor")
+        with self.assertRaises((oc.OneShotCompactionRefused,
+                                prod.ProductionProvisionRefused)) as caught:
+            self.compact(anchor_root=other)
+        self.assertTrue(str(caught.exception))
+
+    def test_an_unapproved_delta_path_refuses(self):
+        rogue = os.path.join(self.tmp, "rogue_delta.zarr")
+        fx.build_block(rogue, self.days, ny=8, nx=8)
+        message = self._assert_refused_before_writing(delta_path=rogue)
+        self.assertIn("is not the", message)
+        self.assertIn("the approved preflight names", message)
+
+    def test_an_unapproved_daily_root_refuses(self):
+        rogue = self._elsewhere("rogue_daily")
+        message = self._assert_refused_before_writing(daily_root=rogue)
+        self.assertIn("names no daily_root", message)
+
+    def test_an_unapproved_monolith_refuses(self):
+        rogue = os.path.join(self.tmp, "rogue_monolith.zarr")
+        fx.build_block(rogue, self.base_days, ny=8, nx=8)
+        with self.assertRaises((oc.OneShotCompactionRefused,
+                                ex.OneShotExceptionRefused)) as caught:
+            self.compact(monolith_path=rogue)
+        self.assertTrue(str(caught.exception))
+
+    def test_a_symlinked_source_refuses(self):
+        """A link can be re-pointed between the approval and the run."""
+        link = os.path.join(self.tmp, "delta_link.zarr")
+        os.symlink(self.delta, link)
+        pre = self._pre()
+        pre["plan"]["paths"]["delta_path"] = link
+        message = self._assert_refused_before_writing(delta_path=link,
+                                                      one_shot_pre_compaction=pre)
+        self.assertIn("is a symlink to", message)
+
+    def test_a_relative_source_path_refuses(self):
+        pre = self._pre()
+        pre["plan"]["paths"]["delta_path"] = "relative/delta.zarr"
+        message = self._assert_refused_before_writing(delta_path="relative/delta.zarr",
+                                                      one_shot_pre_compaction=pre)
+        self.assertIn("is not absolute", message)
+
+    def test_a_nonexistent_source_refuses(self):
+        pre = self._pre()
+        gone = os.path.join(self.tmp, "not_here.zarr")
+        pre["plan"]["paths"]["delta_path"] = gone
+        message = self._assert_refused_before_writing(delta_path=gone,
+                                                      one_shot_pre_compaction=pre)
+        self.assertIn("does not exist", message)
+
+    def test_the_canonical_roots_are_computed_from_the_live_root(self):
+        roots = oc.canonical_roots(self.live)
+        self.assertEqual(roots["manifest_root"], self.manifest_root)
+        self.assertEqual(roots["wal_root"], self.wal_root)
+
+    def test_the_happy_path_still_uses_the_canonical_roots(self):
+        """The positive control: the operation is not simply refusing everything."""
+        result = self.compact()
+        self.assertEqual(result["manifest_root"], self.manifest_root)
+
+
+class TestTheCompactionApprovalIsValidatedField(_CompactionBase):
+    """Finding 4: presence is not validity, and each guard must stand on its own.
+
+    Every case here changes ONE field and leaves the rest correct, so a neighbouring check
+    cannot be what refuses it."""
+
+    def problem(self, **over):
+        return oc.approval_problem(self._approval(**over), live_root=self.live,
+                                   run_id=self.RUN_ID)
+
+    def test_a_complete_approval_passes(self):
+        self.assertIsNone(self.problem())
+
+    def test_every_field_is_required(self):
+        for field in oc.APPROVAL_FIELDS:
+            with self.subTest(field):
+                approval = self._approval()
+                del approval[field]
+                problem = oc.approval_problem(approval, live_root=self.live,
+                                              run_id=self.RUN_ID)
+                self.assertTrue(problem)
+                self.assertIn(field, problem)
+
+    def test_a_record_that_is_not_a_record_is_refused(self):
+        for value in (None, True, "approved", 1, []):
+            with self.subTest(repr(value)):
+                problem = oc.approval_problem(value, live_root=self.live, run_id=self.RUN_ID)
+                self.assertIn("not a record", problem)
+
+    def test_a_non_string_approved_by_is_refused(self):
+        """`True` is not a name, and truthiness would have accepted it."""
+        for value in (True, 1, ["cywhale"], {"name": "cywhale"}, None):
+            with self.subTest(repr(value)):
+                problem = self.problem(approved_by=value)
+                self.assertIn("rather than a string", problem)
+
+    def test_a_blank_approved_by_is_refused(self):
+        for value in ("", "   ", "\t"):
+            with self.subTest(repr(value)):
+                self.assertTrue(self.problem(approved_by=value))
+
+    def test_a_one_character_approved_by_is_refused(self):
+        self.assertIn("does not name anyone", self.problem(approved_by="x"))
+
+    def test_a_non_string_approved_utc_is_refused(self):
+        for value in (True, 1724668800, None, []):
+            with self.subTest(repr(value)):
+                self.assertIn("rather than a string", self.problem(approved_utc=value))
+
+    def test_an_unparseable_approved_utc_is_refused(self):
+        for value in ("soon", "2026-08-26", "yesterday", "2026-13-45T00:00:00Z"):
+            with self.subTest(value):
+                problem = self.problem(approved_utc=value)
+                self.assertIn("not a timestamp", problem)
+
+    def test_a_future_approved_utc_is_refused(self):
+        problem = self.problem(approved_utc=iso(3600))
+        self.assertIn("in the future", problem)
+
+    def test_a_non_string_run_id_is_refused(self):
+        for value in (True, 20260826, None):
+            with self.subTest(repr(value)):
+                self.assertIn("rather than a string", self.problem(run_id=value))
+
+    def test_another_run_is_refused(self):
+        self.assertIn("is for run", self.problem(run_id="some-other-run"))
+
+    def test_another_live_root_is_refused(self):
+        self.assertIn("names live_root", self.problem(live_root=self.tmp))
+
+    def test_a_relative_live_root_is_refused(self):
+        self.assertIn("not an absolute path", self.problem(live_root="G"))
+
+    def test_the_wrong_scope_is_refused(self):
+        problem = self.problem(scope=prod.PRODUCTION_SCOPE)
+        self.assertIn("not an approval to publish", problem)
+
+    def test_an_expiry_is_honoured_when_present(self):
+        self.assertIn("expired at", self.problem(approved_utc=iso(-600),
+                                                 expires_utc=iso(-1)))
+
+    def test_an_expiry_before_the_approval_is_refused(self):
+        problem = self.problem(approved_utc=iso(-60), expires_utc=iso(-600))
+        self.assertIn("authorizes nothing", problem)
+
+    def test_an_unparseable_expiry_is_refused(self):
+        self.assertIn("not a timestamp", self.problem(expires_utc="never"))
+
+    def test_a_live_expiry_passes(self):
+        self.assertIsNone(self.problem(expires_utc=iso(3000)))
+
+    def test_the_operation_refuses_a_malformed_approval_before_anything_else(self):
+        with mock.patch.object(oc, "_build", side_effect=AssertionError("must not run")):
+            with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                self.compact(approval=self._approval(approved_by=True))
+        self.assertIn("compaction approval", str(caught.exception))
+
+
+class TestTheProducerDerivationEdges(_CompactionBase):
+    """The branches the end-to-end path cannot reach, fed directly.
+
+    Each of these was a mutation survivor: the operation only ever calls `producer_identity`
+    with the two registered kinds and with callables that do have a module file, so the guards
+    for everything else had never executed."""
+
+    def _fingerprints(self):
+        return self._identity()["module_fingerprints"]
+
+    def test_a_callable_with_no_module_file_is_refused(self):
+        """A function built from a code object — what a REPL or an `exec` produces.
+
+        It is not an exotic case: it is what an operator gets by defining a producer at an
+        interactive prompt, which is exactly the "reviewed code has a source file and this does
+        not" boundary the guard is about."""
+        import types
+        source = compile("def f(**kw):\n    return {}", "<interactive>", "exec")
+        nowhere = types.FunctionType(source.co_consts[0], {})
+        identity, problem = oc.producer_identity(
+            nowhere, kind=oc.PARITY_POINT_SERIES, module_fingerprints=self._fingerprints())
+        self.assertIsNone(identity)
+        self.assertIn("does not resolve to a module file", problem)
+
+    def test_the_operation_refuses_such_a_callable_too(self):
+        import types
+        source = compile("def f(**kw):\n    return {}", "<interactive>", "exec")
+        nowhere = types.FunctionType(source.co_consts[0], {})
+        with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+            self.compact(api_parity=nowhere)
+        self.assertIn("does not resolve to a module file", str(caught.exception))
+
+    def test_an_unregistered_kind_is_refused(self):
+        """`producer_identity` is public and its kind is an argument; a caller asking about a
+        kind nothing is registered for must be told, not quietly given an identity."""
+        identity, problem = oc.producer_identity(
+            ppd.point_series_parity, kind="throughput_parity",
+            module_fingerprints=self._fingerprints())
+        self.assertIsNone(identity)
+        self.assertIn("no reviewed producer is registered", problem)
+
+    def test_a_callable_outside_the_tree_is_refused(self):
+        """A function from an installed package resolves to a file, just not one of ours."""
+        import json as stdlib_json
+        identity, problem = oc.producer_identity(
+            stdlib_json.dumps, kind=oc.PARITY_API,
+            module_fingerprints=self._fingerprints())
+        self.assertIsNone(identity)
+        self.assertIn("outside this tree", problem)
+
+
+class TestASingleServedReadFailureIsAMismatch(_CompactionBase):
+    """A per-day read failure must COUNT, not be skipped.
+
+    `continue` without recording is the shape that turns a broken read path into a clean parity
+    report: every day fails, every day is skipped, and the artifact says zero mismatches out of
+    the days that happened to work."""
+
+    def test_a_raising_point_series_is_counted_as_a_mismatch(self):
+        from store.segmented_cube import SegmentedCubeStore
+        with mock.patch.object(SegmentedCubeStore, "point_series",
+                               side_effect=RuntimeError("segment unreadable")):
+            with self.assertRaises(oc.GenerationQuarantined) as caught:
+                self.compact()
+        record = oc.read_quarantine(self.manifest_root)
+        self.assertIsNotNone(record)
+        self.assertIn("mismatch(es) out of", str(record["reasons"]))
+        self.assertIn("QUARANTINED", str(caught.exception))
+
+    def test_the_artifact_records_what_went_wrong(self):
+        from store.segmented_cube import SegmentedCubeStore
+        with mock.patch.object(SegmentedCubeStore, "point_series",
+                               side_effect=RuntimeError("segment unreadable")):
+            artifact = ppd.api_parity(
+                manifest_root=self.manifest_root, monolith_path=self.monolith,
+                allowed_legacy_paths=[os.path.realpath(self.monolith)],
+                host="h", run_id="r", deploy_sha="s", generation=1,
+                manifest_checksum="c", source_map_digest="d")
+        self.assertGreater(artifact["mismatches"], 0)
+        self.assertGreater(artifact["samples"], 0)
+        self.assertTrue(any("the served read raised" in d
+                            for d in artifact["differences"]))
+
+    def test_a_raising_oracle_read_is_counted_too(self):
+        from store.time_cube import TimeCubeStore
+        with mock.patch.object(TimeCubeStore, "point_series",
+                               side_effect=RuntimeError("oracle unreadable")):
+            artifact = ppd.api_parity(
+                manifest_root=self.manifest_root, monolith_path=self.monolith,
+                allowed_legacy_paths=[os.path.realpath(self.monolith)],
+                host="h", run_id="r", deploy_sha="s", generation=1,
+                manifest_checksum="c", source_map_digest="d")
+        self.assertGreater(artifact["mismatches"], 0)
+        self.assertTrue(any("the oracle read raised" in d
+                            for d in artifact["differences"]))
+
+    def test_a_clean_run_reports_zero_over_a_positive_sample_count(self):
+        """The positive control: the counting is not simply always non-zero."""
+        artifact = ppd.api_parity(
+            manifest_root=self.manifest_root, monolith_path=self.monolith,
+            allowed_legacy_paths=[os.path.realpath(self.monolith)],
+            host="h", run_id="r", deploy_sha="s", generation=1,
+            manifest_checksum="c", source_map_digest="d")
+        self.assertEqual(artifact["mismatches"], 0)
+        self.assertGreater(artifact["samples"], 0)
+
+    def test_a_silently_omitted_day_is_counted_as_a_mismatch(self):
+        """Distinct from a read that RAISES, and not covered by it.
+
+        `point_series` omits absent days rather than fabricating them, which is correct — but a
+        day the oracle holds and the served view quietly drops is a served view that lost data,
+        and an empty result is not an error anywhere else in the read path. Nothing but this
+        branch would notice."""
+        from store.segmented_cube import SegmentedCubeStore
+        with mock.patch.object(SegmentedCubeStore, "point_series", return_value=[]):
+            artifact = ppd.api_parity(
+                manifest_root=self.manifest_root, monolith_path=self.monolith,
+                allowed_legacy_paths=[os.path.realpath(self.monolith)],
+                host="h", run_id="r", deploy_sha="s", generation=1,
+                manifest_checksum="c", source_map_digest="d")
+        self.assertGreater(artifact["mismatches"], 0)
+        self.assertTrue(any("returned nothing for a day the oracle holds" in d
+                            for d in artifact["differences"]))
+
+    def test_a_silently_omitted_day_quarantines_the_run(self):
+        from store.segmented_cube import SegmentedCubeStore
+        with mock.patch.object(SegmentedCubeStore, "point_series", return_value=[]):
+            with self.assertRaises(oc.GenerationQuarantined):
+                self.compact()
+        self.assertIsNotNone(oc.read_quarantine(self.manifest_root))

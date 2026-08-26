@@ -137,6 +137,118 @@ def _exact_str(value) -> bool:
     return type(value) is str and bool(value.strip())
 
 
+# ---------------------------------------------------------------- canonical paths
+def canonical_roots(live_root: str) -> Dict[str, str]:
+    """The manifest and WAL roots, COMPUTED from the live root rather than taken from a caller.
+
+    The approval names a live root. Accepting a manifest root beside it meant the approval
+    authorized writing wherever the caller pointed -- an approval for `$G` would publish a
+    generation into `/tmp/anywhere` and the record would still read as approved. Containment is
+    only an argument if the path cannot be pointed elsewhere."""
+    return {"manifest_root": os.path.join(live_root, prod.MANIFEST_DIRNAME),
+            "wal_root": os.path.join(live_root, prod.WAL_DIRNAME)}
+
+
+def _inside(path: str, root: str) -> bool:
+    real_root = os.path.realpath(root)
+    real = os.path.realpath(path)
+    return real == real_root or real.startswith(real_root + os.sep)
+
+
+def _bound_source_problem(role: str, path: Optional[str], *, declared, live_root: str):
+    """An external source path must be the one the approved preflight named.
+
+    `delta_path` and `daily_root` are read during the build, so a caller free to name them could
+    have the block folded from a store nobody approved -- and the manifest would record the
+    substituted path as provenance, which is worse than no record. So each is checked against
+    the plan the preflight carries.
+
+    Symlinks are refused rather than resolved-and-accepted: `path` and `realpath` differing
+    means the name that was approved and the bytes that get read are two different questions,
+    and a link can be re-pointed between the approval and the run."""
+    if path is None:
+        return None
+    if not _exact_str(path):
+        return f"{role} is {path!r}, which is not a path"
+    if not os.path.isabs(path):
+        return (f"{role} {path!r} is not absolute; what it names would depend on the directory "
+                f"the operation happened to start in")
+    if not os.path.exists(path):
+        return f"{role} {path!r} does not exist"
+    # The PATH ITSELF, not its ancestors. `/var` is a symlink to `/private/var` on macOS, so
+    # comparing realpath against abspath refuses every temp path and says nothing about the
+    # store. What matters is a link AT the name that was approved: that is the one that can be
+    # re-pointed between the approval and the run without the record changing.
+    if os.path.islink(path.rstrip(os.sep)):
+        return (f"{role} {path!r} is a symlink to {os.readlink(path.rstrip(os.sep))!r}; the "
+                f"name that was approved and the bytes that get read are then two different "
+                f"questions, and the link can be re-pointed between them")
+    if declared is None:
+        return (f"{role} was supplied but the approved preflight plan names no {role}; an "
+                f"unapproved source would be folded into the block and recorded as provenance")
+    if os.path.realpath(declared) != os.path.realpath(path):
+        return (f"{role} {path!r} is not the {declared!r} the approved preflight names")
+    return None
+
+
+def check_operation_paths(*, live_root: str, manifest_root: str, wal_root: str,
+                          block_out_path: str, artifacts_dir: str, anchor_root: str,
+                          monolith_path: str, delta_path, daily_root, pre: Dict) -> Dict:
+    """Bind every path this operation writes or reads to something that approved it.
+
+    Returns the canonical roots, or raises. Grouped here rather than scattered through the
+    operation so the whole path surface is visible in one place -- it was not, and the gap was
+    that an approval for one live root authorized a manifest root anywhere on the filesystem."""
+    if not os.path.isdir(live_root):
+        raise OneShotCompactionRefused(
+            f"live_root {live_root!r} is not an existing directory")
+    canonical = canonical_roots(live_root)
+    for role, want in canonical.items():
+        got = {"manifest_root": manifest_root, "wal_root": wal_root}[role]
+        if os.path.realpath(got) != os.path.realpath(want):
+            raise OneShotCompactionRefused(
+                f"{role} {got!r} is not the canonical {want!r} for the approved live root. The "
+                f"approval names the live root; the roots under it are computed, not chosen, "
+                f"or the approval would authorize writing wherever the caller pointed")
+
+    # The block and the build artifacts are written by this run, so they must land inside the
+    # roots the approval covers.
+    if not _inside(block_out_path, canonical["manifest_root"]):
+        raise OneShotCompactionRefused(
+            f"block_out_path {block_out_path!r} is not inside the manifest root "
+            f"{canonical['manifest_root']!r}; a block written outside the approved root is one "
+            f"the approval does not cover and the cleanup path does not know about")
+    if not _exact_str(artifacts_dir) or not os.path.isabs(artifacts_dir):
+        raise OneShotCompactionRefused(
+            f"artifacts_dir {artifacts_dir!r} must be an absolute path")
+
+    # The anchor must be OUTSIDE the live root and on another device -- it witnesses the volume
+    # it is meant to survive. `check_anchor_domain` is the existing authority for that and is
+    # reused rather than reimplemented.
+    if _inside(anchor_root, live_root):
+        raise OneShotCompactionRefused(
+            f"anchor_root {anchor_root!r} is inside the live root; an anchor that dies with the "
+            f"volume it witnesses witnesses nothing")
+    anchor = prod.check_anchor_domain(anchor_root, live_root)
+
+    # The monolith and the external sources must be the ones the approved preflight named.
+    plan = (pre or {}).get("plan") or {}
+    declared_paths = plan.get("paths") or {}
+    problem = _bound_source_problem(
+        "monolith_path", monolith_path,
+        declared=declared_paths.get("monolith", pre.get("monolith_state", {})
+                                    .get("monolith_realpath")),
+        live_root=live_root)
+    if problem:
+        raise OneShotCompactionRefused(problem)
+    for role, path in (("delta_path", delta_path), ("daily_root", daily_root)):
+        problem = _bound_source_problem(role, path, declared=declared_paths.get(role),
+                                        live_root=live_root)
+        if problem:
+            raise OneShotCompactionRefused(problem)
+    return {**canonical, "anchor": anchor}
+
+
 # ---------------------------------------------------------------- the quarantine state
 #: Written into the manifest root when a generation is published and then FAILS its
 #: post-publish gates. Named with a leading dot so it sits beside the manifest rather than
@@ -146,6 +258,24 @@ QUARANTINE_NAME = ".p5_generation_quarantine.json"
 
 class GenerationQuarantined(OneShotCompactionRefused):
     """A published generation failed its gates and has not been reconciled."""
+
+
+class QuarantineWriteFailed(OneShotCompactionRefused):
+    """A generation is published, unverified, and could NOT be quarantined.
+
+    The worst state this operation can reach, and it gets its own type so nothing can report it
+    as an ordinary quarantine. A quarantine record is what makes every later publish, switch and
+    finalization refuse; without one on disk, the next run sees a normal live manifest and has no
+    way to know. That needs a person, now.
+
+    Carries `generation`, `manifest_root` and `predecessor_archive` as attributes so an operator
+    -- or a supervising script -- can act on them without parsing the message."""
+
+    def __init__(self, message, *, generation, manifest_root, predecessor_archive):
+        super().__init__(message)
+        self.generation = generation
+        self.manifest_root = manifest_root
+        self.predecessor_archive = predecessor_archive
 
 
 def quarantine_path(manifest_root: str) -> str:
@@ -184,6 +314,48 @@ def quarantine_problem(manifest_root: str) -> Optional[str]:
             f"and is what a rollback would restore. Nothing may publish, switch or finalize "
             f"over this state until a person reconciles it and removes "
             f"{quarantine_path(manifest_root)!r}")
+
+
+def _quarantine_or_fail_closed(manifest_root, *, generation, predecessor_generation, run_id,
+                               host, operator, reasons, block_path, result, now, cause):
+    """Record the unverified generation and raise. Never returns.
+
+    Two outcomes and they are different facts, so they are different exceptions:
+
+    * the record is written -> `GenerationQuarantined`, and every later publish, switch and
+      finalization now refuses;
+    * the record CANNOT be written -> `QuarantineWriteFailed`, which says so explicitly and
+      names the published-but-unquarantined generation. Reporting a normal quarantine there
+      would be claiming a guarantee that does not exist on disk: the next run would find a
+      clean manifest root and proceed."""
+    predecessor_archive = (None if predecessor_generation is None
+                           else bm.archive_name(int(predecessor_generation)))
+    try:
+        quarantine = quarantine_generation(
+            manifest_root, generation=generation,
+            predecessor_generation=predecessor_generation,
+            run_id=run_id, host=host, operator=operator,
+            reasons=reasons, block_path=block_path, now=now)
+    except BaseException as write_failure:                          # noqa: BLE001
+        raise QuarantineWriteFailed(
+            f"MANUAL INTERVENTION REQUIRED. Generation {generation} is PUBLISHED, was NOT "
+            f"verified ({reasons}), and could NOT be quarantined: writing "
+            f"{quarantine_path(manifest_root)!r} failed with {write_failure!r}. Nothing was "
+            f"deleted and no service was switched, but there is no record on disk to make the "
+            f"next run refuse -- it would see a normal live manifest. The predecessor archive "
+            f"{predecessor_archive!r} is immutable and should still be present. Reconcile by "
+            f"hand before any further publish, switch or finalization.",
+            generation=generation, manifest_root=manifest_root,
+            predecessor_archive=predecessor_archive) from (cause or write_failure)
+    if result is not None:
+        result["quarantine"] = quarantine
+    raise GenerationQuarantined(
+        f"the post-compaction step did not pass: {reasons}. Generation {generation} is "
+        f"published, NOT verified, and now QUARANTINED: nothing was deleted, no service was "
+        f"switched, and no finalization clearance was issued. The predecessor archive "
+        f"{quarantine['predecessor_archive']!r} is intact. Every publish, switch and "
+        f"finalization refuses until a person reconciles this and removes "
+        f"{quarantine_path(manifest_root)!r}") from cause
 
 
 def quarantine_generation(manifest_root: str, *, generation: int, predecessor_generation,
@@ -315,10 +487,16 @@ def identity_problem(artifact, *, host: str, run_id: str, now=None):
     if absent:
         return (f"fingerprints no {absent}. An unmeasured module is one nobody compared, and a "
                 f"shrunken inventory makes every other comparison pass on a subset")
-    extra = sorted(set(reported) - set(expected))
+    # The deployment inventory is what git holds at the approved commit. The operation's own
+    # producer modules are NOT part of it -- they belong to this tooling rather than to the
+    # deployed service -- so the artifact may carry them in addition, and `producer_identity()`
+    # checks each against the file on disk. Anything else is a module the review never saw
+    # running alongside the ones it did.
+    extra = sorted(set(reported) - set(expected) - set(REVIEWED_PRODUCER_MODULES))
     if extra:
-        return (f"fingerprints {extra}, which the approved commit does not contain. A module "
-                f"the review never saw is running alongside the ones it did")
+        return (f"fingerprints {extra}, which the approved commit does not contain and which "
+                f"are not the operation's own producer modules "
+                f"{list(REVIEWED_PRODUCER_MODULES)}")
     if not _exact_str(artifact["verified_by"]):
         return "does not say who established it; an unattributed identity is not provenance"
     return None
@@ -337,10 +515,96 @@ PARITY_ARTIFACT_FIELDS = ("kind", "host", "run_id", "deploy_sha",
 PARITY_POINT_SERIES = "point_series_parity"
 PARITY_API = "api_parity"
 
+#: The reviewed producers, per kind: (module path relative to the dev2026 tree, qualname).
+#:
+#: A digest carried IN the artifact was forgeable -- a lambda could copy the digest of any
+#: approved module and present itself as that module, returning a fully green result while
+#: measuring nothing. So the identity is DERIVED from the callable the operation holds, and this
+#: registry is the reviewed list of what may be called. Both halves matter: derivation stops an
+#: artifact naming a producer it did not come from, and the registry stops a genuine but
+#: unreviewed function in an approved module standing in for a parity check.
+REVIEWED_PRODUCERS = {
+    PARITY_POINT_SERIES: ("ops/p5_parity_producers.py", "point_series_parity"),
+    PARITY_API: ("ops/p5_parity_producers.py", "api_parity"),
+}
+
+#: Modules that hold the producers. They are part of the OPERATION rather than of the
+#: deployment inventory `p5_readiness.INVENTORY_MODULES` describes, so the identity artifact is
+#: allowed to fingerprint them in addition to the inventory -- and their on-disk digest is
+#: checked against that fingerprint. See `identity_problem`, and the limitation recorded there.
+REVIEWED_PRODUCER_MODULES = ("ops/p5_parity_producers.py",)
+
+
+def _repo_relative(path: str) -> Optional[str]:
+    """`/…/dev2026/ops/x.py` -> `ops/x.py`, or `None` when it is not in the tree."""
+    dev = os.path.dirname(os.path.abspath(__file__))          # …/dev2026/ops
+    dev = os.path.dirname(dev)                                # …/dev2026
+    real = os.path.realpath(path)
+    if not real.startswith(os.path.realpath(dev) + os.sep):
+        return None
+    return os.path.relpath(real, os.path.realpath(dev))
+
+
+def _file_digest(path: str) -> str:
+    import hashlib
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def producer_identity(fn, *, kind: str, module_fingerprints: Dict):
+    """Who this callable ACTUALLY is: `(relpath, qualname, on-disk digest)`, or a refusal.
+
+    Derived from the callable, never read from what it returns. An artifact claiming a producer
+    is a string the artifact chose; `fn.__module__` and `fn.__qualname__` are what Python
+    resolved, and the digest is what is on disk under that module's path right now.
+
+    Three things must hold, and none implies another:
+
+    * the callable resolves to a file inside this tree — a lambda defined in a shell, a
+      test, or a notebook does not;
+    * `(relpath, qualname)` is the entry `REVIEWED_PRODUCERS` names for this kind — a genuine
+      but unreviewed function in an approved module is still not a parity producer;
+    * the file's digest NOW equals the fingerprint the identity artifact recorded for it, so
+      the reviewed code is also the code that ran.
+
+    Returns `(identity_dict, None)` or `(None, problem)`."""
+    import inspect as _inspect
+    registered = REVIEWED_PRODUCERS.get(kind)
+    if registered is None:
+        return None, (f"no reviewed producer is registered for {kind!r}; the operation cannot "
+                      f"adjudicate a parity result it has no approved producer for")
+    module = _inspect.getmodule(fn)
+    source_file = getattr(module, "__file__", None)
+    if not source_file:
+        return None, (f"the {kind} producer {getattr(fn, '__qualname__', fn)!r} does not "
+                      f"resolve to a module file. A callable defined in a shell, a test or a "
+                      f"lambda has no reviewed source, and its result is indistinguishable "
+                      f"from one that measured nothing")
+    relpath = _repo_relative(source_file)
+    if relpath is None:
+        return None, (f"the {kind} producer comes from {source_file!r}, which is outside this "
+                      f"tree; nothing here can say what it contains")
+    qualname = getattr(fn, "__qualname__", None)
+    if (relpath, qualname) != registered:
+        return None, (f"the {kind} producer is {relpath}:{qualname}, and the reviewed producer "
+                      f"for this kind is {registered[0]}:{registered[1]}. Being in an approved "
+                      f"module is not the same as being the approved producer")
+    fingerprint = module_fingerprints.get(relpath)
+    if fingerprint is None:
+        return None, (f"the identity artifact does not fingerprint {relpath}, so the producer "
+                      f"about to measure this run is code nobody recorded")
+    on_disk = _file_digest(source_file)
+    if on_disk != fingerprint:
+        return None, (f"{relpath} on disk hashes to {on_disk[:12]}… but the identity artifact "
+                      f"recorded {fingerprint[:12]}…; the reviewed producer is not the one that "
+                      f"would run")
+    return {"producer": f"{relpath}:{qualname}", "producer_digest": on_disk,
+            "module": relpath, "qualname": qualname}, None
+
 
 def parity_artifact_problem(artifact, *, kind: str, host: str, run_id: str, deploy_sha: str,
                             generation: int, manifest_checksum: str, source_map_digest: str,
-                            module_fingerprints: Dict, now=None):
+                            producer: Dict, now=None):
     """The first thing wrong with an executed parity artifact, or `None`.
 
     The producer is injected -- it has to be, since it reads the deployment's own stores through
@@ -348,9 +612,10 @@ def parity_artifact_problem(artifact, *, kind: str, host: str, run_id: str, depl
     module comparing its own output against its own idea of the truth. What is NOT optional is
     that the producer be reviewed code and that its result be bound to this act:
 
-    * `producer_digest` must be the SHA-256 of a module the identity artifact fingerprinted,
-      which is to say a module `git` holds at the approved commit. An ad-hoc callable defined
-      in a shell has no such digest and cannot acquire one.
+    * `producer` is DERIVED from the callable by `producer_identity()` and checked against what
+      the artifact claims. An earlier revision read the digest out of the artifact and merely
+      required it to be *some* approved module's — which a lambda could satisfy by copying one,
+      returning a fully green result while measuring nothing.
     * the artifact names the candidate generation, the manifest checksum and the source-map
       digest THIS run produced, so a green result from another run or another generation is
       refused rather than reused.
@@ -372,16 +637,16 @@ def parity_artifact_problem(artifact, *, kind: str, host: str, run_id: str, depl
             return (f"records {field}={artifact[field]!r} while this run produced {want!r}. A "
                     f"green result about another act reads exactly like one about this act")
 
-    digest = artifact["producer_digest"]
-    if not ex._is_sha256(digest):
-        return f"records producer_digest {digest!r}, which is not a SHA-256 digest"
-    if digest not in set(module_fingerprints.values()):
-        return (f"was produced by something whose digest {digest[:12]}… is not any module the "
-                f"identity artifact fingerprinted. The producer has to be reviewed code: a "
-                f"callable that merely returns `mismatches: 0` measured nothing, and nothing "
-                f"in a returned dict can distinguish the two")
-    if not _exact_str(artifact["producer"]):
-        return "does not name its producer"
+    # The producer identity is DERIVED by the caller from the callable it holds, and passed in
+    # here. What the artifact says about itself is then checked against it -- an artifact that
+    # names a producer it did not come from is refused, rather than believed.
+    if artifact["producer"] != producer["producer"]:
+        return (f"claims producer {artifact['producer']!r}, but it came from "
+                f"{producer['producer']!r}. What a result says about its own origin is a "
+                f"string it chose")
+    if artifact["producer_digest"] not in (None, producer["producer_digest"]):
+        return (f"claims producer_digest {str(artifact['producer_digest'])[:12]}…, but "
+                f"{producer['module']} on disk hashes to {producer['producer_digest'][:12]}…")
     if not _exact_str(artifact["provenance"]):
         return ("states no verification provenance -- what was read, from where, and how it "
                 "was compared. Without it the counts below are two integers")
@@ -528,7 +793,8 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
             raise OneShotCompactionRefused(f"{name} must be a non-empty string")
 
     # ---- approval, scoped to THIS operation ------------------------------------------------
-    approval = _check_approval(approval, live_root=live_root, run_id=run_id)
+    approval = _check_approval(approval, live_root=live_root, run_id=run_id,
+                               now=now)
 
     # ---- and the code that would run, BEFORE any compaction work --------------------------
     # Checked here rather than under the locks on purpose: an operator whose checkout is dirty
@@ -538,6 +804,19 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
         raise OneShotCompactionRefused(f"the deployment identity artifact {problem}")
     deploy_sha = identity_artifact["deploy_sha"]
     module_fingerprints = dict(identity_artifact["module_fingerprints"])
+
+    # ---- and who is going to measure the parity, derived from the callables themselves ----
+    # Up here with the identity, and for the same reason: a caller who passed an unreviewed
+    # producer should learn it before a lock is taken, not after a multi-minute scan.
+    point_series_identity, problem = producer_identity(
+        point_series_parity, kind=PARITY_POINT_SERIES,
+        module_fingerprints=module_fingerprints)
+    if problem:
+        raise OneShotCompactionRefused(problem)
+    api_identity, problem = producer_identity(
+        api_parity, kind=PARITY_API, module_fingerprints=module_fingerprints)
+    if problem:
+        raise OneShotCompactionRefused(problem)
 
     # ---- a quarantined generation stops everything ----------------------------------------
     problem = quarantine_problem(manifest_root)
@@ -553,6 +832,13 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
         raise OneShotCompactionRefused(
             f"the record authorizes {one_shot_exception.get('operation')!r}; this operation is "
             f"{ex.OP_COMPACTION!r}. A provisioning acceptance is not a compaction acceptance")
+
+    # ---- every path this run reads or writes, bound to something that approved it ---------
+    paths = check_operation_paths(
+        live_root=live_root, manifest_root=manifest_root, wal_root=wal_root,
+        block_out_path=block_out_path, artifacts_dir=artifacts_dir, anchor_root=anchor_root,
+        monolith_path=monolith_path, delta_path=delta_path, daily_root=daily_root,
+        pre=one_shot_pre_compaction or {})
 
     locks = prod.check_lock_paths(live_root=live_root,
                                   compaction_lock_path=compaction_lock_path,
@@ -653,7 +939,7 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
                 parity, kind=PARITY_POINT_SERIES, host=_hostname(), run_id=run_id,
                 deploy_sha=deploy_sha, generation=candidate_generation,
                 manifest_checksum=candidate_checksum, source_map_digest=source_map_digest,
-                module_fingerprints=module_fingerprints, now=now)
+                producer=point_series_identity, now=now)
             if problem:
                 raise OneShotCompactionRefused(
                     f"refusing to publish: the point-series parity artifact {problem}. The "
@@ -682,6 +968,48 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
                     f"publication did not commit: {published.get('reason') or published}")
 
         # ---- ingest lock released; still under the compaction lock ------------------------
+        # From here the authority HAS changed, so every failure below -- a returned problem, a
+        # probe that raises, an unreadable manifest, a reader that throws -- must leave the
+        # generation classified. `_post_publish` does the work and this converts anything it
+        # raises into a quarantine, because an exception escaping unclassified is the exact
+        # state the next run would build on without noticing.
+        published_generation = int(published.get("generation") or 0)
+        predecessor = (published.get("predecessor_generation")
+                       if published.get("predecessor_generation") is not None
+                       else candidate.get("predecessor_generation"))
+        result["predecessor_generation"] = predecessor
+        try:
+            return _post_publish(
+                result=result, manifest_root=manifest_root, live_root=live_root,
+                wal_root=wal_root, anchor_root=anchor_root, monolith_path=monolith_path,
+                protected=protected, inventory_before=inventory_before,
+                remeasured=remeasured, source_map=source_map,
+                source_map_digest=source_map_digest, pre_gates=pre_gates, parity=parity,
+                api_parity=api_parity, api_identity=api_identity,
+                writer_fence_probe=writer_fence_probe, fence_before=fence_before,
+                fence_mid=fence_mid, clock=clock, capability=capability,
+                authorization_evidence=authorization_evidence, verdict=verdict,
+                deploy_sha=deploy_sha, run_id=run_id, operator=operator, at_utc=at_utc,
+                min_free_gib=min_free_gib, plan=plan, now=now)
+        except GenerationQuarantined:
+            raise
+        except QuarantineWriteFailed:
+            raise
+        except BaseException as failure:
+            _quarantine_or_fail_closed(
+                manifest_root, generation=published_generation,
+                predecessor_generation=predecessor, run_id=run_id, host=_hostname(),
+                operator=operator, reasons=f"{type(failure).__name__}: {failure}",
+                block_path=plan["out_path"], result=result, now=now, cause=failure)
+
+
+def _post_publish(*, result, manifest_root, live_root, wal_root, anchor_root, monolith_path,
+                  protected, inventory_before, remeasured, source_map, source_map_digest,
+                  pre_gates, parity, api_parity, api_identity, writer_fence_probe,
+                  fence_before, fence_mid, clock, capability, authorization_evidence, verdict,
+                  deploy_sha, run_id, operator, at_utc, min_free_gib, plan, now):
+    """Everything after the authority changed. Raising from here quarantines the generation."""
+    if True:
         clock.assert_still_held()
         live = bm.load_live(manifest_root)
         fence_after = writer_fence_probe()
@@ -702,7 +1030,7 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
             deploy_sha=deploy_sha, generation=int(live["generation"]),
             manifest_checksum=live["manifest_checksum"],
             source_map_digest=source_map_digest,
-            module_fingerprints=module_fingerprints, now=now)
+            producer=api_identity, now=now)
 
         evidence = {
             "host": _hostname(), "run_id": run_id,
@@ -768,21 +1096,12 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
             # authority change, and performing one in the failure path on the strength of a gate
             # this run could not satisfy is a second unreviewed change chasing the first. The
             # predecessor archive is immutable and intact, so a person can still roll back.
-            quarantine = quarantine_generation(
+            _quarantine_or_fail_closed(
                 manifest_root, generation=int(live["generation"]),
-                predecessor_generation=published.get("predecessor_generation")
-                or candidate.get("predecessor_generation"),
+                predecessor_generation=result.get("predecessor_generation"),
                 run_id=run_id, host=_hostname(), operator=operator,
-                reasons=problem, block_path=plan["out_path"], now=now)
-            result["quarantine"] = quarantine
-            raise GenerationQuarantined(
-                f"the post-compaction gates did not pass: {problem}. Generation "
-                f"{live['generation']} is published, NOT verified, and now QUARANTINED: nothing "
-                f"was deleted, no service was switched, and no finalization clearance was "
-                f"issued. The predecessor archive "
-                f"{quarantine['predecessor_archive']!r} is intact. Every publish, switch and "
-                f"finalization refuses until a person reconciles this and removes "
-                f"{quarantine_path(manifest_root)!r}")
+                reasons=problem, block_path=plan["out_path"], result=result, now=now,
+                cause=None)
 
         result["finalization_clearance"] = ex.issue_finalization_clearance(
             host=_hostname(), run_id=run_id, generation=int(live["generation"]),
@@ -805,25 +1124,75 @@ def _hostname() -> str:
     return socket.gethostname()
 
 
-def _check_approval(approval, *, live_root: str, run_id: str) -> Dict:
-    """A production approval scoped to compaction. Reuses the provisioning shape, not its scope."""
+#: Every field a compaction approval must carry.
+APPROVAL_FIELDS = ("scope", "approved_by", "approved_utc", "live_root", "run_id")
+
+
+def approval_problem(approval, *, live_root: str, run_id: str, now=None):
+    """The first thing wrong with a compaction approval, or `None`.
+
+    Each check is INDEPENDENT of its neighbours on purpose. An earlier version tested only
+    presence and equality, so `approved_by: True` and `approved_utc: "soon"` satisfied it — the
+    record looked complete because the fields it needed were there, and a field being there is
+    not the same as its value meaning anything.
+
+    `approved_utc` in particular carries weight: it is what places the approval before the run
+    rather than after it, and a string that does not parse cannot be placed anywhere."""
     if type(approval) is not dict:
-        raise OneShotCompactionRefused(
-            f"approval is {type(approval).__name__}, not a record")
-    if approval.get("scope") != COMPACTION_SCOPE:
-        raise OneShotCompactionRefused(
-            f"the approval declares scope {approval.get('scope')!r}; this needs "
-            f"{COMPACTION_SCOPE!r}. An approval to create roots is not an approval to publish "
-            f"a compaction generation over them")
-    for field in ("approved_by", "approved_utc", "live_root", "run_id"):
+        return (f"is {type(approval).__name__}, not a record")
+    for field in APPROVAL_FIELDS:
         if field not in approval:
-            raise OneShotCompactionRefused(f"the approval records no {field}")
+            return f"records no {field}"
+    if approval["scope"] != COMPACTION_SCOPE:
+        return (f"declares scope {approval['scope']!r}; this needs {COMPACTION_SCOPE!r}. An "
+                f"approval to create roots is not an approval to publish a compaction "
+                f"generation over them")
+    # Raw types, not truthiness. `True` is not a name, and `1` is not a run id.
+    #
+    # There is deliberately no separate "and it is not blank" pass here. Every one of these
+    # fields has its own check below that a blank value fails -- `approved_by` on length,
+    # `approved_utc` on parsing, `live_root` on being absolute, `run_id` on matching a run id
+    # that is itself required non-empty. A loop refusing blanks in front of those could not
+    # fire, and a mutation deleting it survived precisely because nothing depended on it.
+    for field in ("approved_by", "approved_utc", "live_root", "run_id"):
+        if type(approval[field]) is not str:
+            return (f"records {field}={approval[field]!r}, which is "
+                    f"{type(approval[field]).__name__} rather than a string")
+    if len(approval["approved_by"].split()) < 1 or len(approval["approved_by"].strip()) < 2:
+        return (f"records approved_by {approval['approved_by']!r}, which does not name anyone")
+    approved = ex._parse_utc(approval["approved_utc"])
+    if approved is None:
+        return (f"records approved_utc {approval['approved_utc']!r}, which is not a timestamp. "
+                f"An approval that cannot be placed in time cannot be placed before this run")
+    max_age_s, max_lead_s = ex._policy()
+    when = ex._now(now)
+    if (approved - when).total_seconds() > max_lead_s:
+        return (f"is dated {approval['approved_utc']}, which is in the future. An approval "
+                f"nobody could have given yet is not one")
+    if not os.path.isabs(approval["live_root"]):
+        return f"names live_root {approval['live_root']!r}, which is not an absolute path"
     if os.path.realpath(approval["live_root"]) != os.path.realpath(live_root):
-        raise OneShotCompactionRefused(
-            f"the approval names live_root {approval['live_root']!r}, not {live_root!r}")
+        return (f"names live_root {approval['live_root']!r}, not {live_root!r}")
     if approval["run_id"] != run_id:
-        raise OneShotCompactionRefused(
-            f"the approval is for run {approval['run_id']!r}, not {run_id!r}")
+        return f"is for run {approval['run_id']!r}, not {run_id!r}"
+    # Optional, and checked when present rather than ignored: an approval that carries an
+    # expiry means it.
+    if "expires_utc" in approval:
+        expires = ex._parse_utc(approval["expires_utc"])
+        if expires is None:
+            return (f"records expires_utc {approval['expires_utc']!r}, which is not a "
+                    f"timestamp")
+        if expires <= approved:
+            return "expires at or before it was approved, so it authorizes nothing"
+        if when >= expires:
+            return f"expired at {approval['expires_utc']}"
+    return None
+
+
+def _check_approval(approval, *, live_root: str, run_id: str, now=None) -> Dict:
+    problem = approval_problem(approval, live_root=live_root, run_id=run_id, now=now)
+    if problem:
+        raise OneShotCompactionRefused(f"the compaction approval {problem}")
     return approval
 
 
