@@ -366,15 +366,26 @@ storage, and the read-only checklist that establishes whether it has been met, a
 
 #### The one-shot exception is a detour around step 1, and only step 1
 
-A human has accepted the risk of running **one** compaction before that mount layout exists,
+A human has accepted the risk of running **one** operation before that mount layout exists,
 because VM24 has full automated VM backups. It changes exactly one thing about the path above:
-step 7 may be reached once without step 1. Steps 2–6 are untouched, and each still needs its own
-approval.
+**step 5 may be reached once without step 1.** Steps 2–4 and 6 are untouched, and each still
+needs its own approval.
 
-It is a **record**, not a flag — bound to one host, one run, one monolith at one measured state,
-one verified backup and one expiry — and it is reported in its own field,
+**It does not reach step 7.** The record names the operation it authorizes, and the only one
+implemented is `provision_generation_one` — publishing a `legacy_base` manifest over the
+monolith, which prunes, swaps, deletes and switches nothing. The compaction family is refused
+*by name*, because no one-shot entry point exists for it and therefore nothing would enforce the
+post-compaction gates; `post_compaction_enforcement()` reports `NOT_ADJUDICATED` rather than
+letting a callable checker imply that something runs it. A one-shot *compaction* needs that
+entry point built first.
+
+It is a **record**, not a flag — bound to one host, one run, one operation, one monolith at one
+measured state, one attested backup and one expiry — and it is reported in its own field,
 `one_shot_compaction_exception`. It never makes `monolith_barrier` READY and never makes
 `compaction_ready` true; an eligible exception beside a `BLOCKED` barrier is the expected shape.
+The store is measured by the **operation**, at the point it acts — there is no parameter for a
+caller to supply one — and the readiness assessor, which reads a collected document, can never
+report `eligible` at all.
 The backup makes a failure **recoverable**, not unlikely, and restoring it rolls back the whole
 machine, loses delta days and WAL repairs in the interval, and cannot recall answers already
 served. §6a of the requirement document holds the binding table, the pre- and post-compaction

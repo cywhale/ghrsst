@@ -52,15 +52,32 @@ produce a valid anchor should learn it before roots exist, not after.
 
 ## The one-shot exception, if one is supplied
 
-`one_shot_exception` is a human risk acceptance for **one** compaction without the read-only
-mount barrier — a record, not a flag, and this operation is stricter with it than with anything
-else it is handed. There is no `force`, `skip_seal`, `allow_unsealed` or `require_sealed=False`
-parameter and no environment variable; a test asserts none appears. Supplying a record that does
-not hold **refuses the whole run** rather than warning, and the `subject_realpath` the record is
-checked against comes from this operation's own `monolith_path`, never from the caller's
-evidence: a record and an `observed` that agree with each other prove only that whoever
-assembled them was consistent, not that either describes the store about to be published over.
-See `ops/p5_oneshot_exception.py` and §6a of `specs/p5_monolith_mount_barrier_requirement.md`.
+`one_shot_exception` is a human risk acceptance for **one** run of THIS operation over a
+still-writable monolith. It is a record, not a flag, and this operation is stricter with it than
+with anything else it is handed. There is no `force`, `skip_seal`, `allow_unsealed` or
+`require_sealed=False` parameter and no environment variable; a test asserts none appears.
+
+Three things about it are worth stating plainly, because each was wrong in an earlier revision:
+
+* **It authorizes provisioning, not compaction.** Publishing generation 1 over the monolith
+  prunes nothing, swaps nothing, deletes nothing and switches nothing. The record must name
+  `provision_generation_one`; the compaction family is refused by name, because no one-shot
+  entry point exists for it and therefore nothing would enforce the post-compaction gates.
+* **There is no `one_shot_observed` parameter.** A measurement supplied alongside the record
+  proves only that whoever assembled the pair was consistent. The store is measured HERE, under
+  both locks, by `p5_oneshot_exception.authorize_unsealed()`, which takes no measurement
+  argument and compares what it finds against the record AND the same-run preflight.
+* **The fence widens.** On the sealed path the ingest lock covers the publish alone, because a
+  sealed store cannot change during the scan. Under an authorization the store CAN change, so
+  the ingest lock is taken before the expensive prepare and held through the publish, with the
+  compaction lock still outermost. A one-time writer count is not a fence and is not treated as
+  one.
+
+What the authorization buys is detection, not prevention: `validate_prepared()` re-verifies the
+full content ledger before publishing, which catches a store that changed but cannot stop one
+changing, and cannot see a write landing during its own traversal. That residue is a property of
+the writable layout, and it is why the read-only mount remains the stronger route. See
+`ops/p5_oneshot_exception.py` and §6a of `specs/p5_monolith_mount_barrier_requirement.md`.
 
 ## Interruption: recoverable, NOT atomic
 
@@ -366,7 +383,6 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
                          run_id: str, operator: str, at_utc: str,
                          min_free_gib: float,
                          one_shot_exception: Optional[Dict] = None,
-                         one_shot_observed: Optional[Dict] = None,
                          one_shot_pre_compaction: Optional[Dict] = None,
                          cleanup_on_failure: bool = True) -> Dict:
     """Create the P5 roots, publish generation 1 over the monolith, initialize the WAL.
@@ -395,22 +411,19 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
                              ingest_lock_path=ingest_lock_path)
     # There is NO `force`, `skip_seal`, `allow_unsealed` or `require_sealed=False` here, and a
     # test asserts none appears. The only way past a monolith that is not sealed is a complete
-    # record bound to this host, this run, this monolith's current state, a verified backup and
-    # an expiry -- validated field by field, refusing on any mismatch.
-    exception_verdict = None
+    # record bound to this host, this run, this operation, this monolith's state as measured at
+    # the execution point, an attested backup and an expiry -- refusing on any mismatch.
+    #
+    # What happens HERE is only a fail-fast on the operation name, so a record naming the
+    # compaction family is refused before any root is created rather than after. The binding
+    # that authorizes anything is established LATER, under both locks, by `authorize_unsealed()`
+    # measuring the store itself -- see `_create_roots`.
     if one_shot_exception is not None:
-        # `subject_realpath` comes from THIS operation's own monolith_path, not from the
-        # caller's evidence: a record and an `observed` that agree with each other prove only
-        # that whoever assembled them was consistent.
-        exception_verdict = p5_oneshot_exception.evaluate(
-            record=one_shot_exception, host=socket.gethostname(), run_id=run_id,
-            observed=one_shot_observed,
-            subject_realpath=os.path.realpath(monolith_path),
-            pre=one_shot_pre_compaction)
-        if not exception_verdict["eligible"]:
+        problem = p5_oneshot_exception.operation_problem(
+            one_shot_exception.get("operation") if type(one_shot_exception) is dict else None)
+        if problem:
             raise ProductionProvisionRefused(
-                f"the one-shot compaction exception does not hold: "
-                f"{exception_verdict['problems']}")
+                f"the one-shot exception record {problem}")
 
     manifest_root = os.path.join(live_root, MANIFEST_DIRNAME)
     wal_root = os.path.join(live_root, WAL_DIRNAME)
@@ -463,12 +476,17 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
     created: List[str] = []
     contested: List[str] = []
     published: Dict = {}
+    exception_verdict: Dict = {}
+    lock_report: Dict = {}
     try:
         _create_roots(live_root=live_root, manifest_root=manifest_root, wal_root=wal_root,
                       capacity=capacity, locks=locks, run_id=run_id, created=created,
                       contested=contested, marker_path=marker_path, stamp=stamp,
                       monolith_path=monolith_path, anchor=anchor, at_utc=at_utc,
-                      operator=operator, published=published)
+                      operator=operator, published=published,
+                      one_shot_exception=one_shot_exception,
+                      one_shot_pre_compaction=one_shot_pre_compaction,
+                      exception_verdict=exception_verdict, lock_report=lock_report)
         # The completion write is INSIDE the recovery path. Outside it, a failure here left the
         # roots on disk under a marker still saying `created_paths: []` and `complete: false` --
         # a marker that authorized removing nothing while two directories existed.
@@ -486,13 +504,11 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
         "anchor_root": anchor["anchor_root"], "anchor_domain_id": anchor["domain_id"],
         "created_paths": list(created), "marker": marker, "marker_path": marker_path,
         "monolith_path": os.path.realpath(monolith_path),
-        "locks": {**locks, "order": ("compaction lock held across creation; ingest lock NOT "
-                                     "taken -- §7.1b scopes it to the publish critical "
-                                     "section and this operation publishes nothing")},
+        "locks": {**locks, "order": lock_report.get("fence")},
         "capacity_at_start": capacity, "anchor_verified": anchor,
         "approved_by": approval["approved_by"], "approved_utc": approval["approved_utc"],
         "provisioned_utc": at_utc, "operator": operator,
-        "one_shot_exception": exception_verdict,
+        "one_shot_exception": exception_verdict or None,
         "manifest_published": True, "wal_initialized": True,
         "generation": published.get("generation"),
         "generation_id": published.get("generation_id"),
@@ -508,13 +524,32 @@ def provision_production(*, live_root: str, anchor_root: str, approval: Dict,
 
 def _create_roots(*, live_root, manifest_root, wal_root, capacity, locks, run_id, created,
                   contested, marker_path, stamp, monolith_path, anchor, at_utc, operator,
-                  published) -> None:
+                  published, one_shot_exception=None, one_shot_pre_compaction=None,
+                  exception_verdict=None, lock_report=None) -> None:
     """Roots, generation 1 and the WAL, under §7.1b ordering.
 
+    SEALED path — the ingest lock fences the publish alone:
+
         flock(p5_compaction.lock, LOCK_EX)  ->  create roots
+           ->  prepare (expensive, unfenced: the store cannot change)
            ->  acquire ingest lock  ->  assert compaction lock still held
            ->  publish generation 1  ->  release ingest lock
            ->  initialize the WAL  ->  release compaction lock
+
+    ONE-SHOT UNSEALED path — the same ordering, wider scope, because the store CAN change:
+
+        flock(p5_compaction.lock, LOCK_EX)  ->  create roots
+           ->  acquire ingest lock            <-- BEFORE the scan, not after
+           ->  assert compaction lock still held
+           ->  measure the monolith HERE and mint the single-use capability
+           ->  prepare (expensive)  ->  publish generation 1
+           ->  release ingest lock
+           ->  initialize the WAL  ->  release compaction lock
+
+    The compaction lock stays outermost in both. What changes is how much of the critical
+    section the ingest lock covers, and it changes for a reason that is a property of the
+    store, not a preference: a scan of a store that can be appended to during the scan
+    describes a store that no longer exists by the time the manifest naming it is published.
     """
     holder = f"p5_prod_provision/{run_id}"
     with compaction_lock.CompactionLock(locks["compaction"], holder=holder) as clock:
@@ -551,23 +586,83 @@ def _create_roots(*, live_root, manifest_root, wal_root, capacity, locks, run_id
             # list as well.
             _write_marker(marker_path, {**stamp, "created_paths": list(created)})
 
-        # Everything expensive happens HERE, under the compaction lock and OUTSIDE the ingest
-        # lock. `content_ledger()` walks every file in the monolith; on ~2 TB that is minutes
-        # of stat calls, and it was running inside the ingest lock -- so the daily-append cron
-        # would have blocked behind a scan that has nothing to do with it.
-        prepared = p5_legacy_base.prepare_generation_one(
-            monolith_path=monolith_path, manifest_root=manifest_root,
-            at_utc=at_utc, operator=operator)
+        if one_shot_exception is None:
+            # ---- SEALED PATH, unchanged --------------------------------------------------
+            # Everything expensive happens HERE, under the compaction lock and OUTSIDE the
+            # ingest lock. `content_ledger()` walks every file in the monolith; on ~2 TB that
+            # is minutes of stat calls, and it was running inside the ingest lock -- so the
+            # daily-append cron would have blocked behind a scan that has nothing to do with
+            # it. The store cannot change under a seal, so the fence is not needed for it.
+            prepared = p5_legacy_base.prepare_generation_one(
+                monolith_path=monolith_path, manifest_root=manifest_root,
+                at_utc=at_utc, operator=operator)
+            lock_report["fence"] = (
+                "compaction lock outermost across everything; ingest lock held across the "
+                "PUBLISH ONLY (§7.1b). The monolith is sealed, so the expensive scan needs no "
+                "fence and the daily-append cron is not blocked behind it")
 
-        # The publish critical section: a final cheap validation and the authority change, and
-        # nothing else. This is the only moment ingest must be excluded from.
-        with compaction_lock.CompactionLock(locks["ingest"],
-                                            holder=f"{holder}/publish") as ingest:
-            clock.assert_still_held()
-            published.update(p5_legacy_base.publish_prepared(prepared))
-        # The `with` block above is what releases the ingest lock, and it ends here -- before
-        # the WAL is initialized. An explicit `release()` as the block's last statement was
-        # redundant: removing it changed nothing, which is why a mutation deleting it survived.
+            # The publish critical section: a final cheap validation and the authority change,
+            # and nothing else. This is the only moment ingest must be excluded from.
+            with compaction_lock.CompactionLock(locks["ingest"],
+                                                holder=f"{holder}/publish"):
+                clock.assert_still_held()
+                published.update(p5_legacy_base.publish_prepared(prepared))
+            # The `with` block above is what releases the ingest lock, and it ends here --
+            # before the WAL is initialized. An explicit `release()` as the block's last
+            # statement was redundant: removing it changed nothing, which is why a mutation
+            # deleting it survived.
+        else:
+            # ---- ONE-SHOT UNSEALED PATH ---------------------------------------------------
+            # The monolith is WRITABLE. Two things follow, and neither is optional.
+            #
+            # 1. The fence must cover the whole scan-to-publish interval, not just the publish.
+            #    A store that can be appended to during a minutes-long ledger walk yields a
+            #    manifest describing a store that no longer exists. So the ingest lock is taken
+            #    BEFORE the prepare and held through the publish, with the compaction lock
+            #    still outermost -- the §7.1b ordering is preserved, its SCOPE is widened.
+            #    The cost is real: the daily-append cron blocks for the whole walk. That cost
+            #    is what the sealed path does not pay and this one must.
+            #
+            # 2. The measurement is taken HERE, by this code, inside that fence. A caller
+            #    cannot supply it -- `provision_production` has no parameter for one -- because
+            #    a record and an `observed` that agree prove only that whoever assembled them
+            #    was consistent.
+            lock_report["fence"] = (
+                "compaction lock outermost across everything; ingest lock held from BEFORE "
+                "the expensive prepare THROUGH the publish. The monolith is writable under a "
+                "one-shot authorization, so the scan interval needs the same fence as the "
+                "publish -- and the daily-append cron blocks for the whole walk")
+            with compaction_lock.CompactionLock(locks["ingest"],
+                                                holder=f"{holder}/oneshot-scan-to-publish"):
+                clock.assert_still_held()
+                # Measured and adjudicated under both locks. `authorize_unsealed` takes no
+                # measurement argument: it calls `measure_monolith()` itself.
+                capability, verdict = p5_oneshot_exception.authorize_unsealed(
+                    record=one_shot_exception, host=socket.gethostname(), run_id=run_id,
+                    operation=p5_oneshot_exception.OP_PROVISION,
+                    monolith_path=monolith_path, pre=one_shot_pre_compaction,
+                    expected_dev=capacity["filesystem_dev"])
+                exception_verdict.update(verdict)
+                # There is deliberately NO `capability.matches(host, run_id)` check here.
+                # `authorize_unsealed` was handed this host and this run two statements above
+                # and minted the capability from them, so the comparison could only ever be
+                # true -- a branch that cannot fire is not a guard, and keeping one invites the
+                # belief that something is being checked. The binding that DOES the work is
+                # inside the mint, where the RECORD's host and run are checked against the
+                # caller's real ones. `matches()` remains for a caller that receives a
+                # capability it did not mint.
+                prepared = p5_legacy_base.prepare_generation_one(
+                    monolith_path=monolith_path, manifest_root=manifest_root,
+                    at_utc=at_utc, operator=operator,
+                    unsealed_authorization=capability)
+                clock.assert_still_held()
+                # `validate_prepared` inside `publish_prepared` re-verifies the FULL content
+                # ledger on this path, which is the second expensive walk. It detects a store
+                # that changed; it cannot prevent one, and it cannot see a write landing during
+                # its own traversal. That residue belongs to the writable layout.
+                published.update(p5_legacy_base.publish_prepared(prepared))
+            exception_verdict["fence"] = lock_report["fence"]
+            exception_verdict["capability_consumed"] = capability.consumed
 
         # After the publish, still under the compaction lock: `initialize_wal` binds to the
         # authority that now exists and reads it through `load_live()`.

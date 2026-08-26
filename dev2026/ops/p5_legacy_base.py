@@ -162,8 +162,8 @@ def check_monolith_sealed(monolith_path: str) -> Dict:
 
 def prepare_generation_one(*, monolith_path: str, manifest_root: str, at_utc: str,
                            operator: str, generation_id: Optional[str] = None,
-                           require_sealed: bool = True) -> Dict:
-    """Everything expensive, done OUTSIDE any lock the ingest path needs.
+                           unsealed_authorization=None) -> Dict:
+    """Everything expensive, done OUTSIDE any lock the ingest path needs — on the sealed path.
 
     `inspect_store_contract()` reads the store's metadata and `content_ledger()` walks every
     file in it. On a ~2 TB monolith the second is minutes of `stat` calls, and it was running
@@ -173,8 +173,44 @@ def prepare_generation_one(*, monolith_path: str, manifest_root: str, at_utc: st
 
     So this prepares; `publish_prepared()` publishes. Between the two the monolith could in
     principle change, which is what `check_monolith_sealed()` and the final validation in
-    `publish_prepared()` are for."""
-    seal_evidence = check_monolith_sealed(monolith_path) if require_sealed else None
+    `publish_prepared()` are for.
+
+    ## `unsealed_authorization`
+
+    There is no `require_sealed=False`. That parameter existed, had no caller that ever passed
+    `False`, and was therefore a bypass sitting unused with the door open; it is gone.
+
+    What replaces it is a **capability**, not a flag:
+    `p5_oneshot_exception.UnsealedMonolithAuthorization`, which a caller cannot construct,
+    cannot serialize, and cannot use twice. It is minted only after that module has measured
+    the store itself and found the record, the preflight evidence and the measurement to agree.
+    Presented here, it is CONSUMED — so the same object cannot authorize a second preparation —
+    and the seal check is replaced by its evidence rather than skipped silently.
+
+    When one is in play the caller MUST hold the ingest lock across this call and the publish,
+    and `validate_prepared()` re-verifies the full content ledger rather than metadata alone.
+    Both follow from the store being writable: on the sealed path neither is needed, and the
+    sealed path is unchanged."""
+    seal_evidence = None
+    unsealed_evidence = None
+    if unsealed_authorization is None:
+        seal_evidence = check_monolith_sealed(monolith_path)
+    else:
+        # Consumed here, at the point of use. `consume()` re-checks host, run, operation, store
+        # and expiry, so a capability minted for something else is refused at the door.
+        from ops import p5_oneshot_exception
+        if not isinstance(unsealed_authorization,
+                          p5_oneshot_exception.UnsealedMonolithAuthorization):
+            raise LegacyBaseRefused(
+                f"unsealed_authorization is {type(unsealed_authorization).__name__}, not an "
+                f"UnsealedMonolithAuthorization. A truthy value is not a capability, and this "
+                f"is the one place where accepting one would make it a flag after all")
+        # Only what this code genuinely knows: the operation it performs and the store it is
+        # about to describe. Host and run were bound at the mint and are checked by the
+        # provisioner, which knows them; a capability asked to vouch for its own run would.
+        unsealed_evidence = unsealed_authorization.consume(
+            operation=p5_oneshot_exception.OP_PROVISION,
+            subject_realpath=monolith_path)
     if not os.path.isdir(manifest_root):
         raise LegacyBaseRefused(
             f"manifest_root {manifest_root!r} is not an existing directory; this builds a "
@@ -217,7 +253,9 @@ def prepare_generation_one(*, monolith_path: str, manifest_root: str, at_utc: st
         "manifest_root": manifest_root,
         "monolith_path": os.path.realpath(monolith_path),
         "seal_evidence": seal_evidence,
-        "require_sealed": require_sealed,
+        # Exactly one of these is set, and which one decides how `validate_prepared()` behaves.
+        # A prepared record carrying neither describes a store nothing checked.
+        "unsealed_authorization": unsealed_evidence,
         # What the cheap final validation re-checks. Deliberately NOT the content ledger: that
         # is the expensive walk this refactor exists to keep out of the ingest lock.
         "recheck": {
@@ -243,7 +281,9 @@ def prepare_generation_one(*, monolith_path: str, manifest_root: str, at_utc: st
 
 
 def validate_prepared(prepared: Dict) -> None:
-    """The final check, immediately before the publish. CHEAP by construction.
+    """The final check, immediately before the publish.
+
+    ## On the sealed path: CHEAP by construction
 
     Between `prepare_generation_one()` and here the monolith could in principle have changed,
     so something has to look again — but re-walking every file would put the expensive scan
@@ -252,9 +292,36 @@ def validate_prepared(prepared: Dict) -> None:
 
     What it therefore does not re-verify is the content ledger. That gap is closed by the
     monolith being sealed, not by this function, and `check_monolith_sealed()` is what refuses
-    a store that is not."""
+    a store that is not.
+
+    ## Under an unsealed authorization: the ledger IS re-verified
+
+    Nothing closes that gap when the store is writable, so the expensive walk is paid a second
+    time here. It costs another full traversal inside the fence, and the fence is already held
+    across the whole prepare on that path — which is the trade the exception buys.
+
+    It **detects** a change; it does not prevent one, and it cannot see a write that lands
+    during its own traversal. That residual window is a property of the writable layout, not of
+    this check, and it is the reason the read-only mount remains the stronger route."""
     monolith = prepared["monolith_path"]
-    if prepared.get("require_sealed"):
+    unsealed = prepared.get("unsealed_authorization")
+    if unsealed is None and prepared.get("seal_evidence") is None:
+        raise LegacyBaseRefused(
+            f"the prepared generation for {monolith!r} carries neither seal evidence nor an "
+            f"unsealed authorization; it describes a store nothing checked")
+    if unsealed is not None:
+        # The whole reason this path exists: the store may have been written to, and only the
+        # ledger sees a value rewritten in place inside an existing day.
+        seal = prepared.get("content_seal")
+        problem = block_manifest.verify_content_seal(monolith, seal) if seal else \
+            "the prepared generation records no content_seal to re-verify"
+        if problem:
+            raise LegacyBaseRefused(
+                f"{monolith!r} changed between preparation and publish under a one-shot "
+                f"unsealed authorization: {problem}. The authorization accepted the RISK of a "
+                f"writable store; it did not accept publishing a manifest that describes a "
+                f"store which no longer matches it")
+    else:
         now = check_monolith_sealed(monolith)
         was = prepared.get("seal_evidence") or {}
         if now["mode"] != was.get("mode"):
@@ -297,13 +364,18 @@ def publish_prepared(prepared: Dict) -> Dict:
 
 
 def build_generation_one(*, monolith_path: str, manifest_root: str, at_utc: str,
-                         operator: str, generation_id: Optional[str] = None,
-                         require_sealed: bool = True) -> Dict:
-    """Prepare and publish in one call, for a caller holding no locks.
+                         operator: str, generation_id: Optional[str] = None) -> Dict:
+    """Prepare and publish in one call, for a caller holding no locks. SEALED path only.
 
     `ops/p5_prod_provision.py` does NOT use this: it prepares outside the ingest lock and
-    publishes inside, which is the whole point of the split."""
+    publishes inside, which is the whole point of the split.
+
+    It takes no `unsealed_authorization`, and that is deliberate rather than an omission. Under
+    an authorization the caller MUST hold the ingest lock across the prepare and the publish —
+    a lock this function neither takes nor could take on the caller's behalf, since it does not
+    know the live root. Offering the parameter here would offer the unsealed path without its
+    fence, which is the combination the exception exists to make impossible."""
     prepared = prepare_generation_one(
         monolith_path=monolith_path, manifest_root=manifest_root, at_utc=at_utc,
-        operator=operator, generation_id=generation_id, require_sealed=require_sealed)
+        operator=operator, generation_id=generation_id)
     return publish_prepared(prepared)

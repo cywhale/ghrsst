@@ -1709,7 +1709,14 @@ def _one_shot_exception(target: Dict, results: List[Dict], now=None) -> Dict:
     Eligibility here NEVER implies readiness. `monolith_barrier` keeps whatever verdict it
     earned, `compaction_ready` keeps whatever value it had, and this field says only that a
     person bound an acceptance to this host, this run and this monolith state, and that the
-    fresh operational checks passed."""
+    fresh operational checks passed.
+
+    And this reporter can never make it `eligible`, whatever the evidence says. The assessor
+    reads a collected target -- a JSON document -- so every measurement in it is caller-supplied
+    by construction, and `evaluate()` refuses to authorize on one. What a green record shows
+    here is `eligible_pending_recomputation`: everything a document CAN establish holds, and the
+    measurement the operation must take for itself has not been taken. A report is not an
+    authorization, and this is the field that would have blurred the two."""
     from ops import p5_oneshot_exception as ex
     record = target.get("one_shot_exception")
     if record is None:
@@ -1718,6 +1725,8 @@ def _one_shot_exception(target: Dict, results: List[Dict], now=None) -> Dict:
                          "Compaction waits for the read-only mount barrier")}
     verdict = ex.evaluate(
         record=record, host=target.get("host"), run_id=target.get("run_id"),
+        operation=(record.get("operation") if type(record) is dict else None)
+        or ex.OP_PROVISION,
         observed=target.get("monolith_state"), pre=target.get("pre_compaction"),
         post=target.get("post_compaction"), now=now)
     verdict["supplied"] = True

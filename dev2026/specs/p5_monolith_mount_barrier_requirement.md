@@ -233,32 +233,95 @@ the record as meaningful, and they belong in the run's notes.
 
 ## 6a. The one-shot exception path, and what it does not buy
 
-A human has accepted the risk of running **one** compaction without this barrier, because VM24
-has full automated VM backups. That is a claim about **recoverability**, not about likelihood,
-and nothing in the code treats it as the latter. It does not weaken anything in §1–§5: the
-requirement above stands, and the read-only mount remains the preferred and stronger route.
+A human has accepted the risk of running **one** operation over a still-writable monolith,
+because VM24 has full automated VM backups. That is a claim about **recoverability**, not about
+likelihood, and nothing in the code treats it as the latter. It does not weaken anything in
+§1–§5: the requirement above stands, and the read-only mount remains the preferred and stronger
+route.
 
-The acceptance is a **record**, not a flag. There is no `force`, no `skip_seal`, no
-`allow_unsealed`, no `require_sealed=False` and no environment variable — a test asserts none
-exists — because every one of those is reusable by the next caller who finds it and unauditable
-afterwards. The record binds to:
+### It authorizes provisioning, not compaction
+
+The record names an `operation`, and the only one implemented is `provision_generation_one` —
+publishing a `legacy_base` manifest over the monolith. That **prunes, swaps, deletes and
+switches nothing.** The compaction family (`compaction`, `build_blocks`, `prune`, `swap`,
+`delete`, `switch`) is refused *by name*, with its own message, because no one-shot entry point
+exists for any of it.
+
+That matters for the gates below: `post_compaction_problem()` is callable, and **no operation
+enforces them**, because there is no operation under this exception that can prune, swap, delete
+or switch. A gate invoked by nothing constrains nothing, and `post_compaction_enforcement()`
+reports `NOT_ADJUDICATED` rather than letting the existence of a checker imply that something
+runs it. Before a one-shot *compaction* can be approved, that entry point has to exist and has
+to refuse unless every gate passes.
+
+### It is a **record**, not a flag — and what opens the door is a capability
+
+There is no `force`, no `skip_seal`, no `allow_unsealed`, no `require_sealed=False` and no
+environment variable — a test asserts none exists. `require_sealed` was removed from
+`ops/p5_legacy_base.py` outright: it had no caller that ever passed `False`, so it was a bypass
+sitting unused with the door open.
+
+What opens the unsealed path is an `UnsealedMonolithAuthorization`: an object a caller **cannot
+construct**, cannot pickle or copy, and cannot use twice. It is minted only by
+`authorize_unsealed()`, after the whole chain below passes, and it is **consumed by its single
+use**. A truthy stand-in is refused at the door — that is the one place where accepting a
+duck-typed value would make it a flag after all.
+
+The record binds to:
 
 | bound to | refused when |
 |---|---|
 | `scope` = one-shot compaction risk acceptance | it approves anything else |
+| `operation` | it names anything but `provision_generation_one` — the compaction family by name |
 | `host`, `run_id` | another machine, or another run — **one-shot means one run** |
 | `monolith_realpath`, `monolith_metadata_fingerprint`, `monolith_day_digest`, `monolith_content_ledger` | the store changed after the risk was accepted |
-| `backup_id`, `backup_completed_utc`, `backup_verified`, `backup_retention_ref` | unverified, or completed *after* the approval was signed |
-| `expires_utc` | now is past it, or it expires at or before approval |
+| `backup_id`, `backup_completed_utc`, `backup_verified`, `backup_retention_ref` | unattested, or completed *after* the approval was signed |
+| `expires_utc` | now is past it, it expires at or before approval, or it outlives the capacity reading it rests on |
 | `approved_by`, `approved_utc`, `reason` | the reason is not written in words a reviewer can weigh |
 
-Verification against the record alone is refused: a fresh measurement of the monolith must be
-supplied, or the record is only being checked against itself.
+### The measurement is taken, not accepted
 
-Nor is a self-consistent pair enough. The record and the measurement agreeing proves only that
-whoever assembled them was consistent — both could describe a store this run is not touching.
-So the **operation** supplies the realpath it is about to publish over, from its own argument,
-and a record naming a different store is refused however well it matches its own evidence.
+Verification against the record alone is refused: a fresh measurement of the monolith is
+required, or the record is only being checked against itself.
+
+Nor is a self-consistent pair enough. The record and a supplied measurement agreeing proves only
+that whoever assembled them was consistent — both could describe the store as it *was*. So there
+is no `one_shot_observed` parameter anywhere: the **operation** measures the store itself, at the
+point it acts, under both locks, and compares what it finds against the record *and* the
+same-run preflight. A record naming a different store is refused however well it matches its own
+evidence.
+
+The consequence for reporting: `ops/p5_readiness.py` reads a collected JSON document, so every
+measurement it sees is caller-supplied by construction. Its verdict is therefore **never**
+`eligible` — a green record shows `eligible_pending_recomputation`. A report is not an
+authorization.
+
+### The fence widens, because the store can move
+
+On the sealed path the ingest lock covers the **publish alone**: the store cannot change during
+the expensive scan, and blocking the daily-append cron behind a minutes-long walk was a real
+defect that was fixed. Under an authorization the store **can** change, so the ingest lock is
+taken **before** the expensive scan and held through the publish, with the compaction lock still
+outermost. §7.1b ordering is preserved; its *scope* widens. **A one-time writer count is not a
+fence** and is not treated as one — the count is required, and it is the lock that does the
+excluding.
+
+The cost is real and is the trade the exception buys: the daily-append cron blocks for the whole
+walk.
+
+Before publishing, the **full content ledger is re-verified** — the second expensive walk. It
+*detects* a store that changed; it does not prevent one, and it cannot see a write landing during
+its own traversal. That residual window belongs to the writable layout, not to the check, and it
+is why the read-only mount is the stronger route.
+
+### The backup is attested, not proven
+
+`backup_verified: true` is a person's word. Nothing available to this process can reach the
+hypervisor's backup catalogue, mount the image, or confirm a restore would succeed, so it is
+reported as **NOT_ADJUDICATED** — the same treatment `immutable: true` gets in a segment.
+The backup id and the verification provenance are bound to the record and to the run, so the run
+is covered by the backup the risk was accepted against and not some other one; that binding is
+checkable, and the restore working is not.
 
 ### It never becomes readiness
 
@@ -270,17 +333,19 @@ claims.
 
 ### The surrounding checks are not relaxed
 
-**Before**: fresh capacity and device binding · current healthz/latest · identity on a clean
-reviewed commit · process/PM2/cron quiescence · **no process holds the monolith for writing** ·
-compaction and ingest lock state · fresh monolith fingerprints and content ledger · the verified
-backup · the exact source map and destination manifest plan.
+**Before**, each a validated result bound to this host, this run and a collection time, not a
+field that merely exists: fresh capacity within the canonical window and bound to the device
+this run writes to · current healthz status and served day · identity on a clean reviewed commit
+· process/PM2/cron quiescence · **no process holds the monolith for writing** · both locks free
+· fresh monolith fingerprints and content ledger matching the record · the attested backup ·
+the exact source map and destination manifest plan.
 
-**After**, all of which must pass **before anything is deleted or any service is switched**:
-manifest checksum and generation · WAL/anchor binding · source-map completeness · base/delta
-disjointness · point-series parity against the monolith oracle **including the first and last
-days** · API response parity · a fresh capacity measurement · and an explicit
-`nothing_deleted: true`. The ordering is the point — a parity failure found after the old data
-is gone is a parity failure with nothing to go back to.
+**After** — for a compaction, once one exists — all of which must pass **before anything is
+deleted or any service is switched**: manifest checksum and generation · WAL/anchor binding ·
+source-map completeness · base/delta disjointness · point-series parity against the monolith
+oracle **including the first and last days** · API response parity · a fresh capacity
+measurement · and an explicit `nothing_deleted: true`. The ordering is the point — a parity
+failure found after the old data is gone is a parity failure with nothing to go back to.
 
 ### Rollback limits
 
