@@ -346,6 +346,14 @@ REQUIREMENTS: List[Dict] = [
      "title": "the reviewed commit, checked out clean and detached",
      "why": ("a compaction is run BY code. If the deployed tree is not exactly the reviewed "
              "commit, the review adjudicated something else.")},
+    {"id": "monolith_barrier", "evidence_kind": "measurement",
+     "title": "the legacy monolith on a genuinely read-only mount, beside writable P5 paths",
+     "why": ("a `legacy_base` generation 1 makes the monolith the served authority, and "
+             "`content_seal` only DETECTS that it changed -- after the fact, and blind to a "
+             "write that restores size and mtime. The barrier that stops it changing is "
+             "operational: a read-only mount. No code can arrange that, so this adjudicates "
+             "collected evidence of it, and the P5 roots, WAL and delta must stay writable on "
+             "a different mount or the deployment cannot ingest at all.")},
     {"id": "deployment_tools", "evidence_kind": "preflight",
      "title": "the operator tools the deployment must carry, at the commit it reports",
      "why": ("provisioning the P5 roots is a prerequisite for every store requirement below, "
@@ -1037,6 +1045,133 @@ def _check_identity(t: Dict) -> tuple:
                    f"recomputed from the approved commit and matched")
 
 
+#: Fields a mount-barrier record must carry. Collected on the host by `findmnt` and `stat`;
+#: this module ADJUDICATES that record and cannot establish any of it for a remote filesystem.
+MOUNT_BARRIER_FIELDS = ("monolith_path", "monolith_realpath", "source", "target", "fstype",
+                        "options", "device", "run_id", "host", "collected_utc")
+
+#: The paths that must stay WRITABLE while the monolith is frozen. A deployment whose P5 roots
+#: and delta went read-only with it cannot ingest, cannot repair and cannot compact -- so the
+#: barrier is only meaningful if it is selective.
+MOUNT_BARRIER_WRITABLE_ROLES = ("p5_blocks", "p5_repairs", "delta")
+
+
+def _mount_is_read_only(options) -> bool:
+    """Is this mount read-only, by its option list? By exact token, never by substring.
+
+    `"rw,relatime"` contains no standalone `ro`, but a substring test for `"ro"` finds one
+    inside `relatime` -- and would call a writable mount frozen."""
+    if type(options) is not str:
+        return False
+    return "ro" in [tok.strip() for tok in options.split(",")]
+
+
+def mount_barrier_problem(evidence, *, run_id=None, host=None, now=None):
+    """The first thing wrong with a mount-barrier record, or `None`.
+
+    Adjudicates COLLECTED evidence. Nothing here can look at VM24's mount table; what it can do
+    is refuse a record that is absent, malformed, stale, about another host or run, or that
+    describes a mount which is not actually read-only."""
+    import datetime
+    if type(evidence) is not dict:
+        return (f"is {type(evidence).__name__}, not a record; a barrier nobody measured is not "
+                f"a barrier")
+    for field in MOUNT_BARRIER_FIELDS:
+        if field not in evidence:
+            return f"records no {field}"
+        if field == "device":
+            if type(evidence[field]) is bool or not isinstance(evidence[field], int):
+                return f"records device {evidence[field]!r}, which is not a device number"
+        elif not _exact_nonempty_str(evidence[field]):
+            return f"records {field} {evidence[field]!r}, which is not a non-empty string"
+
+    if evidence["monolith_path"] != evidence["monolith_realpath"]:
+        return (f"names {evidence['monolith_path']!r} but it resolves to "
+                f"{evidence['monolith_realpath']!r}. A symlinked monolith can be re-pointed "
+                f"without the record changing, so the path that is frozen and the path that is "
+                f"served would be different questions")
+    if not _mount_is_read_only(evidence["options"]):
+        return (f"reports mount options {evidence['options']!r} for {evidence['target']!r}, "
+                f"which is not read-only. Permission bits are not this check: `chmod` is "
+                f"reversible by anything with write access to the parent, and a root process "
+                f"ignores it entirely")
+    if not evidence["monolith_realpath"].startswith(evidence["target"].rstrip("/") + "/") \
+            and evidence["monolith_realpath"] != evidence["target"]:
+        return (f"reports the monolith at {evidence['monolith_realpath']!r} but the read-only "
+                f"mount at {evidence['target']!r}; the record does not show the monolith to be "
+                f"ON that mount")
+
+    writable = evidence.get("writable_paths")
+    if type(writable) is not list or not writable:
+        return ("records no writable_paths. A read-only mount for the monolith has to coexist "
+                "with writable P5 roots, WAL and delta -- freezing all of them would leave a "
+                "deployment that cannot ingest, repair or compact")
+    seen_roles = set()
+    for entry in writable:
+        if type(entry) is not dict:
+            return f"records a writable path entry {entry!r} that is not a record"
+        for field in ("role", "path", "source", "target", "options"):
+            if not _exact_nonempty_str(entry.get(field)):
+                return f"a writable_paths entry records no {field}"
+        seen_roles.add(entry["role"])
+        if _mount_is_read_only(entry["options"]):
+            return (f"reports {entry['role']} at {entry['path']!r} on a READ-ONLY mount "
+                    f"({entry['target']!r}, {entry['options']!r}); that deployment cannot "
+                    f"ingest, repair or compact")
+        if entry["target"] == evidence["target"]:
+            return (f"reports {entry['role']} on the SAME mount as the monolith "
+                    f"({entry['target']!r}). A mount is read-only or it is not: if the monolith "
+                    f"is frozen then so is {entry['role']}, and if {entry['role']} is writable "
+                    f"then the monolith is not frozen. The two must be separate mounts")
+    missing_roles = [r for r in MOUNT_BARRIER_WRITABLE_ROLES if r not in seen_roles]
+    if missing_roles:
+        return (f"records no writable mount for {missing_roles}; the barrier is only meaningful "
+                f"if it is selective, and an unrecorded role is one nobody checked")
+
+    if run_id is not None and evidence["run_id"] != run_id:
+        return (f"was collected in run {evidence['run_id']!r}, not {run_id!r}; a mount layout "
+                f"observed in another run is a fact about another moment")
+    if host is not None and evidence["host"] != host:
+        return (f"was collected on {evidence['host']!r}, not {host!r}; a mount layout "
+                f"observed on another host says nothing about this one")
+    stamped = _parse_utc(evidence["collected_utc"])
+    if stamped is None:
+        return f"records collected_utc {evidence['collected_utc']!r}, which is not a timestamp"
+    when = now or datetime.datetime.now(datetime.timezone.utc)
+    age = (when - stamped).total_seconds()
+    if age < -MAX_CLOCK_LEAD_S:
+        return f"was collected {int(-age)}s in the future; that is not a reading"
+    if age > MAX_CAPACITY_AGE_S:
+        return (f"is {int(age)}s old, past the {MAX_CAPACITY_AGE_S}s collection window. A "
+                f"mount can be remounted read-write at any time, so a stale record says what "
+                f"was true then")
+    return None
+
+
+def _check_monolith_barrier(t: Dict) -> tuple:
+    """Is the legacy monolith on a genuinely read-only mount, beside writable P5 paths?
+
+    NOT the same question as `check_monolith_sealed()` in `ops/p5_legacy_base.py`, which reads
+    permission bits at build time and is explicitly necessary-not-sufficient. This adjudicates
+    the operational barrier, and it is the one that has to hold for a `legacy_base` generation
+    to be a safe authority: `content_seal` detects a changed store after the fact, and is blind
+    to a write that restores size and mtime."""
+    evidence = t.get("monolith_barrier", _MISSING)
+    if evidence is _MISSING:
+        return NOT_ADJUDICATED, ("no mount-barrier record was collected. Nothing here can read "
+                                 "VM24's mount table; this adjudicates a record and there is "
+                                 "none, which is missing evidence rather than a barrier shown "
+                                 "to be absent")
+    problem = mount_barrier_problem(evidence, run_id=t.get("run_id"), host=t.get("host"))
+    if problem:
+        return BLOCKED, f"the mount-barrier record {problem}"
+    return READY, _reason(monolith=evidence["monolith_realpath"], mount=evidence["target"],
+                          source=evidence["source"], fstype=evidence["fstype"],
+                          options=evidence["options"],
+                          writable=len(evidence["writable_paths"]),
+                          collected=evidence["collected_utc"])
+
+
 def _check_deployment_tools(t: Dict) -> tuple:
     """Does the deployment carry its operator tools, and are they the approved bytes?
 
@@ -1554,6 +1689,7 @@ def _on_host(target: Dict) -> tuple:
 
 CHECKERS = {
     "identity": _check_identity,
+    "monolith_barrier": _check_monolith_barrier,
     "deployment_tools": _check_deployment_tools,
     "manifest": _check_manifest,
     "blocks": _check_blocks,

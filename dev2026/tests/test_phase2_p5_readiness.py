@@ -4311,9 +4311,10 @@ class TestTheArchivedArtifactIsNotPresentedAsCurrentState(unittest.TestCase):
 
     def test_the_opening_names_both_schema_counts(self):
         """Eight in the artifact, nine in the checker, said where the reader starts."""
+        words = {8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve"}
         opening = self._opening()
         self.assertIn("**eight** requirements", opening)
-        self.assertIn("**nine**", opening)
+        self.assertIn(f"**{words[len(rd.REQUIREMENTS)]}**", opening)
         self.assertIn("no collection has run against the current checker", opening)
 
     def test_the_machine_readable_authority_is_marked_archived(self):
@@ -4344,12 +4345,20 @@ class TestTheArchivedArtifactIsNotPresentedAsCurrentState(unittest.TestCase):
                 self.assertNotIn("deployment_tools", raw)
 
     # ------------------------------------------------- the checker has moved on
-    def test_the_current_checker_has_one_more_requirement_than_the_artifacts(self):
+    #: Requirements added since the archived collection, in the order they were added. Named
+    #: rather than counted: "one more than the artifacts" stopped being true the moment a
+    #: second was added, and a bare count would not have said which.
+    ADDED_SINCE = ("deployment_tools", "monolith_barrier")
+
+    def test_the_current_checker_has_exactly_the_documented_additions(self):
         current = [r["id"] for r in rd.REQUIREMENTS]
-        self.assertIn("deployment_tools", current)
-        self.assertEqual(len(current), len(self.OLD_SCHEMA_IDS) + 1)
-        self.assertEqual([r for r in current if r != "deployment_tools"], self.OLD_SCHEMA_IDS,
-                         "the requirement set changed by more than the documented addition")
+        for rid in self.ADDED_SINCE:
+            with self.subTest(rid):
+                self.assertIn(rid, current)
+        self.assertEqual(len(current), len(self.OLD_SCHEMA_IDS) + len(self.ADDED_SINCE))
+        self.assertEqual([r for r in current if r not in self.ADDED_SINCE],
+                         self.OLD_SCHEMA_IDS,
+                         "the requirement set changed by more than the documented additions")
 
     # ------------------------------------------------- the document keeps them apart
     def test_the_transcript_is_labelled_with_its_count_and_its_run(self):
@@ -4362,9 +4371,13 @@ class TestTheArchivedArtifactIsNotPresentedAsCurrentState(unittest.TestCase):
         doc = self._doc()
         self.assertNotIn("## The nine requirements", doc)
 
-    def test_the_document_says_no_current_nine_requirement_artifact_exists(self):
-        doc = self._doc()
-        self.assertIn("no current nine-requirement readiness artifact", doc.lower())
+    def test_the_document_says_no_current_artifact_exists_for_the_CURRENT_count(self):
+        """Derived from the live requirement set, so adding a requirement cannot leave the
+        document naming a count nobody uses any more."""
+        words = {8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve"}
+        n = len(rd.REQUIREMENTS)
+        self.assertIn(f"no current {words[n]}-requirement readiness artifact",
+                      self._doc().lower())
 
     def test_the_transcript_table_does_not_carry_the_new_requirement_row(self):
         """Read the transcript table itself, not the page: a `deployment_tools` row inside it

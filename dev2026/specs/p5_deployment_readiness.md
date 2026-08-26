@@ -7,7 +7,8 @@
 
 **Those counts belong to the archived historical artifact of 2026-08-21 and to nothing else.**
 It was produced by the assessor as it stood that day, which had **eight** requirements. The
-checker now has **nine**: `deployment_tools` postdates every archived artifact and appears in
+checker now has **ten**: `deployment_tools` and `monolith_barrier` postdate every archived
+artifact and appear in
 none of them, and no collection has run against the current checker. **There is therefore no
 current readiness verdict anywhere on this page** — only a record of what one run reported, and
 reasoning about it.
@@ -156,17 +157,17 @@ produced.
 | `capacity` | **READY** | 1260.7 GiB free against a 403.3 GiB minimum, measured in run `20260821T130320Z` |
 | `failure_semantics` | **NOT_ADJUDICATED** | the local suites prove the *code's* refusal/rollback behaviour, and that code is not deployed, so the property is not a property of this deployment |
 
-### The checker now has nine requirements, and nothing has been collected against it
+### The checker now has ten requirements, and nothing has been collected against it
 
-`deployment_tools` was added after that collection. So there are two counts in play and they
+`deployment_tools` and `monolith_barrier` were added after that collection. So there are two counts in play and they
 must not be read as one state:
 
 | | requirements | what it is |
 |---|---|---|
 | the archived artifacts (2026-08-21) | **8** | what that run produced; not rewritten |
-| the assessor as it stands now | **9** | `REQUIREMENTS` in `ops/p5_readiness.py` |
+| the assessor as it stands now | **10** | `REQUIREMENTS` in `ops/p5_readiness.py` |
 
-**There is no current nine-requirement readiness artifact, and this document does not claim
+**There is no current ten-requirement readiness artifact, and this document does not claim
 one.** No VM24 collection has run since `deployment_tools` was added, and running one needs its
 own authorization. Until then the ninth requirement's state on that host is *unknown to any
 artifact* — what follows is what the current checker would return for the evidence already in
@@ -343,6 +344,43 @@ served at all — the manifest does not authorize its own external path.
 **This has only ever run in a local synthetic fixture.** Running it against `$G` publishes a
 manifest and writes a WAL into production, and is a separate production operation requiring
 explicit approval that has not been requested.
+
+## The critical path
+
+Each step is gated by the one before it, and none of them is code:
+
+```
+1. IT mount-layout decision        the monolith on its own read-only mount,
+                                   beside writable P5 roots / WAL / delta
+2. fresh VM24 read-only collection every readiness figure expires in 2 hours
+3. candidate deployment review     a commit carrying the production tools
+4. provisioning approval           production-scoped, naming the live root and run
+5. provision generation 1 + WAL    roots, legacy_base manifest, WAL bound to it
+6. API switchover approval         GHRSST_BLOCK_MANIFEST_DIR + the runtime allow-list
+7. compaction approval             and only then a first fold
+```
+
+**Step 1 is not a formality, and it blocks everything after it.** The monolith is
+`$G/mur_timecube_s8_t90_sh128.zarr`, and `$G` is on `/dev/sdc1` mounted at
+`/home/odbadmin/Data`. The delta lives on that mount and the P5 roots would. Making it
+read-only would freeze the delta and the WAL along with the monolith, leaving a deployment that
+can neither ingest nor repair nor compact — so the barrier requires the monolith to be moved to,
+or bind-mounted on, a **separate** read-only mount. That is a storage decision for whoever owns
+the volumes, not a change this project can make.
+
+The `monolith_barrier` requirement adjudicates a collected record of that layout:
+
+| what it refuses | why |
+|---|---|
+| no record | missing evidence, `NOT_ADJUDICATED`, still blocks |
+| mount options that are not read-only | `chmod` is not the barrier |
+| a writable role on the SAME mount as the monolith | a mount is read-only or it is not; the two cannot both hold |
+| a missing writable role (`p5_blocks`, `p5_repairs`, `delta`) | an unrecorded role is one nobody checked |
+| a symlinked monolith, or a changed realpath | a link can be re-pointed without the record changing |
+| another run, another host, stale, or future-dated | a mount can be remounted at any time |
+
+Read-only is matched **by option token**, never by substring: `relatime` contains the letters
+`ro`, and a substring test would call a writable mount frozen.
 
 #### The monolith must be sealed BEFORE it becomes an authority
 
@@ -563,7 +601,7 @@ closing that.
 `identity` can now reach `READY` for `708058e` given a matching module inventory. That is the
 only thing that changed. Every store requirement is still `NOT_ADJUDICATED` off-host, `api_parity`
 still needs a person, `capacity` is still short, and no collection has been run against the
-current nine-requirement checker. **`CURRENT_DEPLOY_SHA` is a recommendation recorded in reviewed
+current ten-requirement checker. **`CURRENT_DEPLOY_SHA` is a recommendation recorded in reviewed
 code; it authorizes no deployment.** Deploying, provisioning `$G`, restarting or switching any
 service remain production changes needing their own approval.
 
