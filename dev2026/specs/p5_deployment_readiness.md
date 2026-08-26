@@ -371,13 +371,21 @@ because VM24 has full automated VM backups. It changes exactly one thing about t
 **step 5 may be reached once without step 1.** Steps 2–4 and 6 are untouched, and each still
 needs its own approval.
 
-**It does not reach step 7.** The record names the operation it authorizes, and the only one
-implemented is `provision_generation_one` — publishing a `legacy_base` manifest over the
-monolith, which prunes, swaps, deletes and switches nothing. The compaction family is refused
-*by name*, because no one-shot entry point exists for it and therefore nothing would enforce the
-post-compaction gates; `post_compaction_enforcement()` reports `NOT_ADJUDICATED` rather than
-letting a callable checker imply that something runs it. A one-shot *compaction* needs that
-entry point built first.
+**It reaches step 7, and step 7 does not delete anything.** Two operations are implemented and
+the record names which: `provision_generation_one` publishes a `legacy_base` manifest over the
+monolith, and `one_shot_compaction` builds a block from the delta and publishes it as the next
+generation. Neither prunes, swaps, deletes or switches, and vague aliases like `compaction` are
+refused by name in favour of the exact one.
+
+The post-compaction gates are **enforced** now — `ops/p5_oneshot_compaction.compact_one_shot()`
+assembles them from its own state and refuses the run if any fails. What they gate is a
+**finalization clearance**, not a deletion.
+
+**Releasing the old space is a separate operation, and it does not exist yet.** When it is
+written it must call `refuse_destructive_step()`, which requires the clearance *and* a separate
+human approval — because "this generation is trustworthy" and "the old data should go" are
+different judgements, and only the first is settled by parity checking. So the space this
+milestone makes *releasable* is not yet released, and nothing in this tree can release it.
 
 It is a **record**, not a flag — bound to one host, one run, one operation, one monolith at one
 measured state, one attested backup and one expiry — and it is reported in its own field,

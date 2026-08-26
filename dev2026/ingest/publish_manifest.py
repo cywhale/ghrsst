@@ -907,6 +907,7 @@ def _comparable(manifest: dict) -> dict:
 def execute_publication(plan: dict, *, ingest_lock_path: str,
                         compaction_lock_path: Optional[str] = None,
                         compaction_lock: Optional[CompactionLock] = None,
+                        ingest_lock: Optional[CompactionLock] = None,
                         delta_path: Optional[str] = None,
                         build_artifact_path: Optional[str],
                         release_after_s: int = DEFAULT_RELEASE_AFTER_S,
@@ -924,6 +925,33 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
     """
     # The caller-contract half of the reservation, checked FIRST: it is about the arguments,
     # not about the plan, and discovering it after a plan walk would report the wrong problem.
+    # The ingest fence may also be BORROWED, for the same reason the compaction reservation
+    # may be. A caller compacting a still-writable monolith has to hold the ingest lock from
+    # before its scan through this publish -- a store that can be appended to during a
+    # minutes-long walk yields a manifest describing a store that no longer exists. This
+    # function takes the ingest lock with a BLOCKING flock on a fresh fd, and flock locks are
+    # per open file description, so such a caller would deadlock against itself. Borrowing is
+    # what makes "held across the whole interval" expressible rather than merely intended.
+    #
+    # Same three conditions as the compaction borrow, for the same reasons: bound to the
+    # canonical path by realpath (any held lock would otherwise do), actually held, and still
+    # ours. And never released here -- its owner is still using it.
+    ingest_guard: Optional[CompactionLock] = None
+    ingest_borrowed = ingest_lock is not None
+    if ingest_borrowed:
+        if os.path.realpath(getattr(ingest_lock, "path", "")) != \
+                os.path.realpath(ingest_lock_path):
+            raise PublishRefused(
+                f"the borrowed ingest_lock is on {getattr(ingest_lock, 'path', None)!r} but "
+                f"the canonical ingest lock is {ingest_lock_path!r}. Holding some other lock "
+                f"leaves the real one free for the daily append to take.")
+        if not getattr(ingest_lock, "held", False):
+            raise PublishRefused(
+                "the ingest_lock passed in is not held. Publication borrows a caller's fence; "
+                "a released one is not a fence.")
+        ingest_lock.assert_still_held()
+        ingest_guard = ingest_lock
+
     compaction_guard: Optional[CompactionLock] = None
     borrowed = compaction_lock is not None
     if borrowed:
@@ -1055,9 +1083,15 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
 
     try:
         os.makedirs(root, exist_ok=True)
-        lk = open(ingest_lock_path, "w")
+        lk = None if ingest_borrowed else open(ingest_lock_path, "w")
         try:
-            fcntl.flock(lk, fcntl.LOCK_EX)      # publish and the daily append are exclusive
+            if lk is not None:
+                fcntl.flock(lk, fcntl.LOCK_EX)  # publish and the daily append are exclusive
+            else:
+                # Already fenced by the caller, and still fenced: re-checked here rather than
+                # trusted from the entry check, because everything between the two is where a
+                # lock file can be replaced under us.
+                ingest_guard.assert_still_held()
 
             live = bm.load_live(root)
             if int(live["generation"]) != int(plan["predecessor_generation"]):
@@ -1170,8 +1204,12 @@ def execute_publication(plan: dict, *, ingest_lock_path: str,
                              "not describe delta, and delta still wins for the folded days "
                              "(§4.0).")}
         finally:
-            fcntl.flock(lk, fcntl.LOCK_UN)
-            lk.close()
+            # A BORROWED fence is never released here, for the same reason a borrowed
+            # compaction reservation is not: its owner holds it across a wider interval, and
+            # releasing another component's lock is how "held throughout" becomes a gap.
+            if lk is not None:
+                fcntl.flock(lk, fcntl.LOCK_UN)
+                lk.close()
     finally:
         # Release the compaction reservation only AFTER the ingest lock is dropped and the
         # commit is done -- the whole point is that no build can start while the block is being

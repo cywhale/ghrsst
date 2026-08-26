@@ -95,16 +95,41 @@ def observed(**over):
     return o
 
 
+def fence(**over):
+    f = {
+        "method": "pm2 stop of the writer-producing services + crontab entry commented out",
+        "services_stopped": [{"name": "mur-delta-append", "posture": "stopped"},
+                             {"name": "mur-daily-ingest", "posture": "disabled"}],
+        "cron_disabled": "commented-out",
+        "flock_is_advisory": True,
+        "arbitrary_writer_policy": ("no shell writes to the monolith for the window; the "
+                                    "content ledger is re-verified before the publish and "
+                                    "detects one that happened anyway"),
+        "observed_utc": iso(-30),
+        "verified": True,
+    }
+    f.update(over)
+    return f
+
+
 def pre(**over):
     p = {
         "host": HOST, "run_id": RUN_ID, "collected_utc": iso(-60),
         "capacity": {"free_now_gib": 1252.1, "filesystem_dev": 2081, "measured_utc": iso(-60)},
-        "healthz": {"status": "ok", "latest": "2026-08-25"},
-        "identity": {"reviewed_sha": SHA, "worktree_clean": True, "verified": True},
-        "quiescence": {"pm2": "online", "cron": "no append window", "readers": 0,
+        "healthz": {"status": "ok", "latest": "2026-08-25", "route": "/point"},
+        "identity": {"reviewed_sha": SHA, "worktree_clean": True, "verified": True,
+                     "approved": True, "module_fingerprints": {"ops/p5_readiness.py": "e" * 64}},
+        "quiescence": {"pm2": "stopped", "cron": "disabled", "readers": 0,
+                       "reader_policy": "readers allowed; the old generation stays served "
+                                        "until a separate switch",
                        "verified": True},
         "monolith_writers": {"count": 0, "method": "lsof over the store"},
-        "locks": {"compaction": "free", "ingest": "free", "verified": True},
+        "writer_fence": fence(),
+        "locks": {"compaction": "free", "ingest": "free", "verified": True,
+                  "canonical_paths": {"compaction": "/g/p5_compaction.lock",
+                                      "ingest": "/g/mur_delta.ingest.lock"},
+                  "acquisition_probe": {"compaction": "acquired_and_released",
+                                        "ingest": "acquired_and_released"}},
         "monolith_state": observed(),
         "backup": {"backup_id": "vm24-daily-20260826T0300Z", "verified": True,
                    "method": "restore-catalogue listing + checksum of the manifest",
@@ -118,15 +143,20 @@ def pre(**over):
 
 def post(**over):
     p = {
-        "manifest": {"generation": 2, "checksum_ok": True},
+        "host": HOST, "run_id": RUN_ID,
+        "manifest": {"generation": 2, "checksum_ok": True, "checksum": "f" * 64},
         "wal_anchor": {"bound": True, "anchor_intact": True},
+        "source_map_digest": "9" * 64,
+        "monolith_state": observed(),
         "source_map_complete": True,
         "base_delta_disjoint": True,
         "point_series_parity": {"days_checked": 12, "mismatches": 0,
                                 "boundaries_included": True},
         "api_parity": {"routes_checked": 6, "mismatches": 0},
         "capacity_after": {"free_now_gib": 1100.4, "measured_utc": iso()},
-        "nothing_deleted": True,
+        "nothing_deleted": {"value": True, "derived_from": "inventory",
+                            "before": {"monolith": {"bytes": 10, "files": 2}},
+                            "after": {"monolith": {"bytes": 10, "files": 2}}},
     }
     p.update(over)
     return p
@@ -223,81 +253,181 @@ class TestTheRecordBindsToOneThing(unittest.TestCase):
         self.assertTrue(problem)
 
 
-class TestItAuthorizesOneOperationAndCompactionIsNotOne(unittest.TestCase):
-    """Provisioning publishes a manifest. It prunes, swaps, deletes and switches nothing.
+class TestItAuthorizesTheOperationItNames(unittest.TestCase):
+    """Two operations are implemented, and neither of them removes anything.
 
     An earlier revision called the record a "compaction risk acceptance" and handed it to an
-    operation that provisions — so the post-compaction gates were described as protecting a
-    lifecycle that no code in this tree runs."""
+    operation that provisions. The record now names the exact code path, and the vague aliases
+    are refused with a pointer to it -- "compaction" names several things."""
 
-    def test_only_provisioning_is_implemented(self):
-        self.assertEqual(ex.IMPLEMENTED_OPERATIONS, (ex.OP_PROVISION,))
+    def test_both_operations_are_implemented_and_named_exactly(self):
+        self.assertEqual(ex.IMPLEMENTED_OPERATIONS, (ex.OP_PROVISION, ex.OP_COMPACTION))
+        self.assertIsNone(ex.operation_problem(ex.OP_PROVISION))
+        self.assertIsNone(ex.operation_problem(ex.OP_COMPACTION))
 
-    def test_the_compaction_family_is_refused_by_name(self):
-        for op in ex.COMPACTION_FAMILY:
+    def test_the_destructive_family_is_refused_by_name(self):
+        """These are the ones that remove data or reroute what is served. Nothing implements
+        any of them, and no exception reaches one."""
+        for op in ex.DESTRUCTIVE_FAMILY:
             with self.subTest(op):
                 problem = ex.operation_problem(op)
-                self.assertIn("NO one-shot entry point", problem)
-                self.assertIn("post-compaction gates", problem)
+                self.assertIn("NOTHING implements it", problem)
+                self.assertIn("finalization clearance", problem)
 
-    def test_a_record_naming_compaction_is_refused(self):
-        problem = ex.exception_problem(record(operation="compaction"), host=HOST,
-                                       run_id=RUN_ID, operation="compaction",
-                                       observed=observed())
-        self.assertIn("NO one-shot entry point", problem)
+    def test_vague_compaction_aliases_are_refused_with_the_exact_name(self):
+        for alias in ex.COMPACTION_ALIASES:
+            with self.subTest(alias):
+                problem = ex.operation_problem(alias)
+                self.assertIn("an intention rather than a code path", problem)
+                self.assertIn(ex.OP_COMPACTION, problem)
 
     def test_a_record_for_one_operation_does_not_authorize_another(self):
         problem = ex.exception_problem(record(operation=ex.OP_PROVISION), host=HOST,
-                                       run_id=RUN_ID, operation="compaction",
+                                       run_id=RUN_ID, operation=ex.OP_COMPACTION,
                                        observed=observed())
         self.assertTrue(problem)
 
     def test_an_unimplemented_operation_is_refused(self):
         self.assertIn("nothing implements", ex.operation_problem("make_it_fast"))
 
-    def test_the_verdict_never_authorizes_compaction(self):
-        verdict = ex.evaluate(record=record(), host=HOST, run_id=RUN_ID,
-                              observed=observed(), pre=pre())
-        self.assertFalse(verdict["compaction_authorized"])
-        self.assertIn("NO one-shot entry point", verdict["compaction_note"])
-
-    def test_the_provisioner_refuses_a_compaction_record_before_creating_anything(self):
-        """Fail-fast: the refusal must land before any root exists, not after."""
-        problem = ex.operation_problem("prune")
-        self.assertTrue(problem)
-
-
-class TestTheGatesThatNothingEnforces(unittest.TestCase):
-    """A gate that exists as a function and is invoked by nothing constrains nothing."""
-
-    def test_the_enforcement_report_says_no_operation_runs_them(self):
-        report = ex.post_compaction_enforcement()
-        self.assertEqual(report["verdict"], ex.NOT_ADJUDICATED)
-        self.assertIsNone(report["enforced_by"])
-        self.assertIn("invoked by nothing", report["why"])
-
-    def test_it_names_what_would_have_to_exist_first(self):
-        report = ex.post_compaction_enforcement()
-        self.assertIn("prune, swap, delete or switch", report["before_this_can_change"])
-
-    def test_the_verdict_carries_that_report(self):
-        verdict = ex.evaluate(record=record(), host=HOST, run_id=RUN_ID,
-                              observed=observed(), pre=pre())
-        self.assertEqual(verdict["post_compaction_enforcement"]["verdict"], ex.NOT_ADJUDICATED)
-
-    def test_no_operation_in_the_tree_can_prune_swap_delete_or_switch_under_it(self):
-        """By AST over the provisioner: it must not call the prune/swap executors at all."""
-        tree = ast.parse(inspect.getsource(pp))
+    def _calls(self, module):
         called = set()
-        for node in ast.walk(tree):
+        for node in ast.walk(ast.parse(inspect.getsource(module))):
             if isinstance(node, ast.Call):
-                fn = node.func
-                name = getattr(fn, "attr", None) or getattr(fn, "id", None)
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
                 if name:
                     called.add(name)
-        for banned in ("prune_delta", "execute_swap_plan", "rmtree_store", "switch_manifest"):
+        return called
+
+    def test_neither_operation_calls_a_destructive_executor(self):
+        """By AST over both operations."""
+        from ops import p5_oneshot_compaction as oc
+        for module in (pp, oc):
+            called = self._calls(module)
+            for banned in ("prune_delta", "execute_swap_plan", "prune_staging",
+                           "advance_lifecycle", "execute_rollback"):
+                with self.subTest(module=module.__name__, banned=banned):
+                    self.assertNotIn(banned, called)
+
+    def test_the_compaction_operation_removes_nothing_from_the_filesystem(self):
+        """The removal primitives are asserted absent from the COMPACTION module only.
+
+        `p5_prod_provision` legitimately calls one: its failure path removes the two roots that
+        run itself created moments earlier, which is cleanup of its own partial write rather
+        than removal of anyone's data. Banning it there would be banning rollback. The
+        compaction operation creates no such thing and removes nothing at all."""
+        from ops import p5_oneshot_compaction as oc
+        called = self._calls(oc)
+        for banned in ("rmtree", "unlink", "remove"):
             with self.subTest(banned):
                 self.assertNotIn(banned, called)
+
+
+class TestTheGatesAreEnforcedByTheOperation(unittest.TestCase):
+    """A callable checker is not a gate until something refuses on it."""
+
+    def test_the_enforcement_report_names_the_operation_that_runs_them(self):
+        report = ex.post_compaction_enforcement()
+        self.assertEqual(report["verdict"], "ENFORCED")
+        self.assertEqual(report["enforced_by"],
+                         "ops/p5_oneshot_compaction.compact_one_shot")
+
+    def test_it_says_what_the_gates_actually_gate(self):
+        report = ex.post_compaction_enforcement()
+        self.assertIn("finalization clearance", report["what_it_gates"])
+        self.assertIn("No clearance, no destructive step", report["what_it_gates"])
+
+    def test_the_destructive_steps_are_still_unimplemented_and_it_says_so(self):
+        report = ex.post_compaction_enforcement()
+        self.assertEqual(tuple(report["still_not_implemented"]), ex.DESTRUCTIVE_FAMILY)
+
+    def test_the_operation_really_calls_the_gate(self):
+        """By AST: the enforcement claim above must correspond to a real call."""
+        from ops import p5_oneshot_compaction as oc
+        called = {getattr(n.func, "attr", None)
+                  for n in ast.walk(ast.parse(inspect.getsource(oc)))
+                  if isinstance(n, ast.Call)}
+        self.assertIn("post_compaction_problem", called)
+        self.assertIn("issue_finalization_clearance", called)
+
+
+class TestNothingDestructiveIsReachableWithoutAClearance(unittest.TestCase):
+    """The contract a finalization step must satisfy, fixed before anyone writes one."""
+
+    def clearance(self, **over):
+        c = ex.issue_finalization_clearance(
+            host=HOST, run_id=RUN_ID, generation=2, manifest_checksum="f" * 64,
+            monolith_day_digest=DAYS, source_map_digest="9" * 64,
+            issued_by="tests", gates_passed=True)
+        c.update(over)
+        return c
+
+    def test_a_clearance_cannot_be_issued_when_the_gates_did_not_pass(self):
+        for value in (False, None, "yes"):
+            with self.subTest(repr(value)):
+                with self.assertRaises(ex.FinalizationRefused):
+                    ex.issue_finalization_clearance(
+                        host=HOST, run_id=RUN_ID, generation=2, manifest_checksum="f" * 64,
+                        monolith_day_digest=DAYS, source_map_digest="9" * 64,
+                        issued_by="tests", gates_passed=value)
+
+    def test_every_destructive_step_refuses_without_a_clearance(self):
+        for op in ex.DESTRUCTIVE_FAMILY:
+            with self.subTest(op):
+                with self.assertRaises(ex.FinalizationRefused):
+                    ex.refuse_destructive_step(op, None, host=HOST, run_id=RUN_ID,
+                                               generation=2, manifest_checksum="f" * 64,
+                                               approval=True)
+
+    def test_a_truthy_value_is_not_a_clearance(self):
+        for impostor in (True, 1, "cleared", []):
+            with self.subTest(repr(impostor)):
+                with self.assertRaises(ex.FinalizationRefused) as caught:
+                    ex.refuse_destructive_step("prune", impostor, host=HOST, run_id=RUN_ID,
+                                               generation=2, manifest_checksum="f" * 64,
+                                               approval=True)
+                self.assertIn("not a clearance", str(caught.exception))
+
+    def test_a_clearance_for_another_generation_is_refused(self):
+        with self.assertRaises(ex.FinalizationRefused) as caught:
+            ex.refuse_destructive_step("prune", self.clearance(), host=HOST, run_id=RUN_ID,
+                                       generation=3, manifest_checksum="f" * 64, approval=True)
+        self.assertIn("says nothing about another", str(caught.exception))
+
+    def test_a_clearance_for_another_manifest_is_refused(self):
+        with self.assertRaises(ex.FinalizationRefused):
+            ex.refuse_destructive_step("prune", self.clearance(), host=HOST, run_id=RUN_ID,
+                                       generation=2, manifest_checksum="0" * 64, approval=True)
+
+    def test_a_clearance_for_another_run_is_refused(self):
+        with self.assertRaises(ex.FinalizationRefused):
+            ex.refuse_destructive_step("prune", self.clearance(), host=HOST,
+                                       run_id="another-run", generation=2,
+                                       manifest_checksum="f" * 64, approval=True)
+
+    def test_gates_passing_is_not_a_decision_to_delete(self):
+        """Two independent requirements. The clearance says the new generation is trustworthy;
+        it does not say anyone decided the old data should go."""
+        for approval in (None, False, "sure", 1):
+            with self.subTest(repr(approval)):
+                with self.assertRaises(ex.FinalizationRefused) as caught:
+                    ex.refuse_destructive_step("prune", self.clearance(), host=HOST,
+                                               run_id=RUN_ID, generation=2,
+                                               manifest_checksum="f" * 64, approval=approval)
+                self.assertIn("not a decision to remove anything", str(caught.exception))
+
+    def test_both_together_are_accepted_and_still_perform_nothing(self):
+        out = ex.refuse_destructive_step("prune", self.clearance(), host=HOST, run_id=RUN_ID,
+                                         generation=2, manifest_checksum="f" * 64,
+                                         approval=True)
+        self.assertTrue(out["cleared"])
+        self.assertIn("does not perform the step", out["note"])
+
+    def test_a_clearance_is_not_a_capability(self):
+        """It is a dict on purpose -- a person has to read and review it. What stops it being a
+        standing permission is the generation and checksum binding, not unserializability."""
+        self.assertIsInstance(self.clearance(), dict)
+        self.assertIsNone(self.clearance()["authorizes"])
 
 
 class TestThereIsNoGenericBypass(unittest.TestCase):
@@ -534,29 +664,100 @@ class TestThePreCompactionContract(unittest.TestCase):
                       self.problem(healthz={"status": "ok", "latest": "recently"}))
 
     def test_an_unvalidated_block_is_a_note_not_a_result(self):
-        for field, block in (("identity", {"reviewed_sha": SHA, "worktree_clean": True}),
-                             ("locks", {"compaction": "free", "ingest": "free"}),
-                             ("quiescence", {"pm2": "online", "cron": "-", "readers": 0})):
+        for field, block in (
+                ("identity", {"reviewed_sha": SHA, "worktree_clean": True, "approved": True,
+                              "module_fingerprints": {}}),
+                ("locks", {"compaction": "free", "ingest": "free", "canonical_paths": {},
+                           "acquisition_probe": {}}),
+                ("quiescence", {"pm2": "stopped", "cron": "disabled", "readers": 0,
+                                "reader_policy": "-"})):
             with self.subTest(field):
                 problem = self.problem(**{field: block})
                 self.assertIn("not a result", problem)
 
     def test_a_dirty_worktree_is_refused(self):
         problem = self.problem(identity={"reviewed_sha": SHA, "worktree_clean": False,
-                                         "verified": True})
+                                         "verified": True, "approved": True,
+                                         "module_fingerprints": {"m": "e" * 64}})
         self.assertIn("not the commit that was reviewed", problem)
 
     def test_a_reviewed_sha_that_is_not_a_commit_is_refused(self):
         problem = self.problem(identity={"reviewed_sha": "HEAD", "worktree_clean": True,
-                                         "verified": True})
+                                         "verified": True, "approved": True,
+                                         "module_fingerprints": {"m": "e" * 64}})
         self.assertIn("not a commit id", problem)
 
     def test_a_held_lock_is_refused(self):
         for name in ("compaction", "ingest"):
             with self.subTest(name):
-                locks = {"compaction": "free", "ingest": "free", "verified": True}
+                locks = dict(pre()["locks"])
                 locks[name] = "held"
                 self.assertIn(name, self.problem(locks=locks))
+
+    def test_an_unsafe_cron_posture_is_refused(self):
+        """"No append window right now" is a statement about the clock, and the clock moves."""
+        for value in ("no append window", "next run 18:05", "probably fine", "enabled"):
+            with self.subTest(value):
+                quiescence = dict(pre()["quiescence"], cron=value)
+                problem = self.problem(quiescence=quiescence)
+                self.assertIn("statement about the clock", problem)
+
+    def test_a_quiescence_with_no_reader_policy_is_refused(self):
+        quiescence = dict(pre()["quiescence"], reader_policy="  ")
+        self.assertIn("reader policy", self.problem(quiescence=quiescence))
+
+    # ---------------------------------------------------------------- the writer fence
+    def test_the_preflight_requires_the_writer_fence(self):
+        """A writer COUNT is an observation about an instant. The fence is what holds."""
+        problem = self.problem(writer_fence=fence(verified=False))
+        self.assertIn("the writer fence", problem)
+
+    def test_every_fence_field_is_required(self):
+        for field in ex.WRITER_FENCE_FIELDS:
+            with self.subTest(field):
+                f = fence()
+                del f[field]
+                problem = ex.writer_fence_problem(f)
+                self.assertTrue(problem)
+                self.assertIn(field, problem)
+
+    def test_a_fence_that_stopped_nothing_is_refused(self):
+        """`[]` is caught by the "an unanswered check is not a passing one" rule, which is a
+        different and equally correct refusal, so it is asserted as a refusal rather than as
+        this message. A non-list reaches the branch this test is about."""
+        self.assertTrue(ex.writer_fence_problem(fence(services_stopped=[])))
+        self.assertIn("empty fence is a claim",
+                      ex.writer_fence_problem(fence(services_stopped="none")))
+
+    def test_a_stopped_service_must_name_itself_and_its_posture(self):
+        for field in ("name", "posture"):
+            with self.subTest(field):
+                entry = {"name": "mur-delta-append", "posture": "stopped"}
+                del entry[field]
+                problem = ex.writer_fence_problem(fence(services_stopped=[entry]))
+                self.assertIn(field, problem)
+
+    def test_a_fence_with_a_running_writer_is_refused(self):
+        problem = ex.writer_fence_problem(fence(services_stopped=[
+            {"name": "mur-delta-append", "posture": "online"}]))
+        self.assertIn("still running is the hazard", problem)
+
+    def test_a_fence_that_does_not_admit_flock_is_advisory_is_refused(self):
+        problem = ex.writer_fence_problem(fence(flock_is_advisory=False))
+        self.assertIn("flock is advisory", problem)
+
+    def test_a_fence_with_no_arbitrary_writer_policy_is_refused(self):
+        """Whitespace, not `""`: the empty string is caught by the emptiness rule first."""
+        problem = ex.writer_fence_problem(fence(arbitrary_writer_policy="   "))
+        self.assertIn("arbitrary writers", problem)
+
+    def test_a_fence_with_an_unstamped_observation_is_refused(self):
+        problem = ex.writer_fence_problem(fence(observed_utc="recently"))
+        self.assertIn("not a timestamp", problem)
+
+    def test_a_complete_fence_passes(self):
+        """The positive control: every refusal above is about its own defect."""
+        self.assertIsNone(ex.writer_fence_problem(fence()))
 
     def test_a_process_writing_the_monolith_refuses(self):
         for value in (1, 7):
@@ -644,15 +845,34 @@ class TestThePostCompactionGates(unittest.TestCase):
                 self.assertTrue(problem)
                 self.assertIn(field, problem)
 
-    def test_deleting_anything_before_the_gates_pass_refuses(self):
-        """`None` is caught by the "an unanswered check is not a passing one" rule, which is a
-        different (and correct) refusal, so it is asserted as a refusal rather than as this
-        message."""
-        self.assertTrue(ex.post_compaction_problem(post(nothing_deleted=None)))
-        for value in (False, "later", 0, 1):
+    def test_a_bare_claim_that_nothing_was_deleted_is_not_evidence(self):
+        """`nothing_deleted: true` is the operation's word about itself. What the gate takes is
+        the before/after inventory, and it recomputes the verdict from that."""
+        for value in (True, False, None, "later", 0, 1):
             with self.subTest(repr(value)):
                 problem = ex.post_compaction_problem(post(nothing_deleted=value))
-                self.assertIn("may be removed until every gate", problem)
+                self.assertTrue(problem)
+
+    def test_an_inventory_showing_removal_refuses(self):
+        problem = ex.post_compaction_problem(post(nothing_deleted={
+            "value": False, "derived_from": "inventory",
+            "before": {"daily": {"bytes": 100, "files": 9}},
+            "after": {"daily": {"bytes": 4, "files": 1}}}))
+        self.assertIn("data was removed", problem)
+
+    def test_a_true_verdict_over_a_shrunken_inventory_refuses(self):
+        """The case the re-derivation exists for: the claim and the evidence disagree."""
+        problem = ex.post_compaction_problem(post(nothing_deleted={
+            "value": True, "derived_from": "inventory",
+            "before": {"daily": {"bytes": 100, "files": 9}},
+            "after": {"daily": {"bytes": 4, "files": 1}}}))
+        self.assertIn("recomputed from the inventory", problem)
+
+    def test_an_after_inventory_that_stopped_measuring_a_path_refuses(self):
+        problem = ex.post_compaction_problem(post(nothing_deleted={
+            "value": True, "derived_from": "inventory",
+            "before": {"daily": {"bytes": 1, "files": 1}}, "after": {}}))
+        self.assertIn("stopped being measured", problem)
 
     def test_any_point_series_mismatch_refuses(self):
         problem = ex.post_compaction_problem(post(point_series_parity={
@@ -763,12 +983,20 @@ class _OneShotBase(_ProdBase):
             "capacity": {"free_now_gib": 1252.1,
                          "filesystem_dev": os.stat(self.live).st_dev,
                          "measured_utc": iso(-60)},
-            "healthz": {"status": "ok", "latest": "2026-01-06"},
-            "identity": {"reviewed_sha": SHA, "worktree_clean": True, "verified": True},
-            "quiescence": {"pm2": "online", "cron": "no append window", "readers": 0,
+            "healthz": {"status": "ok", "latest": "2026-01-06", "route": "/point"},
+            "identity": {"reviewed_sha": SHA, "worktree_clean": True, "verified": True,
+                         "approved": True,
+                         "module_fingerprints": {"ops/p5_readiness.py": "e" * 64}},
+            "quiescence": {"pm2": "stopped", "cron": "disabled", "readers": 0,
+                           "reader_policy": "readers allowed until a separate switch",
                            "verified": True},
             "monolith_writers": {"count": 0, "method": "lsof over the store"},
-            "locks": {"compaction": "free", "ingest": "free", "verified": True},
+            "writer_fence": fence(),
+            "locks": {"compaction": "free", "ingest": "free", "verified": True,
+                      "canonical_paths": {"compaction": os.path.realpath(self.clock),
+                                          "ingest": os.path.realpath(self.ilock)},
+                      "acquisition_probe": {"compaction": "acquired_and_released",
+                                            "ingest": "acquired_and_released"}},
             "monolith_state": {k: m[k] for k in ex.MONOLITH_STATE_FIELDS},
             "backup": {"backup_id": "vm24-daily-20260826T0300Z", "verified": True,
                        "method": "restore-catalogue listing", "verified_utc": iso(-3600)},
@@ -839,11 +1067,19 @@ class TestAWritableMonolithNeedsTheCapability(_OneShotBase):
         with self.assertRaises((pp.ProductionProvisionRefused, ex.OneShotExceptionRefused)):
             self.oneshot(one_shot_exception=self.bound_record(expires_utc=iso(-1)))
 
+    def test_a_compaction_record_does_not_authorize_provisioning(self):
+        """The exact name is implemented now, and it is still not THIS operation."""
+        self.unseal()
+        with self.assertRaises((pp.ProductionProvisionRefused, ex.OneShotExceptionRefused)):
+            self.oneshot(one_shot_exception=self.bound_record(operation=ex.OP_COMPACTION))
+        for root in self.roots():
+            self.assertFalse(os.path.exists(root))
+
     def test_an_exception_naming_compaction_refuses_before_anything_is_created(self):
         self.unseal()
         with self.assertRaises(pp.ProductionProvisionRefused) as caught:
             self.oneshot(one_shot_exception=self.bound_record(operation="compaction"))
-        self.assertIn("NO one-shot entry point", str(caught.exception))
+        self.assertIn("an intention rather than a code path", str(caught.exception))
         self.assertFalse(os.path.exists(os.path.join(self.live, pp.marker_name(self.RUN_ID))))
 
     def test_missing_pre_compaction_evidence_refuses(self):
@@ -1160,14 +1396,25 @@ class TestTheRunbookRecordsTheExceptionPath(unittest.TestCase):
         self.assertIn("Nor is a self-consistent pair enough", flat)
         self.assertIn("the **operation** measures the store itself", flat)
 
-    def test_it_says_provisioning_is_not_compaction(self):
+    def test_it_says_each_record_names_exactly_one_operation(self):
         flat = self._flat()
-        self.assertIn("authorizes provisioning, not compaction", flat)
-        self.assertIn("prunes, swaps, deletes and switches nothing", flat)
+        self.assertIn("It authorizes exactly the operation it names", flat)
+        self.assertIn("Vague aliases", flat)
 
-    def test_it_records_that_no_operation_enforces_the_post_gates(self):
+    def test_it_says_neither_operation_removes_anything(self):
         flat = self._flat()
-        self.assertIn("no operation enforces them", flat)
+        self.assertIn("it deletes nothing at all", flat)
+        self.assertIn("Releasing the old space is a separate operation", flat)
+
+    def test_it_records_that_the_gates_are_now_enforced(self):
+        flat = self._flat()
+        self.assertIn("The gates are enforced now", flat)
+        self.assertIn("re-derived, never believed", flat)
+
+    def test_it_says_a_writer_count_is_not_a_fence(self):
+        flat = self._flat()
+        self.assertIn("a count is not a fence", flat)
+        self.assertIn("What probing does not establish", flat)
 
     def test_it_describes_the_widened_fence(self):
         flat = self._flat()
@@ -1243,7 +1490,8 @@ class TestTheRoadmapShowsTheExceptionPath(unittest.TestCase):
         self.assertIn("**The read-only mount remains the preferred route**", flat)
         self.assertIn("step 1 stays on the critical path for every run after this one", flat)
 
-    def test_the_roadmap_says_step_7_is_not_reached_by_the_exception(self):
-        """It buys step 5, not step 7. The compaction entry point does not exist."""
+    def test_the_roadmap_says_step_7_deletes_nothing(self):
+        """It reaches step 7 now. What step 7 does NOT do is release the space."""
         flat = self._flat()
-        self.assertIn("does not reach step 7", flat)
+        self.assertIn("It reaches step 7, and step 7 does not delete anything", flat)
+        self.assertIn("nothing in this tree can release it", flat)

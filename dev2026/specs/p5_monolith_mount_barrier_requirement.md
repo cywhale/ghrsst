@@ -239,20 +239,45 @@ likelihood, and nothing in the code treats it as the latter. It does not weaken 
 §1–§5: the requirement above stands, and the read-only mount remains the preferred and stronger
 route.
 
-### It authorizes provisioning, not compaction
+### It authorizes exactly the operation it names
 
-The record names an `operation`, and the only one implemented is `provision_generation_one` —
-publishing a `legacy_base` manifest over the monolith. That **prunes, swaps, deletes and
-switches nothing.** The compaction family (`compaction`, `build_blocks`, `prune`, `swap`,
-`delete`, `switch`) is refused *by name*, with its own message, because no one-shot entry point
-exists for any of it.
+The record names an `operation`, and there are two:
 
-That matters for the gates below: `post_compaction_problem()` is callable, and **no operation
-enforces them**, because there is no operation under this exception that can prune, swap, delete
-or switch. A gate invoked by nothing constrains nothing, and `post_compaction_enforcement()`
-reports `NOT_ADJUDICATED` rather than letting the existence of a checker imply that something
-runs it. Before a one-shot *compaction* can be approved, that entry point has to exist and has
-to refuse unless every gate passes.
+| operation | what it does | what it removes |
+|---|---|---|
+| `provision_generation_one` | publishes a `legacy_base` manifest over the monolith | nothing |
+| `one_shot_compaction` | builds a block from the delta and publishes it as the next generation | **nothing** — it deletes nothing at all |
+
+Vague aliases — `compaction`, `compact`, `build_blocks`, `fold` — are refused *by name* with a
+pointer to the exact one. "Compaction" names several things, and an approval should say which
+code path it authorizes.
+
+The **destructive family** (`prune`, `swap`, `delete`, `switch`, `finalize`, …) is refused by
+name too, and nothing implements any of it. Releasing the old space is a separate operation that
+does not exist yet; when it is written it must call
+`p5_oneshot_exception.refuse_destructive_step()`, which requires **both** a finalization
+clearance and a separate human approval. The gates passing means the new generation is
+trustworthy; it does not mean anyone decided the old data should go, and those are different
+judgements.
+
+### The gates are enforced now
+
+`post_compaction_problem()` is no longer merely callable.
+`ops/p5_oneshot_compaction.compact_one_shot()` assembles the evidence **from its own state** —
+the generation it published, the manifest checksum it got back, the monolith it measured under
+the locks, and a before/after inventory — and refuses the run and issues no clearance if any
+gate fails. `post_compaction_enforcement()` reports `ENFORCED` and names it.
+
+Two of the gates are checked **before** the publish, while the block is still unreferenced:
+point-series parity against the per-day oracle (first and last days included) and source-map
+completeness, plus base/delta disjointness on the *planned* manifest. A failure there costs a
+rebuild rather than a rollback. Only the checks that need a published manifest — its checksum,
+the WAL/anchor binding, API parity, fresh capacity — run afterwards.
+
+`nothing_deleted` is **re-derived, never believed**. The gate takes the raw before/after
+inventory the operation measured, recomputes the verdict from it, and refuses if the recomputed
+answer and the recorded one disagree — so a hand-written `true` over an inventory showing a
+shrunken store fails.
 
 ### It is a **record**, not a flag — and what opens the door is a capability
 
@@ -295,6 +320,32 @@ The consequence for reporting: `ops/p5_readiness.py` reads a collected JSON docu
 measurement it sees is caller-supplied by construction. Its verdict is therefore **never**
 `eligible` — a green record shows `eligible_pending_recomputation`. A report is not an
 authorization.
+
+### The writer fence: a count is not a fence
+
+`monolith_writers.count == 0` says what was true at one instant. The scan runs for minutes, and
+the append cron does not consult it. So the exception additionally requires a **writer fence**:
+the writer-producing services stopped (`stopped` / `disabled` / `not-installed`) and the append
+cron disabled (`disabled` / `commented-out` / `not-installed`) for the whole window. "No append
+window right now" is a statement about the clock, and the clock moves during a long scan.
+
+The compaction operation probes the fence **three times** — before the scan, after the build,
+after the publish — validates each probe and compares the service sets. There is no default
+probe that reports a posture: the shipped default **refuses**, because whether `pm2` stopped a
+service is a fact about the deployment host that nothing in this process can observe, and a
+plausible-looking default would make every local test pass while proving nothing.
+
+**What probing does not establish.** These are samples. A service that stopped and restarted
+entirely between two of them is invisible to all of them, and nothing here can close that —
+proving a posture held continuously needs something watching continuously. The fence is a
+precondition an operator arranges, not a guarantee this code provides, which is why the
+content-ledger recheck and the parity gates sit behind it.
+
+`flock` is advisory and the fence must say so: the ingest lock excludes the ingest path because
+the ingest path takes it, and it excludes nothing else. An arbitrary writer — a shell, a stray
+script — obeys neither the lock nor the service posture. The record must state the policy that
+covers that, because a fence that does not name what it fails to cover reads as stronger than it
+is.
 
 ### The fence widens, because the store can move
 
