@@ -272,3 +272,63 @@ class TestTheDocumentRecordsTheCriticalPath(unittest.TestCase):
         import inspect
         doc = inspect.getdoc(rd.mount_barrier_problem) or ""
         self.assertIn("Nothing here can look at VM24's mount table", doc)
+
+
+class TestTheOperatorChecklistMatchesTheContract(unittest.TestCase):
+    """A checklist that collects the wrong fields produces a record the validator refuses.
+
+    The document is what an operator will actually run, and the validator is what will judge
+    the result. Nothing but a test keeps the two in step — and "the checklist drifted from the
+    thing it feeds" is precisely the class of defect this phase keeps finding."""
+
+    def _doc(self):
+        path = os.path.join(_DEV, "specs", "p5_monolith_mount_barrier_requirement.md")
+        with open(path) as fh:
+            return fh.read()
+
+    def test_the_checklist_names_every_field_the_contract_requires(self):
+        flat = " ".join(self._doc().split())
+        for field in rd.MOUNT_BARRIER_FIELDS:
+            with self.subTest(field):
+                self.assertIn(f"`{field}`", flat,
+                              f"the checklist does not say where {field} comes from")
+
+    def test_the_checklist_names_every_writable_role(self):
+        flat = " ".join(self._doc().split())
+        for role in rd.MOUNT_BARRIER_WRITABLE_ROLES:
+            with self.subTest(role):
+                self.assertIn(role, flat)
+
+    def test_the_checklist_states_the_freshness_window_the_contract_enforces(self):
+        flat = " ".join(self._doc().split())
+        hours = rd.MAX_CAPACITY_AGE_S // 3600
+        self.assertIn(f"**{hours}-hour** freshness window", flat)
+
+    def test_the_checklist_matches_read_only_by_token_not_substring(self):
+        """The same rule the validator uses, and the same reason given."""
+        flat = " ".join(self._doc().split())
+        self.assertIn("grep -qx 'ro'", flat)
+        self.assertIn("would report a read-write mount as frozen", flat)
+
+    def test_the_checklist_refuses_to_claim_a_bind_mount_works(self):
+        flat = " ".join(self._doc().split())
+        self.assertIn("must not be assumed to work", flat)
+        self.assertIn("does not make the underlying files read-only through their original "
+                      "path", flat)
+        self.assertIn("Nothing in this document claims a bind mount is sufficient", flat)
+
+    def test_the_checklist_requires_the_write_denial_test_as_the_service_user(self):
+        flat = " ".join(self._doc().split())
+        self.assertIn("It must **fail**", flat)
+        self.assertIn("A denial for `root` proves nothing about the service", flat)
+        self.assertIn("Do not adjust permissions to make the test pass", flat)
+
+    def test_the_checklist_records_the_current_fail_closed_status(self):
+        flat = " ".join(self._doc().split())
+        self.assertIn("`monolith_barrier` is `NOT_ADJUDICATED`", flat)
+        self.assertIn("**`compaction_ready` is `false`**", flat)
+        self.assertIn("remain provisional", flat)
+
+    def test_the_checklist_says_nothing_writes_under_G(self):
+        flat = " ".join(self._doc().split())
+        self.assertIn("Nothing writes under `$G`", flat)

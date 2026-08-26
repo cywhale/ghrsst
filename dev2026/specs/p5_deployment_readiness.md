@@ -360,7 +360,9 @@ Each step is gated by the one before it, and none of them is code:
 7. compaction approval             and only then a first fold
 ```
 
-**Step 1 is not a formality, and it blocks everything after it.** The monolith is
+**Step 1 is not a formality, and it blocks everything after it.** The requirement handed to
+storage, and the read-only checklist that establishes whether it has been met, are in
+[`p5_monolith_mount_barrier_requirement.md`](p5_monolith_mount_barrier_requirement.md). The monolith is
 `$G/mur_timecube_s8_t90_sh128.zarr`, and `$G` is on `/dev/sdc1` mounted at
 `/home/odbadmin/Data`. The delta lives on that mount and the P5 roots would. Making it
 read-only would freeze the delta and the WAL along with the monolith, leaving a deployment that
