@@ -89,8 +89,38 @@ def tree_files(sha: str) -> List[str]:
                   if line.startswith(prefix))
 
 
+def dirty_paths() -> List[str]:
+    """Everything git considers untracked or modified, with `--untracked-files=all`.
+
+    The default `--untracked-files=normal` COLLAPSES an untracked directory to a single entry
+    and, more importantly here, a file inside one is never named. A package is a claim about
+    exactly which bytes are in the tree, so the mode that lists them individually is the one
+    that supports the claim."""
+    out = _git("status", "--porcelain", "--untracked-files=all")
+    return [line[3:] for line in out.splitlines() if line.strip()]
+
+
+def ignored_modules() -> List[str]:
+    """Ignored `.py` files under the dev tree. Invisible to `status` at ANY untracked mode.
+
+    `--untracked-files=all` does not list ignored files -- that is what ignoring means -- so a
+    module in `.gitignore` sits on disk, gets imported at run time, and appears in no listing
+    the package produces. The archive would then be missing a file the operation actually runs,
+    and every digest in the manifest would still match.
+
+    This is not hypothetical for THIS operation: `producer_identity()` imports a module by path
+    and hashes the file on disk. An ignored module at a registry path is precisely the shape
+    that would pass the on-disk check and be absent from the reviewed commit."""
+    out = _git("status", "--porcelain", "--ignored=matching", "--untracked-files=all")
+    prefix = DEV_PREFIX + "/"
+    return sorted(line[3:] for line in out.splitlines()
+                  if line.startswith("!! ") and line[3:].startswith(prefix)
+                  and line.rstrip().endswith(".py"))
+
+
 def worktree_is_clean() -> bool:
-    return not _git("status", "--porcelain").strip()
+    """No untracked, modified OR ignored-python state anywhere in the tree."""
+    return not dirty_paths() and not ignored_modules()
 
 
 def identity_update_plan(sha: str) -> Dict:
@@ -101,29 +131,47 @@ def identity_update_plan(sha: str) -> Dict:
     commit."""
     from ops import p5_readiness as rd
     from ops import p5_oneshot_compaction as oc
-    inventory = set(rd.INVENTORY_MODULES)
-    producers = list(oc.REVIEWED_PRODUCER_MODULES)
-    outside = [m for m in producers if m not in inventory]
+    service_inventory = set(rd.INVENTORY_MODULES)
+    operation_inventory = list(oc.OPERATION_INVENTORY)
+    # A module in BOTH would be claiming the service imports it and that only the operator
+    # does. Reported rather than silently tolerated: the two inventories mean different things
+    # and the overlap is where that stops being true.
+    overlap = sorted(set(operation_inventory) & service_inventory)
     steps = [
-        f"add {sha} to p5_readiness.REVIEWED_DEPLOY_SHAS",
+        f"add {sha} to p5_oneshot_compaction.APPROVED_OPERATION_SHAS, so the operation's own "
+        f"modules {operation_inventory} are compared against reviewed git blobs rather than "
+        f"only against the file on disk. Until then the operation refuses",
     ]
-    for module in outside:
+    if not oc.APPROVED_OPERATION_SHAS:
         steps.append(
-            f"decide whether {module} joins p5_readiness.INVENTORY_MODULES. While it does not, "
-            f"identity_problem() admits it as an operation-side module verified against DISK "
-            f"rather than against the git blob at an approved commit, which is the weaker of "
-            f"the two checks")
+            "APPROVED_OPERATION_SHAS is currently EMPTY, which is the shipped fail-closed "
+            "default and is why no production run is possible today")
+    for module in operation_inventory:
+        if rd._git_blob(sha, module) is None:
+            steps.append(
+                f"NOTE: {module} is not present at {sha}; approving that commit would not "
+                f"cover it")
+    if overlap:
         steps.append(
-            f"if it joins the inventory, remove it from "
-            f"p5_oneshot_compaction.REVIEWED_PRODUCER_MODULES -- leaving it in both keeps the "
-            f"weaker path alive alongside the stronger one")
+            f"resolve {overlap}: a module cannot be both service-inventory and "
+            f"operation-inventory. The service inventory is measured by executing the "
+            f"service's import closure, so an entry nothing imports is reported there")
+    steps.append(
+        "decide SEPARATELY whether this commit belongs in p5_readiness.REVIEWED_DEPLOY_SHAS. "
+        "That set is about the code the SERVICE runs; it is not implied by approving operator "
+        "tooling, and merging the two would mean re-approving tooling on every service change")
     steps.append("re-run tests/test_phase2_p5_readiness.py: the assessor measures its own "
-                 "runtime closure and reports a module the readiness path does not import")
+                 "runtime closure by executing the build, prune_swap and API paths, and "
+                 "reports any inventory entry that closure does not reach")
     return {
         "candidate": sha,
-        "producer_modules": producers,
-        "producer_modules_outside_the_deployment_inventory": outside,
-        "already_approved_shas": list(rd.REVIEWED_DEPLOY_SHAS),
+        "operation_inventory": operation_inventory,
+        "service_inventory_size": len(service_inventory),
+        "inventory_overlap": overlap,
+        "approved_operation_shas": list(oc.APPROVED_OPERATION_SHAS),
+        "approved_deploy_shas": list(rd.REVIEWED_DEPLOY_SHAS),
+        "operation_modules_present_at_candidate": {
+            m: rd._git_blob(sha, m) is not None for m in operation_inventory},
         "steps": steps,
         "not_done_here": ("This function edits nothing. Approving a candidate is a human "
                           "decision recorded outside this repository, and a tool that could "
@@ -136,10 +184,18 @@ def manifest(sha: str = "HEAD", *, require_clean: bool = True) -> Dict:
     """Everything a reviewer needs about one candidate commit, derived from that commit."""
     from ops import p5_readiness as rd
     resolved = _git("rev-parse", sha).strip()
-    if require_clean and not worktree_is_clean():
-        raise DeployCandidateError(
-            "the worktree is dirty. A package generated from uncommitted changes describes a "
-            "tree that exists nowhere, and its digests could not be recomputed by anyone else")
+    if require_clean:
+        dirty = dirty_paths()
+        ignored = ignored_modules()
+        if dirty or ignored:
+            raise DeployCandidateError(
+                "the worktree is dirty. A package generated from uncommitted changes describes "
+                "a tree that exists nowhere, and its digests could not be recomputed by anyone "
+                "else."
+                + (f" Untracked or modified: {dirty[:10]}." if dirty else "")
+                + (f" IGNORED python modules under {DEV_PREFIX}: {ignored[:10]} -- these are on "
+                   f"disk, importable at run time, and in no listing this package produces."
+                   if ignored else ""))
     subject = _git("log", "-1", "--format=%s", resolved).strip()
     committed = _git("log", "-1", "--format=%cI", resolved).strip()
     files = tree_files(resolved)

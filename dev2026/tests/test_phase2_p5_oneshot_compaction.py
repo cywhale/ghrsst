@@ -27,6 +27,7 @@ import os
 import shutil
 import socket
 import sys
+import hashlib
 import tempfile
 import textwrap
 import unittest
@@ -207,7 +208,10 @@ class _CompactionBase(unittest.TestCase):
                      # block could be folded from a store nobody approved.
                      "paths": {"monolith": os.path.realpath(self.monolith),
                                "delta_path": os.path.realpath(self.delta),
-                               "daily_root": None}},
+                               "daily_root": None,
+                               # Outside the live root on purpose: build artifacts are operator
+                               # scratch, not P5-owned bytes under the data root.
+                               "artifacts_dir": os.path.realpath(self.artifacts)}},
         }
         p.update(over)
         return p
@@ -349,8 +353,33 @@ class _CompactionBase(unittest.TestCase):
         if "one_shot_pre_compaction" not in over:
             kw["one_shot_pre_compaction"] = self._pre()
         kw.update(over)
-        with dev_map(self.devs):
+        # The operation refuses unless its OWN modules are covered by an approved operation
+        # commit. The shipped set is empty and fails closed, so every run here declares the
+        # commit that actually contains them -- which is what an approval would do, and is the
+        # only honest positive control available before one exists.
+        with dev_map(self.devs), self.approved_operation_commit():
             return oc.compact_one_shot(**kw)
+
+    @staticmethod
+    def operation_commit():
+        """The most recent commit that contains every operation-inventory module unmodified."""
+        import subprocess
+        from ops import p5_readiness as rd
+        root = os.path.dirname(_DEV)
+        log = subprocess.run(("git", "-C", root, "log", "--format=%H", "-40"),
+                             capture_output=True, text=True).stdout.split()
+        for sha in log:
+            if all(rd._git_blob(sha, m) is not None
+                   and hashlib.sha256(rd._git_blob(sha, m)).hexdigest()
+                   == oc._file_digest(os.path.join(_DEV, m))
+                   for m in oc.OPERATION_INVENTORY):
+                return sha
+        raise AssertionError(
+            "no recent commit holds the operation-inventory modules as they are on disk; "
+            "commit them before running this suite")
+
+    def approved_operation_commit(self):
+        return mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (self.operation_commit(),))
 
     def manifest_generation(self):
         return int(bm.load_live(self.manifest_root)["generation"])
@@ -1421,7 +1450,9 @@ class TestParityEvidenceMustBeExecutedAndBound(_CompactionBase):
         prints["ops/p5_parity_producers.py"] = "a" * 64
         with self.assertRaises(oc.OneShotCompactionRefused) as caught:
             self.compact(identity_artifact=self._identity(module_fingerprints=prints))
-        self.assertIn("is not the one that would run", str(caught.exception))
+        # The OPERATION-INVENTORY check now reaches this first, and says the same thing about
+        # the same bytes: what is on disk is not what the identity recorded.
+        self.assertIn("on disk hashes to", str(caught.exception))
 
     def test_the_derivation_is_refused_before_any_lock_or_scan(self):
         with mock.patch.object(oc, "_build", side_effect=AssertionError("must not run")) \
@@ -2044,7 +2075,7 @@ class TestTheApprovalDoesNotAuthorizeArbitraryPaths(_CompactionBase):
 
     def test_a_relative_artifacts_dir_refuses(self):
         message = self._assert_refused_before_writing(artifacts_dir="artifacts")
-        self.assertIn("must be an absolute path", message)
+        self.assertIn("is not absolute", message)
 
     def test_an_anchor_inside_the_live_root_refuses(self):
         message = self._assert_refused_before_writing(
@@ -2477,7 +2508,7 @@ class TestTheProducerCannotBeImpersonated(_CompactionBase):
 
         with self.assertRaises(oc.OneShotCompactionRefused) as caught:
             self.compact(identity_artifact=self._identity(module_fingerprints=prints))
-        self.assertIn("is not the one that would run", str(caught.exception))
+        self.assertIn("on disk hashes to", str(caught.exception))
         self.assertEqual(self.manifest_generation(), 1)
 
     def test_an_identity_that_does_not_fingerprint_the_producer_module_is_refused(self):
@@ -2569,3 +2600,281 @@ class TestTheProducerCannotBeImpersonated(_CompactionBase):
                 module_fingerprints=self._fingerprints())
         self.assertIsNone(identity)
         self.assertIn("not where the registry says it lives", problem)
+
+
+class TestTheArtifactsDirIsApprovedNotMerelyAbsolute(_CompactionBase):
+    """An absolute path is not an approved path.
+
+    The build writes the provenance artifact that the publication then verifies, so the
+    directory is part of the write surface. `os.path.isabs` accepted `/tmp/anything` and
+    accepted a path inside the live root.
+
+    Each fixture below is ISOLATING: the preflight, the approval, the identity and every other
+    path stay correct, and only the artifacts directory moves — so no neighbouring check can be
+    what refuses it."""
+
+    def _pre_declaring(self, declared):
+        pre = self._pre()
+        pre["plan"]["paths"]["artifacts_dir"] = declared
+        return pre
+
+    def _assert_refused_before_writing(self, **over):
+        with mock.patch.object(oc, "_build", side_effect=AssertionError("must not run")) \
+                as build:
+            with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                self.compact(**over)
+        self.assertFalse(build.called, "a rogue artifacts_dir reached the build")
+        self.assertEqual(self.manifest_generation(), 1)
+        return str(caught.exception)
+
+    def test_a_rogue_absolute_path_is_refused(self):
+        """The end-to-end case: everything approved except where artifacts would land."""
+        rogue = os.path.join(self.tmp, "rogue_artifacts")
+        os.makedirs(rogue, exist_ok=True)
+        message = self._assert_refused_before_writing(artifacts_dir=rogue)
+        self.assertIn("is not the", message)
+        self.assertIn("the approved preflight names", message)
+
+    def test_an_artifacts_dir_inside_the_live_root_is_refused(self):
+        """Even when the preflight names it: operator scratch does not belong under the data
+        root the capacity floor and the inventory reason about."""
+        inside = os.path.join(self.live, "artifacts")
+        os.makedirs(inside, exist_ok=True)
+        message = self._assert_refused_before_writing(
+            artifacts_dir=inside, one_shot_pre_compaction=self._pre_declaring(inside))
+        self.assertIn("is inside the live root", message)
+
+    def test_a_preflight_that_names_no_artifacts_dir_is_refused(self):
+        pre = self._pre()
+        del pre["plan"]["paths"]["artifacts_dir"]
+        message = self._assert_refused_before_writing(one_shot_pre_compaction=pre)
+        self.assertIn("names no artifacts_dir", message)
+
+    def test_a_relative_declaration_in_the_preflight_is_refused(self):
+        message = self._assert_refused_before_writing(
+            one_shot_pre_compaction=self._pre_declaring("relative/artifacts"))
+        self.assertIn("which is not absolute", message)
+
+    def test_a_different_spelling_of_the_approved_path_is_accepted(self):
+        """Compared by realpath: `…/artifacts/.` is the same directory, and a string
+        comparison would have refused it for no reason."""
+        spelled = os.path.join(self.artifacts, ".")
+        result = self.compact(artifacts_dir=spelled)
+        self.assertEqual(result["generation"], 2)
+
+    def test_a_symlink_to_the_approved_path_resolves_and_is_accepted(self):
+        link = os.path.join(self.tmp, "artifacts_link")
+        os.symlink(self.artifacts, link)
+        result = self.compact(artifacts_dir=link)
+        self.assertEqual(result["generation"], 2)
+
+    def test_the_approved_artifacts_dir_still_works(self):
+        """The positive control."""
+        self.assertEqual(self.compact()["generation"], 2)
+
+
+class TestTheProducerDigestFieldIsRequired(unittest.TestCase):
+    """`producer_digest=None` was accepted here and refused only by the emptiness rule in
+    `_missing` — a neighbouring check, in another module, that a later edit could relax without
+    anyone connecting the two.
+
+    Every case below supplies a COMPLETE artifact and varies only `producer_digest`, so the
+    emptiness rule cannot be what refuses it."""
+
+    PRODUCER = {"producer": "ops/p5_parity_producers.py:point_series_parity",
+                "producer_digest": "b" * 64,
+                "module": "ops/p5_parity_producers.py",
+                "qualname": "point_series_parity"}
+
+    def problem(self, digest):
+        artifact = {
+            "kind": oc.PARITY_POINT_SERIES, "host": "odb24", "run_id": "R1",
+            "deploy_sha": "d" * 40,
+            "producer": self.PRODUCER["producer"], "producer_digest": digest,
+            "generation": 2, "manifest_checksum": "f" * 64, "source_map_digest": "9" * 64,
+            "executed_utc": iso(), "samples": 40, "mismatches": 0,
+            "provenance": "read per-day and compared point-wise",
+        }
+        return oc.parity_artifact_problem(
+            artifact, kind=oc.PARITY_POINT_SERIES, host="odb24", run_id="R1",
+            deploy_sha="d" * 40, generation=2, manifest_checksum="f" * 64,
+            source_map_digest="9" * 64, producer=self.PRODUCER)
+
+    def test_none_is_refused_by_the_field_check_itself(self):
+        """Not by `_missing`: the message is this check's own."""
+        problem = self.problem(None)
+        self.assertIsNotNone(problem)
+        self.assertIn("records producer_digest=None", problem)
+        self.assertIn("not the same as 'the right answer'", problem)
+        self.assertNotIn("an unanswered check is not a passing one", problem)
+
+    def test_a_non_digest_is_refused(self):
+        for value in ("", "   ", "not-a-digest", 12345, True, ["b" * 64], {"d": "x"}):
+            with self.subTest(repr(value)):
+                problem = self.problem(value)
+                self.assertIsNotNone(problem)
+
+    def test_a_wrong_length_digest_is_refused(self):
+        self.assertIn("not a SHA-256", self.problem("b" * 63))
+        self.assertIn("not a SHA-256", self.problem("b" * 65))
+
+    def test_an_uppercase_digest_is_refused(self):
+        """Hex is lower-case here; accepting either spelling would make two digests for one
+        file compare unequal somewhere else."""
+        self.assertIn("not a SHA-256", self.problem("B" * 64))
+
+    def test_a_digest_that_is_not_the_derived_one_is_refused(self):
+        self.assertIn("on disk hashes to", self.problem("c" * 64))
+
+    def test_the_derived_digest_is_accepted(self):
+        """The positive control: every refusal above is about its own defect."""
+        self.assertIsNone(self.problem(self.PRODUCER["producer_digest"]))
+
+
+class TestTheOperationInventoryIsBoundToReviewedBytes(_CompactionBase):
+    """Item 4: the producers were protected only by a disk-only comparison.
+
+    An identity artifact records what the operator found. Comparing a module against that
+    record proves the operator measured what they shipped — not that anyone reviewed it. The
+    operation inventory is now additionally compared against git blobs at an APPROVED OPERATION
+    commit, which is a separate set from the service's `REVIEWED_DEPLOY_SHAS` because the two
+    answer different questions."""
+
+    def test_the_shipped_default_is_empty_and_fails_closed(self):
+        """Read from the module, not from a fixture: this is the state a fresh checkout is in."""
+        import importlib
+        fresh = importlib.reload(importlib.import_module("ops.p5_oneshot_compaction"))
+        try:
+            self.assertEqual(fresh.APPROVED_OPERATION_SHAS, ())
+        finally:
+            importlib.reload(fresh)
+
+    def test_with_no_approved_operation_commit_the_operation_refuses(self):
+        with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", ()):
+            with mock.patch.object(oc, "_build",
+                                   side_effect=AssertionError("must not run")) as build:
+                with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                    with dev_map(self.devs):
+                        oc.compact_one_shot(**self._kwargs_for_refusal())
+        self.assertIn("APPROVED_OPERATION_SHAS", str(caught.exception))
+        self.assertIn("does not say anyone reviewed it", str(caught.exception))
+        self.assertFalse(build.called)
+
+    def _kwargs_for_refusal(self):
+        kw = dict(
+            live_root=self.live, manifest_root=self.manifest_root, wal_root=self.wal_root,
+            anchor_root=self.anchor, monolith_path=self.monolith, delta_path=self.delta,
+            compaction_lock_path=self.clock, ingest_lock_path=self.ilock,
+            approval=self._approval(), run_id=self.RUN_ID, operator="tests",
+            at_utc=iso(), min_free_gib=self.TEST_FLOOR,
+            start_day=self.grid[0], end_day=self.grid[-1],
+            classification_target=list(self.days),
+            artifacts_dir=self.artifacts, hard_reserve_bytes=1024,
+            block_out_path=self._next_block_path(),
+            writer_fence_probe=self._fence_probe,
+            point_series_parity=ppd.point_series_parity, api_parity=ppd.api_parity,
+            identity_artifact=self._identity(),
+            one_shot_exception=self._record(),
+            one_shot_pre_compaction=self._pre(),
+        )
+        return kw
+
+    def test_an_approved_operation_commit_that_lacks_the_module_refuses(self):
+        """Approving the wrong commit is not approving the module."""
+        from ops import p5_readiness as rd
+        old = rd.REVIEWED_DEPLOY_SHAS[0]          # long predates the producers
+        with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (old,)):
+            problem = oc.operation_inventory_problem(
+                module_fingerprints=self._identity()["module_fingerprints"])
+        self.assertIn("exists at none of the approved operation commits", problem)
+
+    def test_bytes_that_differ_from_the_approved_commit_refuse(self):
+        """The module is at the approved commit, and what is on disk is not those bytes."""
+        approved = self.operation_commit()
+        path = os.path.join(_DEV, "ops/p5_parity_producers.py")
+        with open(path, "rb") as fh:
+            original = fh.read()
+        try:
+            with open(path, "ab") as fh:
+                fh.write(b"\n# local edit\n")
+            prints = dict(self._identity()["module_fingerprints"])
+            prints["ops/p5_parity_producers.py"] = oc._file_digest(path)
+            with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (approved,)):
+                problem = oc.operation_inventory_problem(module_fingerprints=prints)
+        finally:
+            with open(path, "wb") as fh:
+                fh.write(original)
+        self.assertIsNotNone(problem)
+        self.assertIn("does not match the reviewed bytes", problem)
+
+    def test_an_unfingerprinted_operation_module_refuses(self):
+        prints = {k: v for k, v in self._identity()["module_fingerprints"].items()
+                  if k != "ops/p5_parity_producers.py"}
+        with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (self.operation_commit(),)):
+            problem = oc.operation_inventory_problem(module_fingerprints=prints)
+        self.assertIn("does not fingerprint the operation module", problem)
+
+    def test_an_approved_operation_commit_lets_the_operation_run(self):
+        """The positive control, and the only honest one available before a real approval."""
+        self.assertEqual(self.compact()["generation"], 2)
+
+    # ---------------------------------------------------------------- the boundary itself
+    def test_the_two_inventories_are_disjoint(self):
+        from ops import p5_readiness as rd
+        self.assertEqual(set(oc.OPERATION_INVENTORY) & set(rd.INVENTORY_MODULES), set(),
+                         "a module cannot be both what the service imports and what only the "
+                         "operator runs")
+
+    def test_the_producers_are_not_in_the_service_inventory(self):
+        """They are imported by this operation and by nothing the API serves. Putting them in
+        the service inventory would assert something untrue about the deployment."""
+        from ops import p5_readiness as rd
+        self.assertNotIn("ops/p5_parity_producers.py", rd.INVENTORY_MODULES)
+
+    def test_the_service_inventory_is_still_measured_by_execution(self):
+        """The guarantee this must not disturb: the readiness closure executes the build,
+        prune_swap and API paths rather than reading a list."""
+        from ops import p5_readiness as rd
+        self.assertEqual(set(rd.RUNTIME_GROUPS), {"build", "prune_swap", "api"})
+        for stage, (entries, declared, _smoke) in rd.RUNTIME_GROUPS.items():
+            with self.subTest(stage):
+                self.assertTrue(entries)
+                self.assertTrue(declared)
+
+    def test_the_operation_inventory_is_covered_by_the_review_package(self):
+        from ops import p5_deploy_candidate as dc
+        for module in oc.OPERATION_INVENTORY:
+            with self.subTest(module):
+                self.assertIn(module, dc.OPERATION_MODULES)
+
+    def test_a_fingerprint_that_disagrees_with_disk_refuses_in_isolation(self):
+        """The operation-inventory guard, on its own.
+
+        Reached through the operation, `producer_identity` refuses a mismatched producer module
+        first — so the inventory's own comparison was masked and a mutation deleting it
+        survived. It covers a SET, and a future entry that is not a producer module would have
+        nothing else checking it."""
+        prints = dict(self._identity()["module_fingerprints"])
+        prints["ops/p5_parity_producers.py"] = "a" * 64
+        with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (self.operation_commit(),)):
+            problem = oc.operation_inventory_problem(module_fingerprints=prints)
+        self.assertIsNotNone(problem)
+        self.assertIn("on disk hashes to", problem)
+        self.assertIn("the identity artifact recorded", problem)
+
+    def test_a_matching_fingerprint_passes_in_isolation(self):
+        with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (self.operation_commit(),)):
+            problem = oc.operation_inventory_problem(
+                module_fingerprints=self._identity()["module_fingerprints"])
+        self.assertIsNone(problem)
+
+    def test_an_operation_module_missing_from_disk_refuses(self):
+        # Resolved BEFORE the inventory is patched: the helper scans commits for the modules
+        # the inventory names, and asking it about a module that is not on disk is asking it
+        # the question this test is here to pose.
+        approved = self.operation_commit()
+        with mock.patch.object(oc, "OPERATION_INVENTORY", ("ops/not_on_disk.py",)), \
+                mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (approved,)):
+            problem = oc.operation_inventory_problem(
+                module_fingerprints={"ops/not_on_disk.py": "b" * 64})
+        self.assertIn("is not on disk", problem)

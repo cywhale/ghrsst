@@ -29,6 +29,14 @@ from ops import p5_oneshot_compaction as oc  # noqa: E402
 from ops import p5_readiness as rd  # noqa: E402
 
 
+def _read_text(path):
+    """Read and CLOSE. `open(p).read()` leaves the handle to the garbage collector, which
+    under `-W error::ResourceWarning` surfaces as an "Exception ignored" during finalization
+    rather than as a test failure -- visible only to someone reading stderr."""
+    with open(path) as fh:
+        return fh.read()
+
+
 class TestItDescribesACommitNotAWorktree(unittest.TestCase):
 
     def test_digests_come_from_git_not_from_disk(self):
@@ -140,34 +148,37 @@ class TestItApprovesNothing(unittest.TestCase):
 
 
 class TestTheIdentityUpdatePlanIsDerived(unittest.TestCase):
+    """Recomputed from the two inventories, not remembered.
 
-    def test_it_names_the_producer_modules_outside_the_inventory(self):
+    The plan changed shape when the operation-SHA mechanism replaced the disk-only path, and
+    these were rewritten with it rather than patched to keep passing: the old ones asserted
+    that the plan warns about leaving a module in both inventories, which is no longer the
+    outstanding question."""
+
+    def test_it_names_the_operation_inventory(self):
         plan = dc.identity_update_plan("HEAD")
-        outside = plan["producer_modules_outside_the_deployment_inventory"]
-        self.assertIn("ops/p5_parity_producers.py", outside,
-                      "the producers are not in the deployment inventory yet, and the plan "
-                      "must say so rather than implying they are covered")
+        self.assertIn("ops/p5_parity_producers.py", plan["operation_inventory"])
 
-    def test_it_requires_the_candidate_be_added_to_the_approved_set(self):
+    def test_it_reports_both_approved_sets_separately(self):
         plan = dc.identity_update_plan("HEAD")
-        self.assertTrue(any("REVIEWED_DEPLOY_SHAS" in s for s in plan["steps"]))
+        self.assertEqual(tuple(plan["approved_deploy_shas"]), rd.REVIEWED_DEPLOY_SHAS)
+        self.assertEqual(tuple(plan["approved_operation_shas"]), oc.APPROVED_OPERATION_SHAS)
 
-    def test_it_warns_that_leaving_a_module_in_both_keeps_the_weaker_path(self):
-        plan = dc.identity_update_plan("HEAD")
-        self.assertTrue(any("weaker path alive" in s for s in plan["steps"]))
-
-    def test_it_recomputes_rather_than_remembering(self):
-        """With the producers already in the inventory, the outstanding steps shrink."""
-        with mock.patch.object(
-                rd, "INVENTORY_MODULES",
-                tuple(rd.INVENTORY_MODULES) + ("ops/p5_parity_producers.py",)):
+    def test_it_recomputes_the_overlap_rather_than_assuming_none(self):
+        with mock.patch.object(oc, "OPERATION_INVENTORY",
+                               ("ops/p5_parity_producers.py", "store/block_manifest.py")):
             plan = dc.identity_update_plan("HEAD")
-        self.assertEqual(plan["producer_modules_outside_the_deployment_inventory"], [])
-        self.assertFalse(any("weaker path alive" in s for s in plan["steps"]))
+        self.assertEqual(plan["inventory_overlap"], ["store/block_manifest.py"])
+        self.assertTrue(any("cannot be both service-inventory" in s for s in plan["steps"]))
 
-    def test_it_reports_the_currently_approved_shas(self):
+    def test_the_empty_warning_disappears_once_an_operation_sha_is_approved(self):
+        with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", ("f" * 40,)):
+            plan = dc.identity_update_plan("HEAD")
+        self.assertFalse(any("EMPTY" in s for s in plan["steps"]))
+
+    def test_it_requires_an_operation_sha_before_anything_else(self):
         plan = dc.identity_update_plan("HEAD")
-        self.assertEqual(tuple(plan["already_approved_shas"]), rd.REVIEWED_DEPLOY_SHAS)
+        self.assertIn("APPROVED_OPERATION_SHAS", plan["steps"][0])
 
 
 class TestThePackageCoversWhatTheReviewerNeeds(unittest.TestCase):
@@ -232,8 +243,15 @@ class TestTheReviewDocumentSaysWhatIsBlocked(unittest.TestCase):
 
     def test_it_states_why_a_new_candidate_is_needed(self):
         flat = self._flat()
-        self.assertIn("postdates every commit in `p5_readiness.REVIEWED_DEPLOY_SHAS`", flat)
-        self.assertIn("no production run is possible", flat)
+        self.assertIn("postdates every approved commit", flat)
+        self.assertIn("the operation refuses today", flat)
+        self.assertIn("No production run is possible until a commit containing the producers "
+                      "is approved", flat)
+
+    def test_it_names_the_weaker_check_it_replaced(self):
+        flat = self._flat()
+        self.assertIn("the operator measured what they shipped", flat)
+        self.assertIn("it does not establish *anyone reviewed it*", flat)
 
     def test_it_covers_all_four_open_items(self):
         flat = self._flat()
@@ -272,3 +290,202 @@ class TestTheReviewDocumentSaysWhatIsBlocked(unittest.TestCase):
         flat = self._flat()
         self.assertIn("psutil not installed", flat)
         self.assertIn("root bypasses directory permissions", flat)
+
+
+class TestTheCleanlinessCheckSeesEverything(unittest.TestCase):
+    """`--porcelain` alone was not enough, in two separate ways.
+
+    Default `--untracked-files=normal` collapses an untracked DIRECTORY to one entry and never
+    names the files inside it. And no untracked mode lists IGNORED files at all — a module in
+    `.gitignore` sits on disk, gets imported at run time, and appears in no listing the package
+    produces, while every digest in the manifest still matches.
+
+    That second case is not hypothetical here: `producer_identity()` imports a module by path
+    and hashes the file on disk, so an ignored module at a registry path would pass the on-disk
+    check and be absent from the reviewed commit."""
+
+    def test_it_asks_for_untracked_files_all(self):
+        source = inspect.getsource(dc.dirty_paths)
+        self.assertIn("--untracked-files=all", source)
+
+    def test_it_asks_for_ignored_files_too(self):
+        source = inspect.getsource(dc.ignored_modules)
+        self.assertIn("--ignored", source)
+
+    def test_a_file_inside_an_untracked_directory_is_named(self):
+        """The `-uall` case: `normal` would report the directory and not the file."""
+        scratch = os.path.join(_DEV, "ops", "_pkg_probe_dir")
+        module = os.path.join(scratch, "runtime_thing.py")
+        os.makedirs(scratch, exist_ok=True)
+        try:
+            with open(module, "w") as fh:
+                fh.write("VALUE = 1\n")
+            dirty = dc.dirty_paths()
+            self.assertIn("dev2026/ops/_pkg_probe_dir/runtime_thing.py", dirty,
+                          "an untracked directory was collapsed; the file inside is unnamed")
+            self.assertFalse(dc.worktree_is_clean())
+        finally:
+            os.remove(module)
+            os.rmdir(scratch)
+
+    def test_an_ignored_runtime_module_makes_the_package_refuse(self):
+        """The case the review asked for.
+
+        A module git is told to ignore, at a path the operation could import. `status` at any
+        untracked mode reports nothing; the package must still refuse."""
+        gitignore = os.path.join(os.path.dirname(_DEV), ".gitignore")
+        module = os.path.join(_DEV, "ops", "_ignored_runtime_probe.py")
+        had_gitignore = os.path.isfile(gitignore)
+        original = _read_text(gitignore) if had_gitignore else None
+        try:
+            with open(gitignore, "a") as fh:
+                fh.write("\ndev2026/ops/_ignored_runtime_probe.py\n")
+            with open(module, "w") as fh:
+                fh.write("def point_series_parity(**kw):\n    return {'mismatches': 0}\n")
+
+            # `status` at the strictest untracked mode does not see it. That is the hazard.
+            self.assertNotIn("dev2026/ops/_ignored_runtime_probe.py", dc.dirty_paths())
+
+            self.assertIn("dev2026/ops/_ignored_runtime_probe.py", dc.ignored_modules())
+            self.assertFalse(dc.worktree_is_clean())
+            with self.assertRaises(dc.DeployCandidateError) as caught:
+                dc.manifest("HEAD")
+            self.assertIn("IGNORED python modules", str(caught.exception))
+            self.assertIn("_ignored_runtime_probe.py", str(caught.exception))
+        finally:
+            if os.path.isfile(module):
+                os.remove(module)
+            if original is None:
+                if os.path.isfile(gitignore):
+                    os.remove(gitignore)
+            else:
+                with open(gitignore, "w") as fh:
+                    fh.write(original)
+
+    def test_an_ignored_non_python_file_does_not_trip_it(self):
+        """Isolating: build output and caches are ignored on purpose and are not modules."""
+        gitignore = os.path.join(os.path.dirname(_DEV), ".gitignore")
+        blob = os.path.join(_DEV, "ops", "_ignored_probe.log")
+        had = os.path.isfile(gitignore)
+        original = _read_text(gitignore) if had else None
+        try:
+            with open(gitignore, "a") as fh:
+                fh.write("\ndev2026/ops/_ignored_probe.log\n")
+            with open(blob, "w") as fh:
+                fh.write("noise\n")
+            self.assertEqual(dc.ignored_modules(), [],
+                             "an ignored log was treated as a runtime module")
+        finally:
+            if os.path.isfile(blob):
+                os.remove(blob)
+            if original is None:
+                if os.path.isfile(gitignore):
+                    os.remove(gitignore)
+            else:
+                with open(gitignore, "w") as fh:
+                    fh.write(original)
+
+    def test_a_clean_tree_passes(self):
+        """The positive control, and it also proves the suite cleans up after itself."""
+        self.assertEqual(dc.ignored_modules(), [])
+
+
+class TestTheIdentityPlanReflectsTheOperationSha(unittest.TestCase):
+    """Item 4's mechanism, as the plan reports it."""
+
+    def test_it_asks_for_an_approved_operation_sha_first(self):
+        plan = dc.identity_update_plan("HEAD")
+        self.assertIn("APPROVED_OPERATION_SHAS", plan["steps"][0])
+
+    def test_it_says_the_set_is_empty_and_why_that_blocks(self):
+        plan = dc.identity_update_plan("HEAD")
+        self.assertTrue(any("EMPTY" in s and "fail-closed" in s for s in plan["steps"]))
+
+    def test_it_keeps_the_service_decision_separate(self):
+        plan = dc.identity_update_plan("HEAD")
+        self.assertTrue(any("decide SEPARATELY" in s for s in plan["steps"]))
+        self.assertTrue(any("re-approving tooling on every service change" in s
+                            for s in plan["steps"]))
+
+    def test_it_reports_both_inventories_and_their_overlap(self):
+        plan = dc.identity_update_plan("HEAD")
+        self.assertEqual(plan["inventory_overlap"], [])
+        self.assertIn("ops/p5_parity_producers.py", plan["operation_inventory"])
+        self.assertGreater(plan["service_inventory_size"], 20)
+
+    def test_it_reports_whether_the_candidate_actually_contains_the_modules(self):
+        plan = dc.identity_update_plan("HEAD")
+        self.assertEqual(plan["operation_modules_present_at_candidate"],
+                         {"ops/p5_parity_producers.py": True})
+
+    def test_it_warns_when_the_candidate_lacks_an_operation_module(self):
+        old = rd.REVIEWED_DEPLOY_SHAS[0]
+        plan = dc.identity_update_plan(old)
+        self.assertTrue(any("is not present at" in s for s in plan["steps"]))
+        self.assertEqual(plan["operation_modules_present_at_candidate"],
+                         {"ops/p5_parity_producers.py": False})
+
+    def test_the_document_states_the_chosen_boundary(self):
+        with open(os.path.join(_DEV, "specs", "p5_deploy_candidate_review.md")) as fh:
+            flat = " ".join(fh.read().split())
+        self.assertIn("There are **two** inventories", flat)
+        self.assertIn("is the code the SERVICE runs reviewed?", flat)
+        self.assertIn("is the code the OPERATOR runs reviewed?", flat)
+        self.assertIn("Neither is protected by a disk-only comparison any more", flat)
+        self.assertIn("`APPROVED_OPERATION_SHAS` is **empty**", flat)
+        self.assertIn("Why a separate set rather than reusing `REVIEWED_DEPLOY_SHAS`", flat)
+
+
+class TestTheCleanlinessConjunctionInIsolation(unittest.TestCase):
+    """`worktree_is_clean()` is an AND of two independent findings, tested as one.
+
+    The end-to-end ignored-module test asserted `worktree_is_clean()` is False while the working
+    tree ALSO had modified files — so it passed on the `dirty_paths()` half and would have
+    passed with the `ignored_modules()` half deleted. A mutation proved exactly that. These
+    stub each half so the other cannot be the reason.
+    """
+
+    def test_ignored_modules_alone_make_the_tree_unclean(self):
+        with mock.patch.object(dc, "dirty_paths", return_value=[]), \
+                mock.patch.object(dc, "ignored_modules",
+                                  return_value=["dev2026/ops/sneaky.py"]):
+            self.assertFalse(dc.worktree_is_clean())
+
+    def test_dirty_paths_alone_make_the_tree_unclean(self):
+        with mock.patch.object(dc, "dirty_paths", return_value=["dev2026/ops/edited.py"]), \
+                mock.patch.object(dc, "ignored_modules", return_value=[]):
+            self.assertFalse(dc.worktree_is_clean())
+
+    def test_neither_means_clean(self):
+        with mock.patch.object(dc, "dirty_paths", return_value=[]), \
+                mock.patch.object(dc, "ignored_modules", return_value=[]):
+            self.assertTrue(dc.worktree_is_clean())
+
+    def test_the_manifest_refuses_on_ignored_modules_alone(self):
+        """The other masked guard: `if dirty or ignored` passed on `dirty` every time."""
+        with mock.patch.object(dc, "dirty_paths", return_value=[]), \
+                mock.patch.object(dc, "ignored_modules",
+                                  return_value=["dev2026/ops/sneaky.py"]):
+            with self.assertRaises(dc.DeployCandidateError) as caught:
+                dc.manifest("HEAD")
+        message = str(caught.exception)
+        self.assertIn("IGNORED python modules", message)
+        self.assertIn("sneaky.py", message)
+        self.assertNotIn("Untracked or modified", message,
+                         "the refusal named the wrong finding")
+
+    def test_the_manifest_refuses_on_dirty_paths_alone(self):
+        with mock.patch.object(dc, "dirty_paths", return_value=["dev2026/ops/edited.py"]), \
+                mock.patch.object(dc, "ignored_modules", return_value=[]):
+            with self.assertRaises(dc.DeployCandidateError) as caught:
+                dc.manifest("HEAD")
+        message = str(caught.exception)
+        self.assertIn("Untracked or modified", message)
+        self.assertNotIn("IGNORED python modules", message)
+
+    def test_a_clean_tree_produces_a_manifest(self):
+        """The positive control for the conjunction, independent of this checkout's state."""
+        with mock.patch.object(dc, "dirty_paths", return_value=[]), \
+                mock.patch.object(dc, "ignored_modules", return_value=[]):
+            doc = dc.manifest("HEAD")
+        self.assertFalse(doc["approved"])

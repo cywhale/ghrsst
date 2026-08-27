@@ -191,6 +191,39 @@ def _bound_source_problem(role: str, path: Optional[str], *, declared, live_root
     return None
 
 
+def _artifacts_dir_problem(artifacts_dir, *, live_root: str, pre: Dict):
+    """Where the build's provenance artifacts may be written, or the refusal.
+
+    The build writes a provenance artifact and the publication verifies it, so the directory is
+    part of the operation's write surface -- and "absolute" was the whole check. An absolute
+    path is not an approved one: it accepted `/tmp/anything`, and it accepted a path INSIDE the
+    live root, which puts operator scratch under the data root the approval is about.
+
+    So it must be the run-specific artifact root the approved preflight names. Compared by
+    realpath, because a caller can spell the same directory several ways and only one of those
+    spellings would have matched a string comparison."""
+    if not _exact_str(artifacts_dir):
+        return f"{artifacts_dir!r} is not a path"
+    if not os.path.isabs(artifacts_dir):
+        return (f"{artifacts_dir!r} is not absolute; what it names would depend on the "
+                f"directory the operation happened to start in")
+    declared = ((pre or {}).get("plan") or {}).get("paths", {}).get("artifacts_dir")
+    if declared is None:
+        return ("was supplied but the approved preflight plan names no artifacts_dir. An "
+                "absolute path is not an approved path, and the build writes the provenance "
+                "artifact that the publication then verifies")
+    if not os.path.isabs(declared):
+        return f"is declared as {declared!r} in the preflight, which is not absolute"
+    if os.path.realpath(artifacts_dir) != os.path.realpath(declared):
+        return (f"{artifacts_dir!r} is not the {declared!r} the approved preflight names")
+    if _inside(artifacts_dir, live_root):
+        return (f"{artifacts_dir!r} is inside the live root {live_root!r}. Build artifacts are "
+                f"operator scratch; writing them under the data root puts unmanaged files where "
+                f"the capacity floor, the inventory and the cleanup path all reason about "
+                f"P5-owned bytes")
+    return None
+
+
 def check_operation_paths(*, live_root: str, manifest_root: str, wal_root: str,
                           block_out_path: str, artifacts_dir: str, anchor_root: str,
                           monolith_path: str, delta_path, daily_root, pre: Dict) -> Dict:
@@ -218,9 +251,9 @@ def check_operation_paths(*, live_root: str, manifest_root: str, wal_root: str,
             f"block_out_path {block_out_path!r} is not inside the manifest root "
             f"{canonical['manifest_root']!r}; a block written outside the approved root is one "
             f"the approval does not cover and the cleanup path does not know about")
-    if not _exact_str(artifacts_dir) or not os.path.isabs(artifacts_dir):
-        raise OneShotCompactionRefused(
-            f"artifacts_dir {artifacts_dir!r} must be an absolute path")
+    problem = _artifacts_dir_problem(artifacts_dir, live_root=live_root, pre=pre)
+    if problem:
+        raise OneShotCompactionRefused(f"artifacts_dir {problem}")
 
     # The anchor must be OUTSIDE the live root and on another device -- it witnesses the volume
     # it is meant to survive. `check_anchor_domain` is the existing authority for that and is
@@ -406,6 +439,85 @@ def quarantine_generation(manifest_root: str, *, generation: int, predecessor_ge
     return record
 
 
+# ---------------------------------------------------------------- the operation inventory
+#: Modules that are part of the compaction OPERATION rather than of the served deployment.
+#:
+#: The boundary, stated once so it is not re-argued in three places: a module belongs to
+#: `p5_readiness.INVENTORY_MODULES` when the SERVICE imports it, and here when only the
+#: operator tooling does. `ops/p5_parity_producers.py` is imported by this operation and by
+#: nothing the API serves, so putting it in the deployment inventory would assert something
+#: untrue about the deployment -- and the readiness closure probe, which measures the service's
+#: imports by executing them, would report it as an inventory entry nothing imports.
+OPERATION_INVENTORY = ("ops/p5_parity_producers.py",)
+
+#: Commits whose OPERATION inventory a human has reviewed. Empty is the shipped default and
+#: fails closed.
+#:
+#: This exists because "verified against the file on disk" is the weaker of the two available
+#: checks, and it was the only one covering the producers. An identity artifact records what the
+#: operator found; comparing a module against that record proves the operator measured what they
+#: shipped, not that anyone reviewed it. Comparing it against a git blob at an APPROVED commit
+#: is the claim that matters, and it needs an approved commit to compare against.
+#:
+#: Deliberately separate from `p5_readiness.REVIEWED_DEPLOY_SHAS`. That set answers "is the code
+#: the SERVICE runs reviewed", this one answers "is the code the OPERATOR runs reviewed", and a
+#: commit can reasonably be one and not the other. Merging them would mean approving operator
+#: tooling every time a service module changed, which is how an approval set stops being read.
+APPROVED_OPERATION_SHAS: tuple = ()
+
+
+def operation_inventory_problem(*, module_fingerprints: Dict):
+    """Are the operation's own modules the reviewed bytes? The first problem, or `None`.
+
+    Two things, and the second is the one that was missing:
+
+    * the identity artifact fingerprints each operation module, and the file on disk hashes to
+      that fingerprint -- the operator measured what they shipped;
+    * those same bytes are what `git` holds at a commit in `APPROVED_OPERATION_SHAS` -- somebody
+      reviewed them.
+
+    With `APPROVED_OPERATION_SHAS` empty this refuses, and that refusal IS the current state:
+    `ops/p5_parity_producers.py` postdates every approved commit, so no production run is
+    possible until one containing it is approved. Reporting anything else would be reporting
+    the weaker check as though it were the stronger one."""
+    from ops import p5_readiness as rd
+    if not APPROVED_OPERATION_SHAS:
+        return ("no commit is in APPROVED_OPERATION_SHAS, so the operation's own modules "
+                f"{list(OPERATION_INVENTORY)} can be compared against the file on disk and "
+                f"against nothing else. That check says the operator measured what they "
+                f"shipped; it does not say anyone reviewed it. Approve a commit containing "
+                f"them -- see specs/p5_deploy_candidate_review.md -- before any production run")
+    for relpath in OPERATION_INVENTORY:
+        recorded = module_fingerprints.get(relpath)
+        if recorded is None:
+            return (f"the identity artifact does not fingerprint the operation module "
+                    f"{relpath}; the code about to run is code nobody recorded")
+        path = os.path.join(_dev_root(), relpath)
+        if not os.path.isfile(path):
+            return f"the operation module {relpath} is not on disk"
+        on_disk = _file_digest(path)
+        if on_disk != recorded:
+            return (f"the operation module {relpath} on disk hashes to {on_disk[:12]}… but the "
+                    f"identity artifact recorded {recorded[:12]}…")
+        approved = [sha for sha in APPROVED_OPERATION_SHAS
+                    if rd._git_blob(sha, relpath) is not None]
+        if not approved:
+            return (f"the operation module {relpath} exists at none of the approved operation "
+                    f"commits {list(APPROVED_OPERATION_SHAS)}; it postdates every one of them "
+                    f"and is therefore unreviewed")
+        import hashlib
+        matches = [sha for sha in approved
+                   if hashlib.sha256(rd._git_blob(sha, relpath)).hexdigest() == on_disk]
+        if not matches:
+            return (f"the operation module {relpath} on disk does not match the reviewed bytes "
+                    f"at any of {approved}; what would run is not what was approved")
+    return None
+
+
+def _dev_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 # ---------------------------------------------------------------- the deployment identity
 #: What an identity artifact must carry. A production approval names a root and a run; it says
 #: nothing about whether the code about to run was ever reviewed, and those are different
@@ -500,39 +612,6 @@ def identity_problem(artifact, *, host: str, run_id: str, now=None):
     if not _exact_str(artifact["verified_by"]):
         return "does not say who established it; an unattributed identity is not provenance"
     return None
-
-
-# ---------------------------------------------------------------- parity evidence
-#: What an executed parity artifact must carry. A callable that returns `{"mismatches": 0}`
-#: satisfies a gate reading only that key while having measured nothing at all -- so the gate
-#: reads a bound RESULT instead, and the operation checks every binding against its own state.
-PARITY_ARTIFACT_FIELDS = ("kind", "host", "run_id", "deploy_sha",
-                          "producer", "producer_digest",
-                          "generation", "manifest_checksum", "source_map_digest",
-                          "executed_utc", "samples", "mismatches", "provenance")
-
-#: The two parity kinds, named so an artifact for one cannot be presented for the other.
-PARITY_POINT_SERIES = "point_series_parity"
-PARITY_API = "api_parity"
-
-#: The reviewed producers, per kind: (module path relative to the dev2026 tree, qualname).
-#:
-#: A digest carried IN the artifact was forgeable -- a lambda could copy the digest of any
-#: approved module and present itself as that module, returning a fully green result while
-#: measuring nothing. So the identity is DERIVED from the callable the operation holds, and this
-#: registry is the reviewed list of what may be called. Both halves matter: derivation stops an
-#: artifact naming a producer it did not come from, and the registry stops a genuine but
-#: unreviewed function in an approved module standing in for a parity check.
-REVIEWED_PRODUCERS = {
-    PARITY_POINT_SERIES: ("ops/p5_parity_producers.py", "point_series_parity"),
-    PARITY_API: ("ops/p5_parity_producers.py", "api_parity"),
-}
-
-#: Modules that hold the producers. They are part of the OPERATION rather than of the
-#: deployment inventory `p5_readiness.INVENTORY_MODULES` describes, so the identity artifact is
-#: allowed to fingerprint them in addition to the inventory -- and their on-disk digest is
-#: checked against that fingerprint. See `identity_problem`, and the limitation recorded there.
-REVIEWED_PRODUCER_MODULES = ("ops/p5_parity_producers.py",)
 
 
 def _repo_relative(path: str) -> Optional[str]:
@@ -696,9 +775,16 @@ def parity_artifact_problem(artifact, *, kind: str, host: str, run_id: str, depl
       refused rather than reused.
     * `samples` must be a positive count. Zero mismatches out of zero samples is not a passing
       check, it is an absent one."""
-    problem = ex._missing(artifact, PARITY_ARTIFACT_FIELDS, f"the {kind} artifact")
+    # `producer_digest` is swept out of the generic emptiness pass and checked below on its
+    # own. Left in, `_missing` refused `None` first -- with a message about an unanswered check
+    # -- so the field's own guard never executed and a mutation deleting it survived. A guard
+    # whose neighbour always answers first is not a guard.
+    generic = tuple(f for f in PARITY_ARTIFACT_FIELDS if f != "producer_digest")
+    problem = ex._missing(artifact, generic, f"the {kind} artifact")
     if problem:
         return problem
+    if "producer_digest" not in artifact:
+        return f"the {kind} artifact records no producer_digest"
     max_age_s, max_lead_s = ex._policy()
 
     if artifact["kind"] != kind:
@@ -719,8 +805,19 @@ def parity_artifact_problem(artifact, *, kind: str, host: str, run_id: str, depl
         return (f"claims producer {artifact['producer']!r}, but it came from "
                 f"{producer['producer']!r}. What a result says about its own origin is a "
                 f"string it chose")
-    if artifact["producer_digest"] not in (None, producer["producer_digest"]):
-        return (f"claims producer_digest {str(artifact['producer_digest'])[:12]}…, but "
+    # REQUIRED, and equal to the derived digest. `None` used to be accepted here, and the only
+    # thing refusing it was the emptiness rule in `_missing` -- a neighbouring check, in another
+    # module, that a later edit could relax without anyone connecting the two. An artifact that
+    # declines to say what produced it is not evidence that something did.
+    claimed = artifact["producer_digest"]
+    if claimed is None:
+        return ("records producer_digest=None. The field is required: an artifact that does "
+                "not say which bytes produced it cannot be tied to the reviewed producer, and "
+                "'no answer' is not the same as 'the right answer'")
+    if not ex._is_sha256(claimed):
+        return f"records producer_digest {claimed!r}, which is not a SHA-256 digest"
+    if claimed != producer["producer_digest"]:
+        return (f"claims producer_digest {str(claimed)[:12]}…, but "
                 f"{producer['module']} on disk hashes to {producer['producer_digest'][:12]}…")
     if not _exact_str(artifact["provenance"]):
         return ("states no verification provenance -- what was read, from where, and how it "
@@ -879,6 +976,11 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
         raise OneShotCompactionRefused(f"the deployment identity artifact {problem}")
     deploy_sha = identity_artifact["deploy_sha"]
     module_fingerprints = dict(identity_artifact["module_fingerprints"])
+
+    # ---- and the OPERATION's own modules, against reviewed bytes not just against disk ----
+    problem = operation_inventory_problem(module_fingerprints=module_fingerprints)
+    if problem:
+        raise OneShotCompactionRefused(f"the operation inventory: {problem}")
 
     # ---- and who is going to measure the parity, derived from the callables themselves ----
     # Up here with the identity, and for the same reason: a caller who passed an unreviewed

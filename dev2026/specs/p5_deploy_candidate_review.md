@@ -12,19 +12,22 @@ has run. The candidate is a commit on a local branch and nothing more.
 ## 1. Why a new deploy candidate is needed at all
 
 `ops/p5_oneshot_compaction.py` refuses to adjudicate a parity result unless the producer that
-measured it is **the reviewed function** — resolved from `REVIEWED_PRODUCERS`, imported by path,
-and compared by object identity. The producers live in `ops/p5_parity_producers.py`.
+measured it is **the reviewed function** — resolved from `REVIEWED_PRODUCERS`, imported by the
+path the registry names, and compared by object identity. The producers live in
+`ops/p5_parity_producers.py`.
 
-That file **postdates every commit in `p5_readiness.REVIEWED_DEPLOY_SHAS`**. So today:
+That file **postdates every approved commit**, and the operation now says so rather than
+compensating. `operation_inventory_problem()` requires the producers' on-disk bytes to match a
+git blob at a commit in `APPROVED_OPERATION_SHAS`; that set is **empty** in the shipped tree, so
+**the operation refuses today** and the refusal names the reason.
 
-* `identity_problem()` admits it as an *operation-side* module — one of
-  `REVIEWED_PRODUCER_MODULES` — fingerprinted from disk rather than against a git blob at an
-  approved commit;
-* which means the strongest statement the identity check can make about the producer is *"the
-  file on disk matches what the artifact recorded"*, not *"this is code a review approved"*.
+An earlier revision admitted the producers on the strength of the identity artifact's own
+fingerprint — a comparison against the file on disk. That establishes *the operator measured
+what they shipped*; it does not establish *anyone reviewed it*, and treating the weaker check as
+the stronger one is the thing this package exists to stop.
 
-**Until a deploy SHA containing the producers is reviewed and added to
-`REVIEWED_DEPLOY_SHAS`, no production run is possible.** That is the point of this package.
+**No production run is possible until a commit containing the producers is approved.** That is
+the decision this package is asking for, and §5 is what it would change.
 
 ---
 
@@ -79,31 +82,61 @@ manifest is generated from the commit every time.
 
 ---
 
-## 5. How the approved identity must be updated
+## 5. The inventory boundary, and how the approved identity must be updated
 
-If, and only if, the reviewer approves the candidate:
+### The boundary
 
-1. Add the candidate SHA to `p5_readiness.REVIEWED_DEPLOY_SHAS`.
-2. Decide whether `ops/p5_parity_producers.py` should join
-   `p5_readiness.INVENTORY_MODULES`. **Recommended: yes.** Once it is in the inventory,
-   `identity_problem()` compares it against the git blob at the approved SHA like every other
-   deployed module, and the weaker on-disk-only path in `REVIEWED_PRODUCER_MODULES` stops being
-   the thing that admits it.
-3. If it joins the inventory, remove it from `REVIEWED_PRODUCER_MODULES` — leaving it in both
-   would mean the `extra` allowance in `identity_problem()` still covers it, which is exactly
-   the weaker path this step exists to close.
-4. Re-run the closure and inventory tests in `tests/test_phase2_p5_readiness.py`; the assessor
-   measures its own runtime closure, so a module added to the inventory that the readiness path
-   does not import will be reported.
-5. Only then is an operator identity artifact collectable that satisfies
-   `identity_problem()` with the producers covered by git rather than by disk.
+There are **two** inventories, and they answer different questions.
 
-**Step 2 is a judgement, not a formality.** Putting the producers in the deployment inventory
-says they ship with the service. If the intent is that they are operator tooling that never runs
-on the deployment, the honest alternative is a separate approved-tooling SHA set with its own
-review — and that does not exist today.
+| inventory | question | membership |
+|---|---|---|
+| `p5_readiness.INVENTORY_MODULES` (23) | *is the code the SERVICE runs reviewed?* | a module the service imports |
+| `p5_oneshot_compaction.OPERATION_INVENTORY` (1) | *is the code the OPERATOR runs reviewed?* | a module only the compaction tooling imports |
 
----
+`ops/p5_parity_producers.py` belongs to the **operation** inventory. The service does not import
+it and never will: it exists so a compaction can measure parity, and the API serves without it.
+Putting it in the service inventory would assert something untrue about the deployment — and the
+readiness closure, which measures the service's imports **by executing the build, prune_swap and
+API paths**, would report it as an inventory entry nothing imports. The two sets are asserted
+disjoint by a test.
+
+### Neither is protected by a disk-only comparison any more
+
+The weakness this replaces: `identity_problem()` admitted the producers as operation-side
+modules and compared them against the identity artifact's own fingerprint. That proves *the
+operator measured what they shipped*. It does not prove *anyone reviewed it* — the artifact is a
+record of what was found, not of what was approved.
+
+So `operation_inventory_problem()` now requires **both**:
+
+1. the file on disk hashes to the fingerprint the identity artifact recorded; **and**
+2. those same bytes are what `git` holds at a commit in
+   `p5_oneshot_compaction.APPROVED_OPERATION_SHAS`.
+
+`APPROVED_OPERATION_SHAS` is **empty** in the shipped tree, and that is the fail-closed default.
+The operation therefore **refuses today**, and the refusal names the reason. This is not a
+regression: it is the previously-implicit blocker made executable.
+
+### Why a separate set rather than reusing `REVIEWED_DEPLOY_SHAS`
+
+A commit can reasonably be approved as operator tooling and not as service code, or the reverse.
+Merging the sets would mean re-approving the tooling every time a service module changed, which
+is how an approval set stops being read and starts being rubber-stamped.
+
+### What approving this candidate requires
+
+1. Add the candidate SHA to `p5_oneshot_compaction.APPROVED_OPERATION_SHAS`. Until then the
+   operation refuses.
+2. Decide **separately** whether it also belongs in `p5_readiness.REVIEWED_DEPLOY_SHAS`. That is
+   about the code the service runs and is not implied by (1). For this candidate the honest
+   answer is probably *no* — nothing here changes what the service imports.
+3. Re-run `tests/test_phase2_p5_readiness.py`. The assessor measures its own runtime closure by
+   executing the three stages, so an inventory entry the closure does not reach is reported.
+4. Confirm the two inventories are still disjoint; a module in both is a claim that the service
+   imports it *and* that only the operator does.
+
+`ops/p5_deploy_candidate.identity_update_plan()` computes all of this from the tree rather than
+restating it, so a reader gets the version that is true of the commit in front of them.
 
 ## 5a. The 17 skipped tests, and what they are not
 
