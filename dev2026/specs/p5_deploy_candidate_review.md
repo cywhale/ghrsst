@@ -82,61 +82,85 @@ manifest is generated from the commit every time.
 
 ---
 
-## 5. The inventory boundary, and how the approved identity must be updated
+## 5. The two inventories, the runtime closure, and the approval that governs each
 
-### The boundary
+### The closure was one module; it is twenty-one
 
-There are **two** inventories, and they answer different questions.
+`OPERATION_INVENTORY` held `ops/p5_parity_producers.py` — the module the producer registry
+pointed at, mistaken for the set of code a compaction runs. Measuring it by **executing a real
+compaction in a clean process** gives twenty-one first-party modules: the operation and its
+contracts, the provisioner and legacy-base builder it calls into, the whole ingest build and
+publish path, the store layer, and the `p5_readiness` policy chain. Six are reached only through
+lazy imports — `ingest/corrected_day.py` is imported partway through the build, and
+`p5_readiness` arrives via `_policy()` and the canonical capacity floor. **Twenty of the
+twenty-one were unchecked.**
 
-| inventory | question | membership |
+`tests/test_phase2_p5_oneshot_compaction.py` re-measures it the same way and fails if the
+declared list and the measured closure differ in either direction. Padding it would demand
+approval for code that never runs and make the gate look stronger than it is; missing an entry
+is what this finding was.
+
+### The two inventories are NOT disjoint, and should not be
+
+An earlier revision of this document claimed they were, and asserted it in a test. That was only
+true while the operation inventory had one element. Measuring the real closure shows the two
+share eleven modules — the whole store and ingest layer — because reading a store and publishing
+a manifest is the same code whether the service does it or a compaction does.
+
+| | question | authority |
 |---|---|---|
-| `p5_readiness.INVENTORY_MODULES` (23) | *is the code the SERVICE runs reviewed?* | a module the service imports |
-| `p5_oneshot_compaction.OPERATION_INVENTORY` (1) | *is the code the OPERATOR runs reviewed?* | a module only the compaction tooling imports |
+| `p5_readiness.INVENTORY_MODULES` (23) | is the code the SERVICE runs reviewed? | `REVIEWED_DEPLOY_SHAS` |
+| `p5_oneshot_compaction.OPERATION_INVENTORY` (21) | is the code the OPERATION runs reviewed? | the external operation approval record |
 
-`ops/p5_parity_producers.py` belongs to the **operation** inventory. The service does not import
-it and never will: it exists so a compaction can measure parity, and the API serves without it.
-Putting it in the service inventory would assert something untrue about the deployment — and the
-readiness closure, which measures the service's imports **by executing the build, prune_swap and
-API paths**, would report it as an inventory entry nothing imports. The two sets are asserted
-disjoint by a test.
+What separates them is **which approval authority governs**, not which files are in them. Ten
+modules are operation-only — the operation, its contracts, the provisioner, the legacy-base
+builder, the producers, and the policy chain — and a deploy approval does not cover those.
 
-### Neither is protected by a disk-only comparison any more
+### The allow-list cannot live in the operation
 
-The weakness this replaces: `identity_problem()` admitted the producers as operation-side
-modules and compared them against the identity artifact's own fingerprint. That proves *the
-operator measured what they shipped*. It does not prove *anyone reviewed it* — the artifact is a
-record of what was found, not of what was approved.
+`APPROVED_OPERATION_SHAS` was a tuple inside `ops/p5_oneshot_compaction.py`, and that module is
+part of the closure it governs. The circle is concrete: edit the implementation, commit it as Y,
+then commit Z adding X to the allow-list. Whether that works depends only on which modules the
+gate happens to check — and the gate is in the file being edited. **An allow-list a change can
+extend is an allow-list the change approves itself with.**
 
-So `operation_inventory_problem()` now requires **both**:
+So approval comes from **outside**, exactly as it does for the assessor
+(`p5_readiness.APPROVAL_RECORD_PATH`, and for the same reason): the operator holds a record on a
+path outside the repository, pointed at by `P5_OPERATION_APPROVAL`, naming
 
-1. the file on disk hashes to the fingerprint the identity artifact recorded; **and**
-2. those same bytes are what `git` holds at a commit in
-   `p5_oneshot_compaction.APPROVED_OPERATION_SHAS`.
+* `approved_sha` — the commit whose bytes were reviewed;
+* `approved_modules` — the closure that was reviewed, so **widening the inventory later
+  invalidates the approval** rather than riding in on it;
+* `approved_by`, `approved_utc`, and a `scope` of `p5_oneshot_compaction_operation`.
 
-`APPROVED_OPERATION_SHAS` is **empty** in the shipped tree, and that is the fail-closed default.
-The operation therefore **refuses today**, and the refusal names the reason. This is not a
-regression: it is the previously-implicit blocker made executable.
+A record inside the repository is refused, and so is a symlink whose name sits outside but which
+resolves inside — the tree may not choose what its own approval says.
 
-### Why a separate set rather than reusing `REVIEWED_DEPLOY_SHAS`
+`OPERATION_APPROVAL_DEFAULT` is `None`. **No record, no approval, and the operation refuses** —
+which is the state a fresh checkout is in today.
 
-A commit can reasonably be approved as operator tooling and not as service code, or the reverse.
-Merging the sets would mean re-approving the tooling every time a service module changed, which
-is how an approval set stops being read and starts being rubber-stamped.
+### Why the implementation cannot approve a changed implementation
+
+Because `ops/p5_oneshot_compaction.py` is in `OPERATION_INVENTORY`, the gate compares its
+on-disk bytes against the approved commit. A modified operation does not match any commit that
+predates the modification, and it cannot name its own commit: a commit id is a hash of its
+content, so no commit can contain its own id. A *later* commit naming an earlier one is a
+changed implementation vouching for the version it replaced — which is precisely what an
+approval is supposed to rule out. The only thing that can approve a change is a person, after
+the change exists, recording that decision somewhere the change cannot reach.
 
 ### What approving this candidate requires
 
-1. Add the candidate SHA to `p5_oneshot_compaction.APPROVED_OPERATION_SHAS`. Until then the
-   operation refuses.
-2. Decide **separately** whether it also belongs in `p5_readiness.REVIEWED_DEPLOY_SHAS`. That is
-   about the code the service runs and is not implied by (1). For this candidate the honest
-   answer is probably *no* — nothing here changes what the service imports.
-3. Re-run `tests/test_phase2_p5_readiness.py`. The assessor measures its own runtime closure by
-   executing the three stages, so an inventory entry the closure does not reach is reported.
-4. Confirm the two inventories are still disjoint; a module in both is a claim that the service
-   imports it *and* that only the operator does.
+1. Write an operation approval record outside the repository naming this candidate's SHA and
+   all 21 modules of the closure; point `P5_OPERATION_APPROVAL` at it.
+2. Decide **separately** whether the candidate belongs in `REVIEWED_DEPLOY_SHAS`. That is about
+   the code the service runs, and is not implied by (1).
+3. Re-run `tests/test_phase2_p5_readiness.py`: the assessor measures its own runtime closure by
+   executing the build, prune_swap and API paths.
 
-`ops/p5_deploy_candidate.identity_update_plan()` computes all of this from the tree rather than
-restating it, so a reader gets the version that is true of the commit in front of them.
+`ops/p5_deploy_candidate.identity_update_plan()` computes all of this from the tree, and
+`operation_modules()` is **derived from the gate's own inventory** rather than being a second
+hand-written list that can disagree with what actually refuses.
 
 ## 5a. The 17 skipped tests, and what they are not
 

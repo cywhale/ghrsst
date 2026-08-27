@@ -440,53 +440,182 @@ def quarantine_generation(manifest_root: str, *, generation: int, predecessor_ge
 
 
 # ---------------------------------------------------------------- the operation inventory
-#: Modules that are part of the compaction OPERATION rather than of the served deployment.
+#: The COMPLETE first-party runtime closure of a one-shot compaction, measured by executing
+#: one -- not by listing what seemed relevant.
 #:
-#: The boundary, stated once so it is not re-argued in three places: a module belongs to
-#: `p5_readiness.INVENTORY_MODULES` when the SERVICE imports it, and here when only the
-#: operator tooling does. `ops/p5_parity_producers.py` is imported by this operation and by
-#: nothing the API serves, so putting it in the deployment inventory would assert something
-#: untrue about the deployment -- and the readiness closure probe, which measures the service's
-#: imports by executing them, would report it as an inventory entry nothing imports.
-OPERATION_INVENTORY = ("ops/p5_parity_producers.py",)
-
-#: Commits whose OPERATION inventory a human has reviewed. Empty is the shipped default and
-#: fails closed.
+#: It was `("ops/p5_parity_producers.py",)`. That was the module the producer registry pointed
+#: at, and it was mistaken for the set of code the operation runs. A compaction executes the
+#: operation itself, the exception and capability contracts, the provisioner it borrows path and
+#: capacity checks from, the legacy-base builder, the ingest build and publish path, and six
+#: modules reached only through lazy imports -- `ingest/corrected_day.py` is imported partway
+#: through the build, and the `p5_readiness` chain is pulled in by `_policy()` and by the
+#: capacity floor. Twenty of the twenty-one were unchecked.
 #:
-#: This exists because "verified against the file on disk" is the weaker of the two available
-#: checks, and it was the only one covering the producers. An identity artifact records what the
-#: operator found; comparing a module against that record proves the operator measured what they
-#: shipped, not that anyone reviewed it. Comparing it against a git blob at an APPROVED commit
-#: is the claim that matters, and it needs an approved commit to compare against.
+#: `tests/test_phase2_p5_oneshot_compaction.py` re-measures this by running a real compaction in
+#: a clean subprocess and comparing, so a lazy import added later cannot quietly leave the
+#: runtime unguarded -- the same failure this list was created to fix.
+OPERATION_INVENTORY = (
+    # the operation and its contracts
+    "ops/p5_oneshot_compaction.py",
+    "ops/p5_oneshot_exception.py",
+    "ops/p5_parity_producers.py",
+    # provisioning and legacy-base code the operation calls into
+    "ops/p5_legacy_base.py",
+    "ops/p5_prod_provision.py",
+    # the policy chain reached through `_policy()` and the canonical capacity floor
+    "ops/p5_readiness.py",
+    "ops/p5_roadmap.py",
+    "ops/p5s8_evidence.py",
+    "ops/p5s8_report.py",
+    "ops/quiescence.py",
+    # the ingest build and publish path, all three imported lazily during the run
+    "ingest/build_block.py",
+    "ingest/corrected_day.py",
+    "ingest/publish_manifest.py",
+    # the store layer
+    "store/__init__.py",
+    "store/block_manifest.py",
+    "store/compaction_lock.py",
+    "store/durable_jsonl.py",
+    "store/repair_wal.py",
+    "store/segmented_cube.py",
+    "store/source_provenance.py",
+    "store/time_cube.py",
+)
+
+#: Approval for the OPERATION comes from OUTSIDE the operation.
 #:
-#: Deliberately separate from `p5_readiness.REVIEWED_DEPLOY_SHAS`. That set answers "is the code
-#: the SERVICE runs reviewed", this one answers "is the code the OPERATOR runs reviewed", and a
-#: commit can reasonably be one and not the other. Merging them would mean approving operator
-#: tooling every time a service module changed, which is how an approval set stops being read.
-APPROVED_OPERATION_SHAS: tuple = ()
+#: `APPROVED_OPERATION_SHAS` used to live in this module -- and this module is in
+#: `OPERATION_INVENTORY`, so the code being approved carried its own approval. The circle is not
+#: hypothetical: edit the implementation, commit it as Y, then commit Z adding X to the
+#: allow-list. Whether that works depends only on which modules the gate happens to check, and
+#: the gate is in the file being edited. An allow-list a change can extend is an allow-list the
+#: change approves itself with.
+#:
+#: So the operator holds a record instead, on a path outside the repository, naming the exact
+#: commit they approved. `None` is the shipped default and fails closed: no record, no approval.
+#: Nothing here names a SHA, because approving one is not this code's to do.
+#:
+#: This is the same shape as `p5_readiness.APPROVAL_RECORD_PATH`, for the same reason, and it is
+#: a SEPARATE record: that one answers "is the assessor reviewed", this one answers "is the
+#: operation reviewed", and a commit can reasonably be one and not the other.
+OPERATION_APPROVAL_DEFAULT = None
+OPERATION_APPROVAL_ENV = "P5_OPERATION_APPROVAL"
+OPERATION_APPROVAL_PATH = os.environ.get(OPERATION_APPROVAL_ENV) or OPERATION_APPROVAL_DEFAULT
+
+#: What such a record must declare it is for. A record approving something else is not this.
+OPERATION_APPROVAL_SCOPE = "p5_oneshot_compaction_operation"
+
+#: Every field the record must carry.
+OPERATION_APPROVAL_FIELDS = ("scope", "approved_sha", "approved_by", "approved_utc",
+                             "approved_modules")
 
 
-def operation_inventory_problem(*, module_fingerprints: Dict):
-    """Are the operation's own modules the reviewed bytes? The first problem, or `None`.
+def _dev_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    Two things, and the second is the one that was missing:
 
-    * the identity artifact fingerprints each operation module, and the file on disk hashes to
-      that fingerprint -- the operator measured what they shipped;
-    * those same bytes are what `git` holds at a commit in `APPROVED_OPERATION_SHAS` -- somebody
-      reviewed them.
+def _repo_root() -> str:
+    return os.path.dirname(_dev_root())
 
-    With `APPROVED_OPERATION_SHAS` empty this refuses, and that refusal IS the current state:
-    `ops/p5_parity_producers.py` postdates every approved commit, so no production run is
-    possible until one containing it is approved. Reporting anything else would be reporting
-    the weaker check as though it were the stronger one."""
-    from ops import p5_readiness as rd
-    if not APPROVED_OPERATION_SHAS:
-        return ("no commit is in APPROVED_OPERATION_SHAS, so the operation's own modules "
-                f"{list(OPERATION_INVENTORY)} can be compared against the file on disk and "
-                f"against nothing else. That check says the operator measured what they "
-                f"shipped; it does not say anyone reviewed it. Approve a commit containing "
-                f"them -- see specs/p5_deploy_candidate_review.md -- before any production run")
+
+def operation_approval(path=None, *, now=None):
+    """The approved operation record, or `(None, why-not)`.
+
+    Read from outside the repository on purpose. The record names a commit; this code never
+    does, and cannot: a commit id is a hash of its own content, so no commit can name itself,
+    and a later commit naming an earlier one is a changed implementation vouching for the
+    version it replaced."""
+    import json
+    given = path or OPERATION_APPROVAL_PATH
+    if not given:
+        return None, (f"no operation approval record is configured ({OPERATION_APPROVAL_ENV} "
+                      f"is unset), so no build of this operation is approved and it may not "
+                      f"publish a generation")
+    given = os.path.abspath(given)
+    if not os.path.isfile(given):
+        return None, f"the operation approval record {given!r} does not exist"
+    # The boundary is about where the BYTES are, so the name AND what it resolves to are both
+    # checked -- a link whose name sits outside the tree but which points inside it would be
+    # the tree choosing what its own approval says.
+    repo = _repo_root()
+    for label, candidate in (("resolves to", os.path.realpath(given)), ("is at", given)):
+        for root in (os.path.realpath(repo), os.path.abspath(repo)):
+            if candidate == root or candidate.startswith(root + os.sep):
+                return None, (f"the operation approval record {label} {candidate!r}, inside the "
+                              f"repository it approves; the authority has to be outside the "
+                              f"thing it authorizes")
+    try:
+        with open(given) as fh:
+            record = json.load(fh)
+    except Exception as exc:                                        # noqa: BLE001
+        return None, f"the operation approval record {given!r} could not be read: {exc!r}"
+    if type(record) is not dict:
+        return None, f"the operation approval record is {type(record).__name__}, not a record"
+    for field in OPERATION_APPROVAL_FIELDS:
+        if field not in record:
+            return None, f"the operation approval record declares no {field}"
+    if record["scope"] != OPERATION_APPROVAL_SCOPE:
+        return None, (f"the operation approval record declares scope {record['scope']!r}; this "
+                      f"needs {OPERATION_APPROVAL_SCOPE!r}")
+    sha = record["approved_sha"]
+    if type(sha) is not str or len(sha) != 40 or \
+            not all(c in "0123456789abcdef" for c in sha):
+        return None, (f"the operation approval record names approved_sha {sha!r}, which is not "
+                      f"a commit id")
+    if not _exact_str(record.get("approved_by")):
+        return None, "the operation approval record names nobody as having approved it"
+    if ex._parse_utc(record.get("approved_utc")) is None:
+        return None, (f"the operation approval record dates the approval "
+                      f"{record.get('approved_utc')!r}, which is not a timestamp")
+    approved_modules = record["approved_modules"]
+    if type(approved_modules) is not list or not approved_modules:
+        return None, ("the operation approval record lists no approved_modules; an approval "
+                      "that does not say WHAT was reviewed cannot be checked against what runs")
+    # Widening the inventory must invalidate the approval. Otherwise a later change adds a
+    # module to `OPERATION_INVENTORY` and rides in on an approval that never saw it.
+    missing = sorted(set(OPERATION_INVENTORY) - set(approved_modules))
+    if missing:
+        return None, (f"the operation approval record approved {len(approved_modules)} "
+                      f"module(s) and the operation now runs {missing} as well; an approval "
+                      f"does not extend to code it never covered")
+    return record, None
+
+
+def _blob_at(repo_root, sha: str, relpath: str):
+    """The bytes git holds for one dev-tree path at one commit, or `None`.
+
+    `repo_root` is a parameter so a caller can point at a different repository. Production never
+    does -- it defaults to the repository this module lives in -- and the reason it exists is
+    that a positive control has to compare on-disk bytes against a REAL commit containing them,
+    which a dirty development tree by definition does not have."""
+    import subprocess
+    root = repo_root or _repo_root()
+    proc = subprocess.run(("git", "-C", root, "cat-file", "blob", f"{sha}:dev2026/{relpath}"),
+                          capture_output=True)
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def operation_inventory_problem(*, module_fingerprints: Dict, approval_path=None,
+                                repo_root=None, now=None):
+    """Is EVERY module this operation runs the reviewed bytes? The first problem, or `None`.
+
+    Three things, and none implies another:
+
+    * an approval record exists, OUTSIDE the repository, naming a commit and the modules it
+      covers -- see `operation_approval()` for why it cannot live in here;
+    * the identity artifact fingerprints each module of the runtime closure, and the file on
+      disk hashes to that fingerprint, so the operator measured what they shipped;
+    * those same bytes are what `git` holds at the approved commit, so somebody reviewed them.
+
+    The closure is `OPERATION_INVENTORY`, measured by executing a compaction rather than
+    listed. `ops/p5_oneshot_compaction.py` is IN it, which is the point: a modified
+    implementation does not match the approved commit and refuses itself."""
+    import hashlib
+    record, problem = operation_approval(approval_path, now=now)
+    if problem:
+        return problem
+    sha = record["approved_sha"]
     for relpath in OPERATION_INVENTORY:
         recorded = module_fingerprints.get(relpath)
         if recorded is None:
@@ -499,23 +628,14 @@ def operation_inventory_problem(*, module_fingerprints: Dict):
         if on_disk != recorded:
             return (f"the operation module {relpath} on disk hashes to {on_disk[:12]}… but the "
                     f"identity artifact recorded {recorded[:12]}…")
-        approved = [sha for sha in APPROVED_OPERATION_SHAS
-                    if rd._git_blob(sha, relpath) is not None]
-        if not approved:
-            return (f"the operation module {relpath} exists at none of the approved operation "
-                    f"commits {list(APPROVED_OPERATION_SHAS)}; it postdates every one of them "
-                    f"and is therefore unreviewed")
-        import hashlib
-        matches = [sha for sha in approved
-                   if hashlib.sha256(rd._git_blob(sha, relpath)).hexdigest() == on_disk]
-        if not matches:
+        blob = _blob_at(repo_root, sha, relpath)
+        if blob is None:
+            return (f"the operation module {relpath} does not exist at the approved commit "
+                    f"{sha[:12]}…; it postdates the approval and is therefore unreviewed")
+        if hashlib.sha256(blob).hexdigest() != on_disk:
             return (f"the operation module {relpath} on disk does not match the reviewed bytes "
-                    f"at any of {approved}; what would run is not what was approved")
+                    f"at {sha[:12]}…; what would run is not what was approved")
     return None
-
-
-def _dev_root() -> str:
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 # ---------------------------------------------------------------- the deployment identity
@@ -527,7 +647,7 @@ IDENTITY_FIELDS = ("host", "run_id", "deploy_sha", "head_sha", "worktree_clean",
                    "module_fingerprints", "collected_utc", "verified_by")
 
 
-def identity_problem(artifact, *, host: str, run_id: str, now=None):
+def identity_problem(artifact, *, host: str, run_id: str, repo_root=None, now=None):
     """The first thing wrong with the deployment identity artifact, or `None`.
 
     Four independent things, none of which implies another:
@@ -587,7 +707,15 @@ def identity_problem(artifact, *, host: str, run_id: str, now=None):
         if not ex._is_sha256(digest):
             return f"records module fingerprint {name}={digest!r}, which is not a SHA-256"
 
-    expected = rd.expected_module_digests(sha)
+    # Read from git at the approved commit. `repo_root` exists for the same reason it does on
+    # `operation_inventory_problem`: a positive control has to compare against a commit that
+    # really contains the bytes, and production always uses this repository.
+    import hashlib as _h
+    expected = {}
+    for rel in rd.INVENTORY_MODULES:
+        blob = _blob_at(repo_root, sha, rel)
+        if blob is not None:
+            expected[rel] = _h.sha256(blob).hexdigest()
     if not expected:
         return (f"cannot be checked: the module blobs for {sha} are not readable from this "
                 f"repository, so there is nothing to compare the fingerprints against")
@@ -604,11 +732,15 @@ def identity_problem(artifact, *, host: str, run_id: str, now=None):
     # deployed service -- so the artifact may carry them in addition, and `producer_identity()`
     # checks each against the file on disk. Anything else is a module the review never saw
     # running alongside the ones it did.
-    extra = sorted(set(reported) - set(expected) - set(REVIEWED_PRODUCER_MODULES))
+    # The deployment inventory is what git holds at the approved DEPLOY commit. The operation
+    # also runs modules the service never imports -- the operation itself, its contracts, the
+    # provisioner, the producers -- so the artifact may carry those in addition. They are not
+    # unchecked: `operation_inventory_problem()` compares every one of them against the
+    # approved OPERATION commit, which is a separate authority for a separate question.
+    extra = sorted(set(reported) - set(expected) - set(OPERATION_INVENTORY))
     if extra:
         return (f"fingerprints {extra}, which the approved commit does not contain and which "
-                f"are not the operation's own producer modules "
-                f"{list(REVIEWED_PRODUCER_MODULES)}")
+                f"are not part of the operation's own runtime closure")
     if not _exact_str(artifact["verified_by"]):
         return "does not say who established it; an unattributed identity is not provenance"
     return None
@@ -978,7 +1110,7 @@ def compact_one_shot(*, live_root: str, manifest_root: str, wal_root: str, ancho
     module_fingerprints = dict(identity_artifact["module_fingerprints"])
 
     # ---- and the OPERATION's own modules, against reviewed bytes not just against disk ----
-    problem = operation_inventory_problem(module_fingerprints=module_fingerprints)
+    problem = operation_inventory_problem(module_fingerprints=module_fingerprints, now=now)
     if problem:
         raise OneShotCompactionRefused(f"the operation inventory: {problem}")
 

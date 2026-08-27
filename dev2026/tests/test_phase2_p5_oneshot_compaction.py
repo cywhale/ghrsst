@@ -111,6 +111,9 @@ class _CompactionBase(unittest.TestCase):
         evd.MINIMUM_FREE_GIB = self.TEST_FLOOR
 
         self.devs = {self.anchor: 4242}
+        # Pinned BEFORE any test edits a module: the approved commit must hold the tree as it
+        # was, or an edit made first would be committed into the clone and read as approved.
+        self.operation_commit()
         self._provision_generation_one()
         self.probe_calls = []
 
@@ -223,20 +226,20 @@ class _CompactionBase(unittest.TestCase):
         return a
 
     def _identity(self, **over):
-        """A real identity artifact: the fingerprints are the blobs git holds at the approved
-        commit, so nothing here describes itself."""
-        sha = rd.REVIEWED_DEPLOY_SHAS[-1]
+        """A real identity artifact: ON-DISK digests, checked against a commit that holds them.
+
+        An operator collects what is on the deployment host. Earlier this fixture reported the
+        git blobs at an old approved commit instead, which made the artifact agree with the
+        deploy check by construction while several modules on disk had since changed. The
+        throwaway clone is what makes the honest version work: the deployment is "at" a commit
+        that genuinely contains these bytes."""
+        sha = self.operation_commit()
+        modules = sorted(set(oc.OPERATION_INVENTORY) | set(rd.INVENTORY_MODULES))
         a = {
             "host": socket.gethostname(), "run_id": self.RUN_ID,
             "deploy_sha": sha, "head_sha": sha, "worktree_clean": True,
-            # The deployment inventory at the approved commit, PLUS the operation's own
-            # producer module -- which postdates that commit, so it is fingerprinted from disk
-            # and checked against disk. See the limitation in `identity_problem`.
-            "module_fingerprints": {
-                **rd.expected_module_digests(sha),
-                **{m: oc._file_digest(os.path.join(_DEV, m))
-                   for m in oc.REVIEWED_PRODUCER_MODULES},
-            },
+            "module_fingerprints": {m: oc._file_digest(os.path.join(_DEV, m))
+                                    for m in modules},
             "collected_utc": iso(-30),
             "verified_by": "ops tooling on the deployment host",
         }
@@ -328,6 +331,23 @@ class _CompactionBase(unittest.TestCase):
         self._block_seq = getattr(self, "_block_seq", 0) + 1
         return os.path.join(self.manifest_root, f"block_gen2_{self._block_seq}.zarr")
 
+    def _kwargs_for_refusal(self):
+        return dict(
+            live_root=self.live, manifest_root=self.manifest_root, wal_root=self.wal_root,
+            anchor_root=self.anchor, monolith_path=self.monolith, delta_path=self.delta,
+            compaction_lock_path=self.clock, ingest_lock_path=self.ilock,
+            approval=self._approval(), run_id=self.RUN_ID, operator="tests",
+            at_utc=iso(), min_free_gib=self.TEST_FLOOR,
+            start_day=self.grid[0], end_day=self.grid[-1],
+            classification_target=list(self.days),
+            artifacts_dir=self.artifacts, hard_reserve_bytes=1024,
+            block_out_path=self._next_block_path(),
+            writer_fence_probe=self._fence_probe,
+            point_series_parity=ppd.point_series_parity, api_parity=ppd.api_parity,
+            identity_artifact=self._identity(),
+            one_shot_exception=self._record(),
+            one_shot_pre_compaction=self._pre())
+
     # ---------------------------------------------------------------- the call
     def compact(self, **over):
         kw = dict(
@@ -360,26 +380,105 @@ class _CompactionBase(unittest.TestCase):
         with dev_map(self.devs), self.approved_operation_commit():
             return oc.compact_one_shot(**kw)
 
-    @staticmethod
-    def operation_commit():
-        """The most recent commit that contains every operation-inventory module unmodified."""
-        import subprocess
-        from ops import p5_readiness as rd
-        root = os.path.dirname(_DEV)
-        log = subprocess.run(("git", "-C", root, "log", "--format=%H", "-40"),
-                             capture_output=True, text=True).stdout.split()
-        for sha in log:
-            if all(rd._git_blob(sha, m) is not None
-                   and hashlib.sha256(rd._git_blob(sha, m)).hexdigest()
-                   == oc._file_digest(os.path.join(_DEV, m))
-                   for m in oc.OPERATION_INVENTORY):
-                return sha
-        raise AssertionError(
-            "no recent commit holds the operation-inventory modules as they are on disk; "
-            "commit them before running this suite")
+    _CLONE = None
+    _CLONE_ROOT = None
 
-    def approved_operation_commit(self):
-        return mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (self.operation_commit(),))
+    @classmethod
+    def operation_commit(cls):
+        """A real commit, in a THROWAWAY clone, holding the working tree exactly as it is.
+
+        The positive control cannot use a commit of the real repository: the inventory includes
+        `ops/p5_oneshot_compaction.py`, so any uncommitted edit to the operation means no
+        existing commit holds these bytes -- which is the self-approval fix doing its job, not
+        an obstacle to route around. So the control builds a commit that genuinely contains
+        them, in a clone that is deleted afterwards, and the gate compares on-disk bytes against
+        a real git blob at a real commit exactly as it would in production.
+
+        Deliberately NOT a fallback to "compare against disk". That is the weakness this whole
+        mechanism replaced."""
+        # Cached on the BASE class, not on `cls`: each subclass would otherwise build its own
+        # clone, and a test that edits a module before the clone exists would commit the edited
+        # bytes and then find them approved. That is the failure this cache prevents, and it
+        # bit once already.
+        if _CompactionBase._CLONE is not None:
+            return _CompactionBase._CLONE
+        import subprocess
+        repo = os.path.dirname(_DEV)
+        clone = tempfile.mkdtemp(prefix="p5-op-clone-")
+        run = lambda *a: subprocess.run(a, capture_output=True, text=True, check=True)  # noqa
+        run("git", "init", "-q", clone)
+        run("git", "-C", clone, "config", "user.email", "tests@local")
+        run("git", "-C", clone, "config", "user.name", "tests")
+        dest = os.path.join(clone, "dev2026")
+        # The WHOLE dev tree, not just the operation inventory: the identity artifact is checked
+        # against the deployment inventory at the same commit, and a deployment "at" a commit
+        # that only contains ten files is not a deployment.
+        from ops import p5_readiness as rd
+        for rel in sorted(set(oc.OPERATION_INVENTORY) | set(rd.INVENTORY_MODULES)):
+            target = os.path.join(dest, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copyfile(os.path.join(_DEV, rel), target)
+        run("git", "-C", clone, "add", "-A")
+        run("git", "-C", clone, "commit", "-q", "-m", "operation inventory as on disk")
+        sha = run("git", "-C", clone, "rev-parse", "HEAD").stdout.strip()
+        _CompactionBase._CLONE = sha
+        _CompactionBase._CLONE_ROOT = clone
+        return sha
+
+    @classmethod
+    def operation_repo_root(cls):
+        cls.operation_commit()
+        return _CompactionBase._CLONE_ROOT
+
+    def write_operation_approval(self, tmpdir=None, **over):
+        """A synthetic operation approval record, in a TEMPORARY directory outside the repo.
+
+        A unit-test fixture, not an operational approval: it lives in a tempdir that is removed
+        when the test ends, it is never written to `P5_OPERATION_APPROVAL`'s real target, and it
+        says so in its own `note`. The positive path cannot be exercised without one, because
+        the whole design is that the operation refuses until a person writes such a record."""
+        outside = tmpdir or tempfile.mkdtemp(prefix="p5-op-approval-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        record = {
+            "scope": oc.OPERATION_APPROVAL_SCOPE,
+            "approved_sha": self.operation_commit(),
+            "approved_by": "unit tests",
+            "approved_utc": iso(-600),
+            "approved_modules": list(oc.OPERATION_INVENTORY),
+            "note": "UNIT-TEST FIXTURE. Not an operational approval; created in a tempdir.",
+        }
+        record.update(over)
+        path = os.path.join(outside, "p5_operation_approval.json")
+        with open(path, "w") as fh:
+            json.dump(record, fh, indent=2, sort_keys=True)
+        return path
+
+    def approved_operation_commit(self, **over):
+        """Point the operation at a synthetic approval record, and at the clone that holds it."""
+        import contextlib
+        path = self.write_operation_approval(**over)
+        real = oc.operation_inventory_problem
+
+        def bound(**kw):
+            kw.setdefault("repo_root", self.operation_repo_root())
+            kw.setdefault("approval_path", path)
+            return real(**kw)
+
+        real_identity = oc.identity_problem
+
+        def bound_identity(artifact, **kw):
+            kw.setdefault("repo_root", self.operation_repo_root())
+            return real_identity(artifact, **kw)
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(oc, "OPERATION_APPROVAL_PATH", path))
+        stack.enter_context(mock.patch.object(oc, "operation_inventory_problem",
+                                              side_effect=bound))
+        stack.enter_context(mock.patch.object(oc, "identity_problem",
+                                              side_effect=bound_identity))
+        stack.enter_context(mock.patch.object(rd, "REVIEWED_DEPLOY_SHAS",
+                                              (self.operation_commit(),)))
+        return stack
 
     def manifest_generation(self):
         return int(bm.load_live(self.manifest_root)["generation"])
@@ -1311,8 +1410,10 @@ class TestTheDeploymentIdentityIsRequired(_CompactionBase):
                       .parameters["identity_artifact"].default, inspect.Parameter.empty)
 
     def test_a_complete_identity_passes(self):
-        self.assertIsNone(oc.identity_problem(self._identity(),
-                                              host=socket.gethostname(), run_id=self.RUN_ID))
+        with mock.patch.object(rd, "REVIEWED_DEPLOY_SHAS", (self.operation_commit(),)):
+            self.assertIsNone(oc.identity_problem(
+                self._identity(), host=socket.gethostname(), run_id=self.RUN_ID,
+                repo_root=self.operation_repo_root()))
 
     def test_every_field_is_required(self):
         for field in oc.IDENTITY_FIELDS:
@@ -1320,7 +1421,8 @@ class TestTheDeploymentIdentityIsRequired(_CompactionBase):
                 artifact = self._identity()
                 del artifact[field]
                 problem = oc.identity_problem(artifact, host=socket.gethostname(),
-                                              run_id=self.RUN_ID)
+                                              run_id=self.RUN_ID,
+                                              repo_root=self.operation_repo_root())
                 self.assertTrue(problem)
                 self.assertIn(field, problem)
 
@@ -2732,108 +2834,236 @@ class TestTheProducerDigestFieldIsRequired(unittest.TestCase):
 
 
 class TestTheOperationInventoryIsBoundToReviewedBytes(_CompactionBase):
-    """Item 4: the producers were protected only by a disk-only comparison.
+    """The complete runtime closure, bound to an approval that lives outside the operation.
 
-    An identity artifact records what the operator found. Comparing a module against that
-    record proves the operator measured what they shipped — not that anyone reviewed it. The
-    operation inventory is now additionally compared against git blobs at an APPROVED OPERATION
-    commit, which is a separate set from the service's `REVIEWED_DEPLOY_SHAS` because the two
-    answer different questions."""
+    Two findings drove this. The inventory held ONE module — the producers — while a compaction
+    executes twenty-one, six of them reached only through lazy imports. And the allow-list lived
+    inside `p5_oneshot_compaction.py`, which is itself part of the closure: an allow-list a
+    change can extend is one the change approves itself with."""
 
-    def test_the_shipped_default_is_empty_and_fails_closed(self):
-        """Read from the module, not from a fixture: this is the state a fresh checkout is in."""
+    # ---------------------------------------------------------------- the closure is complete
+    def test_the_inventory_is_the_measured_runtime_closure(self):
+        """Re-measured by RUNNING a compaction in a clean subprocess.
+
+        No test module is imported there, so nothing another suite happens to load can be
+        mistaken for something the operation runs — which is how `ops/p5_provision.py` looked
+        like part of the closure until it was measured properly."""
+        measured = self._measure_closure()
+        declared = set(oc.OPERATION_INVENTORY)
+        missing = sorted(measured - declared)
+        self.assertEqual(missing, [],
+                         f"these execute during a real compaction and are not in the "
+                         f"inventory, so nothing checks them: {missing}")
+
+    def test_the_inventory_lists_nothing_that_does_not_execute(self):
+        """The other direction: padding the inventory would demand approval for code the
+        operation never runs, and make the gate look stronger than it is."""
+        measured = self._measure_closure()
+        extra = sorted(set(oc.OPERATION_INVENTORY) - measured)
+        self.assertEqual(extra, [], f"declared but never executed: {extra}")
+
+    def test_the_lazily_imported_modules_are_covered(self):
+        """The ones a static read of the imports would miss entirely."""
+        for lazy in ("ingest/build_block.py", "ingest/corrected_day.py",
+                     "ingest/publish_manifest.py", "store/segmented_cube.py",
+                     "store/time_cube.py", "ops/p5_readiness.py"):
+            with self.subTest(lazy):
+                self.assertIn(lazy, oc.OPERATION_INVENTORY)
+
+    def test_the_operation_itself_is_in_its_own_inventory(self):
+        """Without this the implementation is the one file nothing checks."""
+        self.assertIn("ops/p5_oneshot_compaction.py", oc.OPERATION_INVENTORY)
+
+    def test_the_contract_and_provisioning_modules_are_covered(self):
+        for module in ("ops/p5_oneshot_exception.py", "ops/p5_prod_provision.py",
+                       "ops/p5_legacy_base.py", "ops/p5_parity_producers.py"):
+            with self.subTest(module):
+                self.assertIn(module, oc.OPERATION_INVENTORY)
+
+    _CLOSURE = None
+
+    @classmethod
+    def _measure_closure(cls):
+        if cls._CLOSURE is not None:
+            return cls._CLOSURE
+        import subprocess
+        probe = os.path.join(HERE, "_closure_probe.py")
+        env = dict(os.environ, DEV=_DEV,
+                   APPROVED_OP_SHA=cls.operation_commit(),
+                   APPROVED_OP_REPO=cls.operation_repo_root())
+        proc = subprocess.run([sys.executable, probe], capture_output=True, text=True,
+                              cwd=_DEV, env=env)
+        if proc.returncode != 0:
+            raise AssertionError(f"the closure probe failed:\n{proc.stderr[-3000:]}")
+        payload = [ln for ln in proc.stdout.splitlines() if ln.startswith("{")][-1]
+        cls._CLOSURE = set(json.loads(payload)["closure"])
+        return cls._CLOSURE
+
+    # ---------------------------------------------------------------- approval is external
+    def test_the_shipped_default_configures_no_approval(self):
         import importlib
         fresh = importlib.reload(importlib.import_module("ops.p5_oneshot_compaction"))
         try:
-            self.assertEqual(fresh.APPROVED_OPERATION_SHAS, ())
+            self.assertIsNone(fresh.OPERATION_APPROVAL_DEFAULT)
         finally:
             importlib.reload(fresh)
 
-    def test_with_no_approved_operation_commit_the_operation_refuses(self):
-        with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", ()):
-            with mock.patch.object(oc, "_build",
-                                   side_effect=AssertionError("must not run")) as build:
-                with self.assertRaises(oc.OneShotCompactionRefused) as caught:
-                    with dev_map(self.devs):
-                        oc.compact_one_shot(**self._kwargs_for_refusal())
-        self.assertIn("APPROVED_OPERATION_SHAS", str(caught.exception))
-        self.assertIn("does not say anyone reviewed it", str(caught.exception))
+    def test_the_allow_list_is_not_inside_the_operation(self):
+        """The self-approval fix, asserted structurally: no module-level tuple of SHAs."""
+        source = inspect.getsource(oc)
+        self.assertNotIn("APPROVED_OPERATION_SHAS", source.split('"""')[0] + "\n".join(
+            ln for ln in source.splitlines() if not ln.strip().startswith("#")))
+
+    def test_with_no_approval_record_the_operation_refuses(self):
+        """Everything else correct -- a valid identity at a real approved commit -- and no
+        approval record. The operation must refuse on that alone."""
+        real_id = oc.identity_problem
+
+        def bound_id(artifact, **kw):
+            kw.setdefault("repo_root", self.operation_repo_root())
+            return real_id(artifact, **kw)
+
+        with mock.patch.object(oc, "OPERATION_APPROVAL_PATH", None), \
+                mock.patch.object(oc, "identity_problem", side_effect=bound_id), \
+                mock.patch.object(rd, "REVIEWED_DEPLOY_SHAS", (self.operation_commit(),)), \
+                mock.patch.object(oc, "_build",
+                                  side_effect=AssertionError("must not run")) as build:
+            with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                with dev_map(self.devs):
+                    oc.compact_one_shot(**self._kwargs_for_refusal())
+        self.assertIn("no operation approval record is configured", str(caught.exception))
         self.assertFalse(build.called)
 
-    def _kwargs_for_refusal(self):
-        kw = dict(
-            live_root=self.live, manifest_root=self.manifest_root, wal_root=self.wal_root,
-            anchor_root=self.anchor, monolith_path=self.monolith, delta_path=self.delta,
-            compaction_lock_path=self.clock, ingest_lock_path=self.ilock,
-            approval=self._approval(), run_id=self.RUN_ID, operator="tests",
-            at_utc=iso(), min_free_gib=self.TEST_FLOOR,
-            start_day=self.grid[0], end_day=self.grid[-1],
-            classification_target=list(self.days),
-            artifacts_dir=self.artifacts, hard_reserve_bytes=1024,
-            block_out_path=self._next_block_path(),
-            writer_fence_probe=self._fence_probe,
-            point_series_parity=ppd.point_series_parity, api_parity=ppd.api_parity,
-            identity_artifact=self._identity(),
-            one_shot_exception=self._record(),
-            one_shot_pre_compaction=self._pre(),
-        )
-        return kw
-
-    def test_an_approved_operation_commit_that_lacks_the_module_refuses(self):
-        """Approving the wrong commit is not approving the module."""
-        from ops import p5_readiness as rd
-        old = rd.REVIEWED_DEPLOY_SHAS[0]          # long predates the producers
-        with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (old,)):
-            problem = oc.operation_inventory_problem(
-                module_fingerprints=self._identity()["module_fingerprints"])
-        self.assertIn("exists at none of the approved operation commits", problem)
-
-    def test_bytes_that_differ_from_the_approved_commit_refuse(self):
-        """The module is at the approved commit, and what is on disk is not those bytes."""
-        approved = self.operation_commit()
-        path = os.path.join(_DEV, "ops/p5_parity_producers.py")
-        with open(path, "rb") as fh:
-            original = fh.read()
+    def test_a_record_inside_the_repository_is_refused(self):
+        """The authority has to be outside the thing it authorizes."""
+        inside = os.path.join(_DEV, "p5_operation_approval_probe.json")
+        with open(inside, "w") as fh:
+            json.dump({"scope": oc.OPERATION_APPROVAL_SCOPE,
+                       "approved_sha": self.operation_commit(),
+                       "approved_by": "x", "approved_utc": iso(-60),
+                       "approved_modules": list(oc.OPERATION_INVENTORY)}, fh)
         try:
-            with open(path, "ab") as fh:
-                fh.write(b"\n# local edit\n")
-            prints = dict(self._identity()["module_fingerprints"])
-            prints["ops/p5_parity_producers.py"] = oc._file_digest(path)
-            with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (approved,)):
-                problem = oc.operation_inventory_problem(module_fingerprints=prints)
+            record, problem = oc.operation_approval(inside)
         finally:
-            with open(path, "wb") as fh:
-                fh.write(original)
-        self.assertIsNotNone(problem)
-        self.assertIn("does not match the reviewed bytes", problem)
+            os.remove(inside)
+        self.assertIsNone(record)
+        self.assertIn("inside the repository it approves", problem)
+
+    def test_a_symlink_pointing_inside_the_repository_is_refused(self):
+        outside = tempfile.mkdtemp(prefix="p5-op-link-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        target = os.path.join(_DEV, "p5_operation_approval_target.json")
+        with open(target, "w") as fh:
+            json.dump({"scope": oc.OPERATION_APPROVAL_SCOPE,
+                       "approved_sha": self.operation_commit(),
+                       "approved_by": "x", "approved_utc": iso(-60),
+                       "approved_modules": list(oc.OPERATION_INVENTORY)}, fh)
+        link = os.path.join(outside, "link.json")
+        os.symlink(target, link)
+        try:
+            record, problem = oc.operation_approval(link)
+        finally:
+            os.remove(target)
+        self.assertIsNone(record)
+        self.assertIn("inside the repository", problem)
+
+    def test_a_record_of_another_scope_is_refused(self):
+        path = self.write_operation_approval(scope="p5_readiness_assessor")
+        record, problem = oc.operation_approval(path)
+        self.assertIsNone(record)
+        self.assertIn("declares scope", problem)
+
+    def test_a_record_naming_nobody_or_nothing_is_refused(self):
+        for field, value in (("approved_by", "  "), ("approved_utc", "soon"),
+                             ("approved_sha", "not-a-sha")):
+            with self.subTest(field):
+                path = self.write_operation_approval(**{field: value})
+                record, problem = oc.operation_approval(path)
+                self.assertIsNone(record)
+
+    def test_every_record_field_is_required(self):
+        for field in oc.OPERATION_APPROVAL_FIELDS:
+            with self.subTest(field):
+                outside = tempfile.mkdtemp(prefix="p5-op-approval-")
+                self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+                with open(self.write_operation_approval()) as fh:
+                    full = json.load(fh)
+                del full[field]
+                path = os.path.join(outside, "partial.json")
+                with open(path, "w") as fh:
+                    json.dump(full, fh)
+                record, problem = oc.operation_approval(path)
+                self.assertIsNone(record)
+                self.assertIn(field, problem)
+
+    def test_widening_the_inventory_invalidates_an_older_approval(self):
+        """A later change adds a module and must not ride in on an approval that never saw it."""
+        path = self.write_operation_approval(
+            approved_modules=[m for m in oc.OPERATION_INVENTORY
+                              if m != "ingest/corrected_day.py"])
+        record, problem = oc.operation_approval(path)
+        self.assertIsNone(record)
+        self.assertIn("does not extend to code it never covered", problem)
+        self.assertIn("ingest/corrected_day.py", problem)
+
+    # ---------------------------------------------------------------- the bytes must match
+    def test_a_module_that_postdates_the_approved_commit_refuses(self):
+        from ops import p5_readiness as rd
+        old = rd.REVIEWED_DEPLOY_SHAS[0]
+        path = self.write_operation_approval(approved_sha=old)
+        problem = oc.operation_inventory_problem(
+            module_fingerprints=self._identity()["module_fingerprints"], approval_path=path,
+            repo_root=self.operation_repo_root())
+        self.assertIn("does not exist at the approved commit", problem)
 
     def test_an_unfingerprinted_operation_module_refuses(self):
         prints = {k: v for k, v in self._identity()["module_fingerprints"].items()
-                  if k != "ops/p5_parity_producers.py"}
-        with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (self.operation_commit(),)):
-            problem = oc.operation_inventory_problem(module_fingerprints=prints)
+                  if k != "store/block_manifest.py"}
+        problem = oc.operation_inventory_problem(
+            module_fingerprints=prints, approval_path=self.write_operation_approval(),
+            repo_root=self.operation_repo_root())
         self.assertIn("does not fingerprint the operation module", problem)
+        self.assertIn("store/block_manifest.py", problem)
 
-    def test_an_approved_operation_commit_lets_the_operation_run(self):
-        """The positive control, and the only honest one available before a real approval."""
+    def test_a_fingerprint_that_disagrees_with_disk_refuses(self):
+        prints = dict(self._identity()["module_fingerprints"])
+        prints["ops/p5_oneshot_exception.py"] = "a" * 64
+        problem = oc.operation_inventory_problem(
+            module_fingerprints=prints, approval_path=self.write_operation_approval(),
+            repo_root=self.operation_repo_root())
+        self.assertIn("on disk hashes to", problem)
+
+    def test_a_complete_and_matching_inventory_passes(self):
+        """The positive control: it passes only when EVERY module matches the approved commit."""
+        problem = oc.operation_inventory_problem(
+            module_fingerprints=self._identity()["module_fingerprints"],
+            approval_path=self.write_operation_approval(),
+            repo_root=self.operation_repo_root())
+        self.assertIsNone(problem)
+
+    def test_an_approved_operation_record_lets_the_operation_run(self):
         self.assertEqual(self.compact()["generation"], 2)
 
-    # ---------------------------------------------------------------- the boundary itself
-    def test_the_two_inventories_are_disjoint(self):
-        from ops import p5_readiness as rd
-        self.assertEqual(set(oc.OPERATION_INVENTORY) & set(rd.INVENTORY_MODULES), set(),
-                         "a module cannot be both what the service imports and what only the "
-                         "operator runs")
+    # ---------------------------------------------------------------- the boundary
+    def test_the_inventories_overlap_and_that_is_expected(self):
+        """Corrects an earlier claim that they are disjoint.
 
-    def test_the_producers_are_not_in_the_service_inventory(self):
-        """They are imported by this operation and by nothing the API serves. Putting them in
-        the service inventory would assert something untrue about the deployment."""
+        With one module in the operation inventory they looked disjoint. The measured closure
+        shares the whole store and ingest layer with the service, because reading and publishing
+        is the same code either way. What separates the inventories is which approval authority
+        governs, not which files are in them."""
         from ops import p5_readiness as rd
-        self.assertNotIn("ops/p5_parity_producers.py", rd.INVENTORY_MODULES)
+        shared = set(oc.OPERATION_INVENTORY) & set(rd.INVENTORY_MODULES)
+        self.assertGreater(len(shared), 5)
+        self.assertIn("store/block_manifest.py", shared)
+
+    def test_the_operation_only_modules_are_not_covered_by_the_deploy_approval(self):
+        from ops import p5_readiness as rd
+        only = set(oc.OPERATION_INVENTORY) - set(rd.INVENTORY_MODULES)
+        self.assertIn("ops/p5_oneshot_compaction.py", only)
+        self.assertIn("ops/p5_parity_producers.py", only)
 
     def test_the_service_inventory_is_still_measured_by_execution(self):
-        """The guarantee this must not disturb: the readiness closure executes the build,
-        prune_swap and API paths rather than reading a list."""
         from ops import p5_readiness as rd
         self.assertEqual(set(rd.RUNTIME_GROUPS), {"build", "prune_swap", "api"})
         for stage, (entries, declared, _smoke) in rd.RUNTIME_GROUPS.items():
@@ -2841,40 +3071,157 @@ class TestTheOperationInventoryIsBoundToReviewedBytes(_CompactionBase):
                 self.assertTrue(entries)
                 self.assertTrue(declared)
 
-    def test_the_operation_inventory_is_covered_by_the_review_package(self):
+    def test_the_review_package_derives_its_list_from_the_gate(self):
+        """Not a second hand-written list that can disagree with what actually refuses."""
         from ops import p5_deploy_candidate as dc
-        for module in oc.OPERATION_INVENTORY:
-            with self.subTest(module):
-                self.assertIn(module, dc.OPERATION_MODULES)
+        self.assertTrue(set(oc.OPERATION_INVENTORY).issubset(set(dc.operation_modules())))
 
-    def test_a_fingerprint_that_disagrees_with_disk_refuses_in_isolation(self):
-        """The operation-inventory guard, on its own.
 
-        Reached through the operation, `producer_identity` refuses a mismatched producer module
-        first — so the inventory's own comparison was masked and a mutation deleting it
-        survived. It covers a SET, and a future entry that is not a producer module would have
-        nothing else checking it."""
-        prints = dict(self._identity()["module_fingerprints"])
-        prints["ops/p5_parity_producers.py"] = "a" * 64
-        with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (self.operation_commit(),)):
-            problem = oc.operation_inventory_problem(module_fingerprints=prints)
-        self.assertIsNotNone(problem)
-        self.assertIn("on disk hashes to", problem)
-        self.assertIn("the identity artifact recorded", problem)
 
-    def test_a_matching_fingerprint_passes_in_isolation(self):
-        with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (self.operation_commit(),)):
-            problem = oc.operation_inventory_problem(
-                module_fingerprints=self._identity()["module_fingerprints"])
-        self.assertIsNone(problem)
+class TestAnyModifiedOperationModuleRefusesBeforeAnythingHappens(_CompactionBase):
+    """Item 4: mutate ONE module of the runtime closure and the operation must refuse.
 
-    def test_an_operation_module_missing_from_disk_refuses(self):
-        # Resolved BEFORE the inventory is patched: the helper scans commits for the modules
-        # the inventory names, and asking it about a module that is not on disk is asking it
-        # the question this test is here to pose.
+    Each case edits a different module and leaves everything else — including the producer —
+    untouched, so no neighbouring check can be the reason. Each asserts the refusal lands
+    before any lock is taken, any store is scanned, and anything is written: the operation is
+    patched so `_build` and `CompactionLock.acquire` raise if reached.
+
+    The edit is made to the file ON DISK and reverted afterwards, which is the real shape of
+    the hazard: a deployment whose bytes drift from the reviewed commit."""
+
+    def _refuses_with_module_edited(self, relpath):
+        path = os.path.join(_DEV, relpath)
+        with open(path, "rb") as fh:
+            original = fh.read()
+        try:
+            with open(path, "ab") as fh:
+                fh.write(b"\n# drift introduced by a test\n")
+            # The identity artifact is collected AFTER the edit, as an operator's would be:
+            # it honestly reports what is on disk. The refusal must come from the bytes not
+            # matching the approved commit, not from the artifact disagreeing with disk.
+            identity = self._identity()
+            with mock.patch.object(oc, "_build",
+                                   side_effect=AssertionError("scanned a store")) as build, \
+                    mock.patch.object(cl.CompactionLock, "acquire",
+                                      side_effect=AssertionError("took a lock")) as lock:
+                with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                    self.compact(identity_artifact=identity)
+            self.assertFalse(build.called)
+            self.assertFalse(lock.called)
+        finally:
+            with open(path, "wb") as fh:
+                fh.write(original)
+        self.assertEqual(self.manifest_generation(), 1, "a generation was published")
+        return str(caught.exception)
+
+    def test_a_modified_compaction_operation_refuses(self):
+        """The implementation cannot wave itself through."""
+        message = self._refuses_with_module_edited("ops/p5_oneshot_compaction.py")
+        self.assertIn("ops/p5_oneshot_compaction.py", message)
+
+    def test_a_modified_exception_contract_refuses(self):
+        message = self._refuses_with_module_edited("ops/p5_oneshot_exception.py")
+        self.assertIn("ops/p5_oneshot_exception.py", message)
+
+    def test_a_modified_production_provisioner_refuses(self):
+        message = self._refuses_with_module_edited("ops/p5_prod_provision.py")
+        self.assertIn("ops/p5_prod_provision.py", message)
+
+    def test_a_modified_legacy_base_refuses(self):
+        message = self._refuses_with_module_edited("ops/p5_legacy_base.py")
+        self.assertIn("ops/p5_legacy_base.py", message)
+
+    def test_a_modified_ingest_build_dependency_refuses(self):
+        message = self._refuses_with_module_edited("ingest/build_block.py")
+        self.assertIn("ingest/build_block.py", message)
+
+    def test_a_modified_ingest_publish_dependency_refuses(self):
+        message = self._refuses_with_module_edited("ingest/publish_manifest.py")
+        self.assertIn("ingest/publish_manifest.py", message)
+
+    def test_a_modified_lazily_imported_dependency_refuses(self):
+        """`ingest/corrected_day.py` is imported partway through the build; a static read of
+        the operation's imports would never have listed it."""
+        message = self._refuses_with_module_edited("ingest/corrected_day.py")
+        self.assertIn("ingest/corrected_day.py", message)
+
+    def test_a_modified_store_dependency_refuses(self):
+        message = self._refuses_with_module_edited("store/block_manifest.py")
+        self.assertIn("store/block_manifest.py", message)
+
+    def test_the_producer_is_untouched_in_every_one_of_those(self):
+        """Isolation, asserted rather than assumed: the producer module is byte-identical to
+        the approved commit throughout, so it can never be what refused."""
+        from ops import p5_readiness as rd_mod  # noqa: F401
         approved = self.operation_commit()
-        with mock.patch.object(oc, "OPERATION_INVENTORY", ("ops/not_on_disk.py",)), \
-                mock.patch.object(oc, "APPROVED_OPERATION_SHAS", (approved,)):
-            problem = oc.operation_inventory_problem(
-                module_fingerprints={"ops/not_on_disk.py": "b" * 64})
-        self.assertIn("is not on disk", problem)
+        blob = oc._blob_at(self.operation_repo_root(), approved,
+                           "ops/p5_parity_producers.py")
+        self.assertIsNotNone(blob)
+        self.assertEqual(hashlib.sha256(blob).hexdigest(),
+                         oc._file_digest(os.path.join(_DEV, "ops/p5_parity_producers.py")))
+
+    # ---------------------------------------------------------------- the approval mechanism
+    def test_altering_only_the_approval_mechanism_refuses(self):
+        """Nothing on disk changes. The record points at a commit that is not this code."""
+        from ops import p5_readiness as rd_mod
+        older = rd_mod.REVIEWED_DEPLOY_SHAS[0]
+        with mock.patch.object(oc, "_build",
+                               side_effect=AssertionError("scanned a store")) as build, \
+                mock.patch.object(cl.CompactionLock, "acquire",
+                                  side_effect=AssertionError("took a lock")) as lock:
+            with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                self._compact_with_approval(approved_sha=older)
+        self.assertFalse(build.called)
+        self.assertFalse(lock.called)
+        self.assertIn("does not exist at the approved commit", str(caught.exception))
+
+    def _compact_with_approval(self, **over):
+        with self.approved_operation_commit(**over):
+            with dev_map(self.devs):
+                return oc.compact_one_shot(**self._kwargs_for_refusal())
+
+    def test_an_approval_naming_a_shorter_module_list_refuses(self):
+        with mock.patch.object(oc, "_build",
+                               side_effect=AssertionError("scanned a store")):
+            with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                self._compact_with_approval(
+                    approved_modules=["ops/p5_parity_producers.py"])
+        self.assertIn("does not extend to code it never covered", str(caught.exception))
+
+    def test_an_approval_of_the_wrong_scope_refuses(self):
+        with mock.patch.object(oc, "_build",
+                               side_effect=AssertionError("scanned a store")):
+            with self.assertRaises(oc.OneShotCompactionRefused) as caught:
+                self._compact_with_approval(scope="something_else")
+        self.assertIn("declares scope", str(caught.exception))
+
+    def test_the_unmodified_tree_is_the_positive_control(self):
+        """It passes only because every one of the 21 modules matches the approved commit."""
+        self.assertEqual(self.compact()["generation"], 2)
+
+    def test_an_approved_modules_object_rather_than_a_list_is_refused(self):
+        """The case only the shape check catches.
+
+        A JSON object keyed by module path is a plausible thing to write — it reads like
+        "module → digest" — and its keys would satisfy the coverage check, so the
+        does-not-extend guard never fires. Refusing the shape is what keeps the record's
+        meaning single: a list of modules, not a mapping this code would then have to decide
+        how to interpret."""
+        path = self.write_operation_approval(
+            approved_modules={m: "x" * 64 for m in oc.OPERATION_INVENTORY})
+        record, problem = oc.operation_approval(path)
+        self.assertIsNone(record)
+        self.assertIn("lists no approved_modules", problem)
+
+    def test_an_empty_approved_modules_list_is_refused(self):
+        path = self.write_operation_approval(approved_modules=[])
+        record, problem = oc.operation_approval(path)
+        self.assertIsNone(record)
+
+    def test_an_approved_modules_string_is_refused(self):
+        """`set("ops/...")` is a set of characters, which coincidentally covers nothing — but
+        the shape is what is wrong, and that is what the message should say."""
+        path = self.write_operation_approval(approved_modules="ops/p5_parity_producers.py")
+        record, problem = oc.operation_approval(path)
+        self.assertIsNone(record)
+        self.assertIn("lists no approved_modules", problem)

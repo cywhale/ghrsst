@@ -159,26 +159,30 @@ class TestTheIdentityUpdatePlanIsDerived(unittest.TestCase):
         plan = dc.identity_update_plan("HEAD")
         self.assertIn("ops/p5_parity_producers.py", plan["operation_inventory"])
 
-    def test_it_reports_both_approved_sets_separately(self):
+    def test_it_reports_the_deploy_set_and_the_operation_approval_separately(self):
         plan = dc.identity_update_plan("HEAD")
         self.assertEqual(tuple(plan["approved_deploy_shas"]), rd.REVIEWED_DEPLOY_SHAS)
-        self.assertEqual(tuple(plan["approved_operation_shas"]), oc.APPROVED_OPERATION_SHAS)
+        self.assertIn("operation_approval", plan)
+        self.assertEqual(plan["operation_approval"]["scope"], oc.OPERATION_APPROVAL_SCOPE)
 
-    def test_it_recomputes_the_overlap_rather_than_assuming_none(self):
-        with mock.patch.object(oc, "OPERATION_INVENTORY",
-                               ("ops/p5_parity_producers.py", "store/block_manifest.py")):
-            plan = dc.identity_update_plan("HEAD")
-        self.assertEqual(plan["inventory_overlap"], ["store/block_manifest.py"])
-        self.assertTrue(any("cannot be both service-inventory" in s for s in plan["steps"]))
-
-    def test_the_empty_warning_disappears_once_an_operation_sha_is_approved(self):
-        with mock.patch.object(oc, "APPROVED_OPERATION_SHAS", ("f" * 40,)):
-            plan = dc.identity_update_plan("HEAD")
-        self.assertFalse(any("EMPTY" in s for s in plan["steps"]))
-
-    def test_it_requires_an_operation_sha_before_anything_else(self):
+    def test_it_separates_shared_modules_from_operation_only_ones(self):
+        """They are NOT disjoint, and reporting them as such was the earlier error. The service
+        and a compaction share the whole store and ingest layer."""
         plan = dc.identity_update_plan("HEAD")
-        self.assertIn("APPROVED_OPERATION_SHAS", plan["steps"][0])
+        self.assertIn("store/block_manifest.py", plan["shared_with_service_inventory"])
+        self.assertIn("ops/p5_oneshot_compaction.py", plan["operation_only_modules"])
+        self.assertTrue(any("the deploy approval does not cover them" in s
+                            for s in plan["steps"]))
+
+    def test_it_reports_that_no_approval_record_is_configured(self):
+        plan = dc.identity_update_plan("HEAD")
+        self.assertFalse(plan["operation_approval"]["configured"])
+        self.assertTrue(any("no usable approval record today" in s for s in plan["steps"]))
+
+    def test_it_requires_an_external_approval_record_before_anything_else(self):
+        plan = dc.identity_update_plan("HEAD")
+        self.assertIn("OPERATION APPROVAL RECORD outside the repository", plan["steps"][0])
+        self.assertIn("can approve a change to itself", plan["steps"][0])
 
 
 class TestThePackageCoversWhatTheReviewerNeeds(unittest.TestCase):
@@ -190,19 +194,23 @@ class TestThePackageCoversWhatTheReviewerNeeds(unittest.TestCase):
 
     def test_it_covers_every_operation_module(self):
         doc = dc.manifest("HEAD", require_clean=False)
-        self.assertEqual(set(doc["operation_module_digests"]), set(dc.OPERATION_MODULES))
+        self.assertEqual(set(doc["operation_module_digests"]), set(dc.operation_modules()))
 
     def test_the_operation_modules_include_the_producers_and_the_compaction(self):
         for required in ("ops/p5_parity_producers.py", "ops/p5_oneshot_compaction.py",
                          "ops/p5_oneshot_exception.py"):
             with self.subTest(required):
-                self.assertIn(required, dc.OPERATION_MODULES)
+                self.assertIn(required, dc.operation_modules())
 
-    def test_every_registered_producer_module_is_covered(self):
-        """A producer module the package does not digest is one the reviewer cannot check."""
-        for module in oc.REVIEWED_PRODUCER_MODULES:
+    def test_the_whole_runtime_closure_is_covered(self):
+        """Derived from the gate, so the package cannot report a smaller set than what runs."""
+        for module in oc.OPERATION_INVENTORY:
             with self.subTest(module):
-                self.assertIn(module, dc.OPERATION_MODULES)
+                self.assertIn(module, dc.operation_modules())
+
+    def test_the_package_list_is_not_a_second_hand_written_list(self):
+        source = inspect.getsource(dc.operation_modules)
+        self.assertIn("oc.OPERATION_INVENTORY", source)
 
     def test_the_file_list_is_the_candidate_tree(self):
         doc = dc.manifest("HEAD", require_clean=False)
@@ -393,13 +401,13 @@ class TestTheCleanlinessCheckSeesEverything(unittest.TestCase):
 class TestTheIdentityPlanReflectsTheOperationSha(unittest.TestCase):
     """Item 4's mechanism, as the plan reports it."""
 
-    def test_it_asks_for_an_approved_operation_sha_first(self):
+    def test_it_asks_for_an_external_record_first(self):
         plan = dc.identity_update_plan("HEAD")
-        self.assertIn("APPROVED_OPERATION_SHAS", plan["steps"][0])
+        self.assertIn("outside the repository", plan["steps"][0])
 
-    def test_it_says_the_set_is_empty_and_why_that_blocks(self):
+    def test_it_says_why_the_allow_list_cannot_live_in_the_operation(self):
         plan = dc.identity_update_plan("HEAD")
-        self.assertTrue(any("EMPTY" in s and "fail-closed" in s for s in plan["steps"]))
+        self.assertIn("can approve a change to itself", plan["steps"][0])
 
     def test_it_keeps_the_service_decision_separate(self):
         plan = dc.identity_update_plan("HEAD")
@@ -407,33 +415,47 @@ class TestTheIdentityPlanReflectsTheOperationSha(unittest.TestCase):
         self.assertTrue(any("re-approving tooling on every service change" in s
                             for s in plan["steps"]))
 
-    def test_it_reports_both_inventories_and_their_overlap(self):
+    def test_it_reports_both_inventories_and_what_they_share(self):
         plan = dc.identity_update_plan("HEAD")
-        self.assertEqual(plan["inventory_overlap"], [])
+        self.assertGreater(len(plan["shared_with_service_inventory"]), 5)
         self.assertIn("ops/p5_parity_producers.py", plan["operation_inventory"])
+        self.assertEqual(plan["operation_inventory_size"], len(oc.OPERATION_INVENTORY))
         self.assertGreater(plan["service_inventory_size"], 20)
 
     def test_it_reports_whether_the_candidate_actually_contains_the_modules(self):
         plan = dc.identity_update_plan("HEAD")
-        self.assertEqual(plan["operation_modules_present_at_candidate"],
-                         {"ops/p5_parity_producers.py": True})
+        present = plan["operation_modules_present_at_candidate"]
+        self.assertEqual(set(present), set(oc.OPERATION_INVENTORY))
 
     def test_it_warns_when_the_candidate_lacks_an_operation_module(self):
         old = rd.REVIEWED_DEPLOY_SHAS[0]
         plan = dc.identity_update_plan(old)
         self.assertTrue(any("is not present at" in s for s in plan["steps"]))
-        self.assertEqual(plan["operation_modules_present_at_candidate"],
-                         {"ops/p5_parity_producers.py": False})
+        self.assertFalse(plan["operation_modules_present_at_candidate"]
+                         ["ops/p5_parity_producers.py"])
 
     def test_the_document_states_the_chosen_boundary(self):
-        with open(os.path.join(_DEV, "specs", "p5_deploy_candidate_review.md")) as fh:
-            flat = " ".join(fh.read().split())
-        self.assertIn("There are **two** inventories", flat)
+        flat = " ".join(_read_text(
+            os.path.join(_DEV, "specs", "p5_deploy_candidate_review.md")).split())
+        self.assertIn("The closure was one module; it is twenty-one", flat)
         self.assertIn("is the code the SERVICE runs reviewed?", flat)
-        self.assertIn("is the code the OPERATOR runs reviewed?", flat)
-        self.assertIn("Neither is protected by a disk-only comparison any more", flat)
-        self.assertIn("`APPROVED_OPERATION_SHAS` is **empty**", flat)
-        self.assertIn("Why a separate set rather than reusing `REVIEWED_DEPLOY_SHAS`", flat)
+        self.assertIn("is the code the OPERATION runs reviewed?", flat)
+        self.assertIn("The two inventories are NOT disjoint", flat)
+        self.assertIn("The allow-list cannot live in the operation", flat)
+
+    def test_the_document_explains_the_self_approval_problem(self):
+        flat = " ".join(_read_text(
+            os.path.join(_DEV, "specs", "p5_deploy_candidate_review.md")).split())
+        self.assertIn("Why the implementation cannot approve a changed implementation", flat)
+        self.assertIn("no commit can contain its own id", flat)
+        self.assertIn("a changed implementation vouching for the version it replaced", flat)
+        self.assertIn("An allow-list a change can extend is an allow-list the change approves "
+                      "itself with", flat)
+
+    def test_the_document_corrects_the_earlier_disjointness_claim(self):
+        flat = " ".join(_read_text(
+            os.path.join(_DEV, "specs", "p5_deploy_candidate_review.md")).split())
+        self.assertIn("An earlier revision of this document claimed they were", flat)
 
 
 class TestTheCleanlinessConjunctionInIsolation(unittest.TestCase):

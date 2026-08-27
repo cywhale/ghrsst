@@ -29,19 +29,16 @@ from typing import Dict, List, Optional, Sequence
 #: Where the dev tree sits inside the repository, as git paths see it.
 DEV_PREFIX = "dev2026"
 
-#: The tooling that RUNS a compaction. Distinct from the deployment inventory: these modules
-#: are the operation, and the inventory is what the deployment serves. A reviewer needs both,
-#: and needs to be told which is which -- conflating them is how a module ends up approved for
-#: one purpose and used for another.
-OPERATION_MODULES = (
-    "ops/p5_oneshot_compaction.py",
-    "ops/p5_oneshot_exception.py",
-    "ops/p5_parity_producers.py",
-    "ops/p5_prod_provision.py",
-    "ops/p5_legacy_base.py",
-    "ops/p5_readiness.py",
-    "ops/p5_deploy_candidate.py",
-)
+def operation_modules() -> Sequence[str]:
+    """The tooling that RUNS a compaction, DERIVED from the runtime gate's own inventory.
+
+    Not a second list. It was one -- a hand-written seven beside a runtime inventory of one --
+    and two lists of "the operation's modules" that nothing reconciles are two lists that
+    disagree the moment either moves. The gate is the authority because the gate is what
+    refuses; this package reports what the gate enforces, plus itself, because a reviewer
+    checking the package's digests should be able to check the package's own bytes too."""
+    from ops import p5_oneshot_compaction as oc
+    return tuple(sorted(set(oc.OPERATION_INVENTORY) | {"ops/p5_deploy_candidate.py"}))
 
 
 class DeployCandidateError(Exception):
@@ -133,29 +130,32 @@ def identity_update_plan(sha: str) -> Dict:
     from ops import p5_oneshot_compaction as oc
     service_inventory = set(rd.INVENTORY_MODULES)
     operation_inventory = list(oc.OPERATION_INVENTORY)
-    # A module in BOTH would be claiming the service imports it and that only the operator
-    # does. Reported rather than silently tolerated: the two inventories mean different things
-    # and the overlap is where that stops being true.
-    overlap = sorted(set(operation_inventory) & service_inventory)
+    # Overlap is EXPECTED and is reported as a fact, not a problem. When the operation
+    # inventory held one module it looked like the two sets should be disjoint; measuring the
+    # real runtime closure showed they share the whole store and ingest layer, because the
+    # service and a compaction genuinely run the same code to read and publish. What separates
+    # the inventories is which approval authority governs each, not which files are in them.
+    shared = sorted(set(operation_inventory) & service_inventory)
+    operation_only = sorted(set(operation_inventory) - service_inventory)
+    record, approval_problem = oc.operation_approval()
     steps = [
-        f"add {sha} to p5_oneshot_compaction.APPROVED_OPERATION_SHAS, so the operation's own "
-        f"modules {operation_inventory} are compared against reviewed git blobs rather than "
-        f"only against the file on disk. Until then the operation refuses",
+        f"write an OPERATION APPROVAL RECORD outside the repository naming approved_sha={sha} "
+        f"and listing all {len(operation_inventory)} modules of the runtime closure, then "
+        f"point {oc.OPERATION_APPROVAL_ENV} at it. The allow-list is deliberately NOT in the "
+        f"operation: a module that carries its own approval can approve a change to itself",
     ]
-    if not oc.APPROVED_OPERATION_SHAS:
-        steps.append(
-            "APPROVED_OPERATION_SHAS is currently EMPTY, which is the shipped fail-closed "
-            "default and is why no production run is possible today")
+    if approval_problem:
+        steps.append(f"no usable approval record today: {approval_problem}")
     for module in operation_inventory:
         if rd._git_blob(sha, module) is None:
             steps.append(
                 f"NOTE: {module} is not present at {sha}; approving that commit would not "
                 f"cover it")
-    if overlap:
+    if operation_only:
         steps.append(
-            f"resolve {overlap}: a module cannot be both service-inventory and "
-            f"operation-inventory. The service inventory is measured by executing the "
-            f"service's import closure, so an entry nothing imports is reported there")
+            f"note that {operation_only} run in the operation and are NOT part of the "
+            f"service's import closure, so the deploy approval does not cover them; that is "
+            f"what the operation approval record is for")
     steps.append(
         "decide SEPARATELY whether this commit belongs in p5_readiness.REVIEWED_DEPLOY_SHAS. "
         "That set is about the code the SERVICE runs; it is not implied by approving operator "
@@ -166,9 +166,14 @@ def identity_update_plan(sha: str) -> Dict:
     return {
         "candidate": sha,
         "operation_inventory": operation_inventory,
+        "operation_inventory_size": len(operation_inventory),
+        "operation_approval": {"configured": bool(oc.OPERATION_APPROVAL_PATH),
+                               "problem": approval_problem,
+                               "scope": oc.OPERATION_APPROVAL_SCOPE,
+                               "env": oc.OPERATION_APPROVAL_ENV},
         "service_inventory_size": len(service_inventory),
-        "inventory_overlap": overlap,
-        "approved_operation_shas": list(oc.APPROVED_OPERATION_SHAS),
+        "shared_with_service_inventory": shared,
+        "operation_only_modules": operation_only,
         "approved_deploy_shas": list(rd.REVIEWED_DEPLOY_SHAS),
         "operation_modules_present_at_candidate": {
             m: rd._git_blob(sha, m) is not None for m in operation_inventory},
@@ -211,7 +216,7 @@ def manifest(sha: str = "HEAD", *, require_clean: bool = True) -> Dict:
         "file_count": len(files),
         "files": files,
         "deployment_inventory_digests": digests_at(resolved, rd.INVENTORY_MODULES),
-        "operation_module_digests": digests_at(resolved, OPERATION_MODULES),
+        "operation_module_digests": digests_at(resolved, operation_modules()),
         "identity_update_plan": identity_update_plan(resolved),
     }
 
