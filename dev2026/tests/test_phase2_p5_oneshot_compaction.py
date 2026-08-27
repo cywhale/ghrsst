@@ -3571,3 +3571,228 @@ class TestWhatTheApprovedCommitDoesAndDoesNotBind(_CompactionBase):
         self.addCleanup(restore)
         with open(path, "a") as fh:
             fh.write(text)
+
+
+# =====================================================================================
+class TestTheDeploymentAndTheOperationMustBeTheSameTree(unittest.TestCase):
+    """The composition blocker: an approved deployment that does not CONTAIN the operation.
+
+    Three bindings have to hold at once, and each is checked by a different mechanism:
+
+        HEAD == deploy_sha, worktree clean     `identity_problem`      the whole checkout
+        23 service modules == deploy_sha       `identity_problem`      what the service runs
+        21 operation modules == approved_sha   `operation_inventory_problem`
+
+    Nothing forces `deploy_sha` and `approved_sha` to be the same commit, and they need not be —
+    see `TestWhatTheApprovedCommitDoesAndDoesNotBind`. But they must agree byte-for-byte on all
+    21 operation modules, because a clean checkout of `deploy_sha` is what is ON DISK, and the
+    on-disk bytes are what the operation gate compares against `approved_sha`.
+
+    `708058e` (`CURRENT_DEPLOY_SHA`) does not contain five of the 21 at all and differs on five
+    more, so `708058e + an operation approval at any later commit` is not an executable
+    composition. These tests are built from REAL git blobs — the tree at each commit is
+    materialised with `git archive` — so they fail if that stops being true rather than
+    restating a claim from a report."""
+
+    REPO = os.path.dirname(_DEV)
+    DEPLOY = "708058e15b37a02e1d7aa5a66b9978c6e13bd446"
+    _TREES = {}
+
+    @classmethod
+    def checkout(cls, sha):
+        """`dev2026` exactly as git holds it at `sha`, in a tempdir. Never a production path."""
+        import subprocess
+        if sha in cls._TREES:
+            return cls._TREES[sha]
+        tmp = tempfile.mkdtemp(prefix="p5-tree-")
+        dev = os.path.join(tmp, "dev2026")
+        os.makedirs(dev)
+        tar = subprocess.run(("git", "-C", cls.REPO, "archive", f"{sha}:dev2026"),
+                             capture_output=True, check=True)
+        subprocess.run(("tar", "-x", "-C", dev), input=tar.stdout, check=True)
+        cls._TREES[sha] = (tmp, dev)
+        return cls._TREES[sha]
+
+    @classmethod
+    def tearDownClass(cls):
+        for tmp, _ in cls._TREES.values():
+            shutil.rmtree(tmp, ignore_errors=True)
+        cls._TREES.clear()
+
+    @classmethod
+    def head_sha(cls):
+        import subprocess
+        return subprocess.run(("git", "-C", cls.REPO, "rev-parse", "HEAD"),
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    def fingerprints(self, dev, modules):
+        """What an identity artifact collected on that checkout would honestly record."""
+        out = {}
+        for rel in modules:
+            path = os.path.join(dev, rel)
+            if os.path.isfile(path):
+                with open(path, "rb") as fh:
+                    out[rel] = hashlib.sha256(fh.read()).hexdigest()
+        return out
+
+    def approval(self, sha, **over):
+        outside = tempfile.mkdtemp(prefix="p5-approval-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        record = {
+            "scope": oc.OPERATION_APPROVAL_SCOPE, "approved_sha": sha,
+            "approved_by": "unit tests", "approved_utc": iso(-600),
+            "approved_modules": list(oc.OPERATION_INVENTORY),
+            "note": "UNIT-TEST FIXTURE. Not an operational approval; created in a tempdir.",
+        }
+        record.update(over)
+        path = os.path.join(outside, "p5_operation_approval.json")
+        with open(path, "w") as fh:
+            json.dump(record, fh)
+        return path
+
+    def gate(self, dev, fingerprints, approval_path):
+        with mock.patch.object(oc, "_dev_root", lambda: dev):
+            return oc.operation_inventory_problem(
+                module_fingerprints=fingerprints, approval_path=approval_path,
+                repo_root=self.REPO)
+
+    # ---------------------------------------------------------------- the matrix itself
+    def test_the_deploy_commit_does_not_contain_five_of_the_operation_modules(self):
+        """Read from git, not from a report. If this ever passes trivially, the blocker moved."""
+        _, dev = self.checkout(self.DEPLOY)
+        absent = [r for r in oc.OPERATION_INVENTORY
+                  if not os.path.isfile(os.path.join(dev, r))]
+        self.assertEqual(sorted(absent), sorted([
+            "ops/p5_legacy_base.py", "ops/p5_oneshot_compaction.py",
+            "ops/p5_oneshot_exception.py", "ops/p5_parity_producers.py",
+            "ops/p5_prod_provision.py"]))
+
+    def test_the_deploy_commit_carries_every_service_module(self):
+        """The deployment is not broken — it is a valid deployment that cannot host this
+        operation. Saying so precisely is the point of separating the two inventories."""
+        from ops import p5_readiness as rd_
+        _, dev = self.checkout(self.DEPLOY)
+        missing = [r for r in rd_.INVENTORY_MODULES
+                   if not os.path.isfile(os.path.join(dev, r))]
+        self.assertEqual(missing, [])
+        self.assertEqual(len(rd_.INVENTORY_MODULES), 23)
+
+    # ---------------------------------------------------------------- the refusals
+    def test_a_deploy_sha_without_the_operation_modules_refuses(self):
+        """`708058e` + an operation approval at a later commit. An honest identity artifact
+        collected on that checkout cannot fingerprint code that is not there."""
+        _, dev = self.checkout(self.DEPLOY)
+        fp = self.fingerprints(dev, set(oc.OPERATION_INVENTORY))
+        problem = self.gate(dev, fp, self.approval(self.head_sha()))
+        self.assertIsNotNone(problem, "the composition was accepted")
+        self.assertIn("does not fingerprint the operation module", problem)
+
+    def test_claiming_a_module_the_deployment_lacks_refuses(self):
+        """The other way an operator could arrive here: an artifact that NAMES the module.
+        Fingerprints are compared against disk, so the claim does not survive contact."""
+        _, dev = self.checkout(self.DEPLOY)
+        fp = self.fingerprints(dev, set(oc.OPERATION_INVENTORY))
+        for rel in oc.OPERATION_INVENTORY:
+            fp.setdefault(rel, "0" * 64)
+        problem = self.gate(dev, fp, self.approval(self.head_sha()))
+        self.assertIn("is not on disk", problem)
+
+    def test_an_operation_module_that_differs_from_the_approved_commit_refuses(self):
+        """Present, fingerprinted honestly, and still wrong: five of the 21 exist at `708058e`
+        with DIFFERENT bytes. A tree assembled from the deploy commit's version of one of them
+        is what a partial upgrade would leave behind."""
+        _, dev = self.checkout(self.DEPLOY)
+        head = self.head_sha()
+        _, newer = self.checkout(head)
+        blend = tempfile.mkdtemp(prefix="p5-blend-")
+        self.addCleanup(shutil.rmtree, blend, ignore_errors=True)
+        target = os.path.join(blend, "dev2026")
+        shutil.copytree(newer, target)
+        drifted = "store/segmented_cube.py"
+        shutil.copyfile(os.path.join(dev, drifted), os.path.join(target, drifted))
+        fp = self.fingerprints(target, set(oc.OPERATION_INVENTORY))
+        problem = self.gate(target, fp, self.approval(head))
+        self.assertIsNotNone(problem, "a drifted operation module was accepted")
+        self.assertIn(drifted, problem)
+        self.assertIn("does not match the reviewed bytes", problem)
+
+    def test_the_current_deploy_sha_is_not_an_executable_operation_host(self):
+        """Stated as its own assertion so it cannot be lost in a helper: the recommendation in
+        reviewed code today cannot host this operation, whatever the approval says."""
+        from ops import p5_readiness as rd_
+        _, dev = self.checkout(rd_.CURRENT_DEPLOY_SHA)
+        fp = self.fingerprints(dev, set(oc.OPERATION_INVENTORY))
+        self.assertIsNotNone(self.gate(dev, fp, self.approval(rd_.CURRENT_DEPLOY_SHA)))
+
+    def test_every_reviewed_deploy_sha_is_refused_today(self):
+        """Both entries, not just the current one — so promoting the older one is not a route
+        around this either."""
+        from ops import p5_readiness as rd_
+        for sha in rd_.REVIEWED_DEPLOY_SHAS:
+            with self.subTest(sha[:7]):
+                _, dev = self.checkout(sha)
+                fp = self.fingerprints(dev, set(oc.OPERATION_INVENTORY))
+                self.assertIsNotNone(self.gate(dev, fp, self.approval(sha)))
+
+    # ---------------------------------------------------------------- the positive control
+    def test_an_exact_integration_candidate_passes_the_version_binding(self):
+        """One commit containing the service code AND the operation code, with the operation
+        approval naming that same commit. This is the shape a runnable composition has, and the
+        gate accepts it — so the refusals above are about the composition, not about the gate
+        refusing everything."""
+        head = self.head_sha()
+        _, dev = self.checkout(head)
+        present = [r for r in oc.OPERATION_INVENTORY
+                   if os.path.isfile(os.path.join(dev, r))]
+        self.assertEqual(len(present), len(oc.OPERATION_INVENTORY),
+                         "HEAD is not an integration candidate: it lacks operation modules")
+        fp = self.fingerprints(dev, set(oc.OPERATION_INVENTORY))
+        self.assertIsNone(self.gate(dev, fp, self.approval(head)))
+
+    def test_the_candidate_also_carries_every_service_module(self):
+        from ops import p5_readiness as rd_
+        _, dev = self.checkout(self.head_sha())
+        missing = [r for r in rd_.INVENTORY_MODULES
+                   if not os.path.isfile(os.path.join(dev, r))]
+        self.assertEqual(missing, [])
+
+    def test_the_candidate_is_a_descendant_of_the_deploy_commit(self):
+        """Not a parallel line of development that HEAD would never use."""
+        import subprocess
+        ok = subprocess.run(("git", "-C", self.REPO, "merge-base", "--is-ancestor",
+                             self.DEPLOY, self.head_sha()), capture_output=True)
+        self.assertEqual(ok.returncode, 0)
+
+    # ---------------------------------------------------------------- what must NOT happen
+    def test_the_candidate_is_not_quietly_approved(self):
+        """Being runnable is not being approved. Adding the candidate to `REVIEWED_DEPLOY_SHAS`
+        or moving `CURRENT_DEPLOY_SHA` onto it is a review decision and a separate commit; a
+        test that let it drift in would be the self-approval problem in another costume."""
+        from ops import p5_readiness as rd_
+        head = self.head_sha()
+        self.assertNotIn(head, rd_.REVIEWED_DEPLOY_SHAS)
+        self.assertNotEqual(head, rd_.CURRENT_DEPLOY_SHA)
+
+    def test_the_operation_approval_is_still_unconfigured(self):
+        """No record was written for the candidate, so a fresh checkout still refuses."""
+        self.assertIsNone(oc.OPERATION_APPROVAL_DEFAULT)
+
+    # ---------------------------------------------------------------- schema, in this context
+    def test_an_approval_listing_only_what_the_deploy_commit_has_is_refused(self):
+        """The exact-set schema does the work here too: an approval trimmed to the 16 modules
+        `708058e` happens to contain is not a smaller approval, it is a different one."""
+        _, dev = self.checkout(self.DEPLOY)
+        subset = [r for r in oc.OPERATION_INVENTORY
+                  if os.path.isfile(os.path.join(dev, r))]
+        self.assertEqual(len(subset), 16)
+        problem = oc.approved_modules_problem(subset)
+        self.assertIn("does not extend to code it never covered", problem)
+
+    def test_the_exact_set_schema_still_holds(self):
+        """Guards the previous round's fix against being relaxed to make a composition fit."""
+        self.assertIsNone(oc.approved_modules_problem(list(oc.OPERATION_INVENTORY)))
+        self.assertIsNotNone(oc.approved_modules_problem(
+            list(oc.OPERATION_INVENTORY) + ["ops/p5_provision.py"]))
+        self.assertIsNotNone(oc.approved_modules_problem(list(oc.OPERATION_INVENTORY)[:-1]))
+        self.assertIsNotNone(oc.approved_modules_problem(
+            list(oc.OPERATION_INVENTORY) + [oc.OPERATION_INVENTORY[0]]))

@@ -52,11 +52,37 @@ class TestItDescribesACommitNotAWorktree(unittest.TestCase):
                  if isinstance(n, ast.Call)}
         self.assertNotIn("open", opens)
 
-    def test_a_dirty_worktree_is_refused(self):
-        with mock.patch.object(dc, "worktree_is_clean", return_value=False):
+    def test_a_modified_file_refuses_the_package(self):
+        """Mocks what `manifest()` ACTUALLY calls.
+
+        This test used to patch `worktree_is_clean()`, which `manifest()` never calls -- it
+        reads `dirty_paths()` and `ignored_modules()` directly, because it needs the individual
+        lists for the message. So the mock did nothing and the refusal came from the working
+        tree really being dirty. It passed for two rounds and failed the moment the tree was
+        clean, which is the only honest signal it ever gave."""
+        with mock.patch.object(dc, "dirty_paths", return_value=["dev2026/store/time_cube.py"]), \
+                mock.patch.object(dc, "ignored_modules", return_value=[]):
             with self.assertRaises(dc.DeployCandidateError) as caught:
                 dc.manifest("HEAD")
         self.assertIn("describes a tree that exists nowhere", str(caught.exception))
+        self.assertIn("store/time_cube.py", str(caught.exception))
+
+    def test_an_ignored_module_refuses_the_package_on_its_own(self):
+        """The other half, isolated: `dirty_paths()` is empty, so only the ignored-module
+        finding can be the reason. An ignored `.py` is invisible to `status` at any untracked
+        mode, sits on disk, and is imported at run time."""
+        with mock.patch.object(dc, "dirty_paths", return_value=[]), \
+                mock.patch.object(dc, "ignored_modules",
+                                  return_value=["dev2026/ops/sneaky.py"]):
+            with self.assertRaises(dc.DeployCandidateError) as caught:
+                dc.manifest("HEAD")
+        self.assertIn("IGNORED python modules", str(caught.exception))
+
+    def test_a_clean_tree_is_accepted(self):
+        """The positive control, so the two refusals above are not refusing everything."""
+        with mock.patch.object(dc, "dirty_paths", return_value=[]), \
+                mock.patch.object(dc, "ignored_modules", return_value=[]):
+            self.assertFalse(dc.manifest("HEAD")["approved"])
 
     def test_a_dirty_worktree_can_be_described_only_deliberately(self):
         """`require_clean=False` exists for exactly this suite, and is not the default."""
@@ -511,3 +537,312 @@ class TestTheCleanlinessConjunctionInIsolation(unittest.TestCase):
                 mock.patch.object(dc, "ignored_modules", return_value=[]):
             doc = dc.manifest("HEAD")
         self.assertFalse(doc["approved"])
+
+
+# =====================================================================================
+class TestTheCompatibilityMatrixIsComputedFromGit(unittest.TestCase):
+    """The deployment-version composition question, answered from blobs rather than prose.
+
+    A reviewer asked which commits can host this operation. That is not a matter of opinion:
+    either a commit contains the 21 operation modules at the bytes the approval names, or it
+    does not, and `git cat-file` settles it. These tests assert the matrix reports what git
+    actually holds, so a wrong claim in a document cannot survive the suite."""
+
+    DEPLOY = "708058e15b37a02e1d7aa5a66b9978c6e13bd446"
+
+    def matrix(self):
+        return dc.compatibility_matrix("HEAD")
+
+    def test_the_current_deploy_commit_cannot_host_the_operation(self):
+        row = self.matrix()["baselines"][self.DEPLOY]
+        self.assertFalse(row["can_host_the_operation"])
+        self.assertIn("absent", row["why_not"])
+
+    def test_it_names_the_five_absent_operation_modules(self):
+        row = self.matrix()["baselines"][self.DEPLOY]
+        self.assertEqual(sorted(row["operation_modules_absent"]), sorted([
+            "ops/p5_legacy_base.py", "ops/p5_oneshot_compaction.py",
+            "ops/p5_oneshot_exception.py", "ops/p5_parity_producers.py",
+            "ops/p5_prod_provision.py"]))
+
+    def test_absent_and_differing_are_reported_separately(self):
+        """Two different failures: never reviewed here, versus reviewed at other bytes.
+        Collapsing them would tell a reviewer the wrong thing to go and read."""
+        row = self.matrix()["baselines"][self.DEPLOY]
+        self.assertEqual(sorted(row["operation_modules_differing"]), sorted([
+            "ingest/publish_manifest.py", "ops/p5_readiness.py", "ops/p5s8_evidence.py",
+            "store/block_manifest.py", "store/segmented_cube.py"]))
+        self.assertFalse(set(row["operation_modules_absent"])
+                         & set(row["operation_modules_differing"]))
+
+    def test_the_three_operation_module_groups_partition_the_inventory(self):
+        row = self.matrix()["baselines"][self.DEPLOY]
+        total = (len(row["operation_modules_absent"]) + len(row["operation_modules_differing"])
+                 + len(row["operation_modules_identical"]))
+        self.assertEqual(total, len(oc.OPERATION_INVENTORY))
+
+    def test_the_deploy_commit_carries_every_service_module(self):
+        """It is a valid deployment. It just is not one this operation can run inside."""
+        row = self.matrix()["baselines"][self.DEPLOY]
+        self.assertEqual(row["service_modules_absent"], [])
+
+    def test_every_reviewed_deploy_sha_is_reported(self):
+        matrix = self.matrix()
+        self.assertEqual(sorted(matrix["baselines"]), sorted(rd.REVIEWED_DEPLOY_SHAS))
+        for sha, row in matrix["baselines"].items():
+            with self.subTest(sha[:7]):
+                self.assertFalse(row["can_host_the_operation"])
+
+    def test_the_candidate_does_host_the_operation(self):
+        matrix = self.matrix()
+        self.assertTrue(matrix["candidate_hosts_the_operation"])
+
+    def test_the_inventories_overlap_and_the_matrix_says_so(self):
+        matrix = self.matrix()
+        self.assertEqual(matrix["service_inventory_size"], 23)
+        self.assertEqual(matrix["operation_inventory_size"], 21)
+        self.assertEqual(len(matrix["shared_modules"]), 11)
+        self.assertEqual(len(matrix["service_only_modules"]), 12)
+        self.assertEqual(len(matrix["operation_only_modules"]), 10)
+        self.assertEqual(
+            len(matrix["shared_modules"]) + len(matrix["operation_only_modules"]),
+            matrix["operation_inventory_size"])
+
+    def test_it_reports_which_capabilities_the_changes_touch(self):
+        touched = self.matrix()["capabilities_touched_vs_baselines"]
+        self.assertEqual(sorted(touched), ["api_parity", "generation_one",
+                                           "one_shot_compaction", "provisioning"])
+        self.assertIn("api/app.py", touched["api_parity"])
+        self.assertIn("ops/p5_oneshot_compaction.py", touched["one_shot_compaction"])
+
+    def test_it_names_all_three_approvals_and_grants_none(self):
+        matrix = self.matrix()
+        blob = " ".join(matrix["approvals_required"])
+        self.assertIn("SERVICE DEPLOYMENT APPROVAL", blob)
+        self.assertIn("OPERATION APPROVAL", blob)
+        self.assertIn("ASSESSOR APPROVAL", blob)
+        self.assertFalse(matrix["candidate_is_approved"])
+        self.assertNotEqual(matrix["candidate"], matrix["current_deploy_sha"])
+
+    def test_generating_the_matrix_changes_no_approval_state(self):
+        before = (tuple(rd.REVIEWED_DEPLOY_SHAS), rd.CURRENT_DEPLOY_SHA,
+                  oc.OPERATION_APPROVAL_PATH)
+        self.matrix()
+        self.assertEqual(before, (tuple(rd.REVIEWED_DEPLOY_SHAS), rd.CURRENT_DEPLOY_SHA,
+                                  oc.OPERATION_APPROVAL_PATH))
+
+    def test_the_matrix_agrees_with_git_cat_file(self):
+        """Recomputed independently, by a different code path, from the same commits."""
+        row = self.matrix()["baselines"][self.DEPLOY]
+        for rel in row["operation_modules_absent"]:
+            with self.subTest(rel):
+                proc = subprocess.run(
+                    ("git", "-C", os.path.dirname(_DEV), "cat-file", "blob",
+                     f"{self.DEPLOY}:dev2026/{rel}"), capture_output=True)
+                self.assertNotEqual(proc.returncode, 0, f"{rel} exists at {self.DEPLOY}")
+        head = subprocess.run(("git", "-C", os.path.dirname(_DEV), "rev-parse", "HEAD"),
+                              capture_output=True, text=True, check=True).stdout.strip()
+        for rel in row["operation_modules_differing"]:
+            with self.subTest(rel):
+                digests = [hashlib.sha256(subprocess.run(
+                    ("git", "-C", os.path.dirname(_DEV), "cat-file", "blob",
+                     f"{sha}:dev2026/{rel}"), capture_output=True,
+                    check=True).stdout).hexdigest() for sha in (self.DEPLOY, head)]
+                self.assertNotEqual(digests[0], digests[1])
+
+
+# =====================================================================================
+class TestTheChangedFileListDistinguishesAdditions(unittest.TestCase):
+    """`--name-status`, not `--name-only`. Five operation modules are ADDED relative to the
+    current deploy commit, and a flat list of names cannot say that -- which is exactly the
+    fact a reviewer of this composition needs first."""
+
+    DEPLOY = "708058e15b37a02e1d7aa5a66b9978c6e13bd446"
+
+    def test_the_operation_modules_are_reported_as_additions(self):
+        rows = dc.changed_files(self.DEPLOY, "HEAD")
+        for rel in ("ops/p5_oneshot_compaction.py", "ops/p5_oneshot_exception.py",
+                    "ops/p5_parity_producers.py", "ops/p5_legacy_base.py",
+                    "ops/p5_prod_provision.py"):
+            with self.subTest(rel):
+                self.assertIn(rel, rows["added"])
+                self.assertNotIn(rel, rows["modified"])
+
+    def test_the_shared_store_modules_are_reported_as_modifications(self):
+        rows = dc.changed_files(self.DEPLOY, "HEAD")
+        for rel in ("store/segmented_cube.py", "store/block_manifest.py",
+                    "ingest/publish_manifest.py"):
+            with self.subTest(rel):
+                self.assertIn(rel, rows["modified"])
+
+    def test_nothing_is_deleted(self):
+        """A deployment candidate that removes a module the service imports would be a very
+        different review. Asserting it here means nobody has to notice its absence."""
+        self.assertEqual(dc.changed_files(self.DEPLOY, "HEAD")["deleted"], [])
+
+    def test_the_total_is_the_sum_of_the_groups(self):
+        rows = dc.changed_files(self.DEPLOY, "HEAD")
+        self.assertEqual(rows["total"], len(rows["added"]) + len(rows["modified"])
+                         + len(rows["deleted"]) + len(rows["other"]))
+        self.assertEqual(rows["base"], self.DEPLOY)
+
+    def test_the_package_carries_both(self):
+        with mock.patch.object(dc, "dirty_paths", return_value=[]), \
+                mock.patch.object(dc, "ignored_modules", return_value=[]):
+            doc = dc.manifest("HEAD")
+        self.assertIn("compatibility_matrix", doc)
+        self.assertIn("changed_vs_current_deploy", doc)
+        self.assertEqual(doc["changed_vs_current_deploy"]["base"], rd.CURRENT_DEPLOY_SHA)
+        self.assertEqual(len(doc["deployment_inventory_digests"]), 23)
+        self.assertFalse(doc["approved"])
+
+
+# =====================================================================================
+class TestTheIntegrationCandidateDocumentIsTrue(unittest.TestCase):
+    """A document nobody checks becomes a document that is wrong.
+
+    `p5_integration_candidate.md` states counts and module names that are all derivable from
+    git. These tests re-derive them, so the spec fails the suite rather than quietly ageing
+    into a false claim about which commits can host the operation."""
+
+    DOC = os.path.join(_DEV, "specs", "p5_integration_candidate.md")
+
+    def doc(self):
+        """Whitespace-collapsed. The document is hard-wrapped, so a phrase that reads as one
+        sentence can be split across a newline; asserting on the raw text would make these
+        tests depend on where the wrap happens to fall."""
+        return " ".join(_read_text(self.DOC).split())
+
+    def test_it_exists_and_says_nothing_is_approved(self):
+        text = self.doc()
+        self.assertIn("Nothing here is approved", text)
+        self.assertIn("no operation approval record exists", text)
+
+    def test_the_five_absent_modules_are_named_and_really_absent(self):
+        text = self.doc()
+        matrix = dc.compatibility_matrix("HEAD")
+        absent = matrix["baselines"][rd.CURRENT_DEPLOY_SHA]["operation_modules_absent"]
+        self.assertEqual(len(absent), 5)
+        for rel in absent:
+            with self.subTest(rel):
+                self.assertIn(rel, text)
+
+    def test_the_inventory_counts_in_the_document_match_the_code(self):
+        text = self.doc()
+        matrix = dc.compatibility_matrix("HEAD")
+        self.assertEqual(matrix["service_inventory_size"], 23)
+        self.assertEqual(matrix["operation_inventory_size"], 21)
+        self.assertIn("23 service + 21 operation, sharing 11", text)
+        self.assertEqual(len(matrix["shared_modules"]), 11)
+
+    def test_it_states_all_three_approvals(self):
+        text = self.doc()
+        for phrase in ("Service deployment approval", "Operation approval",
+                       "Assessor approval"):
+            with self.subTest(phrase):
+                self.assertIn(phrase, text)
+
+    def test_it_does_not_claim_readiness(self):
+        text = self.doc().lower()
+        self.assertIn("not compaction readiness", text)
+        self.assertNotIn("ready to deploy", text)
+
+    def test_it_does_not_transcribe_a_total_it_cannot_keep_true(self):
+        """The document is part of the diff it describes, so any commit that updates a written
+        total changes it. The complete list is generated into the package manifest instead, and
+        the document says so rather than carrying a number that is stale on arrival."""
+        text = self.doc()
+        self.assertIn("changed_vs_current_deploy", text)
+        self.assertIn("itself part of the diff it describes", text)
+
+    def test_every_changed_code_module_the_document_lists_really_changed(self):
+        """The stable claim, checked against git: each module named in the document is in the
+        diff, on the side the document puts it."""
+        rows = dc.changed_files(rd.CURRENT_DEPLOY_SHA, "HEAD")
+        text = self.doc()
+        for rel in ("ops/p5_oneshot_compaction.py", "ops/p5_parity_producers.py",
+                    "ops/p5_legacy_base.py", "ops/p5_oneshot_exception.py",
+                    "ops/p5_prod_provision.py"):
+            with self.subTest("added", rel=rel):
+                self.assertIn(rel, text)
+                self.assertIn(rel, rows["added"])
+        for rel in ("api/app.py", "ingest/publish_manifest.py", "ops/p5_readiness.py",
+                    "ops/p5s8_evidence.py", "store/block_manifest.py",
+                    "store/segmented_cube.py"):
+            with self.subTest("modified", rel=rel):
+                self.assertIn(rel, text)
+                self.assertIn(rel, rows["modified"])
+
+    def test_the_document_and_git_agree_that_nothing_is_deleted(self):
+        self.assertEqual(dc.changed_files(rd.CURRENT_DEPLOY_SHA, "HEAD")["deleted"], [])
+        self.assertIn("Deleted — none", self.doc())
+
+
+# =====================================================================================
+class TestEachHalfOfTheHostingRuleIsReachedOnItsOwn(unittest.TestCase):
+    """`can_host_the_operation` is a conjunction, and `708058e` fails BOTH halves.
+
+    That made the field untestable against the current deploy commit: absent and differing are
+    each non-empty there, so dropping either half still reports `False` and every assertion
+    still passed. Mutation testing found it — two mutants survived that weakened the rule to
+    one half. These are the commit pairs that separate them, chosen because each exhibits
+    exactly one failure mode, so the half under test is the only thing that can be the reason.
+
+    The same shape recurs below: a field whose two possible values were never both exercised is
+    a field the suite was not really checking."""
+
+    C_3223FBA = "3223fba37da5d292ea6acb58ccef0da2b5138d31"
+    C_708058E = "708058e15b37a02e1d7aa5a66b9978c6e13bd446"
+    C_2AB737F = "2ab737f10fa73d2adca103ff7f2dafc86a29b294"
+
+    def row(self, candidate, baseline):
+        matrix = dc.compatibility_matrix(candidate, baselines=(baseline,))
+        return list(matrix["baselines"].values())[0]
+
+    def test_absent_modules_alone_prevent_hosting(self):
+        """`3223fba` -> `708058e`: six operation modules are absent and NONE of the present
+        ones differ. Only the `not absent` half can produce the refusal."""
+        row = self.row(self.C_708058E, self.C_3223FBA)
+        self.assertEqual(row["operation_modules_differing"], [])
+        self.assertEqual(len(row["operation_modules_absent"]), 6)
+        self.assertFalse(row["can_host_the_operation"])
+
+    def test_differing_modules_alone_prevent_hosting(self):
+        """`2ab737f` -> HEAD: every operation module is present and one differs. Only the
+        `not differs` half can produce the refusal."""
+        row = self.row("HEAD", self.C_2AB737F)
+        self.assertEqual(row["operation_modules_absent"], [])
+        self.assertEqual(row["operation_modules_differing"],
+                         ["ops/p5_oneshot_compaction.py"])
+        self.assertFalse(row["can_host_the_operation"])
+
+    def test_a_commit_identical_on_every_operation_module_can_host(self):
+        """The positive control for the conjunction: neither half fires."""
+        row = self.row("HEAD", "HEAD")
+        self.assertEqual(row["operation_modules_absent"], [])
+        self.assertEqual(row["operation_modules_differing"], [])
+        self.assertTrue(row["can_host_the_operation"])
+        self.assertIsNone(row["why_not"])
+
+    def test_an_approved_candidate_is_reported_as_approved(self):
+        """The other value of `candidate_is_approved`. Every earlier assertion used a candidate
+        that is NOT approved, so a hardcoded `False` passed them all — and a package that
+        always says 'not approved' would be useless the day one is."""
+        self.assertTrue(dc.compatibility_matrix(self.C_708058E)["candidate_is_approved"])
+        self.assertFalse(dc.compatibility_matrix("HEAD")["candidate_is_approved"])
+
+    def test_deletions_are_classified_as_deletions(self):
+        """No commit in this history deletes a dev-tree file, so `deleted` was always empty and
+        misfiling a deletion as `other` changed nothing observable. Reversing the diff produces
+        genuine `D` statuses from git and exercises the branch."""
+        rows = dc.changed_files("HEAD", self.C_708058E)
+        self.assertEqual(rows["other"], [])
+        self.assertEqual(rows["added"], [])
+        self.assertIn("ops/p5_oneshot_compaction.py", rows["deleted"])
+        # Derived, not hardcoded: reversing a diff turns every addition into a deletion, so the
+        # two must correspond exactly. A literal count here would go stale on the next commit —
+        # which is how this test first failed, one commit after it was written.
+        forward = dc.changed_files(self.C_708058E, "HEAD")
+        self.assertEqual(rows["deleted"], forward["added"])
+        self.assertEqual(rows["modified"], forward["modified"])
+        self.assertEqual(rows["total"], len(rows["deleted"]) + len(rows["modified"]))

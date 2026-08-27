@@ -120,6 +120,106 @@ def worktree_is_clean() -> bool:
     return not dirty_paths() and not ignored_modules()
 
 
+#: Which changed modules bear on which capability. A reviewer's question is never "did bytes
+#: change" but "what could this have broken", and only a person who read the diff can answer
+#: that. This maps a module to the capabilities it participates in, so the package can say which
+#: questions a given candidate raises rather than pretending to answer them.
+CAPABILITY_MODULES = {
+    "api_parity": ("api/app.py", "store/segmented_cube.py", "store/time_cube.py",
+                   "store/block_manifest.py", "store/__init__.py"),
+    "generation_one": ("store/block_manifest.py", "ingest/publish_manifest.py",
+                       "ops/p5_legacy_base.py", "ops/p5_prod_provision.py"),
+    "provisioning": ("ops/p5_prod_provision.py", "ops/p5_readiness.py", "ops/quiescence.py"),
+    "one_shot_compaction": ("ops/p5_oneshot_compaction.py", "ops/p5_oneshot_exception.py",
+                            "ops/p5_parity_producers.py", "ops/p5_legacy_base.py",
+                            "ingest/build_block.py", "ingest/publish_manifest.py",
+                            "store/segmented_cube.py", "store/time_cube.py",
+                            "store/block_manifest.py", "store/repair_wal.py",
+                            "store/source_provenance.py", "store/compaction_lock.py"),
+}
+
+
+def compatibility_matrix(candidate: str, baselines: Sequence[str] = ()) -> Dict:
+    """Which commits can actually HOST this operation, computed from git blobs.
+
+    Three bindings have to hold at once for a composition to be executable:
+
+        HEAD == deploy_sha and the worktree is clean   -> the files on disk ARE deploy_sha
+        the 23 service modules match the deploy approval
+        the 21 operation modules match the operation approval
+
+    `deploy_sha` and `approved_sha` need not be the same commit, but a clean checkout of
+    `deploy_sha` is what is on disk, and the on-disk bytes are what the operation gate compares
+    against `approved_sha`. So the two commits must agree BYTE-FOR-BYTE on all 21 operation
+    modules. A deploy commit that does not contain them cannot host the operation however the
+    approval is written -- which is a fact about the pair, not a defect in either.
+
+    Reported per commit rather than as a verdict: `absent` and `differs` are the two distinct
+    ways a pair fails, and collapsing them would hide that one is "never reviewed here" and the
+    other is "reviewed at other bytes"."""
+    from ops import p5_readiness as rd
+    from ops import p5_oneshot_compaction as oc
+    service = tuple(rd.INVENTORY_MODULES)
+    operation = tuple(oc.OPERATION_INVENTORY)
+    resolved = _git("rev-parse", candidate).strip()
+    shas = [_git("rev-parse", s).strip()
+            for s in (tuple(baselines) or tuple(rd.REVIEWED_DEPLOY_SHAS))]
+    target = digests_at(resolved, sorted(set(service) | set(operation)))
+
+    rows = {}
+    for sha in shas:
+        here = digests_at(sha, sorted(set(service) | set(operation)))
+        absent = [m for m in operation if here[m] is None]
+        differs = [m for m in operation if here[m] is not None and here[m] != target[m]]
+        service_absent = [m for m in service if here[m] is None]
+        service_differs = [m for m in service
+                           if here[m] is not None and here[m] != target[m]]
+        rows[sha] = {
+            "subject": _git("log", "-1", "--format=%s", sha).strip(),
+            "operation_modules_absent": absent,
+            "operation_modules_differing": differs,
+            "operation_modules_identical": [m for m in operation
+                                            if here[m] is not None and here[m] == target[m]],
+            "service_modules_absent": service_absent,
+            "service_modules_differing": service_differs,
+            # The whole question, in one field. False means no operation approval can make this
+            # pair runnable -- not that the approval is missing, that the code is.
+            "can_host_the_operation": not absent and not differs,
+            "why_not": (f"{len(absent)} of the {len(operation)} operation modules are absent and "
+                        f"{len(differs)} differ" if (absent or differs) else None),
+        }
+    capabilities = {}
+    for name, mods in sorted(CAPABILITY_MODULES.items()):
+        touched = sorted({m for sha in shas for m in mods
+                          if digests_at(sha, (m,))[m] != target[m]})
+        capabilities[name] = touched
+    return {
+        "candidate": resolved,
+        "service_inventory_size": len(service),
+        "operation_inventory_size": len(operation),
+        "shared_modules": sorted(set(service) & set(operation)),
+        "service_only_modules": sorted(set(service) - set(operation)),
+        "operation_only_modules": sorted(set(operation) - set(service)),
+        "candidate_hosts_the_operation": all(target[m] is not None for m in operation),
+        "baselines": rows,
+        "capabilities_touched_vs_baselines": capabilities,
+        "current_deploy_sha": rd.CURRENT_DEPLOY_SHA,
+        "candidate_is_approved": resolved in rd.REVIEWED_DEPLOY_SHAS,
+        "approvals_required": [
+            "SERVICE DEPLOYMENT APPROVAL -- add the candidate to "
+            "p5_readiness.REVIEWED_DEPLOY_SHAS, and separately decide CURRENT_DEPLOY_SHA. This "
+            "governs the 23 modules the service imports.",
+            "OPERATION APPROVAL -- an external record at "
+            f"{oc.OPERATION_APPROVAL_ENV} naming approved_sha and all "
+            f"{len(operation)} operation modules. This governs the code the compaction runs.",
+            "ASSESSOR APPROVAL -- p5_readiness.APPROVAL_RECORD_PATH, which governs whether the "
+            "readiness assessor's own verdicts may be relied on.",
+        ],
+        "not_done_here": ("This function computes and edits nothing. None of the three "
+                          "approvals above is created, moved or implied by generating it."),
+    }
+
+
 def identity_update_plan(sha: str) -> Dict:
     """What approving this candidate would REQUIRE. A plan, not a change.
 
@@ -217,8 +317,36 @@ def manifest(sha: str = "HEAD", *, require_clean: bool = True) -> Dict:
         "files": files,
         "deployment_inventory_digests": digests_at(resolved, rd.INVENTORY_MODULES),
         "operation_module_digests": digests_at(resolved, operation_modules()),
+        "compatibility_matrix": compatibility_matrix(resolved),
+        "changed_vs_current_deploy": changed_files(rd.CURRENT_DEPLOY_SHA, resolved),
         "identity_update_plan": identity_update_plan(resolved),
     }
+
+
+def changed_files(base: str, candidate: str) -> Dict:
+    """Every dev-tree path that differs between two commits, by git's own status letter.
+
+    `--name-status` rather than `--name-only`: a reviewer reading a candidate needs to know
+    whether a path was ADDED -- five of the operation modules do not exist at the current deploy
+    commit at all -- and a flat list of names cannot say that."""
+    out = _git("diff", "--name-status", f"{base}..{candidate}", "--", DEV_PREFIX)
+    prefix = DEV_PREFIX + "/"
+    groups: Dict[str, List[str]] = {"added": [], "modified": [], "deleted": [], "other": []}
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        status, _, path = line.partition("\t")
+        path = path.strip()
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+        key = {"A": "added", "M": "modified", "D": "deleted"}.get(status[:1], "other")
+        groups[key].append(path)
+    for value in groups.values():
+        value.sort()
+    rows: Dict = dict(groups)
+    rows["total"] = sum(len(v) for v in groups.values())
+    rows["base"] = base
+    return rows
 
 
 def write_package(out_dir: str, sha: str = "HEAD", *, require_clean: bool = True) -> Dict:
