@@ -3225,3 +3225,349 @@ class TestAnyModifiedOperationModuleRefusesBeforeAnythingHappens(_CompactionBase
         record, problem = oc.operation_approval(path)
         self.assertIsNone(record)
         self.assertIn("lists no approved_modules", problem)
+
+
+# =====================================================================================
+class TestTheApprovedModulesSchemaIsCheckedElementByElement(_CompactionBase):
+    """Every guard on `approved_modules`, each reached on its own.
+
+    The list is the only part of the record that says WHAT was reviewed, and it arrives as
+    whatever JSON a person wrote. Set arithmetic over it is the last step, not the first: a
+    nested list or dict makes `set()` raise `TypeError`, and a gate that crashes on a malformed
+    approval has refused nothing — it has failed, and a caller catching broadly could read that
+    as any other error.
+
+    Each case below is isolated: the record is otherwise canonical, so exactly one guard can be
+    the reason it is refused, and the assertion names that guard's own wording."""
+
+    def _refusal(self, **over):
+        path = self.write_operation_approval(**over)
+        record, problem = oc.operation_approval(path)
+        self.assertIsNone(record, "the record was accepted")
+        return problem
+
+    # ---------------------------------------------------------------- the positive control
+    def test_the_canonical_record_is_accepted(self):
+        """Nothing below is refused for a reason that would also refuse a good record."""
+        path = self.write_operation_approval()
+        record, problem = oc.operation_approval(path)
+        self.assertIsNone(problem)
+        self.assertEqual(sorted(record["approved_modules"]), sorted(oc.OPERATION_INVENTORY))
+
+    def test_the_helper_accepts_the_inventory_itself(self):
+        self.assertIsNone(oc.approved_modules_problem(list(oc.OPERATION_INVENTORY)))
+
+    def test_order_does_not_matter(self):
+        """It is a set of modules. A record written in a different order approves the same code."""
+        self.assertIsNone(
+            oc.approved_modules_problem(sorted(oc.OPERATION_INVENTORY, reverse=True)))
+
+    # ---------------------------------------------------------------- membership, both ways
+    def test_a_missing_module_is_named(self):
+        short = [m for m in oc.OPERATION_INVENTORY if m != "store/time_cube.py"]
+        problem = self._refusal(approved_modules=short)
+        self.assertIn("does not extend to code it never covered", problem)
+        self.assertIn("store/time_cube.py", problem)
+
+    def test_an_extra_module_is_refused_and_named(self):
+        """A subset rule accepted this. It should not: either the inventory shrank without the
+        approval being redone, or the approver was reviewing something else."""
+        problem = self._refusal(
+            approved_modules=list(oc.OPERATION_INVENTORY) + ["ops/p5_provision.py"])
+        self.assertIn("which this operation does not run", problem)
+        self.assertIn("ops/p5_provision.py", problem)
+        self.assertNotIn("does not extend to code it never covered", problem)
+
+    def test_the_set_must_be_exactly_equal(self):
+        """Missing one and adding one keeps the LENGTH right; the sets still differ."""
+        swapped = [m for m in oc.OPERATION_INVENTORY if m != "store/time_cube.py"]
+        swapped.append("store/tiered_cube.py")
+        problem = oc.approved_modules_problem(swapped)
+        self.assertIsNotNone(problem)
+        self.assertIn("store/time_cube.py", problem)
+
+    def test_a_duplicate_module_is_refused(self):
+        """Sets would swallow it, and a reader counting entries would get a different answer
+        from the gate comparing sets."""
+        problem = self._refusal(
+            approved_modules=list(oc.OPERATION_INVENTORY) + ["store/time_cube.py"])
+        self.assertIn("more than once", problem)
+        self.assertIn("store/time_cube.py", problem)
+
+    def test_a_duplicate_is_reported_before_membership(self):
+        """The set is complete and has no extras, so ONLY the duplicate guard can fire."""
+        problem = oc.approved_modules_problem(
+            list(oc.OPERATION_INVENTORY) + [oc.OPERATION_INVENTORY[0]])
+        self.assertIn("more than once", problem)
+
+    # ---------------------------------------------------------------- element types
+    def test_a_nested_list_is_a_controlled_refusal_not_a_TypeError(self):
+        """`set([[...]])` raises. The gate must answer, not crash."""
+        bad = list(oc.OPERATION_INVENTORY[:-1]) + [["store/time_cube.py"]]
+        problem = oc.approved_modules_problem(bad)
+        self.assertIsNotNone(problem)
+        self.assertIn("as list", problem)
+
+    def test_a_nested_dict_is_a_controlled_refusal_not_a_TypeError(self):
+        bad = list(oc.OPERATION_INVENTORY[:-1]) + [{"path": "store/time_cube.py"}]
+        problem = self._refusal(approved_modules=bad)
+        self.assertIn("as dict", problem)
+
+    def test_a_null_item_is_refused(self):
+        bad = list(oc.OPERATION_INVENTORY[:-1]) + [None]
+        problem = self._refusal(approved_modules=bad)
+        self.assertIn("as NoneType", problem)
+
+    def test_a_bool_item_is_refused(self):
+        """`True` is an `int`, hashable, and would have sailed through every set operation."""
+        bad = list(oc.OPERATION_INVENTORY[:-1]) + [True]
+        problem = self._refusal(approved_modules=bad)
+        self.assertIn("as bool", problem)
+
+    def test_an_int_item_is_refused(self):
+        bad = list(oc.OPERATION_INVENTORY[:-1]) + [21]
+        problem = self._refusal(approved_modules=bad)
+        self.assertIn("as int", problem)
+
+    def test_a_float_item_is_refused(self):
+        bad = list(oc.OPERATION_INVENTORY[:-1]) + [1.0]
+        problem = oc.approved_modules_problem(bad)
+        self.assertIn("as float", problem)
+
+    def test_a_str_subclass_is_refused(self):
+        """`type(...) is str`, not `isinstance`: a subclass can define its own `__eq__` and
+        `__hash__`, and the comparison against the inventory would then run by rules the record
+        supplies rather than by the identity of a path."""
+        class Sneaky(str):
+            def __hash__(self):
+                return hash("store/time_cube.py")
+
+            def __eq__(self, other):
+                return True
+
+        bad = list(oc.OPERATION_INVENTORY[:-1]) + [Sneaky("anything at all")]
+        problem = oc.approved_modules_problem(bad)
+        self.assertIn("as Sneaky", problem)
+
+    def test_the_element_index_is_reported(self):
+        bad = list(oc.OPERATION_INVENTORY)
+        bad[3] = None
+        self.assertIn("approved_modules[3]", oc.approved_modules_problem(bad))
+
+    # ---------------------------------------------------------------- canonical paths
+    def test_an_empty_string_item_is_refused(self):
+        bad = list(oc.OPERATION_INVENTORY[:-1]) + [""]
+        self.assertIn("as empty", oc.approved_modules_problem(bad))
+
+    def test_a_whitespace_item_is_refused(self):
+        bad = list(oc.OPERATION_INVENTORY[:-1]) + ["   "]
+        self.assertIn("as empty", oc.approved_modules_problem(bad))
+
+    def test_a_dot_slash_prefix_is_refused(self):
+        """`./store/time_cube.py` names the same file git would resolve, so a record written
+        this way covers a module the equality check reports as both missing and extra."""
+        bad = [("./" + m) if m == "store/time_cube.py" else m for m in oc.OPERATION_INVENTORY]
+        problem = oc.approved_modules_problem(bad)
+        self.assertIn("is not canonical", problem)
+        self.assertNotIn("does not extend", problem)
+
+    def test_a_doubled_separator_is_refused(self):
+        bad = [m.replace("/", "//") if m == "store/time_cube.py" else m
+               for m in oc.OPERATION_INVENTORY]
+        self.assertIn("is not canonical", oc.approved_modules_problem(bad))
+
+    def test_an_absolute_path_is_refused(self):
+        bad = [("/" + m) if m == "store/time_cube.py" else m for m in oc.OPERATION_INVENTORY]
+        problem = oc.approved_modules_problem(bad)
+        self.assertIn("is absolute", problem)
+
+    def test_a_traversal_is_refused(self):
+        bad = list(oc.OPERATION_INVENTORY[:-1]) + ["../ops/p5_oneshot_compaction.py"]
+        problem = oc.approved_modules_problem(bad)
+        self.assertIn("escapes the repository", problem)
+
+    def test_a_backslash_path_is_refused(self):
+        bad = [m.replace("/", "\\") if m == "store/time_cube.py" else m
+               for m in oc.OPERATION_INVENTORY]
+        self.assertIn("backslashes", oc.approved_modules_problem(bad))
+
+    def test_a_trailing_slash_is_refused(self):
+        bad = [(m + "/") if m == "store/time_cube.py" else m for m in oc.OPERATION_INVENTORY]
+        self.assertIn("is not canonical", oc.approved_modules_problem(bad))
+
+    # ---------------------------------------------------------------- malformed JSON roots
+    def test_a_json_list_root_is_refused(self):
+        problem = self._write_raw(json.dumps(list(oc.OPERATION_INVENTORY)))
+        self.assertIn("is list, not a record", problem)
+
+    def test_a_json_string_root_is_refused(self):
+        self.assertIn("is str, not a record", self._write_raw(json.dumps("approved")))
+
+    def test_a_json_null_root_is_refused(self):
+        self.assertIn("is NoneType, not a record", self._write_raw("null"))
+
+    def test_a_json_number_root_is_refused(self):
+        self.assertIn("is int, not a record", self._write_raw("21"))
+
+    def test_unparseable_json_is_refused(self):
+        self.assertIn("could not be read", self._write_raw("{not json at all"))
+
+    def test_an_empty_file_is_refused(self):
+        self.assertIn("could not be read", self._write_raw(""))
+
+    def _write_raw(self, text):
+        outside = tempfile.mkdtemp(prefix="p5-op-approval-raw-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        path = os.path.join(outside, "p5_operation_approval.json")
+        with open(path, "w") as fh:
+            fh.write(text)
+        record, problem = oc.operation_approval(path)
+        self.assertIsNone(record)
+        return problem
+
+
+# =====================================================================================
+class TestAMalformedApprovalRefusesTheOperationRatherThanRaising(_CompactionBase):
+    """`operation_inventory_problem()` answers for every malformed record above.
+
+    A refusal a caller can read, not a `TypeError` escaping from `set()`. Each case is checked
+    at the gate itself and then through the whole operation, with `_build` and the compaction
+    lock patched to raise if reached — so a refusal that happened AFTER a scan or a lock would
+    fail the test rather than pass it."""
+
+    CASES = {
+        "a nested list": lambda inv: list(inv[:-1]) + [["store/time_cube.py"]],
+        "a nested dict": lambda inv: list(inv[:-1]) + [{"m": "store/time_cube.py"}],
+        "a null item": lambda inv: list(inv[:-1]) + [None],
+        "a bool item": lambda inv: list(inv[:-1]) + [True],
+        "an int item": lambda inv: list(inv[:-1]) + [3],
+        "a duplicate": lambda inv: list(inv) + [inv[0]],
+        "an extra module": lambda inv: list(inv) + ["ops/p5_provision.py"],
+        "a missing module": lambda inv: list(inv[:-1]),
+        "a non-canonical path": lambda inv: ["./" + inv[0]] + list(inv[1:]),
+    }
+
+    def test_the_gate_returns_a_refusal_for_every_malformed_list(self):
+        for name, make in self.CASES.items():
+            with self.subTest(name):
+                path = self.write_operation_approval(
+                    approved_modules=make(oc.OPERATION_INVENTORY))
+                problem = oc.operation_inventory_problem(
+                    module_fingerprints=self._identity()["module_fingerprints"],
+                    approval_path=path, repo_root=self.operation_repo_root())
+                self.assertIsInstance(problem, str)
+                self.assertIn("approval record", problem)
+
+    def test_the_operation_refuses_before_locks_or_scans(self):
+        import store.compaction_lock as cl
+        for name, make in self.CASES.items():
+            with self.subTest(name):
+                before = self.manifest_generation()
+                with mock.patch.object(oc, "_build",
+                                       side_effect=AssertionError("scanned a store")), \
+                        mock.patch.object(cl.CompactionLock, "acquire",
+                                          side_effect=AssertionError("took a lock")):
+                    with self.assertRaises(oc.OneShotCompactionRefused):
+                        with self.approved_operation_commit(
+                                approved_modules=make(oc.OPERATION_INVENTORY)):
+                            with dev_map(self.devs):
+                                oc.compact_one_shot(**self._kwargs_for_refusal())
+                self.assertEqual(self.manifest_generation(), before)
+
+    def test_a_malformed_list_does_not_bypass_the_byte_comparison(self):
+        """The schema is a gate in FRONT of the byte check, not a replacement for it: a record
+        that passes the schema still has to match `approved_sha`, the 21 fingerprints, and the
+        blobs on disk."""
+        fingerprints = dict(self._identity()["module_fingerprints"])
+        fingerprints["store/time_cube.py"] = "0" * 64
+        problem = oc.operation_inventory_problem(
+            module_fingerprints=fingerprints,
+            approval_path=self.write_operation_approval(),
+            repo_root=self.operation_repo_root())
+        self.assertIn("store/time_cube.py", problem)
+        self.assertIn("hashes to", problem)
+
+
+# =====================================================================================
+class TestWhatTheApprovedCommitDoesAndDoesNotBind(_CompactionBase):
+    """`approved_sha` binds the 21 inventory modules. It is NOT required to be `HEAD`.
+
+    Two commits answer two questions. `deploy_sha` is required to equal `HEAD` with a clean
+    worktree, which binds the whole checkout; `approved_sha` binds exactly the modules the
+    operation imports. They may differ outside the inventory and must agree byte-for-byte
+    inside it — so a non-inventory file is not unchecked, it is checked by the deploy commit
+    instead. These tests fix that boundary so it cannot drift into an unstated version rule."""
+
+    def test_the_operation_gate_does_not_read_HEAD(self):
+        """The positive control already proves it. The working tree is dirty and `HEAD` is not
+        the approved commit — the approval names a commit in a throwaway clone — and the
+        operation still runs, because every module it imports matches that commit's bytes."""
+        import subprocess
+        head = subprocess.run(("git", "-C", os.path.dirname(_DEV), "rev-parse", "HEAD"),
+                              capture_output=True, text=True).stdout.strip()
+        self.assertNotEqual(head, self.operation_commit())
+        self.assertIsNone(oc.operation_inventory_problem(
+            module_fingerprints=self._identity()["module_fingerprints"],
+            approval_path=self.write_operation_approval(),
+            repo_root=self.operation_repo_root()))
+
+    def test_a_non_inventory_file_changing_does_not_invalidate_the_approval(self):
+        """A spec, a test, or a service module the operation never imports may differ between
+        `HEAD` and `approved_sha`. Requiring otherwise would mean reissuing the operation
+        approval for changes nobody reviewed — which is how approvals come to be reissued
+        without being read."""
+        outside = "specs/p5_deployment_readiness.md"
+        self.assertNotIn(outside, oc.OPERATION_INVENTORY)
+        path = os.path.join(_DEV, outside)
+        self.assertTrue(os.path.isfile(path), outside)
+        self._append_and_restore(path, "\n<!-- edited by a test -->\n")
+        self.assertIsNone(oc.operation_inventory_problem(
+            module_fingerprints=self._identity()["module_fingerprints"],
+            approval_path=self.write_operation_approval(),
+            repo_root=self.operation_repo_root()))
+
+    def test_an_inventory_file_changing_does_invalidate_it(self):
+        """The other side of the same boundary, and the reason the first test is not a hole."""
+        target = os.path.join(_DEV, "store/time_cube.py")
+        self._append_and_restore(target, "\n# edited by a test\n")
+        problem = oc.operation_inventory_problem(
+            module_fingerprints=self._identity()["module_fingerprints"],
+            approval_path=self.write_operation_approval(),
+            repo_root=self.operation_repo_root())
+        self.assertIsNotNone(problem)
+        self.assertIn("store/time_cube.py", problem)
+
+    def test_the_deploy_commit_is_what_binds_HEAD(self):
+        """The version rule that DOES exist, stated where it lives: the identity artifact."""
+        artifact = dict(self._identity())
+        artifact["head_sha"] = "b" * 40
+        problem = self._identity_refusal(artifact)
+        self.assertIn("which is not the reviewed commit", problem)
+
+    def test_a_dirty_worktree_is_what_closes_the_gap(self):
+        """`HEAD == deploy_sha` alone would say nothing about the files on disk."""
+        artifact = dict(self._identity())
+        artifact["worktree_clean"] = False
+        problem = self._identity_refusal(artifact)
+        self.assertIn("not clean", problem)
+
+    def _identity_refusal(self, artifact):
+        """`deploy_sha` is patched into the approved set so ONLY the field under test can be
+        the reason the artifact is refused."""
+        with mock.patch.object(rd, "REVIEWED_DEPLOY_SHAS", (artifact["deploy_sha"],)):
+            problem = oc.identity_problem(artifact, host=oc._hostname(), run_id=self.RUN_ID,
+                                          repo_root=self.operation_repo_root())
+        self.assertIsNotNone(problem)
+        return problem
+
+    def _append_and_restore(self, path, text):
+        with open(path) as fh:
+            original = fh.read()
+
+        def restore():
+            with open(path, "w") as fh:
+                fh.write(original)
+
+        self.addCleanup(restore)
+        with open(path, "a") as fh:
+            fh.write(text)

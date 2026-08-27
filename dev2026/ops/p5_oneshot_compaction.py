@@ -499,6 +499,33 @@ OPERATION_INVENTORY = (
 #: This is the same shape as `p5_readiness.APPROVAL_RECORD_PATH`, for the same reason, and it is
 #: a SEPARATE record: that one answers "is the assessor reviewed", this one answers "is the
 #: operation reviewed", and a commit can reasonably be one and not the other.
+#:
+#: ## `approved_sha` is deliberately NOT required to be `HEAD`
+#:
+#: Two commits are checked, and they answer different questions:
+#:
+#: * `deploy_sha` (in the identity artifact, from `p5_readiness.REVIEWED_DEPLOY_SHAS`) IS
+#:   required to be `HEAD`, with a clean worktree. That binds the WHOLE checkout: every file the
+#:   service runs is the reviewed byte, because nothing is uncommitted and `HEAD` is the commit.
+#: * `approved_sha` (here) binds exactly the 21 paths in `OPERATION_INVENTORY`, byte for byte,
+#:   and says nothing about any other file.
+#:
+#: So the operation does NOT refuse when `HEAD != approved_sha`. It refuses when any module it
+#: actually imports differs from the approved commit. The reason to separate them is that the
+#: two reviews are of different things and land at different times: an operation review reads
+#: the compaction path, and the deployment review reads the service. Requiring one commit to be
+#: both would mean re-approving the operation whenever an unrelated spec, test, or service
+#: module changed -- and an approval that has to be reissued for changes nobody reviewed is an
+#: approval that gets reissued without being read.
+#:
+#: What makes that safe is that the two bind the same bytes from opposite directions: `HEAD ==
+#: deploy_sha` plus a clean worktree means the files on disk ARE `deploy_sha`, and the inventory
+#: gate then requires those same files to equal `approved_sha`. The two commits may differ
+#: freely OUTSIDE the inventory and must agree exactly INSIDE it. A non-inventory file is
+#: therefore never unchecked -- it is checked by the deploy commit instead, which is the
+#: authority for the code the service runs. `tests/_closure_probe.py` is what establishes that
+#: the inventory really is every module the operation imports, so "outside the inventory" means
+#: "does not execute during a compaction" rather than "was left off a list".
 OPERATION_APPROVAL_DEFAULT = None
 OPERATION_APPROVAL_ENV = "P5_OPERATION_APPROVAL"
 OPERATION_APPROVAL_PATH = os.environ.get(OPERATION_APPROVAL_ENV) or OPERATION_APPROVAL_DEFAULT
@@ -568,18 +595,83 @@ def operation_approval(path=None, *, now=None):
     if ex._parse_utc(record.get("approved_utc")) is None:
         return None, (f"the operation approval record dates the approval "
                       f"{record.get('approved_utc')!r}, which is not a timestamp")
-    approved_modules = record["approved_modules"]
+    problem = approved_modules_problem(record["approved_modules"])
+    if problem:
+        return None, problem
+    return record, None
+
+
+def _canonical_module_path(item: str) -> Optional[str]:
+    """Why `item` is not a canonical repository-relative module path, or `None`.
+
+    Canonical means exactly what `OPERATION_INVENTORY` holds and what `_blob_at` interpolates
+    into `{sha}:dev2026/{relpath}`: POSIX separators, no leading slash, no `.` or `..` or empty
+    components, no trailing slash. `ops/x.py` and `./ops/x.py` name the same file and git will
+    resolve either, so an approval written the second way would silently cover a module the
+    equality check below reports as both missing and extra."""
+    import posixpath
+    if "\\" in item:
+        return "uses backslashes; module paths are POSIX repository-relative paths"
+    if posixpath.isabs(item):
+        return "is absolute; an approval names paths in the repository, not on a machine"
+    if posixpath.normpath(item) != item:
+        return (f"is not canonical (normalises to {posixpath.normpath(item)!r}); two spellings "
+                f"of one path cannot be compared against the inventory")
+    if item == ".." or item.startswith("../"):
+        return "escapes the repository"
+    return None
+
+
+def approved_modules_problem(approved_modules) -> Optional[str]:
+    """The first thing wrong with a record's `approved_modules`, or `None`.
+
+    The set must equal `OPERATION_INVENTORY` **exactly**. A subset was the earlier rule, and it
+    is the wrong one in both directions: a *missing* module is code that runs unreviewed, and an
+    *extra* one is an approval whose author believed they were covering something this operation
+    does not run — either the inventory shrank without the approval being redone, or they
+    approved the wrong thing. Neither is a record that can be checked against what executes.
+
+    Every element is validated **before** any set arithmetic, because `set()` over a record
+    containing a nested list or dict raises `TypeError`, and a gate that crashes on a malformed
+    approval is a gate whose refusal nobody can read."""
     if type(approved_modules) is not list or not approved_modules:
-        return None, ("the operation approval record lists no approved_modules; an approval "
-                      "that does not say WHAT was reviewed cannot be checked against what runs")
+        return ("the operation approval record lists no approved_modules; an approval that does "
+                "not say WHAT was reviewed cannot be checked against what runs")
+    for index, item in enumerate(approved_modules):
+        # `type(...) is not str` and not `isinstance`: `True` is an `int`, a `str` subclass can
+        # override `__eq__` and `__hash__`, and either would be compared against the inventory
+        # by rules the record supplies rather than by identity of the path.
+        if type(item) is not str:
+            return (f"the operation approval record lists approved_modules[{index}] as "
+                    f"{type(item).__name__} {item!r}, not a module path")
+        if not item.strip():
+            return f"the operation approval record lists approved_modules[{index}] as empty"
+        why = _canonical_module_path(item)
+        if why:
+            return f"the operation approval record lists approved_modules[{index}] {item!r}: {why}"
+    seen, duplicated = set(), []
+    for item in approved_modules:
+        if item in seen and item not in duplicated:
+            duplicated.append(item)
+        seen.add(item)
+    if duplicated:
+        # A duplicate makes the list length disagree with the set size, so a reader counting
+        # entries to check coverage gets a different answer from the gate comparing sets.
+        return (f"the operation approval record lists {sorted(duplicated)} more than once; a "
+                f"module is reviewed or it is not, and a repeated entry makes the count lie")
     # Widening the inventory must invalidate the approval. Otherwise a later change adds a
     # module to `OPERATION_INVENTORY` and rides in on an approval that never saw it.
-    missing = sorted(set(OPERATION_INVENTORY) - set(approved_modules))
+    missing = sorted(set(OPERATION_INVENTORY) - seen)
     if missing:
-        return None, (f"the operation approval record approved {len(approved_modules)} "
-                      f"module(s) and the operation now runs {missing} as well; an approval "
-                      f"does not extend to code it never covered")
-    return record, None
+        return (f"the operation approval record approved {len(approved_modules)} module(s) and "
+                f"the operation now runs {missing} as well; an approval does not extend to code "
+                f"it never covered")
+    extra = sorted(seen - set(OPERATION_INVENTORY))
+    if extra:
+        return (f"the operation approval record approves {extra}, which this operation does not "
+                f"run; the approval and the runtime closure describe different code, and the "
+                f"one that was reviewed is not the one that would execute")
+    return None
 
 
 def _blob_at(repo_root, sha: str, relpath: str):
@@ -727,11 +819,6 @@ def identity_problem(artifact, *, host: str, run_id: str, repo_root=None, now=No
     if absent:
         return (f"fingerprints no {absent}. An unmeasured module is one nobody compared, and a "
                 f"shrunken inventory makes every other comparison pass on a subset")
-    # The deployment inventory is what git holds at the approved commit. The operation's own
-    # producer modules are NOT part of it -- they belong to this tooling rather than to the
-    # deployed service -- so the artifact may carry them in addition, and `producer_identity()`
-    # checks each against the file on disk. Anything else is a module the review never saw
-    # running alongside the ones it did.
     # The deployment inventory is what git holds at the approved DEPLOY commit. The operation
     # also runs modules the service never imports -- the operation itself, its contracts, the
     # provisioner, the producers -- so the artifact may carry those in addition. They are not

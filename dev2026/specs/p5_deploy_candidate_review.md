@@ -139,6 +139,55 @@ resolves inside — the tree may not choose what its own approval says.
 `OPERATION_APPROVAL_DEFAULT` is `None`. **No record, no approval, and the operation refuses** —
 which is the state a fresh checkout is in today.
 
+### What `approved_modules` has to look like
+
+The list is the only part of the record that says *what* was reviewed, and it arrives as whatever
+JSON a person wrote. `approved_modules_problem()` checks it element by element **before** any set
+arithmetic, because `set()` over a list containing a nested list or dict raises `TypeError`, and a
+gate that crashes on a malformed approval has refused nothing — it has failed, which a caller
+catching broadly could read as any other error.
+
+| Rule | Why |
+|---|---|
+| exact `str` — not `isinstance` | `True` is an `int` and hashable; a `str` subclass can define its own `__eq__`/`__hash__`, and the comparison against the inventory would then run by rules the record supplies |
+| canonical relative POSIX path | `./ops/x.py` and `ops/x.py` name the file git resolves either way, so one spelling reads as *both* missing and extra |
+| no duplicates | sets swallow them, and a reader counting entries gets a different answer from the gate comparing sets |
+| **set equality**, not subset | a *missing* module is code that runs unreviewed; an *extra* one means the inventory shrank without the approval being redone, or the approver was covering something else |
+
+Missing, extra, duplicate and wrong-type each keep their own refusal wording, so the message names
+which rule fired rather than reporting a generic mismatch.
+
+### `approved_sha` is deliberately not required to be `HEAD`
+
+Two commits are checked, and they answer different questions. **This is stated because it is a
+real version rule, and an unstated one is worse than either answer.**
+
+* **`deploy_sha`** (identity artifact, from `p5_readiness.REVIEWED_DEPLOY_SHAS`) **is** required to
+  equal `HEAD`, with a clean worktree. That binds the *whole* checkout.
+* **`approved_sha`** (this record) binds exactly the 21 paths in `OPERATION_INVENTORY`, byte for
+  byte, and says nothing about any other file.
+
+So the operation does **not** refuse when `HEAD != approved_sha`. It refuses when any module it
+actually imports differs from the approved commit.
+
+The reason to keep them separate is that the two reviews are of different things and land at
+different times: an operation review reads the compaction path; a deployment review reads the
+service. Requiring one commit to be both would mean reissuing the operation approval whenever an
+unrelated spec, test, or service module changed — and an approval that must be reissued for
+changes nobody reviewed is an approval that gets reissued without being read.
+
+**Why a non-inventory file may be excluded without leaving a hole.** The two commits bind the same
+bytes from opposite directions: `HEAD == deploy_sha` *plus a clean worktree* means the files on
+disk **are** `deploy_sha`, and the inventory gate then requires those same files to equal
+`approved_sha`. The commits may differ freely outside the inventory and must agree exactly inside
+it. A non-inventory file is therefore never unchecked — it is checked by the deploy commit, which
+is the authority for the code the service runs. What makes "outside the inventory" mean "does not
+execute during a compaction" rather than "was left off a list" is
+`tests/_closure_probe.py`: the inventory is measured by running the operation, not written down.
+
+`TestWhatTheApprovedCommitDoesAndDoesNotBind` fixes this boundary in both directions — editing a
+non-inventory spec does not invalidate the approval, editing `store/time_cube.py` does.
+
 ### Why the implementation cannot approve a changed implementation
 
 Because `ops/p5_oneshot_compaction.py` is in `OPERATION_INVENTORY`, the gate compares its
