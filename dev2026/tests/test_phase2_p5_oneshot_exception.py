@@ -1568,3 +1568,96 @@ class TestTheRoadmapShowsTheExceptionPath(unittest.TestCase):
         flat = self._flat()
         self.assertIn("It reaches step 7, and step 7 does not delete anything", flat)
         self.assertIn("nothing in this tree can release it", flat)
+
+
+# =====================================================================================
+class TestThePublishPreflightReVerifiesTheLedgerWhenUnsealed(_OneShotBase):
+    """`validate_prepared()` is the LAST look before the authority is published.
+
+    On the sealed path it is deliberately cheap: the store cannot have been written to, so
+    re-reading metadata is enough. Under a one-shot unsealed authorization nothing closes that
+    gap, so the full content ledger is walked a second time inside the fence — and that second
+    walk is the only thing standing between "the monolith changed while we were preparing" and
+    a published manifest describing a store that no longer matches it.
+
+    Mutation testing found this unguarded: deleting the re-verification left every existing
+    test passing. These close it, and they are isolating — the prepared record carries a real
+    authorization and a real seal, so the ONLY thing that can produce the refusal is the
+    ledger disagreeing."""
+
+    def prepared_under_authorization(self):
+        """A real prepared generation, minted through the real authorization path."""
+        self.unseal()
+        cap, _ = ex.authorize_unsealed(
+            record=self.bound_record(), host=socket.gethostname(), run_id=self.RUN_ID,
+            monolith_path=self.monolith, pre=self.bound_pre(),
+            expected_dev=os.stat(self.live).st_dev)
+        return lb.prepare_generation_one(
+            monolith_path=self.monolith, manifest_root=self._fresh_root(),
+            at_utc=iso(), operator="tests", unsealed_authorization=cap)
+
+    def _fresh_root(self):
+        root = os.path.join(self.tmp, "mroot_preflight")
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    # ---------------------------------------------------------------- the positive control
+    def test_an_untouched_monolith_passes_the_preflight(self):
+        """So the refusals below are about the change, not about this path refusing always."""
+        prepared = self.prepared_under_authorization()
+        lb.validate_prepared(prepared)
+
+    def test_the_prepared_record_carries_what_the_recheck_needs(self):
+        """Isolating: the authorization branch is the one that will run, and there IS a seal
+        to re-verify — so a refusal cannot come from the 'nothing checked' guard instead."""
+        prepared = self.prepared_under_authorization()
+        self.assertIsNotNone(prepared["unsealed_authorization"])
+        self.assertIsNotNone(prepared.get("content_seal"))
+
+    # ---------------------------------------------------------------- the refusal
+    def test_a_value_rewritten_after_preparation_refuses_the_publish(self):
+        """The change only the ledger can see: a byte inside an existing day. The day set and
+        the array metadata are both unchanged, so every cheaper check still agrees."""
+        prepared = self.prepared_under_authorization()
+        victim = self.mutate_store()
+        with self.assertRaises(lb.LegacyBaseRefused) as caught:
+            lb.validate_prepared(prepared)
+        message = str(caught.exception)
+        self.assertIn("changed between preparation and publish", message)
+        self.assertIn("content_seal mismatch", message)
+        self.assertTrue(os.path.isfile(victim))
+
+    def test_the_refusal_says_the_authorization_did_not_accept_this(self):
+        """The authorization accepted the RISK of a writable store. It did not accept
+        publishing a manifest that describes a store which no longer matches it."""
+        prepared = self.prepared_under_authorization()
+        self.mutate_store()
+        with self.assertRaises(lb.LegacyBaseRefused) as caught:
+            lb.validate_prepared(prepared)
+        self.assertIn("did not accept publishing", str(caught.exception))
+
+    def test_a_prepared_record_whose_seal_was_stripped_is_refused(self):
+        """The other way the re-verification can be defeated: keep the authorization, drop the
+        thing it is checked against. Silently skipping would be indistinguishable from passing."""
+        prepared = self.prepared_under_authorization()
+        prepared["content_seal"] = None
+        with self.assertRaises(lb.LegacyBaseRefused) as caught:
+            lb.validate_prepared(prepared)
+        self.assertIn("records no content_seal to re-verify", str(caught.exception))
+
+    def test_the_preflight_really_walks_the_store(self):
+        """Named separately because it is the expensive property being asserted: under an
+        unsealed authorization this pays a SECOND full traversal, on purpose, inside the fence.
+        If it ever stops walking, the refusals above would still pass on stale evidence."""
+        prepared = self.prepared_under_authorization()
+        calls = []
+        real = lb.block_manifest.verify_content_seal
+
+        def counting(path, seal):
+            calls.append(path)
+            return real(path, seal)
+
+        with mock.patch.object(lb.block_manifest, "verify_content_seal", counting):
+            lb.validate_prepared(prepared)
+        self.assertEqual(len(calls), 1, "the preflight did not re-verify the content seal")
+        self.assertEqual(os.path.realpath(calls[0]), os.path.realpath(self.monolith))

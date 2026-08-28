@@ -189,14 +189,35 @@ seal. The failure is loud and fail-closed rather than silent, which is the right
 specs document mtime as a limit on detection strength (false negatives); this is the opposite
 direction — a false positive after a legitimate restore — and was not written down.
 
-### The seal is verified at every service start
+### The seal scan: measured, and a regression it exposed
 
-`SegmentedCubeStore` construction calls `verify_content_seal`, which walks the entire monolith
-and `stat`s every file. That is metadata only — not the ~2 TB of chunk bytes — but it is still a
-full traversal of a large store inside `lifespan`, on every start and every restart. The cost
-was never measured here and cannot be from this machine. It should be measured on VM24 before
-the deployment, because a multi-minute startup is a different operational profile from the
-current one.
+Measured read-only on VM24 against the real monolith at candidate `f3750cf`:
+
+| | |
+|---|---|
+| files / bytes | **1,012,962** / **2,238,016,046,417** (2.24 TB) |
+| device | `/dev/sdc1` → `/home/odbadmin/Data`, ext4, **`rw,relatime`** |
+| cold-like / warm-like wall | **13.167 s** / **13.077 s** |
+| CPU | 10.14 s user + 3.03 s sys |
+| peak RSS | 21,220 KiB |
+
+**Startup cost is fine**: 13 s against gunicorn `--timeout 180` is ~7%, both workers pay it
+concurrently, and no cron restarts the service.
+
+**The measurement exposed a regression that startup cost alone would have hidden.** The seal
+check lives in `SegmentedCubeStore._build_meta()`, and the lifespan TTL loop called
+`cube.refresh()` — the *unconditional* rebuild. On the production 300 s TTL that is a
+1,012,962-file, 13-second walk **every five minutes, per worker, forever**: roughly 9% of a core
+burned to re-derive an answer that had not changed. At `708058e` the same loop was cheap,
+because `_build_meta()` had no seal check — so this was introduced by the candidate.
+
+Fixed by calling `cube.maybe_refresh(ttl)`, which is what `refresh_if_changed()` was written for
+(*"Reopening every segment on each TTL tick would be pure waste"*). The delta tier still
+refreshes every tick, so a newly appended day appears exactly as before.
+
+What that gives up, and why it is acceptable, is stated in
+`p5_deployment_readiness.md` — **the seal is not continuous protection against an arbitrary
+writer**, and it never was.
 
 ## 6. The three approvals this needs
 

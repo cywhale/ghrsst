@@ -467,6 +467,39 @@ catch a forgery that restored size and mtime, and a test demonstrates precisely 
 by rewriting a byte in place and restoring both. A true seal is an operational control (a
 read-only mount) and remains a deployment prerequisite.
 
+##### When the seal is actually checked — and when it is not
+
+The ledger is a **full metadata traversal of the monolith**. Measured on VM24 against the real
+store at candidate `f3750cf`: **1,012,962 files, 2.24 TB, 13.1 s** per pass, mostly CPU.
+
+| moment | verified? |
+|---|---|
+| `SegmentedCubeStore` construction, i.e. every service start | **yes** |
+| a TTL tick where the manifest generation or checksum **moved** | **yes** — the rebuild re-verifies |
+| a TTL tick where the manifest is **unchanged** | **no** — the cheap generation/checksum check only |
+| `refresh()` called directly | **yes** |
+| compaction / generation-1 publish preflight | **yes**, a fresh traversal inside the fence |
+
+**This is deliberately NOT continuous protection against an arbitrary writer.** An earlier
+revision of the TTL loop called `refresh()` unconditionally, which did re-walk the monolith
+every tick; on the production 300 s TTL with two workers that was roughly 9% of a core burned
+permanently to re-derive an answer that had not changed. It was removed, and what it bought is
+stated here rather than quietly retained:
+
+* **What is lost.** A write to the monolith while the manifest is unchanged is not noticed by
+  the running service. It is caught at the next restart, at the next genuine manifest change,
+  or by the operation's own preflight — whichever comes first.
+* **Why that is acceptable.** The periodic scan was never protection. It detected after the
+  fact, up to a TTL late, and was blind to a forgery that restored size and mtime. The control
+  that actually prevents the write is the **read-only mount**, which remains a prerequisite,
+  and the moment that actually matters — publishing a manifest that describes the monolith — is
+  covered by a fresh traversal inside the lock.
+* **What would change the answer.** If the monolith stays mounted `rw` in production (it is
+  today: `/dev/sdc1 → /home/odbadmin/Data, ext4, rw,relatime`) *and* an operator wants
+  continuous detection anyway, that is a separate periodic seal-check interval with its own
+  budget and its own degraded semantics — not a side effect of the metadata refresh loop, whose
+  job is making a newly appended delta day visible.
+
 #### The block grid is policy, and S is still provisional
 
 `block_grid.block_days` is **S**, and there is no canonical S in the code to derive it from: the

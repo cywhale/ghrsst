@@ -29,6 +29,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _DEV = os.path.dirname(HERE)
@@ -1080,15 +1081,11 @@ class TestTheBlockGridIsPolicyNotAnObservation(_LegacyBase):
         self.assertIn(days[2], bm.load_live(root)["segments"][0]["gaps"])
 
 
-class TestEndToEndIsolatedProvisionAndServe(unittest.TestCase):
-    """The whole path in one place, with no component stubbed.
+class _EndToEndProvisioned(unittest.TestCase):
+    """Fixture only: provision generation 1 for real, and boot the real app against it.
 
-    The real production operation creates the roots, publishes generation 1 through the real
-    builder and publisher, and initializes the real WAL; then the real API lifespan loads that
-    manifest through `SegmentedCubeStore` under the real runtime allow-list, and the values a
-    client receives are compared against a `TimeCubeStore` oracle over the monolith.
-
-    Entirely inside a temporary directory. Nothing here is VM24, `$G`, or a service."""
+    Extracted so more than one suite can use it without paying for a second real provision per
+    test class, and without either copy drifting from the other. It defines no tests."""
 
     ENV = ("GHRSST_ZARR_PATH", "GHRSST_BLOCK_MANIFEST_DIR", "GHRSST_TIMECUBE_PATH",
            "GHRSST_DELTACUBE_PATH", "GHRSST_ALLOWED_LEGACY_PATHS")
@@ -1164,6 +1161,17 @@ class TestEndToEndIsolatedProvisionAndServe(unittest.TestCase):
         return self.boot(GHRSST_BLOCK_MANIFEST_DIR=self.provisioned["manifest_root"],
                          GHRSST_TIMECUBE_PATH=self.monolith,
                          GHRSST_ALLOWED_LEGACY_PATHS=self.monolith)
+
+
+class TestEndToEndIsolatedProvisionAndServe(_EndToEndProvisioned):
+    """The whole path in one place, with no component stubbed.
+
+    The real production operation creates the roots, publishes generation 1 through the real
+    builder and publisher, and initializes the real WAL; then the real API lifespan loads that
+    manifest through `SegmentedCubeStore` under the real runtime allow-list, and the values a
+    client receives are compared against a `TimeCubeStore` oracle over the monolith.
+
+    Entirely inside a temporary directory. Nothing here is VM24, `$G`, or a service."""
 
     # ---------------------------------------------------------------- what was provisioned
     def test_the_operation_published_a_generation_and_bound_a_wal(self):
@@ -1328,3 +1336,208 @@ class TestTheGeneratedManifestSaysBlockDaysIsPolicy(_LegacyBase):
         self.assertIn("S = 90 / C = 30 is not selected", flat)
         self.assertIn("explicit operator decision recorded in the roadmap, and there is none",
                       flat)
+
+
+# =====================================================================================
+class TestTheTtlRefreshDoesNotRewalkTheMonolith(_EndToEndProvisioned):
+    """The TTL loop must not re-verify the content seal on every unchanged tick.
+
+    Rebuilding a `SegmentedCubeStore` re-verifies every segment's `content_seal`, and for a
+    `legacy_base` segment that is a full metadata traversal of the monolith. Measured on VM24
+    against the real store: **1,012,962 files, 2.24 TB, 13.1 s** of mostly-CPU per pass. The
+    lifespan loop called `cube.refresh()` unconditionally on a 300 s TTL, so with two workers
+    that was roughly 9% of a core, permanently, to re-derive an answer that had not changed.
+
+    `maybe_refresh(ttl)` reads the small live manifest and rebuilds only when the generation or
+    checksum moved -- which is what `refresh_if_changed` was written for; its own docstring
+    says "Reopening every segment on each TTL tick would be pure waste".
+
+    These tests count calls to `block_manifest.content_ledger`, the function that does the
+    walking. Counting the real function rather than asserting on source text is the point: the
+    question is whether the traversal HAPPENS."""
+
+    def counted_ledger(self):
+        """Patch `content_ledger` with a counting passthrough. Still does the real work, so a
+        test cannot pass because verification was disabled."""
+        calls = []
+        real = bm.content_ledger
+
+        def counting(path):
+            calls.append(path)
+            return real(path)
+
+        return calls, mock.patch.object(bm, "content_ledger", counting)
+
+    def bump_generation(self):
+        """Publish a genuinely new generation, through the real publisher.
+
+        Not a hand-edited file: `publish()` validates, writes the immutable archive and swaps
+        the pointer, so the store sees exactly what a real publication looks like."""
+        root = self.provisioned["manifest_root"]
+        live = bm.load_live(root)
+        nxt = dict(live)
+        nxt["generation"] = int(live["generation"]) + 1
+        # `publish()` validates a real successor, so the predecessor has to be named. Left to
+        # the validator rather than worked around: a helper that produced a manifest the real
+        # publisher rejects would be testing a document the store never sees.
+        nxt["predecessor_generation"] = int(live["generation"])
+        nxt["manifest_checksum"] = bm.compute_checksum(nxt)
+        bm.publish(root, nxt)
+        return nxt["generation"]
+
+    # ---------------------------------------------------------------- SegmentedCubeStore alone
+    def segmented(self):
+        from store.segmented_cube import SegmentedCubeStore
+        return SegmentedCubeStore(self.provisioned["manifest_root"],
+                                  allowed_legacy_paths=[self.monolith])
+
+    def test_construction_verifies_the_seal(self):
+        """The seal IS checked -- at construction. Establishing this first is what makes the
+        cheap-tick tests below a statement about the TTL path and not about the seal being off."""
+        calls, patch = self.counted_ledger()
+        with patch:
+            self.segmented()
+        self.assertEqual(len(calls), 1, "construction did not verify the content seal")
+        self.assertEqual(os.path.realpath(calls[0]), os.path.realpath(self.monolith))
+
+    def test_an_unchanged_manifest_does_not_walk_the_monolith(self):
+        cube = self.segmented()
+        calls, patch = self.counted_ledger()
+        with patch:
+            for _ in range(5):
+                cube._last_refresh = 0.0            # force the TTL guard open every time
+                self.assertFalse(cube.maybe_refresh(1.0), "it rebuilt an unchanged manifest")
+        self.assertEqual(calls, [], f"the monolith was walked {len(calls)} time(s)")
+
+    def test_a_changed_manifest_rebuilds_and_verifies_the_seal(self):
+        """The other side: a real new generation must still be picked up AND re-verified."""
+        cube = self.segmented()
+        before = cube.generation
+        self.bump_generation()
+        calls, patch = self.counted_ledger()
+        with patch:
+            cube._last_refresh = 0.0
+            self.assertTrue(cube.maybe_refresh(1.0), "a new generation was not picked up")
+        self.assertEqual(len(calls), 1, "the new generation was not seal-verified")
+        self.assertEqual(cube.generation, before + 1)
+
+    def test_refresh_still_verifies_when_called_directly(self):
+        """`refresh()` is unchanged. The fix is which one the loop calls, not a weakening of
+        the store -- an operator or a future caller invoking `refresh()` still gets a full
+        verification."""
+        cube = self.segmented()
+        calls, patch = self.counted_ledger()
+        with patch:
+            cube.refresh()
+        self.assertEqual(len(calls), 1)
+
+    def test_a_seal_mismatch_is_still_caught_on_a_changed_manifest(self):
+        """Cheap ticks are not a hole a writer can drive through unnoticed forever: the next
+        genuine manifest change re-verifies, and refuses."""
+        cube = self.segmented()
+        unseal(self.monolith)
+        with open(os.path.join(self.monolith, "touched-by-a-test"), "w") as fh:
+            fh.write("x")
+        self.bump_generation()
+        cube._last_refresh = 0.0
+        with self.assertRaises(Exception) as caught:
+            cube.maybe_refresh(1.0)
+        self.assertIn("content_seal mismatch", str(caught.exception))
+
+    # ---------------------------------------------------------------- TieredCube over it
+    def tiered(self):
+        from store.tiered_cube import TieredCube
+        from store.time_cube import TimeCubeStore
+        delta = os.path.join(self.tmp, "delta.zarr")
+        fx.build_delta(delta, fx.days_from("2026-02-01", 3), ny=NY, nx=NX)
+        return TieredCube(self.segmented(), TimeCubeStore(delta)), delta
+
+    def test_the_tiered_shape_also_does_not_walk_on_an_unchanged_tick(self):
+        """The shape production actually runs: a segmented base wrapped with a delta tier.
+        `TieredCube.maybe_refresh` must delegate to the base's CHEAP path."""
+        cube, _ = self.tiered()
+        calls, patch = self.counted_ledger()
+        with patch:
+            for _ in range(3):
+                cube.base._last_refresh = 0.0
+                cube.delta._last_refresh = 0.0
+                cube.maybe_refresh(1.0)
+        self.assertEqual(calls, [], f"the monolith was walked {len(calls)} time(s)")
+
+    def test_the_tiered_shape_still_rebuilds_on_a_real_change(self):
+        cube, _ = self.tiered()
+        self.bump_generation()
+        calls, patch = self.counted_ledger()
+        with patch:
+            cube.base._last_refresh = 0.0
+            self.assertTrue(cube.maybe_refresh(1.0))
+        self.assertEqual(len(calls), 1)
+
+    def test_a_newly_appended_delta_day_still_becomes_visible(self):
+        """What the TTL loop exists for, and the thing this fix must not break: the delta tier
+        refreshes on every tick regardless of the base."""
+        cube, delta = self.tiered()
+        before = set(cube.days)
+        new_day = "2026-02-04"
+        self.assertNotIn(new_day, before)
+        fx.append_delta_day(delta, new_day, ny=NY, nx=NX)
+        cube.base._last_refresh = 0.0
+        cube.delta._last_refresh = 0.0
+        cube.maybe_refresh(1.0)
+        self.assertIn(new_day, set(cube.days), "the appended delta day did not appear")
+
+    # ---------------------------------------------------------------- through the real app
+    def serving_with_ttl(self, seconds):
+        """Boot with the refresh loop ACTUALLY RUNNING, and prove that it is.
+
+        `Cfg.CUBE_REFRESH_TTL_SECONDS` is read from the environment once, when `api.app` is
+        first imported, into the module-level `cfg` singleton. Setting the env var in a test
+        therefore does nothing: the TTL stays 0 and the loop is never created. Two tests here
+        were written that way and passed while asserting nothing at all -- they were caught by
+        a mutant that restored `cube.refresh()` and survived.
+
+        So the instance attribute is patched, and `/healthz` is asked to confirm the value the
+        app actually used. A test that cannot observe its own subject is not a test."""
+        self.addCleanup(
+            lambda: app_mod.cfg.__dict__.pop("CUBE_REFRESH_TTL_SECONDS", None))
+        app_mod.cfg.CUBE_REFRESH_TTL_SECONDS = seconds
+        client, cube = self.serving()
+        self.assertIsNotNone(cube, "the cube did not load")
+        self.assertEqual(client.get("/healthz").json()["cube_refresh_ttl_s"], seconds,
+                         "the refresh loop is not running; this test would assert nothing")
+        return client, cube
+
+    def test_the_lifespan_loop_does_not_walk_the_monolith(self):
+        """End to end, through the real app and a real TTL loop.
+
+        A 1 s TTL and a ~3 s wait means the loop fires at least twice. Every walk after
+        construction is counted, and there must be none."""
+        import time as _time
+        client, cube = self.serving_with_ttl(1)
+        calls, patch = self.counted_ledger()
+        with patch:                                   # count only what happens AFTER startup
+            _time.sleep(3.2)
+            body = client.get("/healthz").json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(calls, [],
+                         f"the TTL loop walked the monolith {len(calls)} time(s)")
+
+    def test_the_lifespan_still_verifies_the_seal_at_startup(self):
+        """The protection that remains, asserted through the app rather than the store."""
+        calls, patch = self.counted_ledger()
+        with patch:
+            client, cube = self.serving()
+        self.assertIsNotNone(cube)
+        self.assertGreaterEqual(len(calls), 1, "startup did not verify the content seal")
+
+    def test_the_loop_calls_maybe_refresh_and_not_refresh(self):
+        """Isolating: `refresh` is made to fail loudly, so if the loop still called it the
+        error would surface. `maybe_refresh` is left real."""
+        import time as _time
+        client, cube = self.serving_with_ttl(1)
+        seen = []
+        with mock.patch.object(type(cube), "refresh",
+                               lambda self: seen.append("refresh")):
+            _time.sleep(3.2)
+            self.assertEqual(client.get("/healthz").json()["status"], "ok")
+        self.assertEqual(seen, [], "the TTL loop called refresh() instead of maybe_refresh()")

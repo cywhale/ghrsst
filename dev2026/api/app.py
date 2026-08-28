@@ -18,6 +18,7 @@ Run (dev): GHRSST_ZARR_PATH=... dev2026/.venv/bin/uvicorn api.app:app --port 803
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import re
 import time
@@ -268,16 +269,30 @@ async def lifespan(app: FastAPI):
 
     # P4-S3: TTL background metadata refresh so a newly-appended delta day becomes visible WITHOUT a
     # process restart (the daily-append cron writes attrs['days'] last, so refresh only surfaces
-    # validated days). Off the request path; runs cube.refresh() in an executor. 0 disables (manual/
-    # restart only). Ordering held by ingest: append -> validate -> (within TTL) this refresh.
+    # validated days). Off the request path. 0 disables (manual/restart only). Ordering held by
+    # ingest: append -> validate -> (within TTL) this refresh.
+    #
+    # `maybe_refresh(ttl)`, NOT `refresh()`. They differ only for a segmented base, and there the
+    # difference is not small: `refresh()` rebuilds unconditionally, and rebuilding a segmented
+    # base re-verifies every segment's `content_seal` -- a full metadata traversal of the legacy
+    # monolith. Measured on VM24 against the real store: 1,012,962 files, 2.24 TB, 13.1 s of
+    # mostly-CPU per pass. On a 300 s TTL with two workers that is roughly 9% of a core burned
+    # forever, to re-derive an answer that had not changed.
+    #
+    # `maybe_refresh` reads the small live manifest and rebuilds ONLY when the generation or
+    # checksum moved. The delta tier still refreshes every tick, so a newly appended day appears
+    # exactly as before -- that behaviour is what this loop exists for and it is unchanged.
     app.state.cube_refresh_ttl = cfg.CUBE_REFRESH_TTL_SECONDS
     refresh_task = None
     if cube is not None and cfg.CUBE_REFRESH_TTL_SECONDS > 0:
+        ttl = cfg.CUBE_REFRESH_TTL_SECONDS
+
         async def _refresh_loop():
             while True:
-                await asyncio.sleep(cfg.CUBE_REFRESH_TTL_SECONDS)
+                await asyncio.sleep(ttl)
                 try:
-                    await asyncio.get_event_loop().run_in_executor(None, cube.refresh)
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, functools.partial(cube.maybe_refresh, ttl))
                 except Exception as e:  # noqa: BLE001
                     print(f"[GHRSST] cube refresh skipped: {e}")
         refresh_task = asyncio.create_task(_refresh_loop())
