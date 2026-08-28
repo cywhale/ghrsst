@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -966,3 +967,129 @@ print("ACCEPTED")
             os.path.join(_DEV, "specs", "p5_integration_candidate.md")).split())
         self.assertIn("rolling the service back", text.lower())
         self.assertIn("content_seal", text)
+
+
+# =====================================================================================
+class TestThePromotionPlanMatchesHowPromotionActuallyWorks(unittest.TestCase):
+    """The promotion plan in `p5_integration_candidate.md` §6, checked against git history.
+
+    The plan is not invented here: `708058e` was promoted by a two-step protocol that is still
+    in the repository, and these read that history rather than restating it. A plan that
+    describes a mechanism the project does not actually use would be worse than none."""
+
+    DOC = os.path.join(_DEV, "specs", "p5_integration_candidate.md")
+    DEPLOY = "708058e15b37a02e1d7aa5a66b9978c6e13bd446"
+    PROPOSE = "af2b249"
+    PROMOTE = "5e6b076"
+
+    def doc(self):
+        return " ".join(_read_text(self.DOC).split())
+
+    def reviewed_set_at(self, sha):
+        """`REVIEWED_DEPLOY_SHAS` as it stood AT that commit, read from the blob."""
+        blob = subprocess.run(
+            ("git", "-C", dc._repo_root(), "show", f"{sha}:dev2026/ops/p5_readiness.py"),
+            capture_output=True, text=True, check=True).stdout
+        body = blob.split("REVIEWED_DEPLOY_SHAS = (", 1)[1].split(")", 1)[0]
+        return re.findall(r'"([0-9a-f]{40})"', body)
+
+    # ---------------------------------------------------------------- the precedent
+    def test_the_deploy_commit_did_not_list_itself(self):
+        """The whole reason a promotion needs a second commit."""
+        at_itself = self.reviewed_set_at(self.DEPLOY)
+        self.assertNotIn(self.DEPLOY, at_itself)
+        self.assertEqual(at_itself, ["3223fba37da5d292ea6acb58ccef0da2b5138d31"])
+
+    def test_a_later_commit_promoted_it(self):
+        self.assertIn(self.DEPLOY, self.reviewed_set_at(self.PROMOTE))
+
+    def test_the_promoting_commit_did_not_list_itself_either(self):
+        """A commit id is a hash of its content, so this is arithmetic, not policy. Asserted
+        anyway: if it ever became false, the mechanism would have changed underneath the plan."""
+        full = subprocess.run(("git", "-C", dc._repo_root(), "rev-parse", self.PROMOTE),
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.assertNotIn(full, self.reviewed_set_at(self.PROMOTE))
+
+    def test_the_document_cites_both_steps(self):
+        text = self.doc()
+        self.assertIn(self.PROPOSE, text)
+        self.assertIn(self.PROMOTE, text)
+        self.assertIn("PROPOSED_DEPLOY_SHAS", text)
+
+    # ---------------------------------------------------------------- why it composes
+    def test_the_readiness_module_is_not_a_service_module(self):
+        """The claim the plan rests on: a promotion commit changes no service module, so the
+        candidate stays a valid `deploy_sha` while the promoting commit becomes `approved_sha`."""
+        self.assertNotIn("ops/p5_readiness.py", rd.INVENTORY_MODULES)
+        self.assertIn("ops/p5_readiness.py", oc.OPERATION_INVENTORY)
+
+    def test_a_promotion_commit_would_not_disturb_the_shared_modules(self):
+        """Editing only `ops/p5_readiness.py` leaves all 11 shared modules untouched, which is
+        what keeps the two commits compatible under the §2 rule."""
+        shared = set(rd.INVENTORY_MODULES) & set(oc.OPERATION_INVENTORY)
+        self.assertEqual(len(shared), 11)
+        self.assertNotIn("ops/p5_readiness.py", shared)
+
+    # ---------------------------------------------------------------- nothing was done
+    def test_nothing_has_been_promoted_or_proposed(self):
+        head = subprocess.run(("git", "-C", dc._repo_root(), "rev-parse", "HEAD"),
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(rd.PROPOSED_DEPLOY_SHAS, ())
+        self.assertNotIn(head, rd.REVIEWED_DEPLOY_SHAS)
+        self.assertNotEqual(head, rd.CURRENT_DEPLOY_SHA)
+        self.assertEqual(rd.CURRENT_DEPLOY_SHA, self.DEPLOY)
+
+    def test_the_proposed_and_reviewed_sets_stay_disjoint(self):
+        """An overlap would mean a proposal had been promoted without the commit that promotes
+        it — the self-approval failure in its mildest form."""
+        self.assertFalse(set(rd.PROPOSED_DEPLOY_SHAS) & set(rd.REVIEWED_DEPLOY_SHAS))
+
+    def test_the_document_still_says_nothing_is_approved(self):
+        text = self.doc()
+        self.assertIn("Nothing here has been done", text)
+        self.assertIn("no operation approval record exists", text)
+
+
+# =====================================================================================
+class TestTheServiceReviewScopeIsComplete(unittest.TestCase):
+    """The service-deployment review must have covered every service module that moved.
+
+    Derived from git, so a module that changes later and is not re-reviewed shows up here as a
+    failure rather than as a gap nobody noticed."""
+
+    def changed_service_modules(self):
+        rows = dc.changed_files(rd.CURRENT_DEPLOY_SHA, "HEAD")
+        return sorted(set(rows["added"] + rows["modified"]) & set(rd.INVENTORY_MODULES))
+
+    def test_exactly_four_service_modules_moved(self):
+        self.assertEqual(self.changed_service_modules(), [
+            "api/app.py", "ingest/publish_manifest.py",
+            "store/block_manifest.py", "store/segmented_cube.py"])
+
+    def test_the_full_service_inventory_is_twenty_three_and_all_present(self):
+        digests = dc.digests_at("HEAD", rd.INVENTORY_MODULES)
+        self.assertEqual(len(rd.INVENTORY_MODULES), 23)
+        self.assertEqual([m for m, d in digests.items() if d is None], [])
+
+    def test_every_changed_service_module_is_named_in_the_review_document(self):
+        text = " ".join(_read_text(
+            os.path.join(_DEV, "specs", "p5_integration_candidate.md")).split())
+        for rel in self.changed_service_modules():
+            with self.subTest(rel):
+                self.assertIn(rel, text)
+
+    def test_the_residual_risk_statement_is_present_and_complete(self):
+        """All four clauses. A partial statement is the one that gets read as continuous
+        protection."""
+        text = " ".join(_read_text(
+            os.path.join(_DEV, "specs", "p5_deployment_readiness.md")).split())
+        self.assertIn("SegmentedCubeStore` construction, i.e. every service start", text)
+        self.assertIn("the rebuild re-verifies", text)
+        self.assertIn("a fresh traversal inside the fence", text)
+        self.assertIn("NOT continuous protection against an arbitrary writer", text)
+
+    def test_the_ttl_behaviour_is_documented_as_reviewed_scope(self):
+        text = " ".join(_read_text(
+            os.path.join(_DEV, "specs", "p5_integration_candidate.md")).split())
+        self.assertIn("maybe_refresh", text)
+        self.assertIn("every five minutes, per worker", text)

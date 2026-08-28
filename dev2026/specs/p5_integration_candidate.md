@@ -60,7 +60,7 @@ and is documented in `p5_deploy_candidate_review.md` §5. But a clean checkout o
 `approved_sha`. So the two commits may differ freely **outside** the 21 operation modules and
 must agree **byte-for-byte inside** them.
 
-**Therefore `708058e` + an operation approval at `9f1f6d5` is refused**, and the refusal is
+**Therefore `708058e` + an operation approval at the candidate is refused**, and the refusal is
 correct rather than a gap to widen. Proven in
 `TestTheDeploymentAndTheOperationMustBeTheSameTree`, which materialises each commit with
 `git archive` and runs the real gate against it:
@@ -81,7 +81,9 @@ around this either.
 
 **One commit carrying the service code and the operation code together.** The operation code is
 not parked in a separate commit that `HEAD` would never check out — the candidate is a direct
-descendant of `708058e` (23 commits), and it is the tree that would actually run.
+descendant of `708058e`, and it is the tree that would actually run. (No commit count is written
+here: it moves with every commit, and a number that drifts is worse than no number. Ancestry is
+asserted by `test_the_candidate_is_a_descendant_of_the_deploy_commit`.)
 
 **No architectural change was needed and none was made.** The existing identity/HEAD contract
 already supports this: when `deploy_sha == approved_sha == the candidate`, all three bindings
@@ -191,7 +193,11 @@ direction — a false positive after a legitimate restore — and was not writte
 
 ### The seal scan: measured, and a regression it exposed
 
-Measured read-only on VM24 against the real monolith at candidate `f3750cf`:
+Measured read-only on VM24 against the real monolith. The measurement was taken at `f3750cf`,
+an earlier commit on this same line; `store/block_manifest.py` — which contains
+`content_ledger`, the function measured — is **byte-identical** at `f3750cf` and at the current
+candidate (`c84f6a1aeda4e388…`), so the numbers carry over unchanged. What changed after the
+measurement is how OFTEN that scan runs, not what it costs:
 
 | | |
 |---|---|
@@ -236,6 +242,52 @@ All three are separate, none is implied by another, and **none was created**.
 
 Approving (1) does not approve (2). A commit can reasonably be reviewed as a service deployment
 and not as an operation host, and the two reviews read different code.
+
+### How the candidate is promoted, without approving itself
+
+**A commit cannot contain its own id, so no candidate can list itself in
+`REVIEWED_DEPLOY_SHAS`.** This is not a new problem and it does not need a new mechanism — the
+project already solved it once, and the promotion of `708058e` is the worked example:
+
+| step | commit | what it did |
+|---|---|---|
+| propose | `af2b249` | named the revision in `PROPOSED_DEPLOY_SHAS` — *"approved by nothing"* |
+| promote | `5e6b076` | moved it into `REVIEWED_DEPLOY_SHAS` |
+
+At `708058e` itself, `REVIEWED_DEPLOY_SHAS` contained only `3223fba`. **The deployment commit
+never listed itself; a later commit listed it.** `PROPOSED_DEPLOY_SHAS` is `()` today, and its
+own comment says the mechanism is kept because "the next candidate will need it".
+
+So for this candidate:
+
+1. **Propose** — a child commit adds the candidate SHA to `PROPOSED_DEPLOY_SHAS`. `_check_identity`
+   reads only `REVIEWED_DEPLOY_SHAS`, so a proposed revision can be measured, argued about and
+   rejected without ever being deployable.
+2. **Promote** — a further commit (call it **P**) moves it into `REVIEWED_DEPLOY_SHAS`. **P is the
+   record of the approval.** It is a human decision, made after reading this candidate, recorded
+   in a commit the candidate cannot reach.
+3. `CURRENT_DEPLOY_SHA` is **a separate edit and a separate decision**, in P or later. "Was this
+   reviewed" is historical and does not expire; "which should be deployed now" is a current
+   recommendation and moves. Collapsing them is what made retaining `3223fba` look like
+   endorsing it.
+
+**Why this composes.** `ops/p5_readiness.py` is **operation-only** — it is not one of the 23
+service modules. So P changes no service module, and the 11 shared modules are byte-identical
+between the candidate and P. The three bindings of §2 then hold with:
+
+    deploy_sha    = the candidate      (the service checkout: HEAD == it, worktree clean)
+    approved_sha  = P                  (the operation checkout, which is what reads
+                                        REVIEWED_DEPLOY_SHAS and sees the candidate in it)
+
+That is the §2 separation being used for the reason it exists, not worked around: P differs from
+the candidate **only outside the 21 operation modules'** service-facing set — specifically in
+`ops/p5_readiness.py`, which is itself an operation module, so the operation approval must name
+**P**, not the candidate. Nothing is self-approving: P approves the candidate, and P's own
+operation approval is an external record a person writes.
+
+**Nothing here has been done.** `PROPOSED_DEPLOY_SHAS` is still `()`, `REVIEWED_DEPLOY_SHAS`
+still holds two commits, neither of which is the candidate, and `CURRENT_DEPLOY_SHA` is still
+`708058e`. A test asserts the candidate is absent from all of them.
 
 ### The order is not free
 

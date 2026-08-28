@@ -470,7 +470,9 @@ read-only mount) and remains a deployment prerequisite.
 ##### When the seal is actually checked — and when it is not
 
 The ledger is a **full metadata traversal of the monolith**. Measured on VM24 against the real
-store at candidate `f3750cf`: **1,012,962 files, 2.24 TB, 13.1 s** per pass, mostly CPU.
+store, measured at commit `f3750cf` and unchanged since (`store/block_manifest.py` is
+byte-identical at the current candidate): **1,012,962 files, 2.24 TB, 13.1 s** per pass,
+mostly CPU.
 
 | moment | verified? |
 |---|---|
