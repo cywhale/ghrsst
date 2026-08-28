@@ -12,6 +12,7 @@ import hashlib
 import inspect
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -846,3 +847,122 @@ class TestEachHalfOfTheHostingRuleIsReachedOnItsOwn(unittest.TestCase):
         self.assertEqual(rows["deleted"], forward["added"])
         self.assertEqual(rows["modified"], forward["modified"])
         self.assertEqual(rows["total"], len(rows["deleted"]) + len(rows["modified"]))
+
+
+# =====================================================================================
+class TestASealedManifestCannotBeReadByTheOlderDeployment(unittest.TestCase):
+    """A generation carrying `content_seal` is not backward compatible, and that constrains
+    the ORDER of the two approvals.
+
+    `block_manifest._require_keys` rejects unknown segment fields -- deliberately, so a
+    manifest written by something the deployment does not understand is refused rather than
+    half-read. `content_seal` is new in the candidate. So once the operation publishes a
+    generation carrying one:
+
+        the candidate  reads it, verifies the seal, and serves the base
+        `708058e`      raises ManifestError, leaves `cube = None`, and serves DAILY-ONLY
+
+    and `708058e` has no `degraded` reporting, so its `/healthz` still says `"status": "ok"`
+    while the base has silently left the served view. That is precisely the failure the
+    candidate's healthz change exists to make visible, and the older commit cannot report it.
+
+    **Rolling the service back below the candidate is therefore safe only while no published
+    generation carries a seal.** This is not a defect in either commit -- it is what schema
+    evolution costs -- but it is a fact an operator has to know BEFORE publishing, not after.
+
+    Run in a subprocess against a real checkout: the old module cannot be imported alongside
+    the loaded `store` package, and asserting this from a string in a document would be exactly
+    the kind of claim that is not actually checked."""
+
+    OLD = "708058e15b37a02e1d7aa5a66b9978c6e13bd446"
+    _TREE = None
+
+    @classmethod
+    def old_checkout(cls):
+        if cls._TREE is None:
+            tmp = tempfile.mkdtemp(prefix="p5-old-")
+            dev = os.path.join(tmp, "dev2026")
+            os.makedirs(dev)
+            tar = subprocess.run(("git", "-C", dc._repo_root(), "archive",
+                                  f"{cls.OLD}:dev2026"), capture_output=True, check=True)
+            subprocess.run(("tar", "-x", "-C", dev), input=tar.stdout, check=True)
+            cls._TREE = (tmp, dev)
+        return cls._TREE
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._TREE is not None:
+            shutil.rmtree(cls._TREE[0], ignore_errors=True)
+            cls._TREE = None
+
+    def probe(self, body):
+        """Run `body` inside a checkout of the OLD commit and return its stdout."""
+        _, dev = self.old_checkout()
+        script = os.path.join(dev, "_probe.py")
+        with open(script, "w") as fh:
+            fh.write(f"import sys\nsys.path.insert(0, {dev!r})\n" + body)
+        proc = subprocess.run((sys.executable, script), capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip()
+
+    def test_the_old_validator_rejects_a_sealed_segment(self):
+        out = self.probe('''
+from store import block_manifest as bm
+seg = {k: None for k in bm._SEG_REQUIRED}
+seg["content_seal"] = {"algo": "sha256-path-size-mtime", "ledger_digest": "0" * 64,
+                       "file_count": 1, "total_bytes": 1}
+try:
+    bm._require_keys(seg, bm._SEG_REQUIRED, bm._SEG_OPTIONAL, "segment[0]")
+    print("ACCEPTED")
+except Exception as exc:
+    print("REJECTED:", exc)
+''')
+        self.assertTrue(out.startswith("REJECTED:"), out)
+        self.assertIn("unknown field(s) ['content_seal']", out)
+
+    def test_the_old_commit_does_not_know_the_field_at_all(self):
+        """Isolating the cause: it is absent from the old optional set, not mishandled."""
+        out = self.probe('from store import block_manifest as bm\n'
+                         'print("content_seal" in bm._SEG_OPTIONAL)')
+        self.assertEqual(out, "False")
+
+    def test_the_candidate_accepts_it(self):
+        """The other side, in this process: the same segment shape is optional here."""
+        from store import block_manifest as bm
+        self.assertIn("content_seal", bm._SEG_OPTIONAL)
+        seg = {k: None for k in bm._SEG_REQUIRED}
+        seg["content_seal"] = {"algo": "sha256-path-size-mtime", "ledger_digest": "0" * 64,
+                               "file_count": 1, "total_bytes": 1}
+        bm._require_keys(seg, bm._SEG_REQUIRED, bm._SEG_OPTIONAL, "segment[0]")
+
+    def test_an_unsealed_manifest_stays_readable_by_both(self):
+        """The compatibility that DOES hold, so the constraint above is scoped correctly: a
+        manifest without the field is read by either commit, which is why deploying the
+        candidate before any seal exists is safe."""
+        out = self.probe('''
+from store import block_manifest as bm
+seg = {k: None for k in bm._SEG_REQUIRED}
+bm._require_keys(seg, bm._SEG_REQUIRED, bm._SEG_OPTIONAL, "segment[0]")
+print("ACCEPTED")
+''')
+        self.assertEqual(out, "ACCEPTED")
+
+    def test_only_the_operation_writes_a_seal(self):
+        """What bounds the exposure: no service path writes one, so a seal appears only after
+        the operation runs -- which is itself gated on the operation approval."""
+        writers = []
+        for sub in ("api", "ingest", "store", "ops"):
+            base = os.path.join(_DEV, sub)
+            for dirpath, _, names in os.walk(base):
+                for name in sorted(n for n in names if n.endswith(".py")):
+                    path = os.path.join(dirpath, name)
+                    text = _read_text(path)
+                    if '"content_seal":' in text:
+                        writers.append(os.path.relpath(path, _DEV))
+        self.assertEqual(sorted(writers), ["ops/p5_legacy_base.py"])
+
+    def test_the_ordering_constraint_is_documented(self):
+        text = " ".join(_read_text(
+            os.path.join(_DEV, "specs", "p5_integration_candidate.md")).split())
+        self.assertIn("rolling the service back", text.lower())
+        self.assertIn("content_seal", text)

@@ -145,6 +145,59 @@ questions the candidate **raises**; only a person who reads the diff can answer 
 operation approval does not cover it, and it is on the API-parity path the compaction's
 post-publish gate asserts against.
 
+## 5a. Service-side risks found in review
+
+Three properties of the service changes that are correct as written but constrain how the
+candidate may be deployed. None of them is a reason to weaken a gate; all three are things an
+operator has to know **before** acting, not after.
+
+### The manifest schema is not backward compatible — this constrains approval ORDER
+
+`block_manifest._require_keys` rejects unknown segment fields, deliberately. `content_seal` is
+new in the candidate, so once a generation carrying one is published:
+
+| | reads a sealed manifest | reports |
+|---|---|---|
+| the candidate | yes — verifies the seal | `degraded` if it fails |
+| `708058e` | **no** — `ManifestError: unknown field(s) ['content_seal']` | `"status": "ok"` |
+
+The older commit leaves `cube = None` and serves **daily-only**, and it has no `degraded`
+reporting, so its `/healthz` still says `ok` while the base has left the served view — exactly
+the failure the candidate's healthz change exists to make visible.
+
+**So rolling the service back below the candidate is safe only while no published generation
+carries a seal.** A manifest *without* the field is read by both commits, which is why
+deploying the candidate before any seal exists is safe, and why the service deployment must
+land **before** the operation runs. Pinned by
+`TestASealedManifestCannotBeReadByTheOlderDeployment`, which runs the old validator from a real
+checkout rather than asserting this from a string.
+
+Exposure is bounded: `ops/p5_legacy_base.py` is the only module that writes a seal, no service
+path does, and it is itself gated on the operation approval.
+
+### The seal keys on mtime, so a restore invalidates it
+
+`content_ledger` hashes path, size and `st_mtime_ns`. Anything that rewrites metadata without
+changing content — **a VM-level backup restore**, an `rsync` without `-t`, a `cp -r`, a
+filesystem migration — produces a seal mismatch, and the service then refuses the base and
+serves daily-only.
+
+This interacts directly with the recoverability story: VM-level backup is the stated
+compensation for operating on a writable monolith, and exercising that compensation breaks the
+seal. The failure is loud and fail-closed rather than silent, which is the right direction, but
+**a restore requires re-provisioning the generation, not just restarting the service.** The
+specs document mtime as a limit on detection strength (false negatives); this is the opposite
+direction — a false positive after a legitimate restore — and was not written down.
+
+### The seal is verified at every service start
+
+`SegmentedCubeStore` construction calls `verify_content_seal`, which walks the entire monolith
+and `stat`s every file. That is metadata only — not the ~2 TB of chunk bytes — but it is still a
+full traversal of a large store inside `lifespan`, on every start and every restart. The cost
+was never measured here and cannot be from this machine. It should be measured on VM24 before
+the deployment, because a multi-minute startup is a different operational profile from the
+current one.
+
 ## 6. The three approvals this needs
 
 All three are separate, none is implied by another, and **none was created**.
@@ -162,6 +215,19 @@ All three are separate, none is implied by another, and **none was created**.
 
 Approving (1) does not approve (2). A commit can reasonably be reviewed as a service deployment
 and not as an operation host, and the two reviews read different code.
+
+### The order is not free
+
+§5a fixes it: **(1) before (2), and the service deployment before the operation runs.** A
+generation carrying a `content_seal` cannot be read by `708058e`, so publishing one while the
+service still runs the old commit takes the base out of the served view under a healthy-looking
+`/healthz`. Deploying the candidate first is safe in both directions, because an unsealed
+manifest is readable by either commit.
+
+`deploy_sha` and `approved_sha` should both be **this candidate**. They may differ in principle
+(§2), but only if the two commits agree byte-for-byte on all 21 operation modules — and any
+commit that satisfies that while differing elsewhere would need its own service review anyway,
+so separating them buys nothing here and costs a second review.
 
 ## 7. What a green local suite says
 
