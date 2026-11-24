@@ -1,6 +1,6 @@
 # 04 — 待 Owner 決定事項
 
-> 狀態（截至 2026-11-24）：**F2 readiness（owner 決定於 2026-11-20）— v1 契約政策已由 owner 決定；G-C/D 與 Stage E 已通過 Codex review；Ops-1 公開 POST spot check 通過（未測 GET cache）；G-B 已由 Codex review 通過；**F2 已由 owner 核准（2026-11-24）**，`info.version` 已改為 `1.0.0`；尚未 commit、尚未部署。** 已決定的項目見下方「決定紀錄」（含「F2 readiness 決定」各列）；表中「建議」欄保留決定前的內容。
+> 狀態（截至 2026-11-24）：**F2 readiness（owner 決定於 2026-11-20）— v1 契約政策已由 owner 決定；G-C/D 與 Stage E 已通過 Codex review；Ops-1 公開 POST spot check 通過（未測 GET cache）；G-B 已由 Codex review 通過；**F2 已由 owner 核准（2026-11-24）**，`info.version` 已改為 `1.0.0`；Codex 最終 review 已完成；實作 commit SHA：`b9bd4e46097289632874d1615c5737c37ebc0156`；尚未部署。** 已決定的項目見下方「決定紀錄」（含「F2 readiness 決定」各列）；表中「建議」欄保留決定前的內容。
 > 每項都附「現況」與「建議」；建議不是決定。標 ⚠ 者會改變對外行為或形成新的服務承諾。
 > 欄位「阻擋」表示未決時哪個 Stage／Gate 不能完成（見 [03](03_roadmap_and_validation.md)）。
 
@@ -41,7 +41,8 @@
 | change_log（F2 readiness 決定） | 升版時在 `change_log.md` 新增獨立的「OpenAPI contract v1.0.0」紀錄，與服務部署版本（ver 0.x）分開；須標明「已核准、尚未部署」，部署後再補部署資訊。F2 前不改 `change_log.md` |
 | F2 → commit 流程（F2 readiness 決定；X1） | F2 前**不得** commit。F2 核准先綁定**已 review 的候選 diff**；核准後才升 `info.version` 為 `1.0.0` 並新增 changelog 紀錄；升版與 changelog 完成 review 後才提交；提交後再把 commit SHA 補入紀錄 |
 | 部署目標（F2 readiness 記錄；X2） | v1 契約對應的部署目標是 `6b32e54` 加上 API v1 候選變更（含已核准的 BC-1／BC-2）；目前 production（`6b32e54`）**尚未包含**這些本機改動。若部署前整合 `ee84037` 或其他會改變 503／headers 的 P5 變更，必須先更新並 review OAS（02 §7）。整合時點仍由 owner 與 P5 協調（OD-15） |
-| **F2 核准（2026-11-24）** | Owner 核准 F2：v1 契約（02）為正式公開契約，綁定已 review 的候選 diff。核准**不含** commit、push、部署授權。已執行：`info.version` `0.4.1` → `1.0.0`（OD-20）、snapshot 與版本測試、`change_log.md`「OpenAPI contract v1.0.0」（已核准、尚未部署）、02 → Approved、OD-3（SUPERSEDED 標示＋`AGENTS.md`）。待 Codex review → commit → 補 SHA |
+| **F2 核准（2026-11-24）** | Owner 核准 F2：v1 契約（02）為正式公開契約，綁定已 review 的候選 diff。核准**不含** commit、push、部署授權。已執行：`info.version` `0.4.1` → `1.0.0`（OD-20）、snapshot 與版本測試、`change_log.md`「OpenAPI contract v1.0.0」（已核准、尚未部署）、02 → Approved、OD-3（SUPERSEDED 標示＋`AGENTS.md`）。當時待 Codex review → commit → 補 SHA（其後已完成，見下一列） |
+| 實作 commit（2026-11-24） | Owner 授權 commit；Codex 已完成 F2 候選的最終 review。**實作 commit SHA：`b9bd4e46097289632874d1615c5737c37ebc0156`**（parent `6b32e54`，15 個檔案）。其後的文件狀態同步是另一個 commit，SHA 與實作 commit 不同。此次授權只含本機 commit；部署屬 Stage G，部署前須先處理 `6b32e54` 不在 GitHub 遠端歷史中的問題 |
 | 行為變更 | 需要行為變更時，先交短提案（問題與證據、維持現況的選項、改變行為的選項與影響、建議與測試方式、是否獨立提交）；owner 回覆前不實作。本輪提案見 [05](05_behavior_change_proposals.md) |
 
 | ID | 主題 | 現況（`6b32e54`／production） | 選項 | 建議 | 阻擋 |

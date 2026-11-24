@@ -1,6 +1,6 @@
 # 03 — Roadmap 與驗證計畫
 
-> 狀態（截至 2026-11-24）：**G-C/D 已通過 Codex review（2026-11-20）；Stage E 已由 Codex 完成，E6 用詞統一 Codex 已確認；Ops-1 公開 POST spot check 通過（2026-11-20，owner 修改 NGINX 設定後；未測 GET cache）；G-B 已由 Codex review 通過；**F2 已由 owner 核准（2026-11-24）**；`info.version` 已改為 `1.0.0`；尚未 commit（SHA 待補）、尚未部署（Stage G）；停在 Codex review gate。** **Round 12（2026-11-20）— A 完成、F1 已同意、C／D 已實作；round 5–10 修補（`format`、BC-1、BC-2、日期 `maxLength`、資料日期窗口、Swagger 說明重整、窗口連續性用詞、GET 說明層級／目前覆蓋／freshness、`servers`／`operationId`／`security: []`；round 11 `append` 的 `default: "sst"`；round 12 日期窗口簡潔用詞）當時待 Codex review（其後 G-C/D 已通過）。** **F2 readiness 更新（2026-11-20）**：v1 契約政策已由 owner 決定（04 決定紀錄）；OD-21 已記錄 P5 reviewer 對政策／設計依據的確認（**不是**永久保證）；E（Codex）與 Ops-1（ops 驗收）當時未完成（其後皆已完成，見本行開頭）；當時 **F2 未核准**（2026-11-24 已核准）；G 未開始。見下方「F2 readiness」。
+> 狀態（截至 2026-11-24）：**G-C/D 已通過 Codex review（2026-11-20）；Stage E 已由 Codex 完成，E6 用詞統一 Codex 已確認；Ops-1 公開 POST spot check 通過（2026-11-20，owner 修改 NGINX 設定後；未測 GET cache）；G-B 已由 Codex review 通過；**F2 已由 owner 核准（2026-11-24）**；`info.version` 已改為 `1.0.0`；Codex 最終 review 已完成；實作 commit SHA：`b9bd4e46097289632874d1615c5737c37ebc0156`（parent `6b32e54`；其後的文件同步 commit 另有自己的 SHA）；尚未部署（Stage G；部署前須先處理 `6b32e54` 不在 GitHub 遠端歷史中的問題）。** **Round 12（2026-11-20）— A 完成、F1 已同意、C／D 已實作；round 5–10 修補（`format`、BC-1、BC-2、日期 `maxLength`、資料日期窗口、Swagger 說明重整、窗口連續性用詞、GET 說明層級／目前覆蓋／freshness、`servers`／`operationId`／`security: []`；round 11 `append` 的 `default: "sst"`；round 12 日期窗口簡潔用詞）當時待 Codex review（其後 G-C/D 已通過）。** **F2 readiness 更新（2026-11-20）**：v1 契約政策已由 owner 決定（04 決定紀錄）；OD-21 已記錄 P5 reviewer 對政策／設計依據的確認（**不是**永久保證）；E（Codex）與 Ops-1（ops 驗收）當時未完成（其後皆已完成，見本行開頭）；當時 **F2 未核准**（2026-11-24 已核准）；G 未開始。見下方「F2 readiness」。
 > 角色：Owner/Orchestrator = Human；文件與實作 = Claude；Review = Codex；部署 = **未定**。
 > Round 2 變更：核准拆成 F1（實作範圍）／F2（公開契約），消除「實作需核准、核准需實作」的循環；
 > 基線只需本機完整 commit，推上 origin 改列為發布準備；快取問題改為不阻擋本機工作的獨立 ops 待辦。
@@ -23,9 +23,9 @@ Ops-1 快取（獨立）──────────────────�
 | C | **已實作；G-C/D Codex review 已通過**（2026-11-20） | [02 §11](02_openapi_v1_spec.md#11-stage-c-實作對照round-4) |
 | D | **已實作；G-C/D Codex review 已通過**（2026-11-20）；結果見下方 Stage D | 本文件 |
 | 行為變更 | BC-1（OD-4）：**已核准、已實作**（round 5）。BC-2（OD-5）：**owner 選 B2-b、已實作**（round 6）。兩者已隨 G-C/D 經 Codex 正式 review 並通過（2026-11-20） | [05](05_behavior_change_proposals.md) |
-| 資料日期窗口（OD-21） | owner 選定空間 31 日／單點 366 日最小保證；已寫入本機 OAS 草案（round 7）；round 9 另把 point「目前自 2023-01-01 起連續」寫成現況（非承諾）；round 12 公開用詞改為 owner 接受的簡潔寫法（「support the latest N consecutive calendar days」，已與 P5 Codex reviewer 討論）。**F2 readiness**：已收到 P5 reviewer 確認 366／31 日為資料涵蓋政策與設計依據（owner 於對話中提供；無 P5 commit SHA）；不是無條件或永久保證 | [02 §5.0](02_openapi_v1_spec.md#50-資料日期窗口round-7owner-決定-2026-11-20草案) |
+| 資料日期窗口（OD-21） | owner 選定空間 31 日／單點 366 日最小保證；已寫入本機 OAS 草案（round 7）；round 9 另把 point「目前自 2023-01-01 起連續」寫成現況（非承諾）；round 12 公開用詞改為 owner 接受的簡潔寫法（「support the latest N consecutive calendar days」，已與 P5 Codex reviewer 討論）。**F2 readiness**：已收到 P5 reviewer 確認 366／31 日為資料涵蓋政策與設計依據（owner 於對話中提供；無 P5 commit SHA）；不是無條件或永久保證 | [02 §5.0](02_openapi_v1_spec.md#50-資料日期窗口round-7owner-決定-2026-11-20) |
 | E | **Codex 已完成**（2026-11-20：150 tests passed；`git diff --check` 與 untracked whitespace 乾淨）；依結果統一 E6 用詞，**Codex 已確認**（最終確認 review，150 tests passed） | 下方「Stage E」與「F2 readiness」 |
-| F2 | **已核准**（owner，2026-11-24）。前置全部完成：v1 政策（04）、G-B、G-C/D、E、Ops-1 公開 POST spot check。核准後已升 `info.version` → `1.0.0`、snapshot／版本測試、OD-3、changelog 條目；**待 Codex review**，之後才 commit 並補 SHA | 下方 |
+| F2 | **已核准**（owner，2026-11-24）。前置全部完成：v1 政策（04）、G-B、G-C/D、E、Ops-1 公開 POST spot check。核准後已升 `info.version` → `1.0.0`、snapshot／版本測試、OD-3、changelog 條目；Codex 最終 review 已完成，實作 commit SHA：`b9bd4e46097289632874d1615c5737c37ebc0156`（2026-11-24） | 下方 |
 | G | 未開始；CORS（OD-12）、`app.py` 整合（X2）與部署後 production Swagger smoke 屬此階段 | 下方 |
 | Ops-1 | **公開 POST spot check 通過**（2026-11-20 15:09:11–15:09:22 UTC，owner 修改並 reload NGINX 後）；未測 GET cache 行為，未宣稱驗證所有快取情境 | 下方「Ops-1 驗收結果」；01 §10.4 |
 

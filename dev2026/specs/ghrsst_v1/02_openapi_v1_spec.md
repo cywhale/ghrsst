@@ -1,6 +1,6 @@
 # 02 — OpenAPI v1.0.0 契約規格
 
-> **狀態：APPROVED — OpenAPI 契約 v1.0.0。Gate F2 已由 owner 核准（2026-11-24）；`info.version` 已改為 `1.0.0`（OD-20）。尚未 commit（commit SHA 待 review 通過、提交後補入）、尚未部署（production `6b32e54` 尚未提供此契約；部署屬 Stage G）。Gate F1 已通過（2026-11-20，實作範圍同意）。** 以下為核准前各 round 的紀錄（歷史；當時狀態為 DRAFT、F2 未核准）。Round 5：`format` 描述修正、BC-1；Round 6：BC-2（B2-b）、日期 `maxLength: 10`；Round 7：owner 選定的資料日期窗口（§5.0，**P5 資料流程保障尚待跨工作區確認**）與 Swagger 說明文字重整（§11.3）；Round 8：窗口內連續性、缺日說明與兩種「最新日期」的用詞修正（§11.4）；Round 9：GET 說明依 owner 指定層級重整（Point Query／Bounding-Box Query）、point 目前覆蓋起點 2023-01-01、freshness 提示、BBox 日期參數精確描述（§11.5）；Round 10：`servers`（production，server object 只有 `url`）、穩定 `operationId`、操作層 `security: []`（公開、免認證），以及「generated 文件出現認證需求時拒絕產生」的防護（§11.6）；Round 11：`append` 在 GET 參數與 `PointsRequest` 加 `default: "sst"`（仍為 optional；`mode` 不變），並補 `components: null`／`[]` 拒絕案例的 regression tests（§11.7）；Round 12：日期窗口文字改為 owner 接受的簡潔寫法（已與 P5 Codex reviewer 討論；§5.0、§11.8）——不代表 OD-21 的 P5 資料流程保障或其他 F2 前置事項已完成。F2 readiness 更新（2026-11-20）：§5.0 記錄 P5 reviewer 的政策／設計依據確認（非永久保證），§7 部署目標、§8 版本政策、§9 OD-3 依 owner 決定更新；OAS 文字未改，**F2 仍未核准**。 Stage E（2026-11-20）：Codex 已完成；依結果把 GET Point Query 的 Dates 終點改為「the latest date available to point queries」（E6，§11.9），Codex 已確認。
+> **狀態：APPROVED — OpenAPI 契約 v1.0.0。Gate F2 已由 owner 核准（2026-11-24）；`info.version` 已改為 `1.0.0`（OD-20）。Codex 最終 review 已完成；實作 commit SHA：`b9bd4e46097289632874d1615c5737c37ebc0156`（2026-11-24，parent `6b32e54`；其後的文件同步 commit 另有自己的 SHA）。尚未部署（production `6b32e54` 尚未提供此契約；部署屬 Stage G）。Gate F1 已通過（2026-11-20，實作範圍同意）。** 以下為核准前各 round 的紀錄（歷史；當時狀態為 DRAFT、F2 未核准）。Round 5：`format` 描述修正、BC-1；Round 6：BC-2（B2-b）、日期 `maxLength: 10`；Round 7：owner 選定的資料日期窗口（§5.0，**P5 資料流程保障尚待跨工作區確認**）與 Swagger 說明文字重整（§11.3）；Round 8：窗口內連續性、缺日說明與兩種「最新日期」的用詞修正（§11.4）；Round 9：GET 說明依 owner 指定層級重整（Point Query／Bounding-Box Query）、point 目前覆蓋起點 2023-01-01、freshness 提示、BBox 日期參數精確描述（§11.5）；Round 10：`servers`（production，server object 只有 `url`）、穩定 `operationId`、操作層 `security: []`（公開、免認證），以及「generated 文件出現認證需求時拒絕產生」的防護（§11.6）；Round 11：`append` 在 GET 參數與 `PointsRequest` 加 `default: "sst"`（仍為 optional；`mode` 不變），並補 `components: null`／`[]` 拒絕案例的 regression tests（§11.7）；Round 12：日期窗口文字改為 owner 接受的簡潔寫法（已與 P5 Codex reviewer 討論；§5.0、§11.8）——不代表 OD-21 的 P5 資料流程保障或其他 F2 前置事項已完成。F2 readiness 更新（2026-11-20）：§5.0 記錄 P5 reviewer 的政策／設計依據確認（非永久保證），§7 部署目標、§8 版本政策、§9 OD-3 依 owner 決定更新；OAS 文字未改，**F2 仍未核准**。 Stage E（2026-11-20）：Codex 已完成；依結果把 GET Point Query 的 Dates 終點改為「the latest date available to point queries」（E6，§11.9），Codex 已確認。
 > - **Gate F1（實作範圍同意）**：owner 已同意本草案作為 Stage C／D 的實作範圍；F1 不是對外承諾。
 > - **Gate F2（正式公開契約核准）**：Stage C–E 完成後，owner 核准最終規格，才可對外宣告為 v1 契約。
 >
@@ -405,7 +405,7 @@ Fan-out 的目前部署值（64）只寫在 413 response，並說明依地理區
 - 實際部署版本需能從 commit 追溯（00 §2 顯示版本字串目前無法識別部署）。
 
 ## 9. 舊 Draft 的處置
-`specs/ghrsst_api_v0_1_0.spec` 描述舊 `ghrsst_app.py`，與現況在至少 9 處矛盾（01 §13）。Owner 已採下列建議（[OD-3]，2026-11-20）；**已於 F2 核准（2026-11-24）後執行**（尚未 commit）：
+`specs/ghrsst_api_v0_1_0.spec` 描述舊 `ghrsst_app.py`，與現況在至少 9 處矛盾（01 §13）。Owner 已採下列建議（[OD-3]，2026-11-20）；**已於 F2 核准（2026-11-24）後執行**（已收入實作 commit `b9bd4e4`）：
 1. Gate F2 核准時，在舊檔頂端加「SUPERSEDED by dev2026/specs/ghrsst_v1/…（v1.0.0）；僅描述 legacy `ghrsst_app.py`」橫幅，內容不再維護；
 2. 同一 PR 更新 `AGENTS.md` 中「authoritative interface reference」那一行，改指 v1 規格與 generated OpenAPI；
 3. 不刪除舊檔（legacy rollback launcher 仍指向 `ghrsst_app.py`）。
@@ -573,4 +573,4 @@ Owner 於 2026-11-24 核准 F2。此核准**不包含** commit、push 或部署�
 | 測試 | `test_version_not_bumped_before_f2` 改為 `test_version_is_the_approved_contract`（斷言 `1.0.0` 與 `openapi: 3.1.0`）；`test_servers_operation_ids_and_security` 的版本斷言改為 `1.0.0`；測試數仍 79 |
 | OD-3 | `specs/ghrsst_api_v0_1_0.spec` 頂端加 SUPERSEDED 標示並指向本規格；`AGENTS.md` 不再稱舊 Draft 為 authoritative，改指本規格與 generated OpenAPI；舊檔未刪除 |
 | `change_log.md` | 新增獨立的「OpenAPI contract v1.0.0」紀錄，標明「已核准、尚未部署」；不含部署日期、部署 commit 或 production smoke；服務的 `ver 0.x` 不變 |
-| 未做 | commit（SHA 待提交後補入）、push、部署、production 請求 |
+| 未做（該輪當時） | commit、push、部署、production 請求。其後：Codex 最終 review 完成，owner 授權建立實作 commit `b9bd4e46097289632874d1615c5737c37ebc0156`（2026-11-24）；部署仍屬 Stage G |

@@ -1,9 +1,9 @@
 # 05 — 行為變更提案（Behavior Change Proposals）
 
 > **目前狀態（截至 2026-11-24；G-C/D review 於 2026-11-20）**：
-> - **BC-1（OD-4）：owner 已核准，已實作（round 5，本機，未 commit）。**
-> - **BC-2（OD-5）：owner 已核准選項 B2-b，已實作（round 6，本機，未 commit）。**
-> - 兩者已隨 G-C/D 經 Codex 正式 review 並通過（2026-11-20；Codex 明確檢查這兩項核准的行為變更）。尚未部署：production（`6b32e54`）不含這兩項（X2，Stage G）。G-B 已由 Codex review 通過；F2 已由 owner 核准（2026-11-24），兩者屬於已核准的 OpenAPI 契約 v1.0.0 候選；尚未 commit、尚未部署。
+> - **BC-1（OD-4）：owner 已核准，已實作（round 5），已收入實作 commit `b9bd4e4`。**
+> - **BC-2（OD-5）：owner 已核准選項 B2-b，已實作（round 6），已收入實作 commit `b9bd4e4`。**
+> - 兩者已隨 G-C/D 經 Codex 正式 review 並通過（2026-11-20；Codex 明確檢查這兩項核准的行為變更）。尚未部署：production（`6b32e54`）不含這兩項（X2，Stage G）。G-B 已由 Codex review 通過；F2 已由 owner 核准（2026-11-24），兩者屬於已核准的 OpenAPI 契約 v1.0.0；Codex 最終 review 後已收入實作 commit `b9bd4e46097289632874d1615c5737c37ebc0156`（2026-11-24）；尚未部署。
 >
 > 歷史狀態（round 10，2026-11-20，保留原文）：行為未變，round 7–10 只同步 OpenAPI 說明文字與 metadata 的記錄；BC-1 已實作（round 5），BC-2 已實作（round 6）；兩者當時皆待 Codex review。
 >

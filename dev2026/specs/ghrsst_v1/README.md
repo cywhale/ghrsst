@@ -1,6 +1,6 @@
 # GHRSST API v1.0.0 契約規劃
 
-> 狀態（截至 2026-11-24）：**G-C/D 已通過 Codex review（2026-11-20）；Stage E 已由 Codex 完成（150 tests passed；diff／whitespace 檢查乾淨），E6 用詞統一 Codex 已確認。v1 契約政策已由 owner 決定（04）；OD-21 已記錄 P5 reviewer 的政策／設計依據確認（非永久保證）；Ops-1 公開 POST spot check 通過（owner 修改並 reload NGINX 後；未測 GET cache）；G-B 已由 Codex review 通過；**F2 已由 owner 核准（2026-11-24）**，`info.version` 已改為 `1.0.0`；尚未 commit（SHA 待補）、尚未部署；待 Codex review。** **Round 12（2026-11-20）— 基線 `6b32e54`；F1 已同意；Stage C／D 與 round 5–12 修補已在本機實作，當時待 Codex review（其後 G-C/D 已通過）。Round 7 寫入 owner 選定的資料日期窗口（空間 31 日、單點 366 日；**P5 資料流程保障尚待確認**），round 8 修正窗口內連續性與兩種最新日期的用詞，round 9 依 owner 指定層級重整 GET 說明並加入 point 目前覆蓋（2023-01-01 起，現況）與 freshness 提示，round 10 加入 production `servers`、穩定 `operationId` 與操作層 `security: []`（公開、免認證），round 11 為 `append` 加 `default: "sst"`，round 12 把日期窗口改為 owner 接受的簡潔用詞（已與 P5 Codex reviewer 討論；其後 P5 reviewer 確認 366／31 日為資料涵蓋政策與設計依據，不是永久保證）。當時 Gate F2 未核准、`info.version` 仍為 `0.4.1`（2026-11-24 已核准並升版）。沒有 commit、push、部署；Claude 本輪未啟動或重啟本機 server（本機 Swagger 曾由 Codex 啟動供 owner 檢視）。**
+> 狀態（截至 2026-11-24）：**G-C/D 已通過 Codex review（2026-11-20）；Stage E 已由 Codex 完成（150 tests passed；diff／whitespace 檢查乾淨），E6 用詞統一 Codex 已確認。v1 契約政策已由 owner 決定（04）；OD-21 已記錄 P5 reviewer 的政策／設計依據確認（非永久保證）；Ops-1 公開 POST spot check 通過（owner 修改並 reload NGINX 後；未測 GET cache）；G-B 已由 Codex review 通過；**F2 已由 owner 核准（2026-11-24）**，`info.version` 已改為 `1.0.0`；Codex 最終 review 已完成；實作 commit SHA：`b9bd4e46097289632874d1615c5737c37ebc0156`（parent `6b32e54`；其後的文件同步 commit 另有自己的 SHA）；尚未部署（Stage G）。** **Round 12（2026-11-20）— 基線 `6b32e54`；F1 已同意；Stage C／D 與 round 5–12 修補已在本機實作，當時待 Codex review（其後 G-C/D 已通過）。Round 7 寫入 owner 選定的資料日期窗口（空間 31 日、單點 366 日；**P5 資料流程保障尚待確認**），round 8 修正窗口內連續性與兩種最新日期的用詞，round 9 依 owner 指定層級重整 GET 說明並加入 point 目前覆蓋（2023-01-01 起，現況）與 freshness 提示，round 10 加入 production `servers`、穩定 `operationId` 與操作層 `security: []`（公開、免認證），round 11 為 `append` 加 `default: "sst"`，round 12 把日期窗口改為 owner 接受的簡潔用詞（已與 P5 Codex reviewer 討論；其後 P5 reviewer 確認 366／31 日為資料涵蓋政策與設計依據，不是永久保證）。當時 Gate F2 未核准、`info.version` 仍為 `0.4.1`（2026-11-24 已核准並升版）。沒有 commit、push、部署；Claude 本輪未啟動或重啟本機 server（本機 Swagger 曾由 Codex 啟動供 owner 檢視）。**
 
 ## 範圍
 為現有公開 API 建立可對外承諾的 OpenAPI v1.0.0 契約：
@@ -28,7 +28,7 @@
 | [04_owner_decisions.md](04_owner_decisions.md) | OD-1 … OD-21；2026-11-20 決定紀錄 |
 | [05_behavior_change_proposals.md](05_behavior_change_proposals.md) | 行為變更：BC-1（OD-4）、BC-2（OD-5，選項 B2-b）皆已實作，含前後對照、測試與 P5 協調事項 |
 
-Round 4 的程式與測試（本 worktree，未 commit）：
+Round 4 的程式與測試（本 worktree；當時未 commit，其後收入實作 commit `b9bd4e4`）：
 - `dev2026/api/openapi_contract.py`（新）、`dev2026/api/app.py`（檔尾新增 9 行）——只改寫 generated OpenAPI（02 §11）
 - `dev2026/api/app.py` 的 `_parse_date`（1 行改為 9 行，淨 +8）——BC-1 行為修補（round 5，05）
 - `dev2026/api/app.py` 的 4 個座標 `Query`、`PointsRequest.points`、新增的 `RequestValidationError` handler——BC-2 行為修補（round 6，05）；屬執行行為，需與 P5 協調
@@ -52,7 +52,8 @@ Round 4 的程式與測試（本 worktree，未 commit）：
 10. Round 11（2026-11-20，當時待 Codex review；其後 G-C/D 已通過）：`append` 在 GET 參數與 `PointsRequest` 加 `default: "sst"`（仍為 optional；`mode` 不變）；OAS 前後差異只有這兩處；另補 `components: null`／`[]` 的拒絕 regression tests（02 §11.7、03 Stage D）。
 11. Round 12（2026-11-20，當時待 Codex review；其後 G-C/D 已通過）：日期窗口改為 owner 接受的簡潔用詞（已與 P5 Codex reviewer 討論）——Point「Point queries support the latest 366 consecutive calendar days ending on the latest date available to point queries. The archive currently starts on 2023-01-01.」；Spatial「Bounding-box queries support the latest 31 consecutive calendar days ending on the latest date available to spatial queries. The same window applies to `POST /api/ghrsst/points`.」。取代第 7 點在 OAS 中的「至少保證／不缺日／更早日期可能有缺口」寫法；366 天涵蓋窗口與單次 request 上限明確區分；P5 內部流程不寫進 OAS。只定案用詞，P5 資料流程保障與其他 F2 前置事項仍未完成（02 §5.0、§11.8；04 OD-21 round 12 列）。
 12. F2 readiness（2026-11-20，owner 決定）：路徑固定、不加 `/v1`；`1.0.0` 為第一個正式契約版本，不設棄用期限，之後採 SemVer；OD-3（F2 時執行）、OD-6、OD-11、OD-16、OD-17 已決定，OD-12 屬 Stage G；OD-21 記錄 P5 reviewer 的政策／設計依據確認（非永久保證，無 P5 commit SHA）；F2 前不 commit，核准綁定已 review 的候選 diff；changelog 另立「OpenAPI contract v1.0.0」紀錄；X2 部署目標為 `6b32e54`＋API v1 候選變更（production 尚未包含）。Ops-1 只做離線整理、公開驗收待授權（03）——這是 **2026-11-20 當時的狀態**；後來的公開 POST spot check 結果見 Ops-1 驗收紀錄（01 §10.4、03「Ops-1 驗收結果」）。
-13. F2（2026-11-24，owner 核准）：v1 契約 Approved；`info.version` `1.0.0`；snapshot 與版本測試同步；`change_log.md` 新增「OpenAPI contract v1.0.0」（已核准、尚未部署）；OD-3 已執行（舊 Draft SUPERSEDED、`AGENTS.md` 改指 v1）。尚未 commit（SHA 待補）、尚未部署（Stage G）。
+13. F2（2026-11-24，owner 核准）：v1 契約 Approved；`info.version` `1.0.0`；snapshot 與版本測試同步；`change_log.md` 新增「OpenAPI contract v1.0.0」（已核准、尚未部署）；OD-3 已執行（舊 Draft SUPERSEDED、`AGENTS.md` 改指 v1）。當時尚未 commit（其後見第 14 點）；尚未部署（Stage G）。
+14. 實作 commit（2026-11-24，owner 授權；Codex 已完成 F2 候選的最終 review）：**實作 commit SHA：`b9bd4e46097289632874d1615c5737c37ebc0156`**（parent `6b32e54`；15 個檔案：BC-1／BC-2、OpenAPI 契約、測試與 snapshot、`AGENTS.md`、舊 Draft SUPERSEDED 標示、`change_log.md`、v1 規格文件）。其後的文件狀態同步是另一個 commit，SHA 與實作 commit 不同。尚未部署（Stage G）；部署前須先處理 `6b32e54` 不在 GitHub 遠端歷史中的問題。
 
 ## Review gates
 | Gate | 通過條件 | 誰 | 狀態（截至 2026-11-24） |
@@ -62,7 +63,7 @@ Round 4 的程式與測試（本 worktree，未 commit）：
 | G-F1 | owner 同意實作範圍（非對外承諾） | Owner | 通過 |
 | G-C/D | metadata-only 修補 + 契約測試通過；既有失敗與新失敗分開報告；`git diff --check` 乾淨 | Claude → Codex | **通過**（Codex review，2026-11-20） |
 | G-E | 規格 ↔ generated OpenAPI ↔ handler ↔ tests 無未說明差異 | Codex | **已完成**（150 tests passed；E4 proxy header 不入 OAS、由 Ops-1 處理；E5 改查本機 wiring，production Swagger smoke 移到 G；E6 用詞已統一，Codex 已確認（150 tests passed）；見 03） |
-| G-F2 | owner 核准正式公開契約，綁定 Stage E 已 review 的候選 diff；核准後升 `info.version` → `1.0.0`（OD-20）並加 changelog，review 後才 commit、再補 SHA；公開 POST 正確性已確認（Ops-1） | Owner | **通過**（owner 核准 2026-11-24；不含 commit／push／部署授權）。已升 `info.version` → `1.0.0`、加 changelog 條目、執行 OD-3；待 Codex review → commit → 補 SHA |
+| G-F2 | owner 核准正式公開契約，綁定 Stage E 已 review 的候選 diff；核准後升 `info.version` → `1.0.0`（OD-20）並加 changelog，review 後才 commit、再補 SHA；公開 POST 正確性已確認（Ops-1） | Owner | **通過**（owner 核准 2026-11-24；不含 commit／push／部署授權）。已升 `info.version` → `1.0.0`、加 changelog 條目、執行 OD-3。Codex 最終 review 已完成；實作 commit `b9bd4e4`（見上方第 14 點） |
 | G-G | 發布與部署獲獨立授權；部署目標 `6b32e54`＋API v1 候選變更（含 BC-1／BC-2，X2）；CORS（OD-12）在此規劃；部署後 production Swagger smoke（由 E5 移入） | Owner | 未開始 |
 
 ## 調查範圍紀錄
@@ -84,11 +85,12 @@ Round 4 的程式與測試（本 worktree，未 commit）：
 - Stage E 後續（Claude，依 Codex Stage E 結果）：GET Point Query 的 Dates 改為「the latest date available to point queries」（E6）；snapshot 與一個契約測試同步；03／README 記錄 Stage E 完成、E4／E5 的處理與 production Swagger smoke 移到 Stage G；02 §11.9。未改 handler 行為、`info.version`、`change_log.md`；未 commit、push、部署；未連 VM24、未送 production 請求。
 - Stage E 紀錄同步（Claude，依 Codex 最終確認）：E6 改記為 Codex 已確認（150 tests passed）；03 檢查清單的 E1–E3 改為具測試依據的結論（E3：無可用日期 503 不帶 `Retry-After`、overload 503 帶 `Retry-After: 1`、POST 無資料日期回 400）。G-C/D、F2、Ops-1 狀態不變。只改 03／README／02 的紀錄文字；未改 OAS、snapshot、程式、測試；未 commit、push、部署；未連 VM24、未送 production 請求。
 - G-C/D review 前置自查（Claude，2026-11-20）：修正過期紀錄——04 Stage E 改為 Codex 已完成；01 標頭的本機行號位移（BC-2 新增 46 行、BC-1 淨 +8）；README／02 的 BC-1 行數；02 §5.3.1 註明行號指基線；03 Stage C 驗收補記 `app.py` diff 的 hunk 歸屬；03 驗證紀律補記 Stage E 時 Codex 已重跑測試。G-C/D 當時仍待 Codex review（該輪當時狀態）。同輪依 owner 授權對公開 POST 做 Ops-1 spot check：**結果不符合預期，已停止**；Ops-1 紀錄未更新，證據只保存在本機 scratchpad，待 owner 決定。
-- F2 升版（Claude，依 owner 2026-11-24 核准）：`app.py` 只改 `version=` 一行為 `1.0.0`；snapshot（只有 `/info/version` 改變）、版本測試、OD-3（舊 Draft 標示、`AGENTS.md`）、`change_log.md`「OpenAPI contract v1.0.0」（已核准、尚未部署）；02 → Approved（§11.10），03／04／05／README 狀態同步。未 commit、push、部署；未送 production 請求；未碰 P5／O4。
+- F2 升版（Claude，依 owner 2026-11-24 核准）：`app.py` 只改 `version=` 一行為 `1.0.0`；snapshot（只有 `/info/version` 改變）、版本測試、OD-3（舊 Draft 標示、`AGENTS.md`）、`change_log.md`「OpenAPI contract v1.0.0」（已核准、尚未部署）；02 → Approved（§11.10），03／04／05／README 狀態同步。該輪當時未 commit、push、部署；未送 production 請求；未碰 P5／O4。
 - G-B 狀態同步（Claude，依 Codex G-B review）：README、03、04、05 的 G-B 由「未結案／是否為 F2 前置未決定」改為「已由 Codex review 通過」；該輪當時 F2 未核准、`info.version` `0.4.1` 不變。只改文件。
 - OD-13 狀態同步（Claude）：04 OD-13 列改為「F2 前置的公開 POST spot check 已完成」（僅該請求序列；GET cache、其他快取情境與修改後 NGINX diff 未驗證，不列為 F2 阻擋項）；03 的離線驗收計畫標為當時擬定，第 4–5 項不列為 F2／發佈阻擋項。只改文件。
 - Review 狀態對齊（Claude，依 Codex review）：05 與 03 的 BC-1／BC-2 改為已隨 G-C/D 經 Codex review 通過；02 §7 的 Ops-1 前置改為已完成（只限該 POST 序列、未測 GET cache）；01 §10.4 移除矛盾的根因斷言，改記 Codex 唯讀確認的修改前設定缺陷足以解釋本次錯置、owner 修改後的 diff 未檢視；G-B 記為未結案、是否為 F2 前置未決定，不再寫 F2 只剩 owner 核准；round 11／12 等歷史狀態標為「當時」。只改文件；未改 API、OAS、snapshot、測試；未送 production 請求。
 - Ops-1 驗收紀錄（Claude，依 owner 提供的結果）：記錄修改前 spot check（13:06 UTC，錯置仍可重現）、**owner** 修改並 reload VM24 NGINX（修改前檢視 `/etc/nginx/conf2.d/api_cache_proxy.conf`），以及修改後 15:09 UTC 三筆公開 POST 序列通過；未測 GET cache。G-C/D 記為 Codex review 通過；該輪當時 F2 仍待 owner 書面核准。只改 01／03／04／README 的紀錄文字；Claude 本輪未送 production 請求、未連 SSH／VM24、未改設定、未清快取、未 reload、未 commit／push。
 - 503 證據紀錄同步（Claude，依 Codex review）：README 第 5 點、02 §5.3.1 與 §6 POST 503、03 Stage D 第 5 項、01 §12 的 503 證據改記為「已由 Stage D 本機 HTTP 層測試覆蓋（TestClient＋模擬資料），未對 production 實測」；01 保留盤點當時的原文並加後續註記。只改紀錄文字；未改 OAS、snapshot、程式、測試；該輪當時 G-C/D 待 review、F2 未核准、Ops-1 待驗收的狀態不變。
+- 實作 commit 與文件同步（Claude，2026-11-24，依 owner 授權與 Codex review）：逐檔暫存、建立本機實作 commit `b9bd4e4`（15 個檔案，工作樹乾淨）；其後把 README／02／03／04／05 的目前狀態改為已由 Codex review、已 commit、尚未部署，並明確記錄 `b9bd4e4…` 為實作 commit SHA（文件同步 commit 有自己的 SHA）；修正 03 指向 02 §5.0 的錨點。未改 API、OAS、snapshot、測試、`change_log.md`；未部署、未連 VM24、未碰 P5／O4。
 - Round 1–3 未做：修改程式／測試／設定、commit、push、merge、cherry-pick、切換 branch。
-- 全程未做：commit、push、cherry-pick、碰觸 `/Users/cywhale/proj/ghrsst` working tree 或 O4 worktree（含 VM24 的 O4 候選 checkout）、修改 production 設定或 NGINX、清除快取、重啟或部署。
+- 全程未做（實作 commit 與其後的文件同步 commit 除外，兩者皆經 owner 授權／Codex review）：push、cherry-pick、碰觸 `/Users/cywhale/proj/ghrsst` working tree 或 O4 worktree（含 VM24 的 O4 候選 checkout）、修改 production 設定或 NGINX、清除快取、重啟或部署。
