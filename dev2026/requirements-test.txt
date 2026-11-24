@@ -1,0 +1,7 @@
+# Dev/test-only dependencies — NOT runtime. Never install these on the serving host;
+# the runtime list is the repository-root requirements.txt, which this file does not change.
+#
+# jsonschema: Draft 2020-12 validation of real responses against the generated OpenAPI in
+# dev2026/tests/test_api_v1_contract.py (without it those tests are skipped, not passed).
+# Tested with jsonschema 4.26.0.
+jsonschema>=4.18,<5

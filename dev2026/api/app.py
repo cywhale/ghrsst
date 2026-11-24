@@ -304,7 +304,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ODB Open API of GHRSST (MUR v4.1)",
-    version="0.4.1",
+    version="1.0.0",
     description=(
         "Open API for daily 1-km GHRSST MUR v4.1 sea-surface temperature data.\n\n"
         "* Data source: MUR-JPL-L4-GLOB-v4.1, JPL MUR MEaSUREs Project. 2015. "
@@ -333,12 +333,66 @@ async def _overloaded_handler(request: Request, exc: Overloaded):
                  status_code=503, headers={"Retry-After": "1"})
 
 
+# ---- Web API v1 BC-2: non-finite input inside a 422 body -------------------
+# Coordinates reject NaN / +-Inf during validation (`allow_inf_nan=False`, `FiniteFloat`), so such a
+# request is a 422. FastAPI's 422 echoes the offending `input`; for a JSON body that is a float NaN /
+# Infinity, and Starlette's JSONResponse refuses to serialize it (allow_nan=False) -> 500 instead of
+# 422. This handler returns FastAPI's default 422 unchanged unless the encoded errors contain a
+# non-finite float; only then are exactly those floats written as "NaN" / "Infinity" / "-Infinity".
+from fastapi.encoders import jsonable_encoder  # noqa: E402
+from fastapi.exception_handlers import request_validation_exception_handler  # noqa: E402
+from fastapi.exceptions import RequestValidationError  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
+from pydantic import FiniteFloat  # noqa: E402
+
+_NON_FINITE_NAMES = {float("inf"): "Infinity", float("-inf"): "-Infinity"}
+
+
+def _is_non_finite(v) -> bool:
+    return isinstance(v, float) and (v != v or v in _NON_FINITE_NAMES)
+
+
+def _has_non_finite(v) -> bool:
+    if isinstance(v, dict):
+        return any(_has_non_finite(x) for x in v.values())
+    if isinstance(v, list):
+        return any(_has_non_finite(x) for x in v)
+    return _is_non_finite(v)
+
+
+def _non_finite_to_str(v):
+    """Replace non-finite floats at any depth of JSON-encoded data; leave everything else as is."""
+    if isinstance(v, dict):
+        return {k: _non_finite_to_str(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_non_finite_to_str(x) for x in v]
+    if _is_non_finite(v):
+        return "NaN" if v != v else _NON_FINITE_NAMES[v]
+    return v
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_handler(request: Request, exc: RequestValidationError):
+    encoded = jsonable_encoder(exc.errors())        # what FastAPI's default handler serializes
+    if not _has_non_finite(encoded):
+        return await request_validation_exception_handler(request, exc)   # default, unchanged
+    return JSONResponse(status_code=422, content={"detail": _non_finite_to_str(encoded)})
+
+
 # ---- helpers -------------------------------------------------------------
 def _parse_date(s: Optional[str]) -> Optional[str]:
     if s is None:
         return None
     if isinstance(s, str) and DATE_RE.match(s):
-        return s
+        # Web API v1 BC-1: a well-formed but non-existent day (2025-02-30) is the same client
+        # error as a malformed one. Without this check the point/range path crashed with 500 in
+        # its own strptime, while bbox / POST answered 400 for the same input.
+        try:
+            datetime.strptime(s, "%Y-%m-%d")
+        except ValueError:
+            pass
+        else:
+            return s
     raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD.")
 
 
@@ -432,10 +486,10 @@ def _spatial_window_gate(app, day: str):
 @app.get("/api/ghrsst")
 async def read_ghrsst(
     request: Request,
-    lon0: float = Query(..., description="Longitude or minimum longitude, range [-180, 180].", json_schema_extra={"example": -69.0}),
-    lat0: float = Query(..., description="Latitude or minimum latitude, range [-90, 90].", json_schema_extra={"example": 32.0}),
-    lon1: Optional[float] = Query(None, description="Maximum longitude for BBox mode; provide with lat1."),
-    lat1: Optional[float] = Query(None, description="Maximum latitude for BBox mode; provide with lon1."),
+    lon0: float = Query(..., allow_inf_nan=False, description="Longitude or minimum longitude, range [-180, 180].", json_schema_extra={"example": -69.0}),
+    lat0: float = Query(..., allow_inf_nan=False, description="Latitude or minimum latitude, range [-90, 90].", json_schema_extra={"example": 32.0}),
+    lon1: Optional[float] = Query(None, allow_inf_nan=False, description="Maximum longitude for BBox mode; provide with lat1."),
+    lat1: Optional[float] = Query(None, allow_inf_nan=False, description="Maximum latitude for BBox mode; provide with lon1."),
     start: Optional[str] = Query(None, description="Start date YYYY-MM-DD. Point/range requests are capped at 366 days; BBox is single-day.", json_schema_extra={"example": "2026-05-01"}),
     end: Optional[str] = Query(None, description="End date YYYY-MM-DD. For BBox, use the same date as start.", json_schema_extra={"example": "2026-05-31"}),
     append: Optional[str] = Query(None, description="Comma-separated fields: sst, sst_anomaly, sea_ice. Default: sst.", json_schema_extra={"example": "sst,sst_anomaly"}),
@@ -633,7 +687,7 @@ class PointsRequest(BaseModel):
     }
 
     date: str
-    points: List[List[float]]
+    points: List[List[FiniteFloat]]      # BC-2: NaN / +-Inf -> 422 (finite out-of-grid still clamps)
     append: Optional[str] = None
     mode: Optional[str] = None
 
@@ -766,3 +820,12 @@ async def healthz(request: Request):
             "spatial_window": (list(spatial_policy.spatial_window_bounds(cube.delta.days))
                                if isinstance(cube, TieredCube) and cube.delta and cube.delta.days else None),
             "route_counts": dict(router.route_counts)}
+
+
+# ---- Web API v1: published OpenAPI description (documentation only) -------
+# Rewrites only the document served at `openapi_url` (schemas, responses, headers, examples,
+# parameter docs). No request path calls it, so validation, status codes, headers, caching and
+# reads are untouched. See api/openapi_contract.py and specs/ghrsst_v1/02_openapi_v1_spec.md.
+from api.openapi_contract import install as _install_openapi_contract  # noqa: E402
+
+_install_openapi_contract(app, cfg)

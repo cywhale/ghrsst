@@ -1,0 +1,968 @@
+{
+  "components": {
+    "schemas": {
+      "DataRow": {
+        "additionalProperties": false,
+        "description": "One row of GET /api/ghrsst. Only requested variables appear. A variable with no value at that cell (for example land) is null. A variable that does not exist for that date is left out of point rows and is null in bounding-box rows.",
+        "properties": {
+          "date": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "lat": {
+            "description": "Latitude of the nearest grid cell.",
+            "type": "number"
+          },
+          "lon": {
+            "description": "Longitude of the nearest grid cell (not the requested value).",
+            "type": "number"
+          },
+          "sea_ice": {
+            "description": "Sea-ice fraction, 0–1.",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "sst": {
+            "description": "Sea-surface temperature, °C.",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "sst_anomaly": {
+            "description": "SST anomaly, °C.",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "lon",
+          "lat",
+          "date"
+        ],
+        "type": "object"
+      },
+      "Date": {
+        "description": "Product date of the MUR analysis, YYYY-MM-DD; must be a real calendar date.",
+        "maxLength": 10,
+        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+        "type": "string"
+      },
+      "ErrorMessage": {
+        "properties": {
+          "detail": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "type": "object"
+      },
+      "FieldName": {
+        "enum": [
+          "sst",
+          "sst_anomaly",
+          "sea_ice"
+        ],
+        "type": "string"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "PointsBatchRow": {
+        "additionalProperties": false,
+        "description": "One row of POST /api/ghrsst/points. Every requested variable is present; it is null when the variable does not exist for that date or has no value.",
+        "properties": {
+          "date": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "index": {
+            "description": "Zero-based position of this point in the request `points` array; use it to match the row to its input.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lat": {
+            "description": "Latitude of the nearest grid cell.",
+            "type": "number"
+          },
+          "lon": {
+            "description": "Longitude of the nearest grid cell.",
+            "type": "number"
+          },
+          "sea_ice": {
+            "description": "Sea-ice fraction, 0–1.",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "sst": {
+            "description": "Sea-surface temperature, °C.",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "sst_anomaly": {
+            "description": "SST anomaly, °C.",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "index",
+          "lon",
+          "lat",
+          "date"
+        ],
+        "type": "object"
+      },
+      "PointsRequest": {
+        "properties": {
+          "append": {
+            "default": "sst",
+            "description": "Variables to return, comma-separated: sst, sst_anomaly, sea_ice. Default: sst.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "date": {
+            "$ref": "#/components/schemas/Date"
+          },
+          "mode": {
+            "description": "Optional. `truncate` rounds coordinates to 5 and values to 3 decimals.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "points": {
+            "description": "[lon, lat] pairs, at least 1 and at most 1000 per request (current request-handling limit).",
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "description": "lon",
+                  "type": "number"
+                },
+                {
+                  "description": "lat",
+                  "type": "number"
+                }
+              ],
+              "type": "array"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "date",
+          "points"
+        ],
+        "title": "PointsRequest",
+        "type": "object"
+      },
+      "RangeTooLarge": {
+        "properties": {
+          "detail": {
+            "properties": {
+              "error": {
+                "const": "requested range too large"
+              },
+              "hint": {
+                "type": "string"
+              },
+              "max_days": {
+                "type": "integer"
+              },
+              "requested_days": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "error",
+              "max_days",
+              "requested_days",
+              "hint"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "type": "object"
+      },
+      "SpatialWindowError": {
+        "properties": {
+          "detail": {
+            "properties": {
+              "available_spatial_window": {
+                "description": "First and last date of the spatial data currently served, as \"YYYY-MM-DD..YYYY-MM-DD\", or \"(none)\".",
+                "type": "string"
+              },
+              "error": {
+                "const": "spatial query outside the available window"
+              },
+              "hint": {
+                "type": "string"
+              },
+              "requested_day": {
+                "description": "The requested day, echoed as sent.",
+                "type": "string"
+              },
+              "spatial_window_days": {
+                "description": "Retention target of the recent spatial data, in days. It is not the length of the window currently served, which may be longer; see available_spatial_window.",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "error",
+              "requested_day",
+              "spatial_window_days",
+              "available_spatial_window",
+              "hint"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "type": "object"
+      },
+      "TooManyPoints": {
+        "properties": {
+          "detail": {
+            "properties": {
+              "error": {
+                "const": "too many points"
+              },
+              "hint": {
+                "type": "string"
+              },
+              "max_points": {
+                "type": "integer"
+              },
+              "requested_points": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "error",
+              "max_points",
+              "requested_points",
+              "hint"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Open API for daily 1-km GHRSST MUR v4.1 sea-surface temperature data.\n\n* Data source: MUR-JPL-L4-GLOB-v4.1, JPL MUR MEaSUREs Project. 2015. GHRSST Level 4 MUR Global Foundation Sea Surface Temperature Analysis, Ver. 4.1. PO.DAAC, CA, USA. https://doi.org/10.5067/GHGMR-4FJ04\n",
+    "title": "ODB Open API of GHRSST (MUR v4.1)",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/ghrsst": {
+      "get": {
+        "description": "Query daily sea-surface temperature at a single point (one date or a date range) or over a bounding box (one date). This is a public API; no authentication is required.\n\n**Coordinates** must be finite numbers; NaN, Infinity and -Infinity are rejected as validation errors. Finite values outside the grid are clamped to the nearest grid cell, and each row reports that cell's coordinates.\n\n**Query type** The request is a Bounding-Box Query when both `lon1` and `lat1` are given and (`lon1`, `lat1`) differs from (`lon0`, `lat0`); otherwise it is a Point Query.\n\n**Point Query**\n\n* Dates: without `start` and `end`, the latest date available to point queries is used. With only one of them, that single date. With both, every date in the inclusive range; the two dates may be given in either order.\n* Coverage: point queries support the latest 366 consecutive calendar days ending on the latest date available to point queries. The archive currently starts on 2023-01-01.\n* Request limit: one request may cover at most 366 inclusive calendar dates (current request-handling limit, not a quota). This limits the length of one request, not the coverage window above; split longer periods into several requests.\n\n**Bounding-Box Query**\n\n* Dates: one date per request. Give `start` or `end` alone, or both with the same date. Without a date, the newest date in the daily data is used; if that date is not yet available to spatial queries, the request fails instead of falling back to an earlier date.\n* Coverage: bounding-box queries support the latest 31 consecutive calendar days ending on the latest date available to spatial queries. The same window applies to `POST /api/ghrsst/points`.\n* Request limit: use `sample` to thin large areas. One request may return at most 300000 grid cells after thinning (current request-handling limit, not a quota).\n* In Swagger UI, keep boxes small to avoid large browser responses.\n\n**Data freshness** The newest product date typically lags 1–2 days behind today, depending on upstream GHRSST data availability. Omit date parameters to request the latest available data. Dates in the examples are illustrative.",
+        "operationId": "getGhrsstData",
+        "parameters": [
+          {
+            "description": "Longitude of the point, or of one bounding-box corner (-180 to 180).",
+            "in": "query",
+            "name": "lon0",
+            "required": true,
+            "schema": {
+              "description": "Longitude of the point, or of one bounding-box corner (-180 to 180).",
+              "example": -69.0,
+              "title": "Lon0",
+              "type": "number"
+            }
+          },
+          {
+            "description": "Latitude of the point, or of one bounding-box corner (-90 to 90).",
+            "in": "query",
+            "name": "lat0",
+            "required": true,
+            "schema": {
+              "description": "Latitude of the point, or of one bounding-box corner (-90 to 90).",
+              "example": 32.0,
+              "title": "Lat0",
+              "type": "number"
+            }
+          },
+          {
+            "description": "Longitude of the opposite bounding-box corner; give it together with `lat1`. Boxes crossing the antimeridian are not supported.",
+            "in": "query",
+            "name": "lon1",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Longitude of the opposite bounding-box corner; give it together with `lat1`. Boxes crossing the antimeridian are not supported.",
+              "title": "Lon1"
+            }
+          },
+          {
+            "description": "Latitude of the opposite bounding-box corner; give it together with `lon1`.",
+            "in": "query",
+            "name": "lat1",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Latitude of the opposite bounding-box corner; give it together with `lon1`.",
+              "title": "Lat1"
+            }
+          },
+          {
+            "description": "Date (YYYY-MM-DD). Point Query: a single date, or one end of a range together with `end`. Bounding-Box Query: the query date.",
+            "in": "query",
+            "name": "start",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 10,
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Date (YYYY-MM-DD). Point Query: a single date, or one end of a range together with `end`. Bounding-Box Query: the query date.",
+              "example": "2026-05-01",
+              "title": "Start"
+            }
+          },
+          {
+            "description": "Date (YYYY-MM-DD). Point Query: a single date, or the other end of a range together with `start`. Bounding-Box Query: the query date; if `start` is also given, it must be the same date.",
+            "in": "query",
+            "name": "end",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 10,
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Date (YYYY-MM-DD). Point Query: a single date, or the other end of a range together with `start`. Bounding-Box Query: the query date; if `start` is also given, it must be the same date.",
+              "example": "2026-05-31",
+              "title": "End"
+            }
+          },
+          {
+            "description": "Variables to return, comma-separated: sst, sst_anomaly, sea_ice. Default: sst.",
+            "in": "query",
+            "name": "append",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": "sst",
+              "description": "Variables to return, comma-separated: sst, sst_anomaly, sea_ice. Default: sst.",
+              "example": "sst,sst_anomaly",
+              "title": "Append"
+            }
+          },
+          {
+            "description": "Bounding box only: keep every Nth grid cell along each axis (N of 1 or more). Default 1.",
+            "in": "query",
+            "name": "sample",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "description": "Bounding box only: keep every Nth grid cell along each axis (N of 1 or more). Default 1.",
+              "example": 1,
+              "minimum": 1,
+              "title": "Sample",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional. `truncate` rounds coordinates to 5 and values to 3 decimals.",
+            "in": "query",
+            "name": "mode",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional. `truncate` rounds coordinates to 5 and values to 3 decimals.",
+              "example": "truncate",
+              "title": "Mode"
+            }
+          },
+          {
+            "description": "Only JSON is supported (case-insensitive). Omitted or empty means JSON.",
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "default": "json",
+              "description": "Only JSON is supported (case-insensitive). Omitted or empty means JSON.",
+              "example": "json",
+              "title": "Format",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "bbox": {
+                    "summary": "Bounding box: missing or empty values are null (illustrative)",
+                    "value": [
+                      {
+                        "date": "2026-11-15",
+                        "lat": 24.0,
+                        "lon": 121.0,
+                        "sst": null,
+                        "sst_anomaly": null
+                      },
+                      {
+                        "date": "2026-11-15",
+                        "lat": 24.0,
+                        "lon": 121.01000213623047,
+                        "sst": 25.9,
+                        "sst_anomaly": null
+                      }
+                    ]
+                  },
+                  "point_field_absent": {
+                    "summary": "Point: a variable that does not exist for that date is left out (illustrative)",
+                    "value": [
+                      {
+                        "date": "2026-11-15",
+                        "lat": 23.5,
+                        "lon": 122.5,
+                        "sst": 26.621
+                      }
+                    ]
+                  },
+                  "point_range": {
+                    "description": "?lon0=122.5&lat0=23.5&start=2026-11-15&end=2026-11-16&append=sst,sst_anomaly,sea_ice",
+                    "summary": "Point time series (observed 2026-11-19; dates are illustrative)",
+                    "value": [
+                      {
+                        "date": "2026-11-15",
+                        "lat": 23.5,
+                        "lon": 122.5,
+                        "sea_ice": null,
+                        "sst": 26.621000289916992,
+                        "sst_anomaly": -0.07100000232458115
+                      },
+                      {
+                        "date": "2026-11-16",
+                        "lat": 23.5,
+                        "lon": 122.5,
+                        "sea_ice": null,
+                        "sst": 26.156999588012695,
+                        "sst_anomaly": -0.32899999618530273
+                      }
+                    ]
+                  }
+                },
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/DataRow"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "JSON array of DataRow. Point Query: one row per available date in the requested range, oldest first. Bounding-Box Query: one row per grid cell, south to north and then west to east; the body is streamed but is a single JSON array.",
+            "headers": {
+              "Cache-Control": {
+                "description": "`no-store` when the result can still change (no date given; a point range reaching the newest date; a bounding box without a date or on the newest date). Otherwise `public, max-age=<seconds>`; the seconds are a deployment value (currently 864000).",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Bbox-Format": {
+                "description": "Bounding box only: the body format.",
+                "required": false,
+                "schema": {
+                  "enum": [
+                    "json"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Read-Ms": {
+                "description": "Bounding box only: read time in ms. Informational (observability): may change or disappear without a version change; clients must not depend on it.",
+                "required": false,
+                "schema": {
+                  "type": "number"
+                }
+              },
+              "X-Served-Rows": {
+                "description": "Bounding box only: number of rows (grid cells) in the body.",
+                "required": false,
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Store-Route": {
+                "description": "Point queries only. Informational (observability): may change or disappear without a version change; clients must not depend on it.",
+                "required": false,
+                "schema": {
+                  "enum": [
+                    "cube",
+                    "daily",
+                    "mixed"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Stride": {
+                "description": "Bounding box only: the `sample` stride applied.",
+                "required": false,
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "bbox_too_large": {
+                    "summary": "Box larger than the current cell limit",
+                    "value": {
+                      "detail": "bbox too large (16008001 > 300000); increase stride or shrink bbox"
+                    }
+                  },
+                  "invalid_date": {
+                    "summary": "Malformed or non-existent date (2025/01/01, 2025-02-30)",
+                    "value": {
+                      "detail": "Invalid date format. Use YYYY-MM-DD."
+                    }
+                  },
+                  "spatial_window": {
+                    "summary": "Observed 2026-11-19 (window dates go stale)",
+                    "value": {
+                      "detail": {
+                        "available_spatial_window": "2026-09-04..2026-11-17",
+                        "error": "spatial query outside the available window",
+                        "hint": "bbox / POST points are limited to the recent spatial window (2026-09-04..2026-11-17); use point time-series / single-day point for older days",
+                        "requested_day": "2024-06-01",
+                        "spatial_window_days": 31
+                      }
+                    }
+                  },
+                  "unsupported_field": {
+                    "value": {
+                      "detail": "Unsupported field(s): foo. Allowed: sst,sst_anomaly,sea_ice"
+                    }
+                  }
+                },
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorMessage"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SpatialWindowError"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Bad request. `detail` is a message string, except for SpatialWindowError, whose `detail` is an object. Causes:\n\n* a date that is malformed or not a real calendar date;\n* an unsupported variable (`append`), `mode` or `format`;\n* `sample` other than 1, or a format other than JSON, in a point query; `sample` below 1;\n* a bounding box with two different dates;\n* no data in the requested point date range;\n* a bounding box larger than 300000 grid cells after `sample` thinning; increase `sample` or shrink the box. This is a current request-handling limit for one request, not a rate limit, a quota or a data coverage window.\n* a bounding-box date that is not available, or that is outside the spatial data currently served (SpatialWindowError). Its `available_spatial_window` gives the dates currently served; `spatial_window_days` is a retention target, not the current window length."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "range_too_large": {
+                    "value": {
+                      "detail": {
+                        "error": "requested range too large",
+                        "hint": "split into ranges of <= 366 days",
+                        "max_days": 366,
+                        "requested_days": 731
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/RangeTooLarge"
+                }
+              }
+            },
+            "description": "Point range too long: more than 366 inclusive calendar dates in one request, counted before the range is trimmed to available data. This is a current request-handling limit for one request, not a rate limit, a quota or a data coverage window. Split the request into shorter ranges. `detail` is a RangeTooLarge object."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation error (FastAPI format, `detail` is a list): a required parameter is missing, a value has the wrong type, or a coordinate is not a finite number."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "no_available_dates": {
+                    "summary": "Point query, no data at all (no Retry-After)",
+                    "value": {
+                      "detail": "No available dates."
+                    }
+                  },
+                  "no_available_spatial_dates": {
+                    "summary": "Bounding box, no daily data (no Retry-After)",
+                    "value": {
+                      "detail": "No available dates for spatial queries."
+                    }
+                  },
+                  "overloaded": {
+                    "summary": "Overload (sent with Retry-After: 1)",
+                    "value": {
+                      "detail": "server overloaded; retry later"
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            },
+            "description": "Service unavailable. Either no dates are available (no Retry-After), or the server is overloaded (Retry-After present). Clients should only rely on Retry-After when it is sent.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying. Sent ONLY when the 503 is caused by overload (currently 1). The two no-available-dates cases do not send it.",
+                "required": false,
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "security": [],
+        "summary": "Point Query or Bounding-Box Query"
+      }
+    },
+    "/api/ghrsst/points": {
+      "post": {
+        "description": "Query many points for one date in a single request. This is a public API; no authentication is required.\n\n**Points**\n\n* Send a `date` and a list of [lon, lat] `points`. The response has one row per point, in the same order; duplicate points are kept.\n* Each row's `index` is the zero-based position of its point in `points`, so rows can be matched back to the input.\n* Every requested variable appears in every row; it is null when the variable does not exist for that date or has no value.\n* At most 1000 points per request (current request-handling limit, not a quota). Points spread over a very large area may be rejected; split them into smaller batches by geographic area.\n\n**Date**\n\n* Coverage: this endpoint supports the latest 31 consecutive calendar days ending on the latest date available to spatial queries. This is the same window as a Bounding-Box Query on `GET /api/ghrsst`.\n* The newest product date typically lags 1–2 days behind today, depending on upstream GHRSST data availability. The example date is illustrative; choose a date inside this window.\n\n**Coordinates** must be finite numbers; NaN, Infinity and -Infinity are rejected as validation errors. Finite values outside the grid are clamped to the nearest grid cell, and each row reports that cell's coordinates.",
+        "operationId": "postGhrsstPoints",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "batch": {
+                  "summary": "Illustrative date: use a date inside the 31-day spatial window",
+                  "value": {
+                    "append": "sst,sst_anomaly",
+                    "date": "2026-11-15",
+                    "points": [
+                      [
+                        122.5,
+                        23.5
+                      ],
+                      [
+                        -69.0,
+                        32.0
+                      ]
+                    ]
+                  }
+                }
+              },
+              "schema": {
+                "$ref": "#/components/schemas/PointsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "batch": {
+                    "summary": "Observed 2026-11-19 (append=sst,sea_ice; dates are illustrative)",
+                    "value": [
+                      {
+                        "date": "2026-11-15",
+                        "index": 0,
+                        "lat": 23.5,
+                        "lon": 122.5,
+                        "sea_ice": null,
+                        "sst": 26.621000289916992
+                      },
+                      {
+                        "date": "2026-11-15",
+                        "index": 1,
+                        "lat": 23.5,
+                        "lon": 122.5,
+                        "sea_ice": null,
+                        "sst": 26.621000289916992
+                      },
+                      {
+                        "date": "2026-11-15",
+                        "index": 2,
+                        "lat": 32.0,
+                        "lon": -69.0,
+                        "sea_ice": null,
+                        "sst": 25.138999938964844
+                      }
+                    ]
+                  }
+                },
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PointsBatchRow"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "JSON array of PointsBatchRow: one row per input point, in the same order as `points`. Duplicate points give duplicate rows; `index` is the zero-based position in `points`.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Always `no-store`.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "bad_point": {
+                    "value": {
+                      "detail": "each point must be [lon, lat]."
+                    }
+                  },
+                  "empty_points": {
+                    "value": {
+                      "detail": "points must be a non-empty list of [lon,lat]."
+                    }
+                  },
+                  "invalid_date": {
+                    "summary": "Malformed or non-existent date (2025/01/01, 2025-02-30)",
+                    "value": {
+                      "detail": "Invalid date format. Use YYYY-MM-DD."
+                    }
+                  },
+                  "spatial_window": {
+                    "summary": "Observed 2026-11-19 (window dates go stale)",
+                    "value": {
+                      "detail": {
+                        "available_spatial_window": "2026-09-04..2026-11-17",
+                        "error": "spatial query outside the available window",
+                        "hint": "bbox / POST points are limited to the recent spatial window (2026-09-04..2026-11-17); use point time-series / single-day point for older days",
+                        "requested_day": "2020-01-01",
+                        "spatial_window_days": 31
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorMessage"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SpatialWindowError"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Bad request. `detail` is a message string, except for SpatialWindowError, whose `detail` is an object. Causes:\n\n* a date that is malformed or not a real calendar date;\n* an unsupported variable (`append`) or `mode`;\n* an empty `points` list, or a point that is not exactly [lon, lat];\n* a date that is outside the spatial data currently served (SpatialWindowError; `spatial_window_days` is a retention target, not the current window length), or not available."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "fan_out": {
+                    "summary": "Points cover too many areas: split them into smaller batches of points that are close together",
+                    "value": {
+                      "detail": "batch spans 65 chunks > fan-out limit 64; shrink/split the request"
+                    }
+                  },
+                  "too_many_points": {
+                    "value": {
+                      "detail": {
+                        "error": "too many points",
+                        "hint": "split into batches of <= 1000 points",
+                        "max_points": 1000,
+                        "requested_points": 1001
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/TooManyPoints"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorMessage"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Request too large. This is a current request-handling limit for one request, not a rate limit, a quota or a data coverage window. Causes:\n\n* more than 1000 points (`detail` is a TooManyPoints object); split them into batches of at most 1000;\n* points spread too widely: they fall in more than 64 grid blocks of the daily data (current deployment value; `detail` is a string). Split the points into smaller batches by geographic area, so each batch covers a compact region."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation error (FastAPI format, `detail` is a list): a required field is missing, a value has the wrong type, or a coordinate is not a finite number. Non-finite numbers echoed in `input` are written as the strings \"NaN\", \"Infinity\" or \"-Infinity\"."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "overloaded": {
+                    "value": {
+                      "detail": "server overloaded; retry later"
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorMessage"
+                }
+              }
+            },
+            "description": "Server overloaded; retry after Retry-After seconds. This is the only 503 of this operation (an unavailable date is a 400).",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying. Sent ONLY when the 503 is caused by overload (currently 1). Overload is the only 503 of this operation, so it is currently always sent.",
+                "required": false,
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "security": [],
+        "summary": "Batch point query for one day"
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "https://eco.odb.ntu.edu.tw"
+    }
+  ]
+}

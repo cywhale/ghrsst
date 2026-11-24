@@ -7,7 +7,7 @@
 - `conf/` contains deployment scripts (`start_app.sh`, `simu.sh`), PM2 config, and TLS assets; treat certificates as secrets.
 - `dev/` provides ingestion and sync utilities (cron, NetCDF→Zarr) that keep the store up to date.
 - `tests/` holds validation tooling and sample NetCDF files under `ncfiles/` for parity checks.
-- `specs/` captures the API contract (`ghrsst_api_v0_1_0.spec`) and should remain the authoritative interface reference.
+- `specs/` keeps the legacy `ghrsst_api_v0_1_0.spec`, a SUPERSEDED 0.1.0 Draft kept for history only; do not treat it as authoritative. The authoritative interface reference is the approved OpenAPI contract v1.0.0 in `dev2026/specs/ghrsst_v1/02_openapi_v1_spec.md` (Gate F2, 2026-11-24) together with the generated OpenAPI it specifies (snapshot: `dev2026/tests/snapshots/openapi_v1.json`).
 - `src/.env` is a template for runtime overrides; copy to `.env` locally instead of editing in place.
 
 ## Build, Test, and Development Commands
