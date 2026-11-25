@@ -2,6 +2,7 @@
 
 > 狀態：**Round 10（2026-11-20；本檔內容自 round 4 未變）— 基線已由 owner 決定：`6b32e54`（B1）。** 本機 branch 調整紀錄見 [§7](#7-round-4-本機基線調整紀錄2026-11-20)。
 > §1–§6 為 2026-11-19 的調查紀錄（當時 worktree 在 `e302fc4`），保留原文作為來源證據。
+> 2026-11-25 補記：§4 第 1 點「`6b32e54` 在 GitHub 查不到」是 2026-11-19 查核當時的狀態；其後 owner 已發布 GitHub branch `dev2026-api-v1-base-6b32e54`（HEAD = 原始 `6b32e54`），見 §4 第 1 點的後續註記。
 > 調查方式：本機 Git 物件唯讀檢查 + VM24 唯讀 SSH 檢查 + 公開 API 唯讀請求。本文件不變更 production。
 
 ## 1. 本 worktree 狀態
@@ -34,7 +35,7 @@ reference」。該文件描述的是舊 `ghrsst_app.py`（31 天上限等），�
 | tag `v0.4.1` → `9a8d3d4` | 2026-07-28 | `0.4.1` | production retention checkpoint |
 | tag `v0.5.0`（annotated，物件 `792b15b`）→ `14f26db` | 2026-07-30 | `0.4.1` | time-cube authority + daily retention |
 | P5 chain（`dev2026-p5-*`） | 2026-07-31.. | `0.4.1` | P5 segmented base / 資料生命週期 |
-| **`6b32e54`**（無 remote ref） | 2026-08-28 | `0.4.1` | **目前 production serving code**（§3） |
+| **`6b32e54`**（2026-11-19 查核時無 remote ref；其後見 §4） | 2026-08-28 | `0.4.1` | **目前 production serving code**（§3） |
 | `a833b4b` | 2026-09-17 | `0.4.1` | 文件化「0.6.0 operational milestone」（文件版本，非 API 版本） |
 | `d7ba064`（`dev2026-p5-s6-o2-local`） | 2026-11 | `0.4.1` | `/Users/cywhale/proj/ghrsst`；受保護、有 dirty 檔案；本輪只讀 Git 物件，未讀其 working tree |
 | `1003b25`（O4，`dev2026-p5-gen3-block-replacement`） | — | `0.4.1` | O4；不得帶入 |
@@ -63,14 +64,15 @@ reference」。該文件描述的是舊 `ghrsst_app.py`（31 天上限等），�
 
 ## 4. 落差與風險
 
-1. **`6b32e54` 目前在 GitHub 上查不到**（round 2 補充遠端查核，2026-11-19 08:59 UTC）：
+1. **`6b32e54` 在 2026-11-19 查核當時於 GitHub 上查不到**（round 2 補充遠端查核，2026-11-19 08:59 UTC）：
    - `gh api repos/cywhale/ghrsst/commits/6b32e547…` → HTTP 422 `No commit found for SHA`；
    - `git ls-remote origin 'refs/heads/*' 'refs/tags/*'` 共 42 個 refs，其 SHA 全部存在於本機，且**沒有一個**以 `6b32e54` 為祖先；
    - 本機 remote-tracking refs（`git branch -r --contains`）同樣為空——此項單獨只反映最後一次 fetch，故以上兩項為主要證據。
    查核範圍限 branch／tag refs 與 commits API；未檢查 PR refs 以外的其他 GitHub 物件。
    它存在於本機 `dev2026-p5-s6-o2-local` 與 O4 branch 的歷史中，以及 VM24 deploy bundle `p5deploy_6b32e54.bundle`。
    最近的 origin 祖先是 `origin/dev2026-p4s10-execution-findings`（`24d0413`，落後 96 commits）。
-   → 目前 production 程式**無法只從 GitHub 重現**；但本機工作只需本機完整 commit 與保存的來源證據即可進行（§5）。
+   → 當時 production 程式**無法只從 GitHub 重現**；但本機工作只需本機完整 commit 與保存的來源證據即可進行（§5）。
+   - **後續註記（2026-11-25 記錄）**：owner 其後 決定並發布 GitHub branch `dev2026-api-v1-base-6b32e54`（HEAD = `6b32e54710db5b65fae3e30081d48eae71b26f26`，即原始 `6b32e54`，SHA 未改寫；自既有遠端父提交 `7902b615` 起含 94 個 commits、0 個 merge commits；owner 已接受該段歷史中的運維資訊公開；2026-11-25 記錄）。此後 `6b32e54` 可從 GitHub 取得。上述查核內容保留作歷史證據；API branch `ghrsst_v1` 尚未 push。
 2. **6b32e54 之後已有影響 API 行為、但未部署的 commit**：`ee84037`（2026-11-05，O2-local lineage，亦不在 origin）
    修改 `dev2026/api/app.py`：
    - `GHRSST_FIXED_CACHE_SECONDS` 預設由 `864000`（10 天）改為 `259200`（3 天）——**對外可見的 `Cache-Control` 變更**；

@@ -1,6 +1,6 @@
 # 03 — Roadmap 與驗證計畫
 
-> 狀態（截至 2026-11-24）：**G-C/D 已通過 Codex review（2026-11-20）；Stage E 已由 Codex 完成，E6 用詞統一 Codex 已確認；Ops-1 公開 POST spot check 通過（2026-11-20，owner 修改 NGINX 設定後；未測 GET cache）；G-B 已由 Codex review 通過；**F2 已由 owner 核准（2026-11-24）**；`info.version` 已改為 `1.0.0`；Codex 最終 review 已完成；實作 commit SHA：`b9bd4e46097289632874d1615c5737c37ebc0156`（parent `6b32e54`；其後的文件同步 commit 另有自己的 SHA）；尚未部署（Stage G；部署前須先處理 `6b32e54` 不在 GitHub 遠端歷史中的問題）。** **Round 12（2026-11-20）— A 完成、F1 已同意、C／D 已實作；round 5–10 修補（`format`、BC-1、BC-2、日期 `maxLength`、資料日期窗口、Swagger 說明重整、窗口連續性用詞、GET 說明層級／目前覆蓋／freshness、`servers`／`operationId`／`security: []`；round 11 `append` 的 `default: "sst"`；round 12 日期窗口簡潔用詞）當時待 Codex review（其後 G-C/D 已通過）。** **F2 readiness 更新（2026-11-20）**：v1 契約政策已由 owner 決定（04 決定紀錄）；OD-21 已記錄 P5 reviewer 對政策／設計依據的確認（**不是**永久保證）；E（Codex）與 Ops-1（ops 驗收）當時未完成（其後皆已完成，見本行開頭）；當時 **F2 未核准**（2026-11-24 已核准）；G 未開始。見下方「F2 readiness」。
+> 狀態（截至 2026-11-25）：**G-C/D 已通過 Codex review（2026-11-20）；Stage E 已由 Codex 完成，E6 用詞統一 Codex 已確認；Ops-1 公開 POST spot check 通過（2026-11-20，owner 修改 NGINX 設定後；未測 GET cache）；G-B 已由 Codex review 通過；**F2 已由 owner 核准（2026-11-24）**；`info.version` 已改為 `1.0.0`；Codex 最終 review 已完成；實作 commit SHA：`b9bd4e46097289632874d1615c5737c37ebc0156`（parent `6b32e54`；其後的文件同步 commit 另有自己的 SHA）；基線 `6b32e54` 已由 owner 發布為 GitHub branch `dev2026-api-v1-base-6b32e54`（SHA 未改寫；非新的 F2 核准）；API branch 尚未 push、未開 PR；尚未部署（部署未授權；部署準備清單見「Stage G」）。** **Round 12（2026-11-20）— A 完成、F1 已同意、C／D 已實作；round 5–10 修補（`format`、BC-1、BC-2、日期 `maxLength`、資料日期窗口、Swagger 說明重整、窗口連續性用詞、GET 說明層級／目前覆蓋／freshness、`servers`／`operationId`／`security: []`；round 11 `append` 的 `default: "sst"`；round 12 日期窗口簡潔用詞）當時待 Codex review（其後 G-C/D 已通過）。** **F2 readiness 更新（2026-11-20）**：v1 契約政策已由 owner 決定（04 決定紀錄）；OD-21 已記錄 P5 reviewer 對政策／設計依據的確認（**不是**永久保證）；E（Codex）與 Ops-1（ops 驗收）當時未完成（其後皆已完成，見本行開頭）；當時 **F2 未核准**（2026-11-24 已核准）；G 未開始。見下方「F2 readiness」。
 > 角色：Owner/Orchestrator = Human；文件與實作 = Claude；Review = Codex；部署 = **未定**。
 > Round 2 變更：核准拆成 F1（實作範圍）／F2（公開契約），消除「實作需核准、核准需實作」的循環；
 > 基線只需本機完整 commit，推上 origin 改列為發布準備；快取問題改為不阻擋本機工作的獨立 ops 待辦。
@@ -89,7 +89,7 @@ Owner 指示：不下載 Docker image、不安裝或啟動 NGINX／container，�
 | 產出 | owner 對 OD-1（B1–B4）、OD-2（`ee84037`）、OD-15（`app.py` ownership）的決定；本機 branch 安排（`ghrsst_v1` 重指或另開本機 branch） |
 | 依賴 | 00 文件 |
 | 驗收 | 選定的本機完整 commit 可 `git cat-file -e`；其 `dev2026/api/app.py` sha256 與 VM24 serving 相符（或明確記錄差異）；O4 commits 不在其歷史中（`git merge-base --is-ancestor 93625b3 <base>` 為 false）；來源與重現證據保存在 00 |
-| 不要求 | 推上 origin（列入 Stage G 發布準備） |
+| 不要求 | 推上 origin（列入 Stage G 發布準備；其後基線已由 owner 發布為 `dev2026-api-v1-base-6b32e54`，見 Stage G） |
 | 角色 | Owner 決定；Claude 驗證並更新 00；Codex review |
 
 ## Stage B — 現況盤點與 SPEC review
@@ -375,7 +375,7 @@ Round 12（Claude 執行；當時 Codex 尚未 review；2026-11-20）——只�
 | 前置 | E 完成（Codex 2026-11-20 已完成；E6 後續修正 Codex 已確認）；Ops-1 驗收（公開 POST 對不同 body 回應正確）——宣告 POST 契約的前提，**公開 POST spot check 已通過**（2026-11-20，owner 修改 NGINX 後；未測 GET cache）；G-C/D Codex review 已通過；G-B 已由 Codex review 通過（00–05 文件；2026-11-24 記錄）；OD-21：P5 reviewer 確認 366／31 日為資料涵蓋政策與設計依據（**已收到**，2026-11-20；非無條件或永久保證）。v1 政策項（OD-3、6、11、16、17、20）已由 owner 決定；OD-12 屬 Stage G，不是 F2 前置 |
 | 驗收 | owner 書面核准 |
 | 角色 | Owner |
-| 結果（2026-11-24） | **Owner 已核准 F2**（不含 commit、push、部署授權）。已完成產出 (1)–(4)：`info.version` `1.0.0` 與 snapshot／`test_version_is_the_approved_contract`；`change_log.md`「OpenAPI contract v1.0.0」（已核准、尚未部署）；02 狀態 → Approved（2026-11-24）；OD-3 SUPERSEDED 標示與 `AGENTS.md`。待辦：(5) Codex review 後 commit；(6) commit 後補 SHA。詳見 02 §11.10 |
+| 結果（2026-11-24） | **Owner 已核准 F2**（不含 commit、push、部署授權）。已完成產出 (1)–(4)：`info.version` `1.0.0` 與 snapshot／`test_version_is_the_approved_contract`；`change_log.md`「OpenAPI contract v1.0.0」（已核准、尚未部署）；02 狀態 → Approved（2026-11-24）；OD-3 SUPERSEDED 標示與 `AGENTS.md`。當時待辦：(5) Codex review 後 commit；(6) commit 後補 SHA——其後皆已完成：實作 commit `b9bd4e46097289632874d1615c5737c37ebc0156`，文件已記錄此 SHA（2026-11-24）。changelog 的部署 commit 依 (2) 的約定留到部署後補。詳見 02 §11.10 |
 
 ## F2 readiness（2026-11-20 owner 決定後；狀態截至 2026-11-24）
 
@@ -408,13 +408,125 @@ Stage E 檢查清單（Codex；2026-11-20 已完成）：
 
 | 項目 | 內容 |
 | --- | --- |
-| 產出 | 發布準備：選定基線與 v1 變更在遠端可取得（push／tag 由 owner 授權）；部署計畫：目標 commit、與 P5 serving checkout 的關係、與 `ee84037` 等 P5 變更的合併順序、hash 驗證、rollback、上線後 smoke（公開 `openapi.json` 的 `info.version == 1.0.0`、路由與回應抽查、headers） |
+| 產出 | 發布準備：選定基線與 v1 變更在遠端可取得（push／tag 由 owner 授權；基線已由 owner 發布為 `dev2026-api-v1-base-6b32e54`，HEAD 為原始 `6b32e54`；API branch 的 push／PR 待 owner 安排）；部署計畫：目標 commit、與 P5 serving checkout 的關係、與 `ee84037` 等 P5 變更的合併順序、hash 驗證、rollback、上線後 smoke（公開 `openapi.json` 的 `info.version == 1.0.0`、路由與回應抽查、headers） |
 | 依賴 | F2；部署執行者確定；P5 session 協調（OD-15） |
-| 部署目標（X2） | `6b32e54` 加上 API v1 候選變更（含已核准的 BC-1／BC-2）。目前 production（`6b32e54`）**尚未包含**這些本機改動，部署前 v1 契約描述的 BC-1／BC-2 行為不會在 production 生效。若部署前整合 `ee84037` 或其他會改變 503／headers 的 P5 變更，必須先更新並 review OAS（02 §7） |
+| 部署目標（X2） | `6b32e54` 加上 API v1 候選變更（含已核准的 BC-1／BC-2）。目前 production（`6b32e54`）**尚未包含**這些本機改動，部署前 v1 契約描述的 BC-1／BC-2 行為不會在 production 生效。若部署前整合 `ee84037` 或其他會改變 503／headers 的 P5 變更，必須先更新並 review OAS（02 §7）。部署 commit 的識別方式見下方 G-1 |
 | Production Swagger smoke（由 E5 移入） | 部署後確認：production 使用 VM24 專用的 Swagger 設定（change_log 0.5.0），`/api/swagger/ghrsst/openapi.json` 輸出此契約（`info.version == 1.0.0`）；`servers` URL 加上 `/api/...` 路徑後正確；Swagger UI 可載入。需部署授權後由部署者執行；Claude 不執行 |
 | 其他 G 項目 | CORS（OD-12）：v1 不承諾，是否開放在此階段規劃；部署後在 `change_log.md` 的「OpenAPI contract v1.0.0」紀錄補部署日期、部署 commit 與 smoke 結果 |
 | 驗收 | owner 對發布與部署的獨立授權；部署後 smoke 結果記錄 |
 | 角色 | Owner 授權；部署者執行；Claude 只撰寫計畫，不執行 |
+
+### Stage G 部署準備清單（2026-11-25 整理；**部署未授權**；待 Codex review）
+
+本清單只供 review 與規劃，本身**不授權**任何 production 變更（同 p4s10 runbook §1 的原則）。Claude 不執行清單中任何 VM24／production 步驟。
+
+**依據（皆為本 worktree 內的 repo 文件與腳本，唯讀整理）：**
+
+| 來源 | 用到的內容 |
+| --- | --- |
+| 00 §3、§4 第 1 點 | 2026-11-19 VM24 唯讀證據：PM2 launcher `/home/odbadmin/python/ghrsst/conf/start_app.sh` 以 `cd /home/odbadmin/p5deploy/20260830T082136Z/checkout` 啟動 `gunicorn api.app:app`（`127.0.0.1:8035`，`PYTHONPATH=dev2026`，venv 為 `/home/odbadmin/python/ghrsst-dev2026-phase2/dev2026/.venv`）；deploy checkout HEAD `6b32e54`、乾淨；18 個 api／store 模組 hash 與本機一致；VM24 上有 `p5deploy_6b32e54.bundle` |
+| `conf/ecosystem.config.js` | PM2 app 名稱 `ghrsst`，`script: ./conf/start_app.sh` |
+| `conf/start_app.sh`（repo 版） | 仍是舊的 `ghrsst_app:app`（py314）；**與 production launcher 內容不同**（00 §3），不能拿 repo 版當部署依據 |
+| `dev2026/README.md`「VM24 production deployment (v0.5.0)」 | launcher env 清單；routine restart（`pm2 restart ghrsst`，不換路徑）；回到 pre-dev2026 app 的 rollback；operational checks；Swagger URL |
+| `AGENTS.md`（@`b9bd4e4`） | production path swap：取 GHRSST ingest lock → stop `ghrsst` → 確認 `8035` 已停 → swap → start → 驗 `/healthz`；禁止 ad-hoc `pm2 … --update-env`；不改 NGINX 或無關 PM2 程序。同檔「active API runtime is `ghrsst-dev2026-phase2`」一句已過時（00 §3） |
+| `dev2026/specs/p4s10_production_rollout_runbook.md` | §1：`$DEPLOY_SHA` 必須是完整 40 字元 commit SHA、取自**外部核准紀錄**（文件不能記錄包含自身的 SHA），並在 HEAD 上核對；§3：Asia/Taipei cron 時窗、PM2 lifecycle preflight、stop→swap→start、禁用 `--update-env`；§7：以 HTTP status 為 hard gate，`X-Store-Route` 只記錄；§8：artifacts 與 operator summary；§9：rollback ladder。**該 runbook 是 P4 delta prune 的流程**，此處只引用其通用部署紀律，不表示 v1 部署要執行 prune／swap |
+| `dev2026/specs/p5_integration_candidate.md` §6、`dev2026/ops/p5_readiness.py` | P5 以 `REVIEWED_DEPLOY_SHAS`（目前 `3223fba`、`708058e`）／`CURRENT_DEPLOY_SHA`（`708058e`）／`PROPOSED_DEPLOY_SHAS`（空）管理 service deployment approval，涵蓋含 `api/app.py` 在內的 service modules |
+| `dev2026/api/app.py` | `docs_url="/api/swagger/ghrsst"`、`openapi_url="/api/swagger/ghrsst/openapi.json"` |
+| `dev2026/tests/test_api_v1_contract.py`、05 | BC-1／BC-2 的預期行為（smoke 預期值來源）：`test_bc1_non_existent_day_is_400_on_every_path`、`test_bc1_non_existent_day_is_a_date_error_not_a_window_error`、`test_bc2_get_non_finite_is_422`、`test_bc2_post_non_finite_is_422_with_stringified_input` |
+| `dev2026/requirements-test.txt`、`dev2026/api/openapi_contract.py` | `jsonschema` 只供測試、不裝在 serving host；`openapi_contract.py` 只 import 標準函式庫（`copy`、`typing`），v1 不新增 runtime 依賴 |
+
+#### G-1 部署目標識別
+
+1. `$DEPLOY_SHA` 只能是 owner 在**外部核准紀錄**（部署授權）中寫明的完整 40 字元 commit SHA；branch、tag、縮寫一律不接受（p4s10 §1）。本文件不預先寫入部署 SHA。
+   同一份部署授權也要寫明 `$REVIEWED_API_SHA`：**最新一個已經 Codex review 的 API commit 的完整 SHA**（其 tree 就是核准部署的內容）。本文件寫到的 `b9bd4e4`（實作）與 `956fbe4`（文件同步）只是截至 2026-11-25 已 review 的 commits；之後若有新的已 review commit（例如本輪文件修改提交後），以授權中寫明的 SHA 為準，不以本文件為準。
+2. 候選來源是 API PR merge 後的 commit。merge 方式（merge commit／squash／rebase）由 owner 決定：squash 或 rebase 會產生新的 commit，`b9bd4e4` 不再是部署 commit 的祖先，因此**以 tree 內容比對為主、ancestry 為輔**。
+3. 部署前在完整 clone 上核對（唯讀 git 指令）：
+   - `git rev-parse --verify "$DEPLOY_SHA^{commit}"` 的輸出必須等於輸入本身（完整 SHA）；
+   - `git merge-base --is-ancestor 6b32e54710db5b65fae3e30081d48eae71b26f26 "$DEPLOY_SHA"` 為真（包含 production 基線）；
+   - `$REVIEWED_API_SHA` 同樣以 `git rev-parse --verify "$REVIEWED_API_SHA^{commit}"` 核對為完整 SHA，且 `git merge-base --is-ancestor b9bd4e46097289632874d1615c5737c37ebc0156 "$REVIEWED_API_SHA"` 為真（它承接已 review 的 API 實作）；
+   - `git diff --quiet "$REVIEWED_API_SHA" "$DEPLOY_SHA"` 為真：部署 tree 與授權指定的已 review tree 完全相同。**若不同，或授權中的 SHA 與實際候選對不上（例如 merge 後又有新 commit、squash 產生的 tree 不同），立即停止**：以 `git diff --stat` 逐檔列出差異，交 Codex 重新 review，再由 owner 更新授權中的 SHA；**不得**夾帶未 review 的變更部署；
+   - `git log --oneline 6b32e54710db5b65fae3e30081d48eae71b26f26.."$DEPLOY_SHA"` 只出現 API v1 的 commits（及 merge 方式產生的 merge commit）；出現任何 P5／O4 或其他 commit → NO-GO；
+   - O4 排除：部署前由 owner／P5 提供**目前要排除的 O4 候選 commit 的完整 SHA**（記在部署授權或 preflight 紀錄中），preflight 對每一個 SHA 核對 `git merge-base --is-ancestor <O4 SHA> "$DEPLOY_SHA"` 為假。00 §4 與 Stage A 用的 `93625b3`（2026-11-19／11-20 當時 O4 lineage 的第一個 commit）只是當時的查核點，**不能據以宣稱目前的 O4 歷史已排除**；Claude 不讀取 O4 worktree。O4 SHA 尚未提供前，此項**待確認**（P-h），preflight 不得視為通過；
+   - `ee84037` 不在歷史中（OD-2；若 owner 另行決定先整合，必須先更新並 review OAS，02 §7）。
+4. 部署後身分確認（沿用 00 §3 的取證方式）：新 deploy checkout 的 `git rev-parse HEAD` 等於 `$DEPLOY_SHA`、`git status` 乾淨；執行中 gunicorn master 的 cwd 是該 checkout；`dev2026/api/app.py`、`dev2026/api/openapi_contract.py` 與 `dev2026/store/*.py` 的 sha256 等於 `$DEPLOY_SHA` 中的 blob（00 §3 當時只比對 `app.py` 與 `store/*.py`，v1 新增的 `openapi_contract.py` 也要比）。
+
+#### G-2 部署前檢查
+
+有 repo 依據的項目：
+
+1. Owner 的書面部署授權，寫明部署者、時間窗、`$DEPLOY_SHA` 與 `$REVIEWED_API_SHA`，以及 owner／P5 提供的 O4 排除 SHA（G-1；p4s10 §1）。
+2. 時間窗避開 Asia/Taipei cron（daily ingest 05:05／18:05、delta append 07:30／20:30），前後留 30–60 分鐘（p4s10 §3）。
+3. 部署前狀態留存：`pm2 describe ghrsst`、production launcher 內容的備份、目前 deploy checkout 的 HEAD（應為 `6b32e54`）與 `git status`、`/healthz`、目前公開 `openapi.json`（應為 `info.version` `0.4.1`）（p4s10 §3／§8；00 §3）。
+4. 環境不變：沿用 launcher 現有 env（`dev2026/README.md` 列出的 `GHRSST_*`）；v1 不需要新增 env；不使用 `pm2 … --update-env`（`AGENTS.md`、p4s10 §3）。
+5. 執行環境：沿用 production venv（00 §3：Python 3.13.7、fastapi 0.138.0、pydantic 2.13.4、starlette 1.3.1）；本機契約測試也使用 fastapi 0.138.0。v1 不新增 runtime 依賴（見上表）。
+6. 新 checkout 的 import 檢查：以 production venv、`PYTHONPATH=dev2026` import `api.app`，確認 `app.openapi()["info"]["version"] == "1.0.0"`（p4s10 §1 import preflight 的原則）。`api.app` 在 import 時是否開啟 store、應在什麼環境下執行，**待確認**。
+7. 不改 NGINX（`dev2026/README.md`、`AGENTS.md`）。
+
+**待確認（repo 內沒有依據，不自行假設）：**
+
+| # | 事項 | 現有線索 | 由誰決定 |
+| --- | --- | --- | --- |
+| P-a | 新 deploy checkout 如何建立（路徑、來源） | 00 §3／§4 只證明 production 來自 `/home/odbadmin/p5deploy/20260830T082136Z/checkout` 與 VM24 上的 `p5deploy_6b32e54.bundle`；repo 沒有記錄該 checkout 的建立與切換步驟。`p5_deployment_readiness.md` 記錄過以 git bundle 建立的唯讀 readiness checkout，但那不是 serving 部署 | Owner／部署者 |
+| P-b | production launcher 如何改指新 checkout、備份檔名與位置 | production launcher 不在 repo（repo 的 `conf/start_app.sh` 是舊版） | Owner／部署者 |
+| P-c | 重啟方式：plain `pm2 restart ghrsst`，或 path swap 的 lock → stop → 確認 `8035` 已停 → 切換 → start | `dev2026/README.md` 的 restart 是「不換路徑」的情境；`AGENTS.md` 對 path swap 要求取 ingest lock 並 stop／start。換 deploy checkout 是否屬 path swap、要不要取 lock 與做 PM2 lifecycle preflight（p4s10 §3），repo 沒有針對 API-only 部署的規定 | Owner（必要時與 P5 協調） |
+| P-d | 是否需要 P5 的 service deployment approval | P5 以 `REVIEWED_DEPLOY_SHAS` 管理 service 部署（含 `api/app.py`）；目前 production 的 `6b32e54` 本身也不在該 tuple 中。API v1 的部署 SHA 是否要走 P5 的 propose → promote 流程、P5 readiness 的 `identity` 檢查會如何看待新 SHA，repo 沒有結論 | Owner 與 P5（OD-15）；**待確認**，未決定前不得視為可部署 |
+| P-e | 與 `ee84037` 等 P5 變更的整合順序 | OD-2、X2；若先整合，OAS 必須先更新並 review（02 §7） | Owner 與 P5 |
+| P-f | CORS | OD-12：v1 不承諾；是否開放在 Stage G 規劃 | Owner |
+| P-g | 公開 `openapi.json` 是否受 NGINX GET 快取影響 | Ops-1 只驗證公開 POST，**未測 GET cache**（01 §10.4、02 §7）；部署後若公開端點仍回 `0.4.1`，可能是 proxy 快取。清快取屬 ops 操作，需另行授權 | Owner／ops |
+| P-h | 目前要排除的 O4 候選完整 SHA | repo 中的 `93625b3` 只是 2026-11-19／11-20 的查核點；目前 O4 lineage 需由 owner／P5 提供（Claude 不讀 O4 worktree） | Owner／P5 |
+| P-i | spatial smoke 日期 `D_spatial` 的確認方式 | 見 G-3 的選日規則：`/healthz` 只給 delta 的 `[earliest, latest]` 與 daily 的 bounds，無法證明某一天同時在 delta 中且 daily store 有資料 | Owner／部署者 |
+
+#### G-3 部署後 smoke 計畫（只寫計畫；由部署者在授權範圍內執行，Claude 不執行、不發 production 請求）
+
+先在 VM24 本機查 `http://127.0.0.1:8035`（繞過 NGINX，判斷 app 本身行為），再查公開 `https://eco.odb.ntu.edu.tw`。Hard gate 以 HTTP status 與下列指定欄位為準；headers（如 `X-Store-Route`、`X-API-Cache`）只記錄（p4s10 §7）。GET 日期一律明寫 `start=<日>&end=<日>`（p4s10 §7：GET 不認得 `date=`）；BBox 不可省略日期（理由見下）。
+
+**smoke 日期分兩種（依 `dev2026/api/app.py` 的 `healthz`、`read_ghrsst`、`post_points` 與 `store/spatial_policy.py`）：**
+
+- **`D_point`（S6、S12）**：取 `/healthz` 的 `point_latest`（base＋delta＋daily 聯集的最新日）。Point 查詢以這個聯集為準，所以 `point_latest` 本身就是 point 可查的日期。
+- **`D_spatial`（S7、S8、S13）**：必須是**目前確實可供 spatial query 使用**的日期。程式的條件是：
+  1. 當 `spatial_window_enforce` 為 true 且 delta 已載入時，日期必須**屬於 delta 的日期集合**（`spatial_day_allowed` 判斷的是成員資格，不是落在區間內）；
+  2. 之後還要在 daily store 的 bounds 內，且 `store.day_present(日)` 為真（daily store 有這一天）。
+  BBox 不帶日期時，handler 先取 **daily store 的最新日**，再交給 spatial window gate 判斷，**沒有自動回退**到較早的日期；所以 `daily_latest` 不能一律當成 spatial 可用日期——若它不在 delta 中，請求會回 400。
+  **候選規則**：`D_spatial` = `/healthz` 的 `delta_latest`。前提是 `/healthz` 顯示 `spatial_window_enforce == true`（與 production launcher 的 `GHRSST_SPATIAL_WINDOW_ENFORCE=1` 一致；不一致即停止並記錄）、`spatial_window` 非 null 且 `spatial_window[1] == delta_latest`，並且 `daily_earliest <= delta_latest <= daily_latest`。
+  **仍無法由 repo 證明的部分**：`/healthz` 只回報 delta 的 `[earliest, latest]`（`spatial_window`）與 daily store 的 bounds，不提供 delta 的日期清單，也不提供 daily store 的逐日存在狀態；因此上述前提成立時，仍不能保證 `delta_latest` 這一天 daily store 確實有資料。`D_spatial` 的最終確認方式（例如由部署者在部署前以唯讀方式查核，或在部署前對現行 production 以同一日期執行 S7／S8 作為基準）**部署前待確認**（P-i），由 owner 決定；在確認前，S7／S8 回 400 不能直接判定為 v1 的缺陷，要先排除選日問題。
+
+| # | 檢查 | 預期 |
+| --- | --- | --- |
+| S1 | `GET /api/swagger/ghrsst/openapi.json` | 200；`openapi == "3.1.0"`；`info.version == "1.0.0"`；`servers == [{"url": "https://eco.odb.ntu.edu.tw"}]` |
+| S2 | 同上文件的 paths／operations | 只有 `/api/ghrsst`（get，`operationId` `getGhrsstData`）與 `/api/ghrsst/points`（post，`operationId` `postGhrsstPoints`）；兩個 operation 都是 `security: []`，無 `securitySchemes` |
+| S3 | 同上文件與 `dev2026/tests/snapshots/openapi_v1.json` 比對 | 差異只能來自部署值（例如由 `cfg` 讀出的 request cap：VM24 `GHRSST_BBOX_POINT_LIMIT=300000`，程式預設 1000000）；每一處差異逐項記錄 |
+| S4 | `GET /api/swagger/ghrsst` | Swagger UI 可載入（不需要按 Try it out） |
+| S5 | `GET /healthz` | 200 |
+| S6 | GET point：`/api/ghrsst?lon0=121&lat0=24&start=D_point&end=D_point&append=sst` | 200 |
+| S7 | GET bbox：`/api/ghrsst?lon0=135&lat0=15&lon1=136&lat1=16&start=D_spatial&end=D_spatial&append=sst` | 200 |
+| S8 | `POST /api/ghrsst/points`，body `{"date":"D_spatial","points":[[135,15]],"append":"sst"}` | 200 |
+| S9 | BC-1，GET point：`start=2025-02-30&end=2025-02-30&lon0=121&lat0=24` | 400，body `{"detail":"Invalid date format. Use YYYY-MM-DD."}`（部署前是 500） |
+| S10 | BC-1，GET bbox：S7 的座標加 `start=2025-02-30&end=2025-02-30` | 400，同上 body（不是 `SpatialWindowError`） |
+| S11 | BC-1，POST：`{"date":"2025-02-30","points":[[135,15]],"append":"sst"}` | 400，同上 body |
+| S12 | BC-2，GET：`lon0=nan&lat0=24&start=D_point&end=D_point` | 422；`detail[0].type == "finite_number"`、`loc == ["query","lon0"]` |
+| S13 | BC-2，POST：raw body `{"date":"D_spatial","points":[[NaN,15]],"append":"sst"}`（JSON 字面值 `NaN`；422 在日期檢查前發生） | 422；`loc == ["body","points",0,0]`、`input == "NaN"`（部署前是 200） |
+
+- 公開端點的錯誤回應可能被 proxy 快取約 1 分鐘（02 §7），因此 BC-1／BC-2 的行為以 `127.0.0.1:8035` 的結果為準；公開端點只確認可達，結果與本機不一致時記錄、不清快取（見 P-g）。
+- 結果記入 `change_log.md`「OpenAPI contract v1.0.0」紀錄：部署日期、部署 commit、smoke 結果（Gate F2 產出 (2) 的約定）。任何 hard gate 失敗 → G-4。
+
+#### G-4 回復準備
+
+- **回復目標**：部署前的 serving 狀態，即 deploy checkout `/home/odbadmin/p5deploy/20260830T082136Z/checkout` @ `6b32e54710db5b65fae3e30081d48eae71b26f26`（00 §3），加上部署前備份的 production launcher 與 PM2 定義（G-2 第 3 項）。部署期間與部署後，舊 checkout 不得刪除或改動，保留期限由 owner 決定。
+- **repo 中可查證的既有回復流程只有一個**：`dev2026/README.md`「Rollback to the pre-dev2026 app」——以 `start_app.sh.pre-dev2026` 還原 launcher，再 `pm2 stop ghrsst`／`pm2 start ghrsst` 並查 `/healthz`。它回到的是 **pre-dev2026 舊 app，不是 `6b32e54`**，不能直接當作 v1 的回復步驟；可沿用的只有它的形式（還原 launcher 備份 → PM2 stop／start，不用 `--update-env` → `/healthz`）。
+- v1 只改程式與文件、不改資料或 store，回復只涉及 checkout 與 launcher；p4s10 §9 的資料 hold／reverse-swap 不適用。
+- **回復後驗證要分兩處看**：
+  - **VM24 本機服務**（`http://127.0.0.1:8035`，繞過 NGINX）：判斷應用是否已回復，以這裡的結果為準。預期 `/api/swagger/ghrsst/openapi.json` 回到 `info.version` `0.4.1`，BC-1／BC-2 也回到基線行為（不存在日期在 point 模式回 500、非有限座標回 200）。
+  - **公開 URL**（`https://eco.odb.ntu.edu.tw`）：公開 `openapi.json` 是否受 NGINX GET proxy cache 影響仍**未驗證**（P-g），因此回復後公開 URL 可能暫時仍傳回回復前已被快取的契約內容（v1，`info.version` `1.0.0`）。未經確認，不得把這種情況直接判定為應用回復失敗，也不得據此判定回復成功；只記錄觀察到的內容與時間，並與本機結果並列。
+  - **不清快取**。若需要清除快取，或要對公開 URL 做額外驗證（例如等待快取過期後重查），都屬於需 Owner／ops 另行決定並授權的事項，不包含在回復步驟內。
+- **待確認**：launcher 備份檔名與位置（P-b）；回復的觸發條件與決策者（建議：G-3 任一 hard gate 失敗即回復，由 owner 決定）；回復時是否同樣取 ingest lock（P-c）。
+
+#### G-5 責任與授權界線
+
+- 部署**尚未授權**。部署者、時間窗與 `$DEPLOY_SHA` 由 owner 安排。
+- Claude：只撰寫並更新本清單；不連 VM24、不送 production 請求、不操作 PM2／NGINX／快取、不部署。API branch 的 push／PR 依 owner 指示另行處理；merge 由 owner。
+- Codex：review 本清單；部署時的角色由 owner 指派。
+- P5：P-d、P-e 需與 P5 協調（OD-15）。
+- 基線 branch `dev2026-api-v1-base-6b32e54` 的發布不是新的 F2 核准，也不是部署授權。
 
 ## 驗證紀律
 - 只報告實際執行的結果；未執行的測試標示「未執行」。
