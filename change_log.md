@@ -53,3 +53,11 @@
 - Extended `/healthz` with explicit `point_*` and `daily_*` availability fields. At deployment, point history was `2023-01-01..2026-07-28` (1,305 days), while daily staging was 38 days.
 - Verified VM24 production performance after pruning: historical 365/366-day ranges completed in about 76–100 ms through the cube; base→delta crossing range in about 219 ms; recent bbox in 39 ms; recent `POST /points` in 31 ms.
 - Deployed source logic from commit `5099613` while preserving the VM24-specific Swagger documentation. PM2 recovery took 1.422 seconds. Deployment artifacts are under `/home/odbadmin/Data/ghrsst/logs/p4_point_availability_deploy_20260730T064815Z`.
+
+#### OpenAPI contract v1.0.0 (approved 2026-11-24; not yet deployed)
+- Status: **approved, not yet deployed.** Gate F2 was approved by the owner on 2026-11-24. This entry records the OpenAPI contract version (`info.version` `0.4.1` → `1.0.0`); it is separate from the service release numbering (`ver 0.x`), which this entry does not change.
+- Contract: `dev2026/specs/ghrsst_v1/02_openapi_v1_spec.md` (Approved) for `GET /api/ghrsst` and `POST /api/ghrsst/points`. Routes are unchanged and there is no `/v1` prefix.
+- Documents the 400/413/422/503 responses, error schemas, `Retry-After` (overload 503 only), request caps as current deployment values, the 31-day spatial and 366-day point data-date windows, `servers`, stable `operationId`s, and `security: []` (public, no authentication).
+- Includes two owner-approved behaviour changes in the candidate: a well-formed but non-existent calendar date returns 400 on every path (BC-1), and non-finite coordinates return 422 (BC-2).
+- The legacy `specs/ghrsst_api_v0_1_0.spec` Draft is marked SUPERSEDED, and `AGENTS.md` now points to the v1 contract (OD-3).
+- Production (`6b32e54`) does not yet serve this contract or BC-1/BC-2. The deployment date, deployment commit and post-deploy smoke results will be added after deployment (Stage G).

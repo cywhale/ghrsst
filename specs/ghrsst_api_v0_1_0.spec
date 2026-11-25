@@ -1,3 +1,8 @@
+> **SUPERSEDED (2026-11-24) by `dev2026/specs/ghrsst_v1/` (OpenAPI contract v1.0.0).** This 0.1.0 Draft describes only the legacy `ghrsst_app.py`; it is no longer the API contract, is no longer maintained, and is kept only as history.
+> The authoritative interface reference is the approved OpenAPI contract v1.0.0:
+> [`dev2026/specs/ghrsst_v1/02_openapi_v1_spec.md`](../dev2026/specs/ghrsst_v1/02_openapi_v1_spec.md)
+> (Gate F2 approved by the owner on 2026-11-24; OD-3). Where this file disagrees with the v1 contract, the v1 contract wins.
+
 # GHRSST API (MUR v4.1, daily 1-km) — Functional Spec
 
 **Version:** 0.1.0
